@@ -1,0 +1,16 @@
+# Schema documented at https://render.com/docs/yaml-spec
+services:
+  - type: web
+    name: solara
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    plan: free
+    numInstances: 1
+    envVars:
+      - key: VUE_USERNAME
+        generateValue: false
+        sync: false
+      - key: VUE_PASSWORD
+        generateValue: false
+        sync: false

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>solara</title>
+<style>
+  div.metrics {
+      font-size: 4em;
+  }
+  div.metrics table {
+      width: 100%;
+  }
+  div.metrics td {
+      vertical-align: top;
+  }
+  div.metrics td.note {
+      color: red;
+      overflow: "scroll";
+      padding-left: 0.5em;
+      width: 100%;
+  }
+  div.metrics td.note::before {
+      content: "# ";
+  }
+  div.metrics td.op {
+      padding-left: 0.5em;
+      padding-right: 0.5em;
+      text-align: right;
+  }
+  div.metrics td.num {
+      text-align: right;
+  }
+</style>
+</head>
+<body>
+
+<div class="metrics">
+  {% for vd in metrics.devices %}
+  <table>
+    <tr>
+      <td colspan="3" class="note">
+        [{{ vd.gid }}] {{ vd.name }}
+        at
+        {{ (metrics.instant|astimezonestr(vd.timezone)).strftime("%H:%M:%S") }}
+      </td>
+    </tr>
+    <tr>
+      <td colspan="3" class="note">
+        data age:
+        {{ vd.lag }}
+      </td>
+    </tr>
+    <tr>
+      <td class="op"></td>
+      <td class="num">
+        {% if vd.scales["1MIN"].usage < 10 %}
+        {{ "%.1f" % (vd.scales["1MIN"].usage) }}</td>
+        {% else %}
+        {{ "%.0f" % (vd.scales["1MIN"].usage) }}</td>
+        {% endif %}
+      <td class="note">W, latest minute</td>
+    </tr>
+    <tr>
+      <td class="op">x</td>
+      <td class="num">{{ "%.0f" % (vd.minutes_remaining) }}</td>
+      <td class="note">minutes remaining</td>
+    </tr>
+    <tr>
+      <td class="op">&asymp;</td>
+      <td class="num">
+        {{ "%.0f" % (vd.minute_predicted) }}
+      </td>
+      <td class="note">Wh, remaining</td>
+    </tr>
+    <tr>
+      <td class="op">+</td>
+      <td class="num">{{ "%.0f" % (vd.scales["1H"].usage) }}</td>
+      <td class="note">Wh, hour so far</td>
+    </tr>
+    <tr>
+      <td class="op">&asymp;</td>
+      <td class="num"><b>{{ "%.0f" % (vd.prediction) }}</b></td>
+      <td class="note">Wh, predicted total</td>
+    </tr>
+    <tr>
+      <td colspan="3" class="note">
+      range:
+      {{ "%.0f" % (vd.prediction_min) }}
+      to
+      {{ "%.0f" % vd.prediction_max }}
+      Wh
+      </td>
+    </tr>
+    <tr>
+      <td colspan="3" class="note">
+        response time:
+        {{ metrics.api_response.total }}
+      </td>
+    </tr>
+  </table>
+  {% endfor %}
+</div>
+
+<script>
+  var timePrev = Date.now()
+  var millisMax = 5 * 60 * 1000
+  var timestamp = function() {
+    return new Date(Date.now()).toLocaleTimeString()
+  }
+
+  console.log('millisMax', millisMax, timestamp())
+
+  document.addEventListener('visibilitychange', function () {
+    console.log('visibilitychange', document.visibilityState, timestamp())
+  })
+
+  window.onfocus = function() {
+    console.log('onfocus', timestamp())
+    millis = Date.now() - timePrev
+    if (millis > millisMax) {
+      console.log('reloading via onfocus', timestamp())
+      window.location.reload()
+    }
+  }
+
+  var reloadIfVisibleFn = function() {
+    if (document.visibilityState === "hidden") {
+      // reload later
+      console.log('not visible: resetting timer', timestamp())
+      setTimeout(reloadIfVisibleFn, 1000)
+      return
+    }
+    console.log('reloading via setTimeout', timestamp())
+    window.location.reload()
+  }
+
+  setTimeout(reloadIfVisibleFn, millisMax)
+</script>
+
+{% if metrics.debug %}
+<div class="debug">
+<pre style="white-space: pre-wrap">{{ metrics }}</pre>
+</div>
+{% endif %}
+
+</body>
+</html>

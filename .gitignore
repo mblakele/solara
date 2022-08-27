@@ -1,0 +1,3 @@
+*.pyc
+.env
+.vue-keys.json
