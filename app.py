@@ -42,7 +42,7 @@ app.json_encoder = JSONEncoderSolara
 
 @app.route('/')
 def index():
-    logger.info('index')
+    logger.debug('index')
     # TODO retry loop? Not clearly useful
     is_mock = config('VUE_USERNAME', None) is None
     # TODO handle requests.exceptions.HTTPError
@@ -59,5 +59,13 @@ def index():
 
     # content negotiation failed
     return abort(406)
+
+@app.route('/health')
+def health():
+    logger.debug('health')
+    model = MetricsMock()
+    resp = Response('ok')
+    resp.headers['Content-Type'] = 'text/plain'
+    return resp
 
 # end
