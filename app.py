@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from decouple import config
-from flask import Flask, Response, abort, render_template, request
+from flask import Flask, Response
+from flask import abort, make_response, render_template, request
 from flask.json import JSONEncoder
 
 import isodate
@@ -40,12 +41,20 @@ class JSONEncoderSolara(JSONEncoder):
 
 app.json_encoder = JSONEncoderSolara
 
+@app.errorhandler(RetryableMetricsException)
+def error_retryable(e):
+    resp = make_response(
+        render_template('error_retryable.html', exception=e),
+        500)
+    resp.headers['Refresh'] = 5
+    return resp
+
 @app.route('/')
 def index():
     logger.debug('index')
-    # TODO retry loop? Not clearly useful
-    is_mock = config('VUE_USERNAME', None) is None
     # TODO handle requests.exceptions.HTTPError
+    # TODO check exception text for Unauthorized, etc TBD.
+    is_mock = config('VUE_USERNAME', None) is None
     model = MetricsMock() if is_mock else Metrics(logger)
 
     # check for default html first, to handle missing Accept header.
