@@ -52,7 +52,9 @@ class Metrics:
         self.instant = datetime.now(timezone.utc)
         self.metrics['instant'] = self.instant
 
-        # We only need to fetch this data once.
+        # We only need to fetch this data once...
+        # unless the devices change!
+        # In that case restart the web service.
         if len(self.device_info) < 1:
             self.get_device_info()
 
@@ -84,17 +86,21 @@ class Metrics:
 
     def get_device_info(self):
         """
-        Wrapper for vue.get_devices,
+        Wrapper for vue get_devices,
         filtering results for ZIG001 devices.
         """
         rt_start = datetime.now(timezone.utc)
 
         try:
             devices = self.vue.get_devices()
-        except:
-            # Might be stale auth tokens, so force login on retry
-            logger.logexception('invalidating auth tokens')
-            self.vue.auth = None
+        except requests.exceptions.HTTPError as ex:
+            # If the auth tokens are stale, force login on retry.
+            if (ex.code == 401):
+                logger.exception('invalidating auth tokens')
+                self.vue.auth = None
+            else:
+                # Log, so we can figure out additional error handling.
+                logger.exception(ex)
             raise RetryableMetricsException('get_devices failed')
 
         self.metrics['api_response']['get_devices'] = (
@@ -273,7 +279,7 @@ class Metrics:
                            password=config('VUE_PASSWORD'),
                            token_storage_file=self.vue_keys)
 
-        # TODO This is buggy: response 403 but pyemvue expects 404
+        # TODO downtime check is buggy: response 403 but pyemvue expects 404
         #downtime = self.vue.down_for_maintenance()
         #if downtime:
         #    raise RetryableMetricsException(downtime)

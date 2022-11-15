@@ -52,8 +52,6 @@ def error_retryable(e):
 @app.route('/')
 def index():
     logger.debug('index')
-    # TODO handle requests.exceptions.HTTPError
-    # TODO check exception text for Unauthorized, etc TBD.
     is_mock = config('VUE_USERNAME', None) is None
     model = MetricsMock() if is_mock else Metrics(logger)
 
