@@ -90,7 +90,7 @@ git clone https://github.com/mblakele/solara.git
 Next, install the python requirements:
 
 ```
-pip3 -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 Next, the local server will need your Emporia account credentials.
