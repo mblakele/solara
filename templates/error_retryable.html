@@ -14,15 +14,11 @@
 <body>
 
 <div class="error">
-
-<div>INTERNAL SERVER ERROR</div>
-
-<div class="message">
-{{ exception }}
-</div>
-
-<div><a href=".">RETRY</a></div>
-
+  <div>INTERNAL SERVER ERROR</div>
+  <div class="message">{{ exception.message }}</div>
+  <div><a href=".">RETRY</a></div>
+  <div class="instant">{{ exception.instant }}</div>
 </div>
 
 </body>
+</html>
