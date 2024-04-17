@@ -119,7 +119,7 @@ For development work you may prefer this:
 ```
 gunicorn --reload \
     --reload-extra-file .env \
-    --reload-extra-file templates/* \
+    --reload-extra-file templates \
     app:app
 ```
 
