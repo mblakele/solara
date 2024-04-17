@@ -1,6 +1,7 @@
 """
 Call Emporia VUE API and marshal predicted usage.
 """
+
 from datetime import datetime, timedelta, timezone
 
 import json
@@ -21,7 +22,12 @@ class RetryableMetricsException(Exception):
     """
     Use this exception class to signal that the Emporia VUE API
     responded with a server error and the controller should retry.
+    Include utcnow for display, so that page refresh is obvious.
     """
+    def __init__(self, message, *args):
+        self.message = message
+        self.instant = datetime.utcnow()
+        super(RetryableMetricsException, self).__init__(message, *args)
 
 class Metrics:
     """
@@ -101,6 +107,7 @@ class Metrics:
             else:
                 # Log, so we can figure out additional error handling.
                 logger.exception(ex)
+            # probably no useful metrics data at this point
             raise RetryableMetricsException('get_devices failed')
 
         self.metrics['api_response']['get_devices'] = (
@@ -287,7 +294,6 @@ class Metrics:
         self.metrics['api_response']['auth'] = (
             datetime.now(timezone.utc) - rt_start)
 
-
 class MetricsMock:
     """
     Mock metrics data, for testing.
@@ -300,52 +306,51 @@ class MetricsMock:
                 'total': timedelta(microseconds=750072)
             },
             'debug': True,
-            'devices': [
-                {
-                    'gid': 12345,
-                    'lag': timedelta(seconds=2, microseconds=170162),
-                    'name': 'MOCK',
-                    'minute_predicted': -468.43419509779943,
-                    'minutes_remaining': 17.466666666666665,
-                    'prediction': -52.516668090260964,
-                    'prediction_min': -52.516668090260964,
-                    'prediction_max': -38.242027851465195,
-                    'scales': {
-                        '1H': {
-                            'data': [
-                                0.0012375001112620038,
-                                0.0012375001112620038,
-                                0.0012299999926090241
-                            ],
-                            'data_len': 2552,
-                            'data_start': datetime(2022, 8, 27, 18, 0, tzinfo=timezone.utc),
-                            'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc),
-                            'seconds': 2552,
-                            'usage': 415.91752700753847
-                        },
-                        '1MIN': {'data': [-0.0004437500238418579, -0.0004437500238418579, -0.0004437500238418579], 'data_len': 60, 'data_start': datetime(2022, 8, 27, 18, 41, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 60, 'usage': -26.818751627736606},
-                        '2MIN': {'data': [-0.00044500003258387253, -0.00044500003258387253, -0.00044500003258387253], 'data_len': 120, 'data_start': datetime(2022, 8, 27, 18, 40, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 120, 'usage': -26.768751608861805},
-                        '3MIN': {'data': [-0.0004450000325838725, -0.0004450000325838725, -0.0004450000325838725], 'data_len': 180, 'data_start': datetime(2022, 8, 27, 18, 39, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 180, 'usage': -26.71666824208363},
-                        '4MIN': {'data': [-0.00043750001319249474, -0.00043750001319249474, -0.00043750001319249474], 'data_len': 240, 'data_start': datetime(2022, 8, 27, 18, 38, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 240, 'usage': -26.600001379847455},
-                        '5MIN': {'data': [-0.0004375000132189857, -0.0004375000132189857, -0.0004375000132189857], 'data_len': 300, 'data_start': datetime(2022, 8, 27, 18, 37, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 300, 'usage': -26.50000128470518},
-                        '6MIN': {'data': [-0.0004300000270207724, -0.0004300000270207724, -0.0004300000270207724], 'data_len': 360, 'data_start': datetime(2022, 8, 27, 18, 36, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 360, 'usage': -26.402084584633567},
-                        '7MIN': {'data': [-0.0004300000270207724, -0.0004300000270207724, -0.0004300000270207724], 'data_len': 420, 'data_start': datetime(2022, 8, 27, 18, 35, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 420, 'usage': -26.298215559494096},
-                        '8MIN': {'data': [-0.00042000002337826625, -0.00042000002337826625, -0.00042500002516640556], 'data_len': 480, 'data_start': datetime(2022, 8, 27, 18, 34, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 480, 'usage': -26.20343880499426},
-                        '9MIN': {'data': [-0.0004175000058809917, -0.0004175000058809917, -0.0004175000058809917], 'data_len': 540, 'data_start': datetime(2022, 8, 27, 18, 33, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 540, 'usage': -26.098890160866922},
-                        '10MIN': {'data': [-0.0004200000233385299, -0.0004200000233385299, -0.0004200000233385299], 'data_len': 600, 'data_start': datetime(2022, 8, 27, 18, 32, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 600, 'usage': -26.001501232385706}
+            'devices': [{
+                'gid': 12345,
+                'lag': timedelta(seconds=2, microseconds=170162),
+                'name': 'MOCK',
+                'minute_predicted': -468.43419509779943,
+                'minutes_remaining': 17.466666666666665,
+                'prediction': -52.516668090260964,
+                'prediction_min': -52.516668090260964,
+                'prediction_max': -38.242027851465195,
+                'scales': {
+                    '1H': {
+                        'data': [
+                            0.0012375001112620038,
+                            0.0012375001112620038,
+                            0.0012299999926090241
+                        ],
+                        'data_len': 2552,
+                        'data_start': datetime(2022, 8, 27, 18, 0, tzinfo=timezone.utc),
+                        'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc),
+                        'seconds': 2552,
+                        'usage': 415.91752700753847
                     },
-                    'smoothing': {
-                        '1MIN': -52.516668090260964,
-                     '2MIN': -51.64333442724774,
-                     '3MIN': -50.733611620855584,
-                     '4MIN': -48.69583042713043,
-                     '5MIN': -46.94916209864539,
-                     '6MIN': -45.23888373739453,
-                     '7MIN': -43.42463809829178,
-                     '8MIN': -41.769204119694564,
-                     '9MIN': -39.94308780227044,
-                     '10MIN': -38.242027851465195},
-                 'timezone': 'America/Los_Angeles'}],
+                    '1MIN': {'data': [-0.0004437500238418579, -0.0004437500238418579, -0.0004437500238418579], 'data_len': 60, 'data_start': datetime(2022, 8, 27, 18, 41, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 60, 'usage': -26.818751627736606},
+                    '2MIN': {'data': [-0.00044500003258387253, -0.00044500003258387253, -0.00044500003258387253], 'data_len': 120, 'data_start': datetime(2022, 8, 27, 18, 40, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 120, 'usage': -26.768751608861805},
+                    '3MIN': {'data': [-0.0004450000325838725, -0.0004450000325838725, -0.0004450000325838725], 'data_len': 180, 'data_start': datetime(2022, 8, 27, 18, 39, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 180, 'usage': -26.71666824208363},
+                    '4MIN': {'data': [-0.00043750001319249474, -0.00043750001319249474, -0.00043750001319249474], 'data_len': 240, 'data_start': datetime(2022, 8, 27, 18, 38, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 240, 'usage': -26.600001379847455},
+                    '5MIN': {'data': [-0.0004375000132189857, -0.0004375000132189857, -0.0004375000132189857], 'data_len': 300, 'data_start': datetime(2022, 8, 27, 18, 37, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 300, 'usage': -26.50000128470518},
+                    '6MIN': {'data': [-0.0004300000270207724, -0.0004300000270207724, -0.0004300000270207724], 'data_len': 360, 'data_start': datetime(2022, 8, 27, 18, 36, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 360, 'usage': -26.402084584633567},
+                    '7MIN': {'data': [-0.0004300000270207724, -0.0004300000270207724, -0.0004300000270207724], 'data_len': 420, 'data_start': datetime(2022, 8, 27, 18, 35, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 420, 'usage': -26.298215559494096},
+                    '8MIN': {'data': [-0.00042000002337826625, -0.00042000002337826625, -0.00042500002516640556], 'data_len': 480, 'data_start': datetime(2022, 8, 27, 18, 34, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 480, 'usage': -26.20343880499426},
+                    '9MIN': {'data': [-0.0004175000058809917, -0.0004175000058809917, -0.0004175000058809917], 'data_len': 540, 'data_start': datetime(2022, 8, 27, 18, 33, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 540, 'usage': -26.098890160866922},
+                    '10MIN': {'data': [-0.0004200000233385299, -0.0004200000233385299, -0.0004200000233385299], 'data_len': 600, 'data_start': datetime(2022, 8, 27, 18, 32, 32, tzinfo=timezone.utc), 'instant': datetime(2022, 8, 27, 18, 42, 32, tzinfo=timezone.utc), 'seconds': 600, 'usage': -26.001501232385706}
+                },
+                'smoothing': {
+                    '1MIN': -52.516668090260964,
+                    '2MIN': -51.64333442724774,
+                    '3MIN': -50.733611620855584,
+                    '4MIN': -48.69583042713043,
+                    '5MIN': -46.94916209864539,
+                    '6MIN': -45.23888373739453,
+                    '7MIN': -43.42463809829178,
+                    '8MIN': -41.769204119694564,
+                    '9MIN': -39.94308780227044,
+                    '10MIN': -38.242027851465195},
+                'timezone': 'America/Los_Angeles'}],
             'instant': datetime(2022, 8, 27, 18, 42, 34, 170162, tzinfo=timezone.utc)
         }
 

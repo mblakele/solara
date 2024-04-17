@@ -5,13 +5,10 @@ from flask import abort, make_response, render_template, request
 from flask.json import JSONEncoder
 
 import isodate
-import json
 import logging
 import pytz
 
 from metrics import Metrics, MetricsMock, RetryableMetricsException
-
-import metrics
 
 # global setup
 app = Flask(__name__)
@@ -53,7 +50,17 @@ def error_retryable(e):
 def index():
     logger.debug('index')
     is_mock = config('VUE_USERNAME', None) is None
-    model = MetricsMock() if is_mock else Metrics(logger)
+    if config('MOCK', default='False', cast=bool):
+        is_mock = True
+    is_mock_error = config('MOCK_ERROR', default='False', cast=bool)
+
+    model = None
+    if is_mock_error:
+        raise RetryableMetricsException('mock')
+    elif is_mock:
+        model = MetricsMock()
+    else:
+        model = Metrics(logger)
 
     # check for default html first, to handle missing Accept header.
     if request.accept_mimetypes.accept_html:
@@ -70,7 +77,6 @@ def index():
 @app.route('/health')
 def health():
     logger.debug('health')
-    model = MetricsMock()
     resp = Response('ok')
     resp.headers['Content-Type'] = 'text/plain'
     return resp
