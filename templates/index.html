@@ -38,7 +38,7 @@
   <table>
     <tr>
       <td colspan="3" class="note">
-        [{{ vd.gid }}] {{ vd.name }}
+        {{ vd.name }}
         at
         {{ (metrics.instant|astimezonestr(vd.timezone)).strftime("%H:%M:%S") }}
       </td>
