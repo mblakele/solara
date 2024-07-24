@@ -142,38 +142,50 @@ class Metrics:
         for vdi in self.device_info.values():
             for chan in vdi.channels:
                 rt_start = datetime.now(timezone.utc)
-                usage_data, usage_data_start = self.vue.get_chart_usage(
-                    chan, chart_start, self.instant,
-                    scale=scale,
-                    unit=Unit.KWH.value)
-                if len(usage_data) < 1:
-                    raise RetryableMetricsException("No data for hour")
-                if usage_data[0] is None:
-                    raise RetryableMetricsException("No data for hour")
-                self.metrics['api_response'][
-                    'get_chart_usage/' + str(chan.channel_num)] = (
-                        datetime.now(timezone.utc) - rt_start)
-                # hourly sum
-                self.populate_scale(
-                    chan, usage_data, usage_data_start, Scale.HOUR.value)
-                # successively slice off the last x minutes of data
-                usage_data_len = len(usage_data)
-                usage_data_end = usage_data_start + timedelta(
-                    seconds=usage_data_len)
-                usage_minutes = min([10, max(1, usage_data_end.minute)])
-                logger.debug({
-                    'usage_data': usage_data[:3],
-                    'usage_data_start': usage_data_start,
-                    'usage_data_len': usage_data_len,
-                    'usage_minutes': usage_minutes })
-                for usm in range(1, 1 + usage_minutes):
-                    # most recent minute(s) presented as xMIN scale
-                    uss = 60 * usm
-                    scale = str(usm) + 'MIN'
-                    offset_data = usage_data[-uss:]
-                    offset_start = usage_data_end - timedelta(minutes=usm)
+                # TODO handle requests.exceptions.HTTPError
+                # when vue devices are in a bad state
+                # Proceed to try other devices anyway.
+                try:
+                    usage_data, usage_data_start = self.vue.get_chart_usage(
+                        chan, chart_start, self.instant,
+                        scale=scale, unit=Unit.KWH.value)
+                    if len(usage_data) < 1:
+                        raise RetryableMetricsException("No data for hour")
+                    if usage_data[0] is None:
+                        raise RetryableMetricsException("No data for hour")
+                    self.metrics['api_response'][
+                        'get_chart_usage/' + str(chan.channel_num)] = (
+                            datetime.now(timezone.utc) - rt_start)
+                    # hourly sum
                     self.populate_scale(
-                        chan, offset_data, offset_start, scale)
+                        chan, usage_data, usage_data_start, Scale.HOUR.value)
+                    # successively slice off the last x minutes of data
+                    usage_data_len = len(usage_data)
+                    usage_data_end = usage_data_start + timedelta(
+                        seconds=usage_data_len)
+                    usage_minutes = min([10, max(1, usage_data_end.minute)])
+                    logger.debug({
+                        'usage_data': usage_data[:3],
+                        'usage_data_start': usage_data_start,
+                        'usage_data_len': usage_data_len,
+                        'usage_minutes': usage_minutes })
+                    for usm in range(1, 1 + usage_minutes):
+                        # most recent minute(s) presented as xMIN scale
+                        uss = 60 * usm
+                        scale = str(usm) + 'MIN'
+                        offset_data = usage_data[-uss:]
+                        offset_start = usage_data_end - timedelta(minutes=usm)
+                        self.populate_scale(
+                            chan, offset_data, offset_start, scale)
+                except (requests.exceptions.HTTPError, IOError):
+                    logger.exception('bad device data: skipping %s', vdi.device_name)
+                    # fake scales data and proceed
+                    vdi.scales = {}
+                    self.populate_scale(
+                        chan, [], usage_data_start, Scale.HOUR.value)
+                    for usm in range(1, 1 + usage_minutes):
+                        scale = str(usm) + 'MIN'
+                        self.populate_scale(chan, [], usage_data_start, scale)
 
     def populate_scale(self, channel, data, data_start, scale):
         """
@@ -203,7 +215,7 @@ class Metrics:
         # Convert from kWh to Wh while we are here.
         # There may be any number of seconds in data
         usage = 1000.0 * sum(data)
-        if not scale == '1H':
+        if not scale == '1H' and data_len != 0:
             # seconds: scale to minutes
             usage = usage * 60.0 / data_len
 
