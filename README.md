@@ -346,4 +346,4 @@ Emporia account username exactly.
 Thanks to
 [Emporia Energy](https://www.emporiaenergy.com)
 and to
-[PyEmVue](https://github.com/magico13/PyEmVue/pyemvue).
+[PyEmVue](https://github.com/magico13/PyEmVue).
