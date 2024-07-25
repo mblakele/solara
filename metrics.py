@@ -70,7 +70,7 @@ class Metrics:
         self.metrics['api_response']['total'] = sum(
             self.metrics['api_response'].values(), timedelta())
 
-        logger.debug(self.device_info.keys())
+        logger.debug("device %s", self.device_info)
         for gid, vdi in self.device_info.items():
             device_metrics = {
                 'gid': gid,
@@ -98,7 +98,7 @@ class Metrics:
         rt_start = datetime.now(timezone.utc)
 
         try:
-            devices = self.vue.get_devices()
+            devices = [self.vue.get_devices()[-1]] # DEBUG
         except requests.exceptions.HTTPError as ex:
             # If the auth tokens are stale, force login on retry.
             if (ex.code == 401):
@@ -114,6 +114,7 @@ class Metrics:
             datetime.now(timezone.utc) - rt_start)
 
         for vdi in devices:
+            logger.debug('device %s, connected %s, model %s, channels %d', vdi.device_gid, vdi.connected, vdi.model, len(vdi.channels))
             if not vdi.connected:
                 continue
             # Only recognize the zigbee utility connect,
@@ -126,6 +127,9 @@ class Metrics:
                 # not needed? we seem to have timezone anyway
                 #vdi = vue.populate_device_properties(vdi)
                 self.device_info[vdi.device_gid] = vdi
+                # Due to rate limiting, stop with first valid device
+                # TODO allow device config? by gid? by name?
+                break
 
     def populate(self):
         """
@@ -140,12 +144,16 @@ class Metrics:
             microseconds=self.instant.microsecond)
         scale = Scale.SECOND.value
         for vdi in self.device_info.values():
+            logger.debug("device: %s", vdi)
             for chan in vdi.channels:
+                logger.debug("channel: %s", chan.name)
                 rt_start = datetime.now(timezone.utc)
-                # TODO handle requests.exceptions.HTTPError
+                # handle requests.exceptions.HTTPError
                 # when vue devices are in a bad state
                 # Proceed to try other devices anyway.
                 try:
+                    # TODO rate limited?
+                    # TODO refactor for a single call for all channels? can't?
                     usage_data, usage_data_start = self.vue.get_chart_usage(
                         chan, chart_start, self.instant,
                         scale=scale, unit=Unit.KWH.value)
@@ -178,7 +186,7 @@ class Metrics:
                         self.populate_scale(
                             chan, offset_data, offset_start, scale)
                 except (requests.exceptions.HTTPError, IOError):
-                    logger.exception('bad device data: skipping %s', vdi.device_name)
+                    logger.exception('error fetching device data: skipping %s', vdi.device_name)
                     # fake scales data and proceed
                     vdi.scales = {}
                     self.populate_scale(
