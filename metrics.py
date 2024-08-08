@@ -189,7 +189,7 @@ class Metrics:
                         self.populate_scale(
                             dig, scale, offset_start, offset_data)
                     # pass though recent data up to 300-sec for sparklines etc.
-                    dig.chart_data = usage_data[:300]
+                    dig.chart_data = usage_data[-300:]
                 except (requests.exceptions.HTTPError, IOError):
                     logger.exception('error fetching device data: skipping %s', vdi.device_name)
                     # fake empty data and proceed
