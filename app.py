@@ -4,6 +4,7 @@ from flask import Flask, Response
 from flask import abort, make_response, render_template, request
 from flask.json import JSONEncoder
 
+import humps
 import isodate
 import logging
 import pytz
@@ -67,7 +68,7 @@ def index():
         return render_template('index.html', metrics=model.metrics)
 
     if request.accept_mimetypes.accept_json:
-        resp = Response(app.json.dumps(model.metrics))
+        resp = Response(app.json.dumps(humps.camelize(model.metrics)))
         resp.headers['Content-Type'] = 'application/json'
         return resp
 

@@ -81,6 +81,7 @@ class Metrics:
                 'prediction': vdi.prediction,
                 'prediction_min': vdi.prediction_min,
                 'prediction_max': vdi.prediction_max,
+                'chart_data': vdi.chart_data,
                 'scales': vdi.scales,
                 'smoothing': vdi.smoothing,
                 'timezone': vdi.time_zone,
@@ -148,6 +149,8 @@ class Metrics:
             for chan in vdi.channels:
                 logger.debug("channel: %s", chan.name)
                 rt_start = datetime.now(timezone.utc)
+                gid = chan.device_gid
+                dig = self.device_info[gid]
                 # handle requests.exceptions.HTTPError
                 # when vue devices are in a bad state
                 # Proceed to try other devices anyway.
@@ -166,7 +169,7 @@ class Metrics:
                             datetime.now(timezone.utc) - rt_start)
                     # hourly sum
                     self.populate_scale(
-                        chan, usage_data, usage_data_start, Scale.HOUR.value)
+                        dig, Scale.HOUR.value, usage_data_start, usage_data)
                     # successively slice off the last x minutes of data
                     usage_data_len = len(usage_data)
                     usage_data_end = usage_data_start + timedelta(
@@ -184,41 +187,43 @@ class Metrics:
                         offset_data = usage_data[-uss:]
                         offset_start = usage_data_end - timedelta(minutes=usm)
                         self.populate_scale(
-                            chan, offset_data, offset_start, scale)
+                            dig, scale, offset_start, offset_data)
+                    # pass though recent data up to 300-sec for sparklines etc.
+                    dig.chart_data = usage_data[-300:]
                 except (requests.exceptions.HTTPError, IOError):
                     logger.exception('error fetching device data: skipping %s', vdi.device_name)
-                    # fake scales data and proceed
+                    # fake empty data and proceed
                     vdi.scales = {}
                     self.populate_scale(
-                        chan, [], usage_data_start, Scale.HOUR.value)
-                    for usm in range(1, 1 + usage_minutes):
-                        scale = str(usm) + 'MIN'
-                        self.populate_scale(chan, [], usage_data_start, scale)
+                        dig, Scale.HOUR.value, usage_data_start, [])
 
-    def populate_scale(self, channel, data, data_start, scale):
+    # TODO refactor as pure function?
+    def populate_scale(self, dig, scale, data_start, data):
         """
         Populate N seconds of usage data for a scale
         of 1H or M minutes.
         """
-        data_len = len(data)
-        gid = channel.device_gid
-
-        dig = self.device_info[gid]
+        logger.debug({
+            'dig': dig,
+            'scale': scale,
+            'data_start': data_start,
+            'data': data[:3] })
         if not hasattr(dig, 'scales'):
             dig.scales = {}
         if not hasattr(dig.scales, scale):
             dig.scales[scale] = {}
-        dsi = dig.scales[scale]
+        dig.scales[scale] = self.data_for_scale(data, data_start, scale)
+
+    @staticmethod
+    def data_for_scale(data, data_start, scale):
+        dsi = {}
+        data_len = len(data)
 
         if DEBUG:
             dsi['data'] = data[:3]
             dsi['data_len'] = data_len
             dsi['data_start'] = data_start
-        logger.debug({
-            'scale': scale,
-            'data': data[:3],
-            'data_len': data_len,
-            'data_start': data_start })
+
         # sum all available data to hour so far
         # Convert from kWh to Wh while we are here.
         # There may be any number of seconds in data
@@ -227,9 +232,11 @@ class Metrics:
             # seconds: scale to minutes
             usage = usage * 60.0 / data_len
 
+        # TODO safe to assume we have data for every second?
         dsi['instant'] = data_start + timedelta(seconds=data_len)
         dsi['seconds'] = data_len
         dsi['usage'] = usage
+        return dsi
 
     def predict(self):
         """Predict consumption or surplus at end of current hour."""
