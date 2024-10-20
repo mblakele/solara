@@ -1,0 +1,21 @@
+modules = ["python-3.12", "web"]
+run = "gunicorn app:app --bind 0.0.0.0:8000"
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "gunicorn app:app"]
+
+[[ports]]
+localPort = 8000
+externalPort = 80
+
+[pypi]
+no_auto_install = true
+
+[packager]
+
+[packager.features]
+guessImports = false
+packageSearch = false

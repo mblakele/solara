@@ -1,0 +1,8 @@
+[tool.poetry.dependencies]
+      python = "^3.8"
+      flask = "^2.2.0"
+      gunicorn = "^22.0.0"
+      isodate = "^0.6.0"
+      pyemvue = "^0.18.0"
+      python-decouple = "^3.6.0"
+      pytz = "^2022.0"
