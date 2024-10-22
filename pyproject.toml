@@ -6,7 +6,7 @@ authors = ["Michael Blakeley <mike@blakeley.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = "^3.11.9"
 flask = "2.2.5"
 gunicorn = "^22.0.0"
 isodate = "^0.6.0"
