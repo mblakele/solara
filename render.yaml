@@ -3,7 +3,7 @@ services:
   - type: web
     name: solara
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: poetry install
     startCommand: gunicorn app:app
     plan: free
     numInstances: 1
