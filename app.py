@@ -24,18 +24,18 @@ def astimezone_filter(dt, tz_str):
 app.jinja_env.filters['astimezonestr'] = astimezone_filter
 
 class JSONEncoderSolara(JSONEncoder):
-    def default(self, obj):
+    def default(self, o):
         try:
-            if isinstance(obj, datetime):
-                return obj.isoformat()
-            if isinstance(obj, timedelta):
-                return isodate.duration_isoformat(obj)
-            iterable = iter(obj)
+            if isinstance(o, datetime):
+                return o.isoformat()
+            if isinstance(o, timedelta):
+                return isodate.duration_isoformat(o)
+            iterable = iter(o)
         except TypeError:
             pass
         else:
             return list(iterable)
-        return JSONEncoder.default(self, obj)
+        return JSONEncoder.default(self, o)
 
 app.json_encoder = JSONEncoderSolara
 
@@ -44,7 +44,7 @@ def error_retryable(e):
     resp = make_response(
         render_template('error_retryable.html', exception=e),
         500)
-    resp.headers['Refresh'] = 5
+    resp.headers['Refresh'] = '5'
     return resp
 
 @app.route('/')

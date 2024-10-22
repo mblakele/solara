@@ -1,6 +1,9 @@
 modules = ["python-3.12", "web"]
 run = "gunicorn app:app --bind 0.0.0.0:8000"
 
+[env]
+PYTHON_PACKAGES = ""
+
 [nix]
 channel = "stable-24_05"
 
@@ -11,11 +14,14 @@ run = ["sh", "-c", "gunicorn app:app"]
 localPort = 8000
 externalPort = 80
 
-[pypi]
-no_auto_install = true
-
 [packager]
+language = "python3"
+ignoredPackages = ["decouple", "humps", "requests"]
 
 [packager.features]
-guessImports = false
 packageSearch = false
+guessImports = false
+
+[auth]
+pageEnabled = false
+buttonEnabled = false

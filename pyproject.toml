@@ -1,9 +1,23 @@
+[tool.poetry]
+name = "solara"
+version = "0.1.0"
+description = "Simple web service that helps maximize self-consumption of solar energy"
+authors = ["Michael Blakeley <mike@blakeley.com>"]
+readme = "README.md"
+
 [tool.poetry.dependencies]
-      python = "^3.8"
-      flask = "^2.2.0"
-      gunicorn = "^22.0.0"
-      isodate = "^0.6.0"
-      pyemvue = "^0.18.0"
-      pyhumps = "3.8.*"
-      python-decouple = "^3.6.0"
-      pytz = "^2022.0"
+python = "^3.12"
+flask = "2.2.5"
+gunicorn = "^22.0.0"
+isodate = "^0.6.0"
+pyemvue = "^0.18.0"
+pyhumps = "^3.8.0"
+pytz = "^2022.0"
+requests = "^2.32.3"
+python-decouple = "^3.6.0"
+decouple = "^666.42.69" # bug workaround
+humps = "^666.42.69" # bug workaround
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
