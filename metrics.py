@@ -18,6 +18,10 @@ DEBUG = config('DEBUG', default='False', cast=bool)
 # avoid need for `self.logger`
 logger = logging.getLogger(__name__)
 
+class VueAuthenticationError(Exception):
+    """Raised when Vue authentication fails"""
+    pass
+
 class RetryableMetricsException(Exception):
     """
     Use this exception class to signal that the Emporia VUE API
@@ -303,15 +307,22 @@ class Metrics:
             vkf = open(self.vue_keys, encoding=encoding)
             with vkf:
                 vkf_data = json.load(vkf)
-                self.vue.login(id_token=vkf_data['id_token'],
+                login_ok = self.vue.login(id_token=vkf_data['id_token'],
                                access_token=vkf_data['access_token'],
                                refresh_token=vkf_data['refresh_token'],
                                token_storage_file=self.vue_keys)
         except (requests.exceptions.HTTPError, IOError):
             logger.exception('keys failed: will use password')
-            self.vue.login(username=config('VUE_USERNAME'),
+            login_ok = self.vue.login(username=config('VUE_USERNAME'),
                            password=config('VUE_PASSWORD'),
                            token_storage_file=self.vue_keys)
+
+        # check return from login for error
+        if login_ok:
+            logger.debug("login ok")
+        else:
+            logger.error('login failed')
+            raise VueAuthenticationError('Vue authentication failed: check credentials')
 
         # TODO downtime check is buggy: response 403 but pyemvue expects 404
         #downtime = self.vue.down_for_maintenance()
