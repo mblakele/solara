@@ -15,8 +15,6 @@ pyhumps = "^3.8.0"
 pytz = "^2022.0"
 requests = "^2.32.3"
 python-decouple = "^3.6.0"
-#decouple = "^666.42.69" # replit bug workaround
-#humps = "^666.42.69" # replit bug workaround
 
 [build-system]
 requires = ["poetry-core"]
