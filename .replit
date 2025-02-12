@@ -1,8 +1,7 @@
 modules = ["python-3.12", "web"]
 run = "gunicorn app:app --bind 0.0.0.0:8000"
-
-[env]
-PYTHON_PACKAGES = ""
+# replit guesses wrong about decouple, humps
+disableGuessImports = true
 
 [nix]
 channel = "stable-24_05"
@@ -16,11 +15,6 @@ externalPort = 80
 
 [packager]
 language = "python3"
-ignoredPackages = ["decouple", "humps", "requests"]
-
-[packager.features]
-packageSearch = false
-guessImports = false
 
 [auth]
 pageEnabled = false
