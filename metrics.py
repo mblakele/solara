@@ -42,6 +42,7 @@ class Metrics:
     instant = None
     metrics = {}
     vue = PyEmVue()
+    vue_auth = {}
     vue_keys = '.vue-keys.json'
 
     def __init__(self, logger_next=None):
@@ -56,17 +57,14 @@ class Metrics:
             logger = logger_next
 
         logger.debug('init')
+        logger.debug(self.device_info)
         self.vue_init()
 
-        # take instant after any auth, to reduce data lag
+        self.get_device_info()
+
+        # take instant after init, to reduce data lag
         self.instant = datetime.now(timezone.utc)
         self.metrics['instant'] = self.instant
-
-        # We only need to fetch this data once...
-        # unless the devices change!
-        # In that case restart the web service.
-        if len(self.device_info) < 1:
-            self.get_device_info()
 
         self.populate()
         self.predict()
@@ -101,6 +99,18 @@ class Metrics:
         filtering results for ZIG001 devices.
         """
         rt_start = datetime.now(timezone.utc)
+
+        # Avoid extra fetches
+        age_limit = timedelta(hours=24)
+        logger.debug({"device_info_len": len(self.device_info),
+                      "vue_auth": self.vue_auth})
+        if (len(self.device_info) > 0
+            and 'last' in self.vue_auth):
+            age = rt_start - self.vue_auth['last']
+            logger.debug({'age': age})
+            if age < age_limit:
+                logger.debug({"device_info": self.device_info})
+                return
 
         try:
             devices = [self.vue.get_devices()[-1]] # DEBUG
@@ -164,9 +174,12 @@ class Metrics:
                     usage_data, usage_data_start = self.vue.get_chart_usage(
                         chan, chart_start, self.instant,
                         scale=scale, unit=Unit.KWH.value)
-                    if len(usage_data) < 1:
-                        raise RetryableMetricsException("No data for hour")
-                    if usage_data[0] is None:
+                    # TODO may also mean API auth key is bad
+                    if (usage_data_start is None
+                        or usage_data is None
+                        or len(usage_data) < 1
+                        or usage_data[0] is None):
+                        logger.debug({'usage_data': usage_data})
                         raise RetryableMetricsException("No data for hour")
                     self.metrics['api_response'][
                         'get_chart_usage/' + str(chan.channel_num)] = (
@@ -298,10 +311,14 @@ class Metrics:
         rt_start = datetime.now(timezone.utc)
 
         # are we already authenticated?
+        # TODO is auth still valid?
+        # auth object doesn't seem to have a timestamp or valid check
         if self.vue and hasattr(self.vue, 'auth'):
+            logger.debug({'auth': getattr(self.vue, 'auth'),
+                          'vue_auth': self.vue_auth})
             return
 
-        logger.debug('trying %s', self.vue_keys)
+        logger.debug({'keys': self.vue_keys})
         try:
             encoding = locale.getpreferredencoding()
             vkf = open(self.vue_keys, encoding=encoding)
@@ -329,6 +346,8 @@ class Metrics:
         #if downtime:
         #    raise RetryableMetricsException(downtime)
 
+        # success
+        self.vue_auth['last'] = datetime.now(timezone.utc)
         self.metrics['api_response']['auth'] = (
             datetime.now(timezone.utc) - rt_start)
 
