@@ -19,3 +19,6 @@ language = "python3"
 [auth]
 pageEnabled = false
 buttonEnabled = false
+
+[agent]
+expertMode = true
