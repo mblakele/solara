@@ -2,8 +2,7 @@ from datetime import datetime, timedelta
 from decouple import config
 from flask import Flask, Response
 from flask import abort, make_response, render_template, request
-from flask.json import JSONEncoder
-
+from flask.json.provider import DefaultJSONProvider
 import humps
 import isodate
 import logging
@@ -23,7 +22,9 @@ def astimezone_filter(dt, tz_str):
 
 app.jinja_env.filters['astimezonestr'] = astimezone_filter
 
-class JSONEncoderSolara(JSONEncoder):
+
+class CustomJSONProvider(DefaultJSONProvider):
+
     def default(self, o):
         try:
             if isinstance(o, datetime):
@@ -35,9 +36,10 @@ class JSONEncoderSolara(JSONEncoder):
             pass
         else:
             return list(iterable)
-        return JSONEncoder.default(self, o)
+        return super().default(o)
 
-app.json_encoder = JSONEncoderSolara
+app.json = CustomJSONProvider(app)
+
 
 @app.errorhandler(RetryableMetricsException)
 def error_retryable(e):
