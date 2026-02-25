@@ -12,6 +12,8 @@ from metrics import Metrics, MetricsMock, RetryableMetricsException
 
 # global setup
 app = Flask(__name__)
+# The template_folder and static_folder default to 'templates' and 'static'
+# relative to the application path. Using the default root structure.
 DEBUG = config('DEBUG', False, cast=bool)
 logger = app.logger
 logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
