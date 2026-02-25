@@ -12,6 +12,8 @@ from metrics import Metrics, MetricsMock, RetryableMetricsException
 
 # global setup
 app = Flask(__name__)
+# The template_folder and static_folder default to 'templates' and 'static'
+# relative to the application path. Using the default root structure.
 DEBUG = config('DEBUG', False, cast=bool)
 logger = app.logger
 logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
@@ -84,4 +86,5 @@ def health():
     resp.headers['Content-Type'] = 'text/plain'
     return resp
 
-# end
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
