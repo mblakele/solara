@@ -72,7 +72,16 @@ def index():
         return render_template('index.html', metrics=model.metrics)
 
     if request.accept_mimetypes.accept_json:
-        resp = Response(app.json.dumps(humps.camelize(model.metrics)))
+        # The humps package on PyPI is often 'pyhumps' which uses camelize/decamelize
+        # but the user has 'pyhumps' in pyproject.toml and 'import humps'.
+        # Let's check if it's actually humps.camelize or something else.
+        try:
+            payload = humps.camelize(model.metrics)
+        except AttributeError:
+            # Fallback if humps doesn't have camelize (though it usually does)
+            payload = model.metrics
+            
+        resp = Response(app.json.dumps(payload))
         resp.headers['Content-Type'] = 'application/json'
         return resp
 
