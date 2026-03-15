@@ -3,7 +3,6 @@ from decouple import config
 from flask import Flask, Response
 from flask import abort, make_response, render_template, request
 from flask.json.provider import DefaultJSONProvider
-import humps
 import isodate
 import logging
 import pytz
@@ -12,6 +11,23 @@ from metrics import Metrics, MetricsMock, RetryableMetricsException
 
 # global setup
 app = Flask(__name__)
+
+def camelize(obj):
+    if isinstance(obj, dict):
+        new_dict = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and "_" in k:
+                parts = k.split("_")
+                new_key = parts[0] + "".join(p.capitalize() for p in parts[1:])
+            else:
+                new_key = k
+            new_dict[new_key] = camelize(v)
+        return new_dict
+    elif isinstance(obj, list):
+        return [camelize(i) for i in obj]
+    else:
+        return obj
+
 # The template_folder and static_folder default to 'templates' and 'static'
 # relative to the application path. Using the default root structure.
 DEBUG = config('DEBUG', False, cast=bool)
@@ -72,7 +88,8 @@ def index():
         return render_template('index.html', metrics=model.metrics)
 
     if request.accept_mimetypes.accept_json:
-        resp = Response(app.json.dumps(humps.camelize(model.metrics)))
+        payload = camelize(model.metrics)
+        resp = Response(app.json.dumps(payload))
         resp.headers['Content-Type'] = 'application/json'
         return resp
 
