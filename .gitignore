@@ -1,3 +1,4 @@
 *.pyc
 .env
 .vue-keys.json
+.venv

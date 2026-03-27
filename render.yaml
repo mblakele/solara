@@ -3,7 +3,7 @@ services:
   - type: web
     name: solara
     env: python
-    buildCommand: poetry install
+    buildCommand: uv sync
     startCommand: gunicorn app:app
     plan: free
     numInstances: 1

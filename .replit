@@ -11,7 +11,7 @@ run = ["sh", "-c", "gunicorn app:app"]
 
 [[ports]]
 localPort = 8000
-externalPort = 80
+externalPort = 8000
 
 [packager]
 language = "python3"
@@ -39,6 +39,10 @@ args = "Run Flask App"
 name = "Run Flask App"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "console"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python app.py"
+args = "UV_PROJECT_ENVIRONMENT=.venv uv run python app.py"
+waitForPort = 8000
