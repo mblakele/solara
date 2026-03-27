@@ -1,17 +1,13 @@
 modules = ["python-3.12", "web"]
-run = "gunicorn app:app --bind 0.0.0.0:8000"
-# replit guesses wrong about decouple, humps
+run = "uv run gunicorn app:app --bind 0.0.0.0:5000"
+# replit guesses wrong about decouple
 disableGuessImports = true
 
 [nix]
 channel = "stable-24_05"
 
 [deployment]
-run = ["sh", "-c", "gunicorn app:app"]
-
-[[ports]]
-localPort = 5000
-externalPort = 5000
+run = ["sh", "-c", "uv run gunicorn app:app --bind 0.0.0.0:5000"]
 
 [[ports]]
 localPort = 5000
