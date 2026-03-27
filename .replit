@@ -44,5 +44,10 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "UV_PROJECT_ENVIRONMENT=.venv uv run python app.py"
+args = "uv run python app.py"
 waitForPort = 8000
+
+[userenv]
+
+[userenv.shared]
+UV_PROJECT_ENVIRONMENT = ".venv"
