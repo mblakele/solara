@@ -10,6 +10,10 @@ channel = "stable-24_05"
 run = ["sh", "-c", "gunicorn app:app"]
 
 [[ports]]
+localPort = 5000
+externalPort = 5000
+
+[[ports]]
 localPort = 8000
 externalPort = 8000
 
@@ -40,12 +44,12 @@ name = "Run Flask App"
 author = "agent"
 
 [workflows.workflow.metadata]
-outputType = "console"
+outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "uv run python app.py"
-waitForPort = 8000
+args = "uv run gunicorn app:app --bind 0.0.0.0:5000"
+waitForPort = 5000
 
 [userenv]
 
