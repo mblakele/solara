@@ -14,8 +14,8 @@ localPort = 5000
 externalPort = 5000
 
 [[ports]]
-localPort = 8000
-externalPort = 8000
+localPort = 5000
+externalPort = 80
 
 [packager]
 language = "python3"
