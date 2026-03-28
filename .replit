@@ -1,16 +1,16 @@
 modules = ["python-3.12", "web"]
-run = "gunicorn app:app --bind 0.0.0.0:8000"
-# replit guesses wrong about decouple, humps
+run = "uv run gunicorn app:app --bind 0.0.0.0:5000"
+# replit guesses wrong about decouple
 disableGuessImports = true
 
 [nix]
 channel = "stable-24_05"
 
 [deployment]
-run = ["sh", "-c", "gunicorn app:app"]
+run = ["sh", "-c", "uv run gunicorn app:app --bind 0.0.0.0:5000"]
 
 [[ports]]
-localPort = 8000
+localPort = 5000
 externalPort = 80
 
 [packager]
@@ -39,6 +39,15 @@ args = "Run Flask App"
 name = "Run Flask App"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "webview"
+
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python app.py"
+args = "uv run gunicorn app:app --bind 0.0.0.0:5000"
+waitForPort = 5000
+
+[userenv]
+
+[userenv.shared]
+UV_PROJECT_ENVIRONMENT = ".venv"

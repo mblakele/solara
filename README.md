@@ -80,6 +80,7 @@ Requirements:
 
 * [git](https://git-scm.com)
 * [python3](https://www.python.org)
+* [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 First, clone this repository:
 
@@ -87,10 +88,10 @@ First, clone this repository:
 git clone https://github.com/mblakele/solara.git
 ```
 
-Next, install the python requirements:
+Next, install dependencies:
 
 ```
-poetry install
+uv sync
 ```
 
 Next, the local server will need your Emporia account credentials.
@@ -111,7 +112,7 @@ VUE_PASSWORD=yourEmporiaPassword
 Finally, start a local server with:
 
 ```
-gunicorn app:app
+uv run python app.py
 ```
 
 For development work you may prefer this:
@@ -168,54 +169,75 @@ Sample output:
 
 ```
 {
-  "api_response": {
-    "get_chart_usage/1,2,3": "P0DT00H00M00.677919S",
-    "total": "P0DT00H00M00.677919S"
+  "apiResponse": {
+    "getChartUsage/1,2,3": "PT0.677919S",
+    "total": "PT0.677919S"
   },
   "debug": false,
   "devices": [
     {
       "gid": 654321,
-      "lag": "P0DT00H00M06.279410S",
+      "lag": "PT6.279410S",
       "name": "fubar",
-      "minute_predicted": -8.23541694800059,
-      "minutes_remaining": 9.833333333333334,
+      "minutePredicted": -8.23541694800059,
+      "minutesRemaining": 9.833333333333334,
       "prediction": -27.6879148912382,
-      "prediction_min": -27.6879148912382,
-      "prediction_max": -22.758956398742814,
+      "predictionMin": -27.6879148912382,
+      "predictionMax": -22.758956398742814,
       "scales": {
         "1H": {
           "instant": "2022-03-08T20:50:10Z",
+          "seconds": 2950,
           "usage": -19.45249794323761
         },
         "1MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 60,
           "usage": -0.8375000286102295
         },
         "2MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 120,
           "usage": -0.7937500305308247
         },
         "3MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 180,
           "usage": -0.787500029890627
         },
         "4MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 240,
           "usage": -0.7140625274926442
         },
         "5MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 300,
           "usage": -0.6456250248617615
         },
         "6MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 360,
           "usage": -0.5750000218164057
         },
         "7MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 420,
           "usage": -0.5196428765190988
         },
         "8MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 480,
           "usage": -0.4531250170204389
         },
         "9MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 540,
           "usage": -0.3958333481829856
         },
         "10MIN": {
+          "instant": "2022-03-08T20:50:10Z",
+          "seconds": 600,
           "usage": -0.33625001242425817
         }
       },
@@ -240,7 +262,7 @@ Sample output:
 
 As you can see, the JSON data includes information that isn't
 available in the HTML view. For example you can see projections based
-on the past minute (`1M`), but also based on the past 2, 3, 4, 5, 6,
+on the past minute (`1MIN`), but also based on the past 2, 3, 4, 5, 6,
 7, 8, 9, and 10 minutes.  This data may be useful for custom
 integrations.
 
@@ -286,7 +308,7 @@ To help with these variables, this code makes a primary prediction
 based on the last minute, plus predictions for various time intervals
 up to 10 minutes.  The HTML view shows the minimum and maximum these
 predictions.  In the JSON data, each time interval is broken out and
-labeled: 1M, 2M, 3M, etc.
+labeled: 1MIN, 2MIN, 3MIN, etc.
 
 Finally, at times the data coming from Emporia Energy's APIs may not
 be as accurate as we would all like. This could be due to faults at
