@@ -2,11 +2,21 @@
 
 This document serves as a style guide and command reference for AI coding agents operating within the `solara` repository. Adhering to these guidelines ensures code consistency, maintainability, and adherence to project standards.
 
+## General Advice
+
+Take time to think things through.
+
+Don't worry about whether a bug or any error is "your fault" or pre-existing. Just fix it.
+
+When asked to plan changes, try to break up tasks to fit within a budget 32k-64k tokens.
+
 ## 🚀 Build, Lint, & Test Commands
 
 Use these commands for routine maintenance and validation.
 
 ### Testing
+- **Write tests for new functionality** Any new functionality must be accompanied by new tests.
+- **Never add special-case code that only exists to let tests pass** However it may be necessary to update test data to modernize the dates.
 - **Run all tests:** `uv run pytest`
   - *Purpose:* Executes the full test suite to ensure all features work as expected.
 - **Run a single specific test:** `uv run pytest tests/test_app.py::test_function_name`
