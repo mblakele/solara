@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import locale
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -312,7 +312,17 @@ class HourlyProjection(MetricsBase):
     def data_for_scale(
         data: List[float], data_start: datetime, scale: str
     ) -> Dict[str, object]:
-        """Calculate usage statistics for a given scale (hour or minutes)."""
+        """Calculate usage statistics for a given scale (hour or minutes).
+
+        Args:
+            data: kWh values per second/minute. Negative values indicate solar export.
+            data_start: Start time of the first data point.
+            scale: Scale identifier ('1H', '1MIN'-'10MIN').
+
+        Returns:
+            Dict with keys: usage (Wh), seconds, instant, and optionally
+                data/data_len/data_start if DEBUG is enabled.
+        """
         dsi: Dict[str, object] = {}
         data_len = len(data)
 
@@ -496,9 +506,14 @@ Metrics = HourlyProjection
 class MetricsMock:
     """
     Mock metrics data, for testing.
+
+    NOTE: Negative 'usage' values represent solar generation exceeding consumption
+    (power exported to the grid). This is physically normal during sunny hours when
+    PV panels produce more than the home uses. The downstream TOU aggregator handles
+    these correctly by reducing the bucket total.
     """
 
-    metrics: Dict[str, object]
+    metrics: Dict[str, Any]
 
     def __init__(self) -> None:
         self.metrics: Dict[str, object] = {

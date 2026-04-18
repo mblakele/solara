@@ -13,13 +13,17 @@ class EnergyDataAggregator:
     """
     Aggregates raw energy consumption data into Time-of-Use buckets.
 
+    IMPORTANT: Negative kWh values represent solar generation (power exported
+    to the grid). These are aggregated normally — a negative value in any bucket
+    reduces that bucket's total, which is correct for net metering calculations.
+
     Calculates four buckets based on time-of-day rules:
     - Total: Sum of all power used in the period.
-    - Peak: Sum of power used daily between 16:00 and 21:00 (inclusive).
-    - Off-Peak: Sum of power used daily between 00:00 and 15:00 (inclusive).
-    - Part-Peak: Sum of power used in windows 15:00-16:00 and 21:00-00:00.
+    - Peak: Sum of power used daily from 16:00 to 21:00.
+    - Off-Peak: Sum of power used daily from 00:00 to 15:00.
+    - Part-Peak: Sum of power used daily from 15:00 to 16:00 and from 21:00 to 00:00.
 
-    Units: All results in Watt-hours (Wh).
+    Units: All results in Watt-hours (Wh). Negative totals indicate net export.
     """
 
     @staticmethod
