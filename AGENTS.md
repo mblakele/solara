@@ -8,6 +8,10 @@ Take time to think things through.
 
 Don't worry about whether a bug or any error is "your fault" or pre-existing. Just fix it.
 
+## Planning
+
+When planning, run in read-only mode. The sole exception is that you may create and edit files in `.opencode/plans/` as requested.
+
 When asked to plan changes, try to break up tasks to fit within a budget 32k-64k tokens.
 
 ## 🚀 Build, Lint, & Test Commands
