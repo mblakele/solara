@@ -61,7 +61,7 @@
         {% else %}
         {{ "%.0f" % (vd.scales["1MIN"].usage) }}</td>
         {% endif %}
-      <td class="note">W, latest minute</td>
+      <td class="note">Wh, latest minute</td>
     </tr>
     <tr>
       <td class="op">x</td>
@@ -105,6 +105,7 @@
           —
         {% elif not qh.complete %}
           {{ "%.0f" % (qh.predicted_wh) }}
+          / {{ "%.0f" % (qh.raw_wh) }}
         {% else %}
           {{ "%.0f" % (qh.raw_wh) }}
         {% endif %}
@@ -114,7 +115,7 @@
         {% if qh is none %}
           future
         {% elif not qh.complete %}
-          Wh predicted; raw {{ "%.0f" % (qh.raw_wh) }} Wh
+          Wh predicted / raw
         {% else %}
           Wh
         {% endif %}
