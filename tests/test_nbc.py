@@ -21,7 +21,8 @@ import pytz
 
 from app import app
 from energy_aggregator import EnergyDataAggregator
-from metrics import HourlyProjection, MetricsMock
+from metrics import HourlyProjection
+from mockdata import MetricsMock
 from util import TIMEZONE
 
 
@@ -202,8 +203,9 @@ class TestComputeNBCUnit(unittest.TestCase):
 
         self.assertIsNotNone(result["QH2"])
         self.assertFalse(result["QH2"]["complete"])
-        # predicted_wh should be clamped to 0 (negative rate * 900 → max(0, ...) = 0)
-        self.assertEqual(result["QH2"]["predicted_wh"], 0)
+        # predicted_wh should not be clamped to 0
+        self.assertEqual(result["QH2"]["predicted_wh"], -450.0)
+        # wh should be clamped to 0
         self.assertEqual(result["QH2"]["wh"], 0)
 
     def test_raw_wh_preserved_for_transparency(self):

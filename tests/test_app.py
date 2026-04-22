@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import requests
 from app import app
-from metrics import MetricsMock, RetryableMetricsException
-
+from metrics import RetryableMetricsException
+from mockdata import MetricsMock
 
 class TestApp(unittest.TestCase):
     def setUp(self):

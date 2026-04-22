@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime, timezone, timedelta
-from metrics import Metrics, MetricsMock, RetryableMetricsException
+from metrics import Metrics, RetryableMetricsException
+from mockdata import MetricsMock
 
 
 class TestTOUReporterAggregate(unittest.TestCase):

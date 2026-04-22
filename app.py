@@ -14,7 +14,8 @@ from decouple import config
 from flask import Flask, Response, abort, make_response, render_template, request
 import pytz
 
-from metrics import Metrics, MetricsMock, TOUReporter, RetryableMetricsException
+from metrics import Metrics, TOUReporter, RetryableMetricsException
+from mockdata import MetricsMock
 from util import CustomJSONProvider, TIMEZONE
 
 # global setup
