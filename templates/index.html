@@ -18,6 +18,10 @@
       padding-left: 0.5em;
       width: 100%;
   }
+  td.note sup {
+      font-size: 0.5em;
+      color: #999;
+  }
   div.metrics td.note::before {
       content: "# ";
   }
@@ -96,6 +100,31 @@
         {{ metrics.api_response.total }}
       </td>
     </tr>
+    {% if vd.nbc %}
+    <tr>
+      <td colspan="3" style="color: #666; font-size: 0.85em;">Non-Bypassable Charges:</td>
+    </tr>
+    {% set qh_labels = [("QH1", ":00–:14"), ("QH2", ":15–:29"), ("QH3", ":30–:44"), ("QH4", ":45–:59")] %}
+    {% for qh_key, qh_label in qh_labels %}
+    <tr>
+      <td class="op" style="color: #666; font-size: 0.85em;">{{ qh_key }}</td>
+      <td class="num" style="color: #666; font-size: 0.85em;">
+        {% set qh = vd.nbc[qh_key] %}
+        {% if qh is none %}
+          —
+        {% elif not qh.complete %}
+          {{ "%.0f" % (qh.predicted_wh) }}
+        {% else %}
+          {{ "%.0f" % (qh.raw_wh) }}
+        {% endif %}
+      </td>
+      <td class="note" style="color: #666; font-size: 0.85em;">
+        {% set qh = vd.nbc[qh_key] %}
+        {% if qh is none %}future{% elif not qh.complete %}Wh predicted{% else %}Wh{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    {% endif %}
   </table>
   {% endfor %}
 </div>

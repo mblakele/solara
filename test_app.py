@@ -141,6 +141,17 @@ class TestApp(unittest.TestCase):
                 self.assertEqual(response.status_code, 500)
                 self.assertIn(b"Error fetching usage data", response.data)
 
+    def test_tou_endpoint_mock_realistic_values(self):
+        """Verify TOU endpoint returns non-zero buckets in mock mode."""
+        with patch("app.config", return_value="True", cast=bool):
+            response = self.app.get(
+                "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-01T04:00:00"
+            )
+        data = json.loads(response.data)
+        self.assertEqual(response.status_code, 200)
+        self.assertGreater(data["buckets"]["total"], 0)
+        self.assertGreater(data["buckets"]["peak"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

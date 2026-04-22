@@ -74,25 +74,35 @@ def _get_model(
     logger: logging.Logger,
     is_mock_error: bool = False,
     force_mock: bool = False,
+    instant_minute: int | None = None,
 ):
     """Select and return the appropriate data model (mock or real).
 
     Raises RetryableMetricsException when is_mock_error is True.
     Returns MetricsMock in mock mode, Metrics otherwise.
+
+    Args:
+        logger: Logger instance.
+        is_mock_error: If True, raise RetryableMetricsException.
+        force_mock: If True, use MetricsMock even if real credentials exist.
+        instant_minute: For testing — sets the minute component of MetricsMock's
+            simulated "now" time (0-59). Only used in mock mode.
     """
     if is_mock_error:
         raise RetryableMetricsException("mock")
     is_mock = config("VUE_USERNAME", None) is None or force_mock
     if is_mock:
+        if instant_minute is not None:
+            return MetricsMock(instant_minute=instant_minute)
         return MetricsMock()
     return Metrics(logger)
 
 
 def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = False):
-    """Return TOUReporter or mock dict based on configuration.
+    """Return TOUReporter or realistic mock values based on configuration.
 
     Raises requests.exceptions.HTTPError or IOError from TOUReporter.
-    Returns a dict with zeroed buckets in mock mode.
+    Returns a dict with realistic non-zero bucket values in mock mode.
     """
     is_mock = (
         config("VUE_USERNAME", None) is None
@@ -100,7 +110,7 @@ def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = 
         or config("MOCK", default="False", cast=bool)
     )
     if is_mock:
-        return {"total": 0.0, "peak": 0.0, "part_peak": 0.0, "off_peak": 0.0}
+        return MetricsMock().tou_result
     model = TOUReporter(start_date, end_date, logger)
     return model.tou_result
 
@@ -156,7 +166,13 @@ def index() -> Response:
     is_mock_error = config("MOCK_ERROR", default="False", cast=bool)
     force_mock = config("MOCK", default="False", cast=bool)
 
-    model = _get_model(logger, is_mock_error, force_mock)
+    instant_minute = request.args.get("instant_minute")
+    if instant_minute is not None and force_mock:
+        try:
+            instant_minute = int(instant_minute)
+        except (ValueError, TypeError):
+            instant_minute = None
+    model = _get_model(logger, is_mock_error, force_mock, instant_minute=instant_minute)
 
     # check for default html first, to handle missing Accept header.
     if request.accept_mimetypes.accept_html:

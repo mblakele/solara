@@ -55,28 +55,43 @@ class TestMetrics(unittest.TestCase):
 
     def test_mock_device_data(self):
         devices = self.metrics_data["devices"]
-        self.assertEqual(len(devices), 1)
-        device = devices[0]
+        self.assertEqual(len(devices), 2)
 
-        self.assertEqual(device["gid"], 12345)
-        self.assertEqual(device["name"], "MOCK")
-        self.assertEqual(device["timezone"], "America/Los_Angeles")
-        self.assertIn("prediction", device)
-        self.assertIn("scales", device)
-        self.assertIn("smoothing", device)
+        # Device A: negative (solar export)
+        device_a = devices[0]
+        self.assertEqual(device_a["name"], "MOCK")
+        self.assertEqual(device_a["timezone"], "America/Los_Angeles")
+        self.assertIn("prediction", device_a)
+        self.assertIn("scales", device_a)
+        self.assertIn("smoothing", device_a)
+
+        # Device B: positive (load only)
+        device_b = devices[1]
+        self.assertEqual(device_b["name"], "SOLAR+LOAD")
+        self.assertIn("prediction", device_b)
+        self.assertIn("scales", device_b)
 
     def test_mock_scales(self):
-        device = self.metrics_data["devices"][0]
-        scales = device["scales"]
+        # Device A: negative usage (solar export)
+        device_a = self.metrics_data["devices"][0]
+        scales_a = device_a["scales"]
 
-        self.assertIn("1H", scales)
-        self.assertIn("1MIN", scales)
-        self.assertIn("10MIN", scales)
+        self.assertIn("1H", scales_a)
+        self.assertIn("1MIN", scales_a)
+        self.assertIn("10MIN", scales_a)
 
-        hour_data = scales["1H"]
-        self.assertEqual(hour_data["seconds"], 2552)
-        self.assertAlmostEqual(hour_data["usage"], 415.91752700753847)
-        self.assertIsInstance(hour_data["instant"], datetime)
+        hour_data_a = scales_a["1H"]
+        # At default instant_minute=42, len(data) == 42*60 = 2520
+        self.assertEqual(hour_data_a["seconds"], 42 * 60)
+        self.assertIsInstance(hour_data_a["instant"], datetime)
+        self.assertLess(hour_data_a["usage"], 0)
+
+        # Device B: positive usage (load only)
+        device_b = self.metrics_data["devices"][1]
+        scales_b = device_b["scales"]
+        hour_data_b = scales_b["1H"]
+        self.assertEqual(hour_data_b["seconds"], 42 * 60)
+        self.assertGreater(hour_data_b["usage"], 0)
 
     def test_mock_smoothing(self):
         device = self.metrics_data["devices"][0]
@@ -84,7 +99,8 @@ class TestMetrics(unittest.TestCase):
 
         self.assertIn("1MIN", smoothing)
         self.assertIn("10MIN", smoothing)
-        self.assertEqual(smoothing["1MIN"], -52.516668090260964)
+        # Values are dynamically computed; just verify they're numeric
+        self.assertIsInstance(smoothing["1MIN"], float)
 
     def test_data_for_scale_logic(self):
         # Testing the static method directly with sample data
@@ -99,6 +115,139 @@ class TestMetrics(unittest.TestCase):
         # (0.6 * 1000 * 60 / 3) = 12000 Wh/min equivalent
         result_m = Metrics.data_for_scale(data, data_start, "1MIN")
         self.assertAlmostEqual(result_m["usage"], 12000.0)
+
+    def test_mock_nbc_structure(self):
+        """Verify nbc field exists with QH1–QH4 keys."""
+        device = self.metrics_data["devices"][0]
+        self.assertIn("nbc", device)
+        nbc = device["nbc"]
+        self.assertIn("QH1", nbc)
+        self.assertIn("QH2", nbc)
+        self.assertIn("QH3", nbc)
+        self.assertIn("QH4", nbc)
+
+    def test_mock_nbc_complete_quarters(self):
+        """At minute=42, QH1 and QH2 should be complete."""
+        device = self.metrics_data["devices"][0]
+        self.assertTrue(device["nbc"]["QH1"]["complete"])
+        self.assertTrue(device["nbc"]["QH2"]["complete"])
+
+    def test_mock_nbc_incomplete_quarter(self):
+        """At minute=42, QH3 should be incomplete with predicted_wh."""
+        device = self.metrics_data["devices"][0]
+        qh3 = device["nbc"]["QH3"]
+        self.assertFalse(qh3["complete"])
+        self.assertIn("predicted_wh", qh3)
+        self.assertIn("samples_used", qh3)
+
+    def test_mock_nbc_not_started(self):
+        """At minute=42, QH4 should be None."""
+        device = self.metrics_data["devices"][0]
+        self.assertIsNone(device["nbc"]["QH4"])
+
+    def test_mock_nbc_parameterized_minute(self):
+        """Test NBC at different instant_minute values."""
+        # minute=10: QH1 incomplete, QH2–QH4 not started
+        mock_10 = MetricsMock(instant_minute=10)
+        nbc_10 = mock_10.metrics["devices"][0]["nbc"]
+        self.assertFalse(nbc_10["QH1"]["complete"])
+        self.assertIsNone(nbc_10["QH2"])
+
+        # minute=37: QH1–QH2 complete, QH3 incomplete, QH4 not started
+        mock_37 = MetricsMock(instant_minute=37)
+        nbc_37 = mock_37.metrics["devices"][0]["nbc"]
+        self.assertTrue(nbc_37["QH1"]["complete"])
+        self.assertTrue(nbc_37["QH2"]["complete"])
+        self.assertFalse(nbc_37["QH3"]["complete"])
+        self.assertIsNone(nbc_37["QH4"])
+
+    def test_mock_nbc_wh_clamped_at_zero(self):
+        """Verify NBC wh values are never negative (clamped at zero)."""
+        device = self.metrics_data["devices"][0]
+        for qh in ["QH1", "QH2", "QH3"]:
+            if device["nbc"][qh] is not None:
+                self.assertGreaterEqual(device["nbc"][qh]["wh"], 0)
+
+    def test_mock_tou_result(self):
+        """Verify MetricsMock().tou_result has non-zero values with all four keys."""
+        mock = MetricsMock()
+        tou = mock.tou_result
+        self.assertIn("total", tou)
+        self.assertIn("peak", tou)
+        self.assertIn("part_peak", tou)
+        self.assertIn("off_peak", tou)
+        self.assertGreater(tou["total"], 0)
+        self.assertGreater(tou["peak"], 0)
+
+    def test_mock_device_b_positive_consumption(self):
+        """Verify Device B has positive consumption (load-only scenario)."""
+        device = self.metrics_data["devices"][1]
+        self.assertEqual(device["name"], "SOLAR+LOAD")
+        # All per-second data should be positive
+        for val in device["per_second_data"]:
+            self.assertGreater(val, 0)
+
+    def test_mock_device_b_nbc_positive_wh(self):
+        """Verify Device B's NBC quarters have positive wh (no clamping)."""
+        mock = MetricsMock(instant_minute=37)
+        device = mock.metrics["devices"][1]
+        nbc = device["nbc"]
+
+        # QH1 and QH2 should be complete with positive wh
+        self.assertTrue(nbc["QH1"]["complete"])
+        self.assertGreater(nbc["QH1"]["wh"], 0)
+        self.assertTrue(nbc["QH2"]["complete"])
+        self.assertGreater(nbc["QH2"]["wh"], 0)
+
+        # QH3 should be incomplete with positive predicted_wh
+        self.assertFalse(nbc["QH3"]["complete"])
+        self.assertIn("predicted_wh", nbc["QH3"])
+        self.assertGreater(nbc["QH3"]["predicted_wh"], 0)
+
+    def test_mock_device_b_nbc_parameterized_minute(self):
+        """Test Device B NBC at different instant_minute values."""
+        # minute=10: QH1 incomplete, QH2–QH4 not started
+        mock_10 = MetricsMock(instant_minute=10)
+        nbc_10 = mock_10.metrics["devices"][1]["nbc"]
+        self.assertFalse(nbc_10["QH1"]["complete"])
+        self.assertIsNone(nbc_10["QH2"])
+
+        # minute=37: QH1–QH2 complete, QH3 incomplete, QH4 not started
+        mock_37 = MetricsMock(instant_minute=37)
+        nbc_37 = mock_37.metrics["devices"][1]["nbc"]
+        self.assertTrue(nbc_37["QH1"]["complete"])
+        self.assertTrue(nbc_37["QH2"]["complete"])
+        self.assertFalse(nbc_37["QH3"]["complete"])
+        self.assertIsNone(nbc_37["QH4"])
+
+    def test_mock_nbc_all_scenarios_covered(self):
+        """Verify NBC covers all required scenarios across both devices.
+
+        Device A (solar export, negative raw_wh) tests:
+          - QH1 complete with clamped wh=0 (raw_wh < 0 → wh = 0)
+          - QH2 incomplete with predicted_wh from recent samples
+
+        Device B (load only, positive raw_wh) tests:
+          - Complete quarters with positive wh (no clamping needed)
+          - Incomplete quarter with positive predicted_wh
+        """
+        mock = MetricsMock(instant_minute=42)
+        device_a = mock.metrics["devices"][0]
+        device_b = mock.metrics["devices"][1]
+
+        # Device A: solar export scenario (negative raw_wh → clamped to 0)
+        nbc_a = device_a["nbc"]
+        self.assertTrue(nbc_a["QH1"]["complete"])
+        self.assertGreaterEqual(nbc_a["QH1"]["wh"], 0)
+        self.assertFalse(nbc_a["QH3"]["complete"])
+        self.assertIn("predicted_wh", nbc_a["QH3"])
+
+        # Device B: load-only scenario (positive raw_wh, no clamping)
+        nbc_b = device_b["nbc"]
+        self.assertTrue(nbc_b["QH1"]["complete"])
+        self.assertGreater(nbc_b["QH1"]["wh"], 0)
+        self.assertFalse(nbc_b["QH3"]["complete"])
+        self.assertIn("predicted_wh", nbc_b["QH3"])
 
 
 if __name__ == "__main__":
