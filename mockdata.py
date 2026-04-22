@@ -253,12 +253,15 @@ class MetricsMock:
                 lookback_start = max(n - 60, start_idx)
                 values = per_second_data[lookback_start:n]
                 rate = sum(values) / len(values) if values else 0.0
-                # predicted_wh not clamped to zero by design
-                predicted_wh = rate * 900 * 1000
 
                 # raw_wh = actual observed data in this quarter only (not lookback)
                 raw_values = per_second_data[obs_start:obs_end]
                 raw_wh = sum(raw_values) * 1000
+
+                # predicted_wh = observed data + extrapolation for remaining seconds
+                # not clamped to zero by design
+                remaining_seconds = end_idx + 1 - n
+                predicted_wh = raw_wh + rate * remaining_seconds * 1000
 
                 result[qh_name] = {
                     "wh": max(0, predicted_wh),

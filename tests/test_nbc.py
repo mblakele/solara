@@ -251,6 +251,54 @@ class TestComputeNBCUnit(unittest.TestCase):
         self.assertGreater(qh2["predicted_wh"], 0)
         self.assertGreater(qh2["raw_wh"], 0)
 
+    def test_predicted_wh_near_quarter_end(self):
+        """predicted_wh must not over-extrapolate when most of the quarter has passed.
+
+        At n=1695 (795s into QH2, only 105s remaining), the lookback window
+        captures recent low-rate data while earlier QH2 had high negative values.
+        The buggy code multiplied rate * 900 (full quarter) instead of projecting
+        forward for only the remaining seconds added to observed raw_wh.
+        """
+        instant = datetime(2026, 1, 1, 8, 28, 15, tzinfo=timezone.utc)
+        fixture = _NBCFixture(instant)
+
+        # n = 1695 → QH2 has indices 900..1694 observed (795 seconds), 105 remain.
+        # First 735s of QH2: high negative consumption (-0.005 kWh/s).
+        # Remaining 225s of QH2: low negative consumption (-0.001 kWh/s) — the last
+        # 60 of these are what the lookback window sees, giving a much lower rate.
+        data = (
+            _make_data(735, -0.005) +   # indices 0-734: QH1 high negative
+            _make_data(735, -0.005) +   # indices 735-1469: early QH2 high negative
+            _make_data(225, -0.001)     # indices 1470-1694: late QH2 low negative
+        )
+        start = instant.replace(minute=0, second=0, microsecond=0)
+
+        result = fixture._compute_nbc(data, start)
+
+        self.assertIsNotNone(result["QH2"])
+        self.assertFalse(result["QH2"]["complete"])
+
+        qh2 = result["QH2"]
+        raw_wh = qh2["raw_wh"]
+        predicted_wh = qh2["predicted_wh"]
+
+        # raw_wh: QH2 indices 900-1694 → 570s at -0.005 + 225s at -0.001, all * 1000
+        expected_raw = (570 * (-0.005) + 225 * (-0.001)) * 1000
+        self.assertAlmostEqual(raw_wh, expected_raw, places=1)
+
+        # Lookback: last 60 samples are all -0.001 → rate = -0.001 kWh/s
+        # Remaining seconds in QH2: 900 - 795 = 105
+        # predicted_wh = raw_wh + rate * remaining_seconds * 1000
+        expected_remaining = (900 - 795) * (-0.001) * 1000
+        expected_predicted = expected_raw + expected_remaining
+
+        # Buggy code: rate * 900 * 1000 = -0.001 * 900 * 1000 = -900 Wh
+        # (ignores the -3075 Wh already observed in raw_wh)
+        self.assertAlmostEqual(predicted_wh, expected_predicted, places=1)
+
+        # Sanity: |predicted_wh - raw_wh| should be small (only ~105s remaining extrapolation)
+        self.assertLess(abs(predicted_wh - raw_wh), 200)
+
     def test_device_timezone_fallback(self):
         """_compute_nbc falls back to TIMEZONE when device has no time_zone."""
         instant = datetime(2026, 1, 1, 8, 59, 30, tzinfo=timezone.utc)
