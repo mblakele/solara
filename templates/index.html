@@ -53,6 +53,36 @@
         {{ vd.lag }}
       </td>
     </tr>
+    {% if vd.nbc %}
+    {% set qh_labels = [("QH4", ":45–:59"), ("QH3", ":30–:44"), ("QH2", ":15–:29"), ("QH1", ":00–:14")] %}
+    {% for qh_key, qh_label in qh_labels %}
+    {% set qh = vd.nbc[qh_key] %}
+    {% if qh is not none %}
+    <tr>
+      <td class="op">{{ qh_key }}</td>
+      <td class="num">
+        {% if qh is none %}
+          —
+        {% elif not qh.complete %}
+          {{ "%.0f" % (qh.predicted_wh) }}&nbsp;/&nbsp;{{ "%.0f" % (qh.raw_wh) }}
+        {% else %}
+          {{ "%.0f" % (qh.raw_wh) }}
+        {% endif %}
+      </td>
+      <td class="note">
+        {% if not qh.complete %}
+          Wh predicted / raw
+        {% else %}
+          Wh
+        {% endif %}
+      </td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+    <tr>
+      <td colspan="3" class="note">Current Hour:</td>
+    </tr>
+    {% endif %}
     <tr>
       <td class="op"></td>
       <td class="num">
@@ -91,38 +121,6 @@
         {{ metrics.api_response.total }}
       </td>
     </tr>
-    {% if vd.nbc %}
-    <tr>
-      <td colspan="3" class="note" style="margin-top: 0.5em;">NBC Periods:</td>
-    </tr>
-    {% set qh_labels = [("QH1", ":00–:14"), ("QH2", ":15–:29"), ("QH3", ":30–:44"), ("QH4", ":45–:59")] %}
-    {% for qh_key, qh_label in qh_labels %}
-    <tr>
-      <td class="op">{{ qh_key }}</td>
-      <td class="num">
-        {% set qh = vd.nbc[qh_key] %}
-        {% if qh is none %}
-          —
-        {% elif not qh.complete %}
-          {{ "%.0f" % (qh.predicted_wh) }}
-          / {{ "%.0f" % (qh.raw_wh) }}
-        {% else %}
-          {{ "%.0f" % (qh.raw_wh) }}
-        {% endif %}
-      </td>
-      <td class="note">
-        {% set qh = vd.nbc[qh_key] %}
-        {% if qh is none %}
-          future
-        {% elif not qh.complete %}
-          Wh predicted / raw
-        {% else %}
-          Wh
-        {% endif %}
-      </td>
-    </tr>
-    {% endfor %}
-    {% endif %}
   </table>
   {% endfor %}
 </div>
