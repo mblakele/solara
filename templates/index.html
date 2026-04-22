@@ -87,28 +87,19 @@
     </tr>
     <tr>
       <td colspan="3" class="note">
-      range:
-      {{ "%.0f" % (vd.prediction_min) }}
-      to
-      {{ "%.0f" % vd.prediction_max }}
-      Wh
-      </td>
-    </tr>
-    <tr>
-      <td colspan="3" class="note">
         response time:
         {{ metrics.api_response.total }}
       </td>
     </tr>
     {% if vd.nbc %}
     <tr>
-      <td colspan="3" style="color: #666; font-size: 0.85em;">Non-Bypassable Charges:</td>
+      <td colspan="3" class="note" style="margin-top: 0.5em;">NBC Periods:</td>
     </tr>
     {% set qh_labels = [("QH1", ":00–:14"), ("QH2", ":15–:29"), ("QH3", ":30–:44"), ("QH4", ":45–:59")] %}
     {% for qh_key, qh_label in qh_labels %}
     <tr>
-      <td class="op" style="color: #666; font-size: 0.85em;">{{ qh_key }}</td>
-      <td class="num" style="color: #666; font-size: 0.85em;">
+      <td class="op">{{ qh_key }}</td>
+      <td class="num">
         {% set qh = vd.nbc[qh_key] %}
         {% if qh is none %}
           —
@@ -118,7 +109,7 @@
           {{ "%.0f" % (qh.raw_wh) }}
         {% endif %}
       </td>
-      <td class="note" style="color: #666; font-size: 0.85em;">
+      <td class="note">
         {% set qh = vd.nbc[qh_key] %}
         {% if qh is none %}
           future
