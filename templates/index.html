@@ -120,7 +120,13 @@
       </td>
       <td class="note" style="color: #666; font-size: 0.85em;">
         {% set qh = vd.nbc[qh_key] %}
-        {% if qh is none %}future{% elif not qh.complete %}Wh predicted{% else %}Wh{% endif %}
+        {% if qh is none %}
+          future
+        {% elif not qh.complete %}
+          Wh predicted; raw {{ "%.0f" % (qh.raw_wh) }} Wh
+        {% else %}
+          Wh
+        {% endif %}
       </td>
     </tr>
     {% endfor %}
