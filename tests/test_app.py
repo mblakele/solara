@@ -1,12 +1,32 @@
+import contextlib
 import json
 import unittest
 from datetime import datetime, timedelta
+from typing import Any
 from unittest.mock import patch
 
 import requests
 from app import app
 from metrics import RetryableMetricsException
-from mockdata import MetricsMock
+
+
+@contextlib.contextmanager
+def mock_config(**overrides: Any):
+    """Patch app.config with default mock values plus any overrides."""
+    defaults = {
+        "VUE_USERNAME": None,
+        "MOCK_ERROR": False,
+        "MOCK": False,
+    }
+    config_values = {**defaults, **overrides}
+
+    cfg_patch = patch(
+        "app.config",
+        side_effect=lambda key, default=None, cast=str: config_values.get(key, default),
+    )
+    with cfg_patch:
+        yield
+
 
 class TestApp(unittest.TestCase):
     def setUp(self):
@@ -20,8 +40,8 @@ class TestApp(unittest.TestCase):
         self.assertEqual(response.headers["Content-Type"], "text/plain")
 
     def test_index_json_mock(self):
-        # By default, VUE_USERNAME is None in this environment, so it uses MetricsMock
-        response = self.app.get("/", headers={"Accept": "application/json"})
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "application/json"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["Content-Type"], "application/json")
 
@@ -36,7 +56,8 @@ class TestApp(unittest.TestCase):
         self.assertIn("prediction", device)
 
     def test_index_html_mock(self):
-        response = self.app.get("/", headers={"Accept": "text/html"})
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
         self.assertEqual(response.status_code, 200)
         # The word 'MOCK' might not be in the HTML if it's using the values directly.
         # Let's check for some characteristic HTML instead.
@@ -51,26 +72,20 @@ class TestApp(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_tou_endpoint_valid_dates(self):
-        with patch("app.config", return_value="True", cast=bool):
+        with mock_config(MOCK=True):
             response = self.app.get(
                 "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-01T04:00:00"
             )
         self.assertEqual(response.status_code, 200)
 
     def test_not_acceptable(self):
-        response = self.app.get("/", headers={"Accept": "text/plain"})
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/plain"})
         self.assertEqual(response.status_code, 406)
 
     def test_index_mock_error_retryable(self):
         """Test index() with MOCK_ERROR=True triggers RetryableMetricsException."""
-        mock_config = patch(
-            "app.config",
-            side_effect=lambda key, default=None, cast=str: {
-                "MOCK_ERROR": "True",
-                "VUE_USERNAME": None,
-            }.get(key, default),
-        )
-        with mock_config:
+        with mock_config(MOCK_ERROR="True"):
             response = self.app.get("/")
         self.assertEqual(response.status_code, 500)
         self.assertIn(b"RETRY", response.data or b"")
@@ -79,14 +94,7 @@ class TestApp(unittest.TestCase):
         """Test tou() rejects date ranges exceeding 366 days with 400."""
         start = datetime(2025, 1, 1)
         end = start + timedelta(days=367)
-        mock_config = patch(
-            "app.config",
-            side_effect=lambda key, default=None, cast=str: {
-                "MOCK": True,
-                "VUE_USERNAME": None,
-            }.get(key, default),
-        )
-        with mock_config:
+        with mock_config(MOCK=True):
             response = self.app.get(
                 f"/api/v1/tou?start_date={start.strftime('%Y-%m-%d')}"
                 f"&end_date={end.strftime('%Y-%m-%d')}"
@@ -97,14 +105,7 @@ class TestApp(unittest.TestCase):
         """Test tou() accepts date ranges of exactly 366 days."""
         start = datetime(2025, 1, 1)
         end = start + timedelta(days=366)
-        mock_config = patch(
-            "app.config",
-            side_effect=lambda key, default=None, cast=str: {
-                "MOCK": True,
-                "VUE_USERNAME": None,
-            }.get(key, default),
-        )
-        with mock_config:
+        with mock_config(MOCK=True):
             response = self.app.get(
                 f"/api/v1/tou?start_date={start.strftime('%Y-%m-%d')}"
                 f"&end_date={end.strftime('%Y-%m-%d')}"
@@ -125,14 +126,7 @@ class TestApp(unittest.TestCase):
         http_error = requests.exceptions.HTTPError()
         http_error.response = mock_response
 
-        mock_config = patch(
-            "app.config",
-            side_effect=lambda key, default=None, cast=str: {
-                "MOCK": False,
-                "VUE_USERNAME": "test_user",
-            }.get(key, default),
-        )
-        with mock_config:
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch("app.TOUReporter") as mock_tou:
                 mock_tou.side_effect = http_error
                 response = self.app.get(
@@ -143,7 +137,7 @@ class TestApp(unittest.TestCase):
 
     def test_tou_endpoint_mock_realistic_values(self):
         """Verify TOU endpoint returns non-zero buckets in mock mode."""
-        with patch("app.config", return_value="True", cast=bool):
+        with mock_config(MOCK=True):
             response = self.app.get(
                 "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-01T04:00:00"
             )
