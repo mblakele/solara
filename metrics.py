@@ -460,7 +460,10 @@ class HourlyProjection(MetricsBase):
                 # (absolute window - may include data from previous quarter)
                 lookback_start = max(n - 60, start_idx)
                 values = usage_data_local[lookback_start:n]
-                rate = sum(values) / len(values) if values else 0.0
+                if not(values):
+                    raise RetryableMetricsException("No data for period")
+
+                rate = sum(values) / len(values)
 
                 # raw_wh = actual observed data in this quarter only (not lookback)
                 raw_values = usage_data_local[obs_start:obs_end]
