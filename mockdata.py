@@ -32,8 +32,7 @@ def _generate_hour_seconds(
     num_seconds = min(minute_of_hour * 60, 3600)
     if sign < 0:
         return [rng.uniform(-0.001, -0.0004) for _ in range(num_seconds)]
-    else:
-        return [rng.uniform(0.0002, 0.0008) for _ in range(num_seconds)]
+    return [rng.uniform(0.0002, 0.0008) for _ in range(num_seconds)]
 
 
 class MetricsMock:
@@ -161,7 +160,7 @@ class MetricsMock:
 
         return {
             "gid": hash(device_name) % (10**8),
-            "lag": timedelta(seconds=2, microseconds=(hash(device_name) % 999999)),
+            "lag": timedelta(seconds=2, microseconds=hash(device_name) % 999999),
             "name": device_name,
             "minute_predicted": round(minute_predicted, 14),
             "minutes_remaining": round(seconds_remaining / 60.0, 14),

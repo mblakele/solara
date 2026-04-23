@@ -36,7 +36,7 @@ class RetryableMetricsException(Exception):
     def __init__(self, message, *args):
         self.message = message
         self.instant = datetime.now(timezone.utc)
-        super(RetryableMetricsException, self).__init__(message, *args)
+        super().__init__(message, *args)
 
 
 class MetricsBase:
@@ -460,7 +460,7 @@ class HourlyProjection(MetricsBase):
                 # (absolute window - may include data from previous quarter)
                 lookback_start = max(n - 60, start_idx)
                 values = usage_data_local[lookback_start:n]
-                if not(values):
+                if not values:
                     raise RetryableMetricsException("No data for period")
 
                 rate = sum(values) / len(values)
@@ -615,5 +615,4 @@ def _generate_hour_seconds(
     num_seconds = min(minute_of_hour * 60, 3600)
     if sign < 0:
         return [rng.uniform(-0.001, -0.0004) for _ in range(num_seconds)]
-    else:
-        return [rng.uniform(0.0002, 0.0008) for _ in range(num_seconds)]
+    return [rng.uniform(0.0002, 0.0008) for _ in range(num_seconds)]

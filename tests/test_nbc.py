@@ -15,12 +15,12 @@ Covers:
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytz
 
 from app import app
-from energy_aggregator import EnergyDataAggregator
+
 from metrics import HourlyProjection
 from mockdata import MetricsMock
 from util import TIMEZONE

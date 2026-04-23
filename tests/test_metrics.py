@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from metrics import Metrics, RetryableMetricsException
 from mockdata import MetricsMock
 
@@ -32,7 +32,7 @@ class TestTOUReporterAggregate(unittest.TestCase):
                 ]
 
         reporter = PartialTOU()
-        # This should NOT raise AttributeError: 'PartialTOU' object has no attribute 'EnergyDataAggregator'
+        # Should not raise AttributeError for missing EnergyDataAggregator
         reporter.aggregate_tou()
         self.assertIsNotNone(reporter.tou_result)
         self.assertIn("total", reporter.tou_result)

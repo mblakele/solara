@@ -24,7 +24,7 @@ def test_misaligned_start_time():
     """
     start_time = datetime.datetime(2024, 1, 1, 23, 0, 0)
 
-    data = [(start_time, 1.0)]
+    _data = [(start_time, 1.0)]
 
     print("Test complete")
 

@@ -34,7 +34,7 @@ def camelize(obj: object) -> object:
                 new_key = k
             new_dict[new_key] = camelize(v)
         return new_dict
-    elif isinstance(obj, list):
+    if isinstance(obj, list):
         return [camelize(i) for i in obj]
     return obj
 
