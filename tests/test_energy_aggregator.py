@@ -3,7 +3,7 @@ Unit tests for EnergyDataAggregator.
 """
 
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
 from energy_aggregator import EnergyDataAggregator
@@ -82,7 +82,7 @@ class TestAggregateFromSeconds(unittest.TestCase):
 
     def test_bucket_boundaries(self):
         usage_data = [0.001] * 3600
-        for hour in range(1, 24):
+        for _ in range(1, 24):
             usage_data += [0.001] * 3600
 
         result = EnergyDataAggregator.aggregate_from_seconds(
@@ -138,7 +138,7 @@ class TestAggregateFromMinutes(unittest.TestCase):
 
     def test_mixed_hours(self):
         usage_data = [0.001] * 60
-        for hour in range(1, 24):
+        for _ in range(1, 24):
             usage_data += [0.001] * 60
 
         result = EnergyDataAggregator.aggregate_from_minutes(

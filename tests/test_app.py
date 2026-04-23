@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import requests
 from app import app
-from metrics import RetryableMetricsException
+
 
 
 @contextlib.contextmanager
