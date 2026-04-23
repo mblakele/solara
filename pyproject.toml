@@ -12,7 +12,11 @@ dependencies = [
     "pytz>=2022.0",
     "requests>=2.32.4",
     "python-decouple>=3.6.0",
+    "mypy>=1.20.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.uv]
 package = false

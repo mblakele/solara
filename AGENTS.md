@@ -29,8 +29,8 @@ Use these commands for routine maintenance and validation.
 ### Linting & Type Checking
 - **Run Linter:** `uv run pylint`
   - *Purpose:* Checks for general code style issues, potential bugs, and bad practices according to Python standards.
-- **Type Checking:** (Specify command if found, e.g., `mypy src/`)
-  - *Recommendation:* Add explicit type-checking commands here once the linter/type checker is confirmed.
+- **Type Checking:** `uv run mypy`
+  - *Purpose:* Checks explicit type-checking implementation.
 
 ### Running the Application
 - **Local Development (Development Server):** `uv run python app.py`
