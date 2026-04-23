@@ -299,6 +299,60 @@ class TestComputeNBCUnit(unittest.TestCase):
         # Sanity: |predicted_wh - raw_wh| should be small (only ~105s remaining extrapolation)
         self.assertLess(abs(predicted_wh - raw_wh), 200)
 
+    def test_stale_data_lookback_beyond_array(self):
+        """Stale API data: wall-clock n exceeds len(data), causing empty lookback slice.
+
+        When the VUE API returns data that lags behind real-time, n (computed from
+        elapsed wall-clock time) can be larger than len(usage_data_local). The
+        lookback window then slices beyond the array bounds, producing an empty list
+        and raising RetryableMetricsException("No data for period").
+
+        This test verifies the fix: _compute_nbc should clamp n to actual data length.
+        """
+        # Wall clock says we're at minute 17 (n = 1020 seconds into hour),
+        # but API only returned data through second 950 (lagging by ~70s).
+        instant = datetime(2026, 1, 1, 8, 17, 0, tzinfo=timezone.utc)
+        fixture = _NBCFixture(instant)
+
+        # Only 951 data points (indices 0..950), lagging behind wall clock
+        data = _make_data(951, 0.001)
+        start = instant.replace(minute=0, second=0, microsecond=0)
+
+        # Without fix: lookback_start = max(1020 - 60, 900) = 960
+        # values = data[960:1020] → empty (data only has indices 0..950)
+        # → RetryableMetricsException("No data for period")
+        result = fixture._compute_nbc(data, start)
+
+        # QH1 should be complete (indices 0-899 all exist in data)
+        self.assertIsNotNone(result["QH1"])
+        self.assertTrue(result["QH1"]["complete"])
+
+        # QH2 should still produce a prediction using whatever data is available
+        self.assertIsNotNone(result["QH2"])
+        self.assertFalse(result["QH2"]["complete"])
+        self.assertGreater(result["QH2"]["samples_used"], 0)
+
+    def test_stale_data_lookback_early_quarter(self):
+        """Stale API data in early quarter: lookback window falls entirely outside data.
+
+        Wall clock says minute 2 (n=120), but API only has 41 seconds of data.
+        Without clamping, lookback_start = max(120-60, 0) = 60, and data[60:120]
+        is empty since the array only goes to index 40.
+        """
+        instant = datetime(2026, 1, 1, 8, 2, 0, tzinfo=timezone.utc)
+        fixture = _NBCFixture(instant)
+
+        # Only 41 data points (indices 0..40), wall clock says n=120
+        data = _make_data(41, 0.001)
+        start = instant.replace(minute=0, second=0, microsecond=0)
+
+        result = fixture._compute_nbc(data, start)
+
+        # QH1 should use whatever data is available (indices 0..40)
+        self.assertIsNotNone(result["QH1"])
+        self.assertFalse(result["QH1"]["complete"])
+        self.assertGreater(result["QH1"]["samples_used"], 0)
+
     def test_device_timezone_fallback(self):
         """_compute_nbc falls back to TIMEZONE when device has no time_zone."""
         instant = datetime(2026, 1, 1, 8, 59, 30, tzinfo=timezone.utc)

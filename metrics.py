@@ -413,6 +413,10 @@ class HourlyProjection(MetricsBase):
         elapsed = self.instant - usage_data_start_local
         n = max(0, int(elapsed.total_seconds()))
 
+        # Clamp to actual data length — API may return stale/lagging data where
+        # wall-clock elapsed time exceeds the number of data points returned.
+        n = min(n, len(usage_data_local))
+
         # Convert instant to device's local timezone for quarter boundary checks
         try:
             local_tz = pytz.timezone(self.device_info.get("time_zone", TIMEZONE))
@@ -442,10 +446,6 @@ class HourlyProjection(MetricsBase):
                 result[qh_name] = None
                 continue
 
-            # Determine which indices have data in this quarter
-            obs_start = max(start_idx, 0)
-            obs_end = min(n, end_idx + 1)  # exclusive upper bound
-
             if n > end_idx:
                 # Complete: all seconds in this quarter have been observed
                 values = usage_data_local[start_idx:end_idx + 1]
@@ -466,6 +466,9 @@ class HourlyProjection(MetricsBase):
                 rate = sum(values) / len(values)
 
                 # raw_wh = actual observed data in this quarter only (not lookback)
+                # Determine which indices have data in this quarter
+                obs_start = max(start_idx, 0)
+                obs_end = min(n, end_idx + 1)  # exclusive upper bound
                 raw_values = usage_data_local[obs_start:obs_end]
                 raw_wh = sum(raw_values) * 1000
 
