@@ -379,7 +379,8 @@ def _get_load_manager():
 
 def _load_management_loop() -> None:
     """Background thread that runs load management cycle every 30 seconds."""
-    interval_secs = config("LOAD_MANAGE_INTERVAL_SECS", default=30, cast=int)
+    interval_secs_config = config("LOAD_MANAGE_INTERVAL_SECS", default=30, cast=int)
+    interval_secs = interval_secs_config
     logger.info(
         "Load management background loop started (interval=%ds)", interval_secs
     )
@@ -392,8 +393,10 @@ def _load_management_loop() -> None:
                     _last_cycle_result = result
                 logger.debug("Load management cycle result: %s", result)
         except RetryableMetricsException as e:
+            interval_secs = interval_secs_config
             logger.warning("Load management cycle retryable: %s", e)
         except Exception as e:
+            interval_secs = interval_secs_config
             logger.error("Error in load management loop: %s", e)
         time.sleep(interval_secs)
 

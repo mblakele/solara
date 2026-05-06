@@ -217,7 +217,7 @@ def test_get_current_qh_probes_on_qh_end_within_ttl():
     # First call: populates cache with QH1, seconds_remaining=30
     result1 = reader.get_current_qh("panel")
     assert result1 is not None
-    qh_name1, predicted_wh1, _, _, _ = result1
+    qh_name1, predicted_wh1, _, _ = result1
     assert qh_name1 == "QH1"
     assert pytest.approx(predicted_wh1) == -2000.0
     assert len(call_log) == 1
@@ -230,7 +230,7 @@ def test_get_current_qh_probes_on_qh_end_within_ttl():
     # Second call: cache TTL still valid (600s), but QH has ended -> fresh fetch
     result2 = reader.get_current_qh("panel")
     assert result2 is not None
-    qh_name2, predicted_wh2, _, _, _ = result2
+    qh_name2, predicted_wh2, _, _ = result2
     assert qh_name2 == "QH2"
     assert pytest.approx(predicted_wh2) == -300.0
     # fetch_func must have been called a second time (not served from cache)

@@ -15,6 +15,10 @@ failing test, **stop and ask** rather than continuing to iterate blindly.
 
 Write tests first, then diagnose and fix bugs.
 
+### Tool Use
+
+Always invoke tools using the structured function-calling API. Never emit tool calls as inline XML or markdown text.
+
 ### Communication Style
 
 Use simple, everyday language. Avoid unnecessary jargon unless the context
@@ -147,18 +151,20 @@ project-root
 - Template templates/index.html displays NBC QH1-QH4 values, minute/hour usage, predictions
 
 ### Device State Tracking
-- StateTracker class (load_manager.py lines 430-580) maintains:
+- StateTracker class (load_nbc.py lines 315–578) maintains:
   - devices: dict[str, DeviceState] - desired/actual state, current_amps, last_toggle
-  - pending_effects: list[PendingEffect] - actions taken since last NBC fetch,
+  - pending_effects: list[PendingEffect] - actions taken since last NBC data point,
     pruned when fresh data arrives via `prune_old_effects()`
-  - last_nbc_fetch, last_nbc_predicted_wh
+  - last_data_point_at, last_nbc_predicted_wh
 - Key methods:
   - `estimated_current_wh()`: adjusts raw NBC prediction with pending effect deltas
   - `has_pending_effect_since()`: checks if any action was taken after given timestamp
   - `pending_since_count()`: counts effects after a given timestamp (for diagnostics)
   - `prune_old_effects()`: removes effects older than cutoff to prevent unbounded growth
 - DeviceState dataclass tracks per-device runtime state
-- Stale data threshold: 120 seconds; min toggle interval: 60 seconds
+- Stale detection uses **data-point age** (not fetch time): `data_point_at = fetched_at - timedelta(seconds=data_lag_secs)`.
+  The threshold is 120 seconds from the most recent per-second data point, accounting for
+  Emporia API lag. Min toggle interval: 60 seconds.
 
 ### Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread

@@ -332,7 +332,7 @@ def test_stale_no_pending_effects_proceeds():
     """NBC data >120s old with zero pending effects should NOT skip.
 
     Regression test: previously, stale data alone (with no unreflected
-    actions) caused permanent lockout since last_nbc_fetch was never
+    actions) caused permanent lockout since last_data_point_at was never
     updated while stuck in the stale path. With zero pending effects,
     there are no unreflected actions, so it's safe to proceed.
     """
@@ -393,7 +393,7 @@ def test_waits_for_fresh_data():
     )
 
     now = datetime.now(timezone.utc)
-    mgr.state.last_nbc_fetch = fetched_at
+    mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="plug",
@@ -489,7 +489,7 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
         dry_run=False,
     )
 
-    mgr.state.last_nbc_fetch = fetched_at
+    mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="plug",
@@ -798,7 +798,7 @@ def test_waiting_for_fresh_data_includes_count():
     )
 
     now = datetime.now(timezone.utc)
-    mgr.state.last_nbc_fetch = fetched_at
+    mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="plug", action="turn_on",
@@ -843,7 +843,7 @@ def test_waiting_for_fresh_data_includes_candidates():
     )
 
     now = datetime.now(timezone.utc)
-    mgr.state.last_nbc_fetch = fetched_at
+    mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="heater", action="turn_on",

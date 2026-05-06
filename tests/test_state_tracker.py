@@ -70,7 +70,6 @@ def test_can_toggle_off_false_before_debounce():
 def test_has_pending_effect_since():
     """True when effect after NBC fetch."""
     tracker = StateTracker()
-    tracker.last_nbc_fetch = datetime(2025, 1, 1, tzinfo=timezone.utc)
     tracker.pending_effects.append(
         PendingEffect(
             device_name="plug",

@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 import threading
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timezone
 from typing import Any, Callable
 
 import pytz
@@ -863,8 +863,7 @@ class LoadManager:
     def _check_pending_state(
         self,
         now_postfetch: datetime,
-        fetched_at: datetime,
-        data_lag_secs: float,
+        data_point_at: datetime,
         seconds_remaining: int,
     ) -> dict[str, Any] | None:
         """Check for stale NBC data or unconfirmed pending effects.
@@ -882,11 +881,9 @@ class LoadManager:
 
         Args:
             now_postfetch: Timestamp taken after the NBC fetch completed.
-            fetched_at: Timestamp of the underlying NBC API data (when fetch
-                completed).
-            data_lag_secs: Seconds between the most recent data point and
-                fetched_at. Used to derive the actual data-point timestamp for
-                accurate stale detection.
+            data_point_at: When the most recent per-second data point was
+                recorded (fetched_at minus API lag). Used for accurate stale
+                and waiting detection.
             seconds_remaining: Seconds left in the current QH (for diag).
 
         Returns:
@@ -904,11 +901,8 @@ class LoadManager:
             "plugs_configured": plugs_configured,
         }
 
-        # Derive the actual data-point timestamp from fetch time and lag.
-        # This is when the most recent per-second data point was recorded,
-        # which is what stale detection and waiting detection should use.
-        data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
-
+        # data_point_at is the timestamp of the most recent per-second data
+        # point — what stale detection and waiting detection should use.
         nbc_data_age_secs = (now_postfetch - data_point_at).total_seconds()
         if (
             nbc_data_age_secs > StateTracker.STALE_THRESHOLD_SECS
@@ -1029,26 +1023,23 @@ class LoadManager:
                 qh_name,
                 predicted_wh,
                 seconds_remaining,
-                fetched_at,
-                data_lag_secs,
+                data_point_at,
             ) = qh_result
             now_postfetch = datetime.now(timezone.utc)
 
             # ── Stage 3: pending-state check ───────────────────────────────
             if not force:
                 early = self._check_pending_state(
-                    now_postfetch, fetched_at, data_lag_secs, seconds_remaining
+                    now_postfetch, data_point_at, seconds_remaining
                 )
                 if early is not None:
                     return early
 
             # ── Stage 4: accept fresh data, compute gap ────────────────────
-            # Derive the actual data-point timestamp for pruning.
-            data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
             pruned = self.state.prune_old_effects(data_point_at)
             if pruned > 0:
                 logger.debug("Pruned %d old pending effects", pruned)
-            self.state.last_nbc_fetch = data_point_at
+            self.state.last_data_point_at = data_point_at
             # Adjust prediction with still-pending effects so decide() accounts
             # for actions already taken this quarter-hour.
             adjusted_wh = self.state.estimated_current_wh(predicted_wh)

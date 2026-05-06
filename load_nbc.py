@@ -146,21 +146,20 @@ class NBCReader:
 
     def get_current_qh(
         self, device_name: str
-    ) -> tuple[str, float, int, datetime, float] | None:
-        """Return (qh_name, predicted_wh, seconds_remaining, fetched_at, data_lag_secs) for QH.
+    ) -> tuple[str, float, int, datetime] | None:
+        """Return (qh_name, predicted_wh, seconds_remaining, data_point_at) for QH.
 
         Uses cache to avoid redundant API calls. Returns None if all quarters
-        are complete or no data available. The fetched_at timestamp tracks when
-        the underlying API data was actually fetched, and _data_lag_secs records
-        how far behind the most recent data point is relative to fetch time.
+        are complete or no data available. The data_point_at timestamp is the
+        time of the most recent per-second data point (fetched_at minus API
+        lag), which is what stale detection and waiting detection use.
 
         Args:
             device_name: Name of the VUE device to query.
 
         Returns:
             Tuple of (qh_name, predicted_wh in Wh, seconds remaining in QH,
-            fetched_at timestamp, data_lag_secs), or None if no incomplete QH
-            available.
+            data_point_at), or None if no incomplete QH available.
         """
         if self.metrics_fetch is None:
             return None
@@ -200,12 +199,14 @@ class NBCReader:
             return None
         fetched_at = cached.get("_fetched_at", now)
         data_lag_secs: float = cached.get("_data_lag_secs", 0.0)
+        # Derive the actual data-point timestamp so callers don't need to
+        # recompute it from fetched_at + lag.
+        data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
         return (  # type: ignore[return-value]
             cached.get("qh_name"),
             cached.get("predicted_wh", 0),
             cached.get("seconds_remaining", 0),
-            fetched_at,
-            data_lag_secs,
+            data_point_at,
         )
 
     def get_current_qh_direct(
@@ -370,7 +371,7 @@ class StateTracker:
     def __init__(self) -> None:
         self.devices: dict[str, DeviceState] = {}
         self.pending_effects: list[PendingEffect] = []
-        self.last_nbc_fetch: datetime | None = None
+        self.last_data_point_at: datetime | None = None
         self.last_nbc_predicted_wh: float | None = None
         self.last_commanded_amps: int | None = None
         # Settle-window state: set when Tesla amps are increased so that the
@@ -550,7 +551,7 @@ class StateTracker:
         """Serialize state for API/template consumption.
 
         Returns:
-            Dict with devices, pending_effects, and last_nbc_fetch
+            Dict with devices, pending_effects, and last_data_point_at
             suitable for JSON serialization.
         """
         return {
@@ -567,8 +568,8 @@ class StateTracker:
                 "timestamp": eff.timestamp.isoformat(),
                 "power_delta_wh": eff.power_delta_wh,
             } for eff in self.pending_effects],
-            "last_nbc_fetch": (self.last_nbc_fetch.isoformat()
-                              if self.last_nbc_fetch else None),
+            "last_data_point_at": (self.last_data_point_at.isoformat()
+                                   if self.last_data_point_at else None),
             "last_commanded_amps": self.last_commanded_amps,
             "last_tesla_increase_at": (
                 self.last_tesla_increase_at.isoformat()

@@ -21,6 +21,22 @@ Key components:
 - Controllers: `RealPlugController` (HomeKit), `VocolincPlugController`,
   `RealTeslaController` — or stub versions for testing
 
+## Stale Data Detection
+
+The load manager uses **data-point age** (not fetch time) to determine whether
+NBC data is stale. The Emporia VUE API has inherent lag — the most recent
+per-second data point in a prediction may be several seconds behind when the
+API call completes. The system derives `data_point_at = fetched_at - lag` and
+compares it against a 120-second threshold.
+
+When data is stale **and** there are pending effects (actions taken since the
+last data point that may not yet be reflected), the cycle is skipped to avoid
+double-counting load. When data is stale but there are no pending effects, the
+cycle proceeds normally since there's nothing to wait for.
+
+If actions were taken after the last data point, the system enters a
+`waiting_for_fresh_data` state until the next NBC fetch confirms those actions.
+
 ## Configuration Reference
 
 | Variable | Default | Description |
