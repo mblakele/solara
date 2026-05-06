@@ -291,6 +291,15 @@ class HourlyProjection(MetricsBase):
             "reporting metrics for %d devices", len(self.metrics["devices"])
         )
 
+        # Compute overall API lag from the first device's prediction.
+        # This represents how far behind the most recent data point is
+        # relative to when metrics were computed (self.instant).
+        if predictions:
+            first_gid = next(iter(predictions))
+            pred_result = predictions[first_gid]
+            lag_td: timedelta = pred_result.get("lag", timedelta(0))
+            self.metrics["_data_lag_secs"] = lag_td.total_seconds()
+
     def _fetch_channel_data(self, chan, chart_start, instant):
         """
         Fetch channel usage data from the VUE API and validate it.

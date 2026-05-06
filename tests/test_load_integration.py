@@ -408,6 +408,102 @@ def test_waits_for_fresh_data():
     assert result["status"] == "waiting_for_fresh_data"
 
 
+# --- Data-point-age stale detection tests ---
+
+
+def test_stale_detection_uses_data_point_age_not_fetch_time():
+    """NBC data fetched recently but with large lag should be treated as stale.
+
+    _fetched_at is only 60s ago, but lag=80s means the most recent data point
+    is actually 140s old. Stale threshold is 120s, so this should trigger
+    stale_data status (not proceed as it would with fetch-time-only check).
+    """
+    plugs: dict[str, PlugConfig] = {}
+    plug_ctrl = PlugController(plugs)
+
+    fetched_at = datetime.now(timezone.utc) - timedelta(seconds=60)
+    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
+    metrics_data["_fetched_at"] = fetched_at
+    metrics_data["_data_lag_secs"] = 80.0
+
+    def metrics_fetch():
+        return metrics_data
+
+    nbc_cache = NBCCache(ttl_seconds=60)
+    mgr = LoadManager(
+        metrics_fetch=metrics_fetch,
+        nbc_cache=nbc_cache,
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    mgr.state.pending_effects.append(
+        PendingEffect(
+            device_name="plug", action="turn_on",
+            timestamp=now, power_delta_wh=500.0,
+        )
+    )
+
+    result = mgr.run_cycle()
+
+    assert result["status"] == "stale_data"
+
+
+def test_waiting_detection_uses_data_point_age_not_fetch_time():
+    """Action taken between data point and fetch should trigger waiting.
+
+    _fetched_at is 10s ago, lag=50s means data point is 60s old.
+    A pending effect at fetched_at - 30s (i.e., 40s ago) is after the
+    data point but before the fetch. Waiting detection should trigger
+    because this effect isn't reflected in the data.
+    """
+    plugs: dict[str, PlugConfig] = {}
+    plug_ctrl = PlugController(plugs)
+
+    now = datetime.now(timezone.utc)
+    fetched_at = now - timedelta(seconds=10)
+    data_point_at = fetched_at - timedelta(seconds=50)  # 60s ago
+    effect_time = fetched_at - timedelta(seconds=30)     # 40s ago
+
+    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
+    metrics_data["_fetched_at"] = fetched_at
+    metrics_data["_data_lag_secs"] = 50.0
+
+    def metrics_fetch():
+        return metrics_data
+
+    nbc_cache = NBCCache(ttl_seconds=60)
+    mgr = LoadManager(
+        metrics_fetch=metrics_fetch,
+        nbc_cache=nbc_cache,
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=False,
+    )
+
+    mgr.state.last_nbc_fetch = fetched_at
+    mgr.state.pending_effects.append(
+        PendingEffect(
+            device_name="plug",
+            action="turn_on",
+            timestamp=effect_time,
+            power_delta_wh=500.0,
+        )
+    )
+
+    result = mgr.run_cycle()
+
+    assert result["status"] == "waiting_for_fresh_data"
+
+
 def test_full_lifecycle_action_wait_resolve():
     """Full lifecycle: action taken -> wait for fresh data -> new NBC fetch
     arrives with updated timestamp -> pending effects pruned -> new decision."""

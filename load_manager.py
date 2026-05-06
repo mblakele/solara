@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 import threading
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Callable
 
 import pytz
@@ -864,6 +864,7 @@ class LoadManager:
         self,
         now_postfetch: datetime,
         fetched_at: datetime,
+        data_lag_secs: float,
         seconds_remaining: int,
     ) -> dict[str, Any] | None:
         """Check for stale NBC data or unconfirmed pending effects.
@@ -881,7 +882,11 @@ class LoadManager:
 
         Args:
             now_postfetch: Timestamp taken after the NBC fetch completed.
-            fetched_at: Timestamp of the underlying NBC API data.
+            fetched_at: Timestamp of the underlying NBC API data (when fetch
+                completed).
+            data_lag_secs: Seconds between the most recent data point and
+                fetched_at. Used to derive the actual data-point timestamp for
+                accurate stale detection.
             seconds_remaining: Seconds left in the current QH (for diag).
 
         Returns:
@@ -899,14 +904,19 @@ class LoadManager:
             "plugs_configured": plugs_configured,
         }
 
-        nbc_data_age_secs = (now_postfetch - fetched_at).total_seconds()
+        # Derive the actual data-point timestamp from fetch time and lag.
+        # This is when the most recent per-second data point was recorded,
+        # which is what stale detection and waiting detection should use.
+        data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
+
+        nbc_data_age_secs = (now_postfetch - data_point_at).total_seconds()
         if (
             nbc_data_age_secs > StateTracker.STALE_THRESHOLD_SECS
             and len(self.state.pending_effects) > 0
         ):
             # Prune old effects even during stale cycles so the list doesn't
             # grow unbounded while we wait for fresh data.
-            pruned = self.state.prune_old_effects(fetched_at)
+            pruned = self.state.prune_old_effects(data_point_at)
             if pruned > 0:
                 logger.debug("Pruned %d old pending effects (stale)", pruned)
             pending_count = len(self.state.pending_effects)
@@ -928,7 +938,7 @@ class LoadManager:
                 },
             }
 
-        nbc_timestamp = fetched_at
+        nbc_timestamp = data_point_at
         if nbc_timestamp is not None and self.state.has_pending_effect_since(
             nbc_timestamp
         ):
@@ -1015,22 +1025,30 @@ class LoadManager:
                         "plugs_configured": plugs_configured,
                     },
                 }
-            qh_name, predicted_wh, seconds_remaining, fetched_at = qh_result
+            (
+                qh_name,
+                predicted_wh,
+                seconds_remaining,
+                fetched_at,
+                data_lag_secs,
+            ) = qh_result
             now_postfetch = datetime.now(timezone.utc)
 
             # ── Stage 3: pending-state check ───────────────────────────────
             if not force:
                 early = self._check_pending_state(
-                    now_postfetch, fetched_at, seconds_remaining
+                    now_postfetch, fetched_at, data_lag_secs, seconds_remaining
                 )
                 if early is not None:
                     return early
 
             # ── Stage 4: accept fresh data, compute gap ────────────────────
-            pruned = self.state.prune_old_effects(fetched_at)
+            # Derive the actual data-point timestamp for pruning.
+            data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
+            pruned = self.state.prune_old_effects(data_point_at)
             if pruned > 0:
                 logger.debug("Pruned %d old pending effects", pruned)
-            self.state.last_nbc_fetch = fetched_at
+            self.state.last_nbc_fetch = data_point_at
             # Adjust prediction with still-pending effects so decide() accounts
             # for actions already taken this quarter-hour.
             adjusted_wh = self.state.estimated_current_wh(predicted_wh)

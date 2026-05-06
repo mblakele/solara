@@ -146,20 +146,21 @@ class NBCReader:
 
     def get_current_qh(
         self, device_name: str
-    ) -> tuple[str, float, int, datetime] | None:
-        """Return (qh_name, predicted_wh, seconds_remaining, fetched_at) for QH.
+    ) -> tuple[str, float, int, datetime, float] | None:
+        """Return (qh_name, predicted_wh, seconds_remaining, fetched_at, data_lag_secs) for QH.
 
         Uses cache to avoid redundant API calls. Returns None if all quarters
         are complete or no data available. The fetched_at timestamp tracks when
-        the underlying API data was actually fetched, enabling accurate stale
-        data detection.
+        the underlying API data was actually fetched, and _data_lag_secs records
+        how far behind the most recent data point is relative to fetch time.
 
         Args:
             device_name: Name of the VUE device to query.
 
         Returns:
             Tuple of (qh_name, predicted_wh in Wh, seconds remaining in QH,
-            fetched_at timestamp), or None if no incomplete QH available.
+            fetched_at timestamp, data_lag_secs), or None if no incomplete QH
+            available.
         """
         if self.metrics_fetch is None:
             return None
@@ -198,11 +199,13 @@ class NBCReader:
         if cached is None:
             return None
         fetched_at = cached.get("_fetched_at", now)
+        data_lag_secs: float = cached.get("_data_lag_secs", 0.0)
         return (  # type: ignore[return-value]
             cached.get("qh_name"),
             cached.get("predicted_wh", 0),
             cached.get("seconds_remaining", 0),
             fetched_at,
+            data_lag_secs,
         )
 
     def get_current_qh_direct(
@@ -271,7 +274,7 @@ class NBCReader:
             metrics_data: The raw metrics dict from HourlyProjection, or None.
 
         Returns:
-            Dict with qh_name, predicted_wh, seconds_remaining, or None.
+            Dict with qh_name, predicted_wh, seconds_remaining, _data_lag_secs, or None.
         """
         if metrics_data is None:
             return None
@@ -302,6 +305,7 @@ class NBCReader:
                     "qh_name": qh_name,
                     "predicted_wh": predicted_wh,
                     "seconds_remaining": seconds_remaining,
+                    "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
                 }
 
         return None
@@ -1044,7 +1048,8 @@ class TetrisEngine:
                     new_amps,
                     self.charge_amps_min,
                 )
-                return None                
+                return None
+
             if not stop_allowed:
                 logger.debug(
                     "[_decide_tesla_reduce] skipped stop: stop_allowed=False, "
