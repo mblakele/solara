@@ -18,6 +18,10 @@
       padding-left: 0.5em;
       width: 100%;
   }
+  td.note sup {
+      font-size: 0.5em;
+      color: #999;
+  }
   div.metrics td.note::before {
       content: "# ";
   }
@@ -28,6 +32,35 @@
   }
   div.metrics td.num {
       text-align: right;
+  }
+  div.load-management {
+      margin-top: 1em;
+      font-size: 1em;
+      border-top: 1px solid #ccc;
+      padding-top: 0.5em;
+  }
+  div.load-management h3 {
+      margin: 0.5em 0 0.25em;
+  }
+  div.load-management table {
+      width: 100%;
+      border-collapse: collapse;
+  }
+  div.load-management td, div.load-management th {
+      padding: 0.2em 0.5em;
+      border-bottom: 1px solid #eee;
+  }
+  div.load-management td.num {
+      text-align: right;
+  }
+  div.load-management .status-ok {
+      color: green;
+  }
+  div.load-management .status-warn {
+      color: orange;
+  }
+  div.load-management .status-err {
+      color: red;
   }
 </style>
 </head>
@@ -49,6 +82,39 @@
         {{ vd.lag }}
       </td>
     </tr>
+    {% if vd.nbc %}
+    {% set qh_labels = [("QH4", ":45–:59"), ("QH3", ":30–:44"), ("QH2", ":15–:29"), ("QH1", ":00–:14")] %}
+    {% for qh_key, qh_label in qh_labels %}
+    {% set qh = vd.nbc[qh_key] %}
+    {% if qh is not none %}
+    <tr>
+      <td class="op">{{ qh_key }}</td>
+      <td class="num">
+        {% if qh is none %}
+          —
+        {% elif not qh.complete %}
+          {{ "%.0f" % (qh.raw_wh) }}&nbsp;/&nbsp;{{ "%.0f" % (qh.predicted_wh) }}
+        {% else %}
+          {{ "%.0f" % (qh.raw_wh) }}
+        {% endif %}
+      </td>
+      <td class="note">
+        {% if not qh.complete %}
+          Wh now / predicted
+        {% else %}
+          Wh
+        {% endif %}
+      </td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+    {% endif %}
+    <tr>
+      <td class="op"></td>
+      <td class="num">
+        {{ "%.0f" % (60 * vd.scales["1MIN"].usage) }}</td>
+      <td class="note">W, latest minute</td>
+    </tr>
     <tr>
       <td class="op"></td>
       <td class="num">
@@ -57,38 +123,17 @@
         {% else %}
         {{ "%.0f" % (vd.scales["1MIN"].usage) }}</td>
         {% endif %}
-      <td class="note">W, latest minute</td>
+      <td class="note">Wh, latest minute</td>
     </tr>
     <tr>
-      <td class="op">x</td>
-      <td class="num">{{ "%.0f" % (vd.minutes_remaining) }}</td>
-      <td class="note">minutes remaining</td>
-    </tr>
-    <tr>
-      <td class="op">&asymp;</td>
-      <td class="num">
-        {{ "%.0f" % (vd.minute_predicted) }}
-      </td>
-      <td class="note">Wh, remaining</td>
-    </tr>
-    <tr>
-      <td class="op">+</td>
+      <td class="op"></td>
       <td class="num">{{ "%.0f" % (vd.scales["1H"].usage) }}</td>
       <td class="note">Wh, hour so far</td>
     </tr>
     <tr>
-      <td class="op">&asymp;</td>
+      <td class="op"></td>
       <td class="num"><b>{{ "%.0f" % (vd.prediction) }}</b></td>
       <td class="note">Wh, predicted total</td>
-    </tr>
-    <tr>
-      <td colspan="3" class="note">
-      range:
-      {{ "%.0f" % (vd.prediction_min) }}
-      to
-      {{ "%.0f" % vd.prediction_max }}
-      Wh
-      </td>
     </tr>
     <tr>
       <td colspan="3" class="note">
@@ -102,7 +147,7 @@
 
 <script>
   var timePrev = Date.now()
-  var millisMax = 5 * 60 * 1000
+  var millisMax = 2 * 60 * 1000
   var timestamp = function() {
     return new Date(Date.now()).toLocaleTimeString()
   }
@@ -135,6 +180,170 @@
 
   setTimeout(reloadIfVisibleFn, millisMax)
 </script>
+
+{% if load_management %}
+<div class="load-management">
+  <h3>Load Management</h3>
+  <table>
+    <tr>
+      <td>Enabled</td>
+      <td class="num">{{ "yes" if load_management.enabled else "no" }}</td>
+    </tr>
+    <tr>
+      <td>Dry Run</td>
+      <td class="num">{{ "yes" if load_management.dry_run else "no" }}</td>
+    </tr>
+    <tr>
+      <td>Target Wh</td>
+      <td class="num">{{ "%.0f" % load_management.target_wh }}</td>
+    </tr>
+  </table>
+
+  {% if load_management.last_cycle_result %}
+  <h3>Last Cycle</h3>
+  <table>
+    <tr>
+      <td>Status</td>
+      <td class="num {{ 'status-ok' if load_management.last_cycle_result.status in ['ok', 'dry-run'] else 'status-err' if load_management.last_cycle_result.status == 'stale_data' else 'status-warn' }}">
+        {{ load_management.last_cycle_result.status }}
+      </td>
+    </tr>
+    {% if load_management.last_cycle_result.predicted_wh is defined %}
+    <tr>
+      <td>Predicted Wh</td>
+      <td class="num">{{ "%.0f" % load_management.last_cycle_result.predicted_wh }}</td>
+    </tr>
+    {% endif %}
+  </table>
+
+  {% if load_management.last_cycle_result.diagnostics %}
+  {% set diag = load_management.last_cycle_result.diagnostics %}
+  <h3>Diagnostics</h3>
+  <table>
+    {% if diag.gap_wh is not none %}
+    <tr>
+      <td>Gap Wh</td>
+      <td class="num {{ 'status-ok' if diag.reason == 'ok' else 'status-warn' }}">
+        {{ "%.0f" % diag.gap_wh }}
+      </td>
+    </tr>
+    {% endif %}
+    <tr>
+      <td>Hysteresis Wh</td>
+      <td class="num">{{ diag.hysteresis_wh }}</td>
+    </tr>
+    {% if diag.seconds_remaining is not none %}
+    <tr>
+      <td>Seconds Remaining</td>
+      <td class="num">{{ diag.seconds_remaining }}</td>
+    </tr>
+    {% endif %}
+    {% if diag.pending_effects_count is defined and diag.pending_effects_count is not none %}
+    <tr>
+      <td>Pending Effects</td>
+      <td class="num {{ 'status-err' if diag.pending_effects_count > 0 else '' }}">
+        {{ diag.pending_effects_count }}
+      </td>
+    </tr>
+    {% endif %}
+    <tr>
+      <td>Reason</td>
+      <td class="num {{ 'status-ok' if diag.reason == 'ok' else 'status-warn' if diag.reason in ['hysteresis', 'no_candidates', 'no_eligible', 'loads_too_large'] else 'status-err' }}">
+        {{ diag.reason }}
+      </td>
+    </tr>
+    {% if diag.candidates %}
+    <tr>
+      <td colspan="2">
+        <table class="sub-table">
+          <tr>
+            <th>Name</th>
+            <th>Role</th>
+            <th>Watts</th>
+            <th>Capacity Wh</th>
+            <th>Can Toggle</th>
+            <th>Desired</th>
+            <th>Actual</th>
+          </tr>
+          {% for c in diag.candidates %}
+          <tr>
+            <td>{{ c.name }}</td>
+            <td>{{ c.role }}</td>
+            <td class="num">{{ c.power_watts }}</td>
+            <td class="num">{{ c.capacity_wh }}</td>
+            <td class="num {{ 'status-ok' if c.can_toggle else 'status-warn' }}">
+              {{ 'yes' if c.can_toggle else 'no' }}
+            </td>
+            <td>{{ c.desired_state if c.get('desired_state') is not none else '-' }}</td>
+            <td>{{ c.actual_state if c.get('actual_state') is not none else '-' }}</td>
+          </tr>
+          {% endfor %}
+        </table>
+      </td>
+    </tr>
+    {% endif %}
+    {% if diag.tesla_state %}
+    <tr>
+      <td>Tesla</td>
+      <td class="num">
+        {% if diag.tesla_state.is_charging %}charging{% else %}not charging{% endif %}
+        {% if diag.tesla_state.current_amps is not none %}({{ diag.tesla_state.current_amps }}A){% endif %}
+        {% if diag.tesla_state.soc_percent is not none %}{{ "%.0f" % diag.tesla_state.soc_percent }}%{% endif %}
+        {% if diag.tesla_state.plugged_in %}plugged{% else %}unplugged{% endif %}
+        {% if diag.tesla_state.at_home %}at home{% else %}away{% endif %}
+      </td>
+    </tr>
+    {% endif %}
+  </table>
+  {% endif %}
+
+  {% if load_management.last_cycle_result.actions %}
+  <h3>Actions</h3>
+  <table>
+    {% for action in load_management.last_cycle_result.actions %}
+    <tr>
+      <td>{{ action.device }}</td>
+      <td class="num">{{ action.action }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  {% endif %}
+
+  {% if load_management.state and load_management.state.devices %}
+  <h3>Devices</h3>
+  <table>
+    <tr>
+      <th>Name</th>
+      <th>Desired</th>
+      <th>Actual</th>
+      <th>Amps</th>
+    </tr>
+    {% for name, dev in load_management.state.devices.items() %}
+    <tr>
+      <td>{{ name }}</td>
+      <td class="num">{{ "on" if dev.desired_state else "off" }}</td>
+      <td class="num">{{ "on" if dev.actual_state else "off" if dev.actual_state is not none else "?" }}</td>
+      <td class="num">{{ dev.current_amps if dev.current_amps is not none else "?" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  {% if load_management.state and load_management.state.pending_effects %}
+  <h3>Pending Effects</h3>
+  <table>
+    {% for effect in load_management.state.pending_effects %}
+    <tr>
+      <td>{{ effect.device_name }}</td>
+      <td class="num">{{ effect.action }}</td>
+      <td class="num">{{ effect.timestamp }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% endif %}
 
 {% if metrics.debug %}
 <div class="debug">

@@ -1,0 +1,1241 @@
+"""
+Load management for solar self-consumption optimization.
+
+LoadManager orchestrator, config loading functions, time-range parsing,
+and TeslaAuthError exception. Re-exports all public symbols from submodules
+for backward compatibility.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import threading
+from datetime import datetime, time, timezone
+from typing import Any, Callable
+
+import pytz
+from decouple import UndefinedValueError, config
+
+import device_config
+
+from load_models import (  # noqa: F401
+    AbstractPlugController,
+    AbstractTeslaController,
+    DeviceState,
+    PendingEffect,
+    PlugAction,
+    PlugConfig,
+    TeslaAuthError,
+    TeslaConfig,
+    TeslaState,
+    _tesla_state_to_dict,
+)
+from load_controllers import (  # noqa: F401
+    CompositePlugController,
+    PAIRINGS_FILE,
+    PlugController,
+    RealPlugController,
+    RealTeslaController,
+    TESLA_TOKENS_FILE,
+    TeslaController,
+    VocolincPlugController,
+    load_tesla_tokens,
+    pair_homekit_accessory,
+    remove_tesla_tokens,
+    save_tesla_tokens,
+    tesla_auth_cli,
+)
+from vocolinc import VOCOlinc  # noqa: F401  # pylint: disable=unused-import
+from load_nbc import NBCCache, NBCReader, StateTracker, TetrisEngine  # noqa: F401
+
+
+logger = logging.getLogger(__name__)
+
+
+# === Time-range parsing helpers ===
+
+_TIME_RANGE_RE = re.compile(r"^(\d{1,2}:\d{2})-(\d{1,2}:\d{2})$")
+
+
+def _parse_time(value: str) -> time:
+    """Parse a HH:MM string into a datetime.time object.
+
+    Args:
+        value: Time string in HH:MM 24-hour format.
+
+    Returns:
+        A timezone-naive time object.
+
+    Raises:
+        ValueError: If the string is not a valid HH:MM time.
+    """
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid time format: {value!r}, expected HH:MM")
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(
+            f"Time out of range: {value!r}, hour must be 0-23, minute 0-59"
+        )
+    return time(hour=hour, minute=minute)
+
+
+def _parse_load_manage_enabled(value: str) -> bool | tuple[time, time]:
+    """Parse LOAD_MANAGE_ENABLED value.
+
+    Accepts "True", "False" (case-insensitive), or a time range in
+    HH:MM-HH:MM 24-hour format (e.g., "06:45-15:00"). A time range means
+    load management is active only during that window (inclusive start,
+    exclusive end).
+
+    Args:
+        value: Raw string from the environment variable.
+
+    Returns:
+        True if always enabled, False if never enabled, or a tuple of
+        (start_time, end_time) for time-range mode.
+
+    Raises:
+        ValueError: If the value doesn't match any recognized format.
+    """
+    if value.strip().lower() in ("true", "1", "yes"):
+        return True
+    if value.strip().lower() in ("false", "0", "no", ""):
+        return False
+
+    match = _TIME_RANGE_RE.match(value.strip())
+    if match is not None:
+        start = _parse_time(match.group(1))
+        end = _parse_time(match.group(2))
+        return (start, end)
+
+    raise ValueError(
+        f"Invalid LOAD_MANAGE_ENABLED value: {value!r}. "
+        'Expected True/False or a time range like "06:45-15:00"'
+    )
+
+
+def _parse_device_time_range(value: str | None) -> tuple[time, time] | None:
+    """Parse a device-level time range string like '10:00-15:00'.
+
+    Args:
+        value: Raw string from devices.json, or None if not configured.
+
+    Returns:
+        Tuple of (start_time, end_time) or None if not configured.
+        Logs warning and returns None on parse error (device loads without
+        time restriction).
+    """
+    if value is None:
+        return None
+    match = _TIME_RANGE_RE.match(value.strip())
+    if match is None:
+        logger.warning("Invalid device time range %r, ignoring", value)
+        return None
+    return (_parse_time(match.group(1)), _parse_time(match.group(2)))
+
+
+# === Config loading functions ===
+
+
+def load_plugs_from_file() -> dict[str, PlugConfig]:
+    """Load HomeKit plug configurations from devices.json."""
+    plugs: dict[str, PlugConfig] = {}
+    for entry in device_config.get_homekit_plugs():
+        name = entry["name"].lower()
+        role = entry.get("role", "flexible")
+        if role not in ("flexible", "fixed"):
+            logger.warning("Invalid role %s for plug %s", role, name)
+            continue
+        plugs[name] = PlugConfig(
+            name=name,
+            accessory_id=entry["accessory_id"],
+            power_watts=float(entry["power_watts"]),
+            role=role,  # type: ignore
+            priority=int(entry.get("priority", 0)),
+            time_range=_parse_device_time_range(entry.get("time_range")),
+        )
+    return plugs
+
+
+def load_vocolinc_credentials() -> tuple[str, str] | None:
+    """Load VOCOlinc username and password from environment variables.
+
+    Returns:
+        Tuple of (username, password) or None if not configured.
+    """
+    username = config("VOCOLINC_USERNAME", "").strip()
+    password = config("VOCOLINC_PASSWORD", "").strip()
+    if username and password:
+        return (username, password)
+    return None
+
+
+def load_vocolinc_plugs_from_file() -> dict[str, PlugConfig]:
+    """Load VOCOlinc plug configurations from devices.json."""
+    plugs: dict[str, PlugConfig] = {}
+    for entry in device_config.get_vocolinc_plugs():
+        name = entry["name"].lower()
+        role = entry.get("role", "flexible")
+        if role not in ("flexible", "fixed"):
+            logger.warning("Invalid role %s for VOCOlinc plug %s", role, name)
+            continue
+        plugs[name] = PlugConfig(
+            name=name,
+            accessory_id=entry["device_name"],
+            power_watts=float(entry["power_watts"]),
+            role=role,  # type: ignore
+            priority=int(entry.get("priority", 0)),
+            controller_type="vocolinc",
+            time_range=_parse_device_time_range(entry.get("time_range")),
+        )
+    return plugs
+
+
+def load_tesla_config() -> TeslaConfig | None:
+    """Load Tesla configuration.
+
+    Secrets (client_id, client_secret) come from environment variables via
+    decouple. Device settings (vehicle_id, GPS coords, charge limits) come
+    from devices.json.
+    """
+    dc = device_config.get_tesla_config()
+    if dc is None:
+        return None
+    try:
+        client_id = config("TESLA_CLIENT_ID")
+        client_secret = config("TESLA_CLIENT_SECRET")
+    except (UndefinedValueError, ValueError, TypeError):
+        return None
+
+    private_key_path = config("TESLA_PRIVATE_KEY_PATH", default=None) or None
+    return TeslaConfig(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=dc["redirect_uri"],
+        vehicle_id=dc["vehicle_id"],
+        home_lat=float(dc.get("home_lat", 0)),
+        home_lon=float(dc.get("home_lon", 0)),
+        home_radius_m=float(dc.get("home_radius_m", 500)),
+        charge_amps_min=int(dc.get("charge_amps_min", 5)),
+        charge_amps_max=int(dc.get("charge_amps_max", 48)),
+        private_key_path=private_key_path,
+        time_range=_parse_device_time_range(dc.get("time_range")),
+    )
+
+
+# === LoadManager Orchestrator ===
+
+
+class LoadManager:
+    """Top-level orchestrator that runs the load management loop.
+
+    Wires together NBCReader+Cache, StateTracker, controllers, and TetrisEngine
+    to execute one load management cycle per call. Thread-safe via internal lock.
+    """
+
+    def __init__(  # pylint: disable=too-many-locals
+        self,
+        metrics_fetch: Callable[[], dict[str, Any] | None] | None = None,
+        nbc_cache: NBCCache | None = None,
+        plug_ctrl: AbstractPlugController | None = None,
+        tesla_ctrl: AbstractTeslaController | None = None,
+        engine: TetrisEngine | None = None,
+        target_wh: int | None = None,
+        nbc_device: str | None = None,
+        enabled: bool | str | tuple[time, time] | None = None,
+        dry_run: bool | None = None,
+    ) -> None:
+        """Initialize LoadManager with optional dependency injection.
+
+        Args:
+            metrics_fetch: Callable that returns fresh metrics data.
+            nbc_cache: Cache instance for NBC predictions.
+            plug_ctrl: Plug controller instance. If None, selected via
+                LOAD_PLUG_CONTROLLER env var (real or stub).
+            tesla_ctrl: Tesla controller instance. If None, loaded from env.
+            engine: TetrisEngine instance. If None, creates default.
+            target_wh: Target Wh per QH. Defaults to smartmeter.target_wh in
+                devices.json.
+            nbc_device: Device name for NBC readings. Defaults to
+                smartmeter.device in devices.json.
+            enabled: Whether load management is active. Accepts True/False, or a
+                time range string like "06:45-15:00" (24-hr clock). When a time
+                range is given, load management is only active during that window
+                (inclusive start, exclusive end) in the device timezone. Defaults to
+                LOAD_MANAGE_ENABLED env var.
+            dry_run: If True, log actions without executing them. Defaults to
+                LOAD_MANAGE_DRY_RUN env var.
+        """
+        self._lock = threading.Lock()
+        self.plug_ctrl: AbstractPlugController
+        self.tesla_ctrl: AbstractTeslaController | None
+        self.plugs: dict[str, PlugConfig]
+
+        if target_wh is None:
+            target_wh = device_config.get_target_wh()
+        self.target_wh = target_wh
+
+        if nbc_device is None:
+            nbc_device = device_config.get_smartmeter_device()
+        self.nbc_device = nbc_device
+
+        if isinstance(enabled, str):
+            try:
+                enabled = _parse_load_manage_enabled(enabled)
+            except ValueError as e:
+                logger.error("%s. Disabling load management.", e)
+                enabled = False
+        elif enabled is None:
+            enabled = LoadManager._resolve_enabled()
+        self.enabled: bool | tuple[time, time] = enabled
+        logger.info("LoadManager %s", self.enabled)
+
+        if dry_run is None:
+            dry_run = config("LOAD_MANAGE_DRY_RUN", default="False", cast=bool)
+        self.dry_run = dry_run
+
+        hysteresis_wh = int(abs(target_wh) / 3)
+        self.tesla_config = load_tesla_config()
+        tesla_config = self.tesla_config
+        if engine is not None:
+            self.engine = engine
+        else:
+            self.engine = TetrisEngine(
+                hysteresis_wh=hysteresis_wh,
+                charge_amps_min=tesla_config.charge_amps_min if tesla_config else 5,
+                charge_amps_max=tesla_config.charge_amps_max if tesla_config else 48,
+            )
+        self.state = StateTracker()
+
+        logger.debug("LoadManager %s", plug_ctrl)
+        if plug_ctrl is not None:
+            self.plug_ctrl = plug_ctrl
+        else:
+            plugs_from_file = load_plugs_from_file()
+            vocolinc_plugs = load_vocolinc_plugs_from_file()
+            has_homekit_plugs = bool(plugs_from_file)
+            has_vocolinc_plugs = bool(vocolinc_plugs)
+
+            # Auto-detect: if both types exist, use composite controller
+            if has_homekit_plugs and has_vocolinc_plugs:
+                controller_type = config(
+                    "LOAD_PLUG_CONTROLLER", default="real", cast=str
+                ).lower()
+                hk_ctrl = (
+                    RealPlugController(plugs_from_file)
+                    if controller_type == "real"
+                    else PlugController(plugs_from_file)
+                )
+                vc_creds = load_vocolinc_credentials()
+                vc_ctrl = VocolincPlugController(
+                    vocolinc_plugs,
+                    username=vc_creds[0] if vc_creds else None,
+                    password=vc_creds[1] if vc_creds else None,
+                )
+                self.plug_ctrl = CompositePlugController(hk_ctrl, vc_ctrl)
+            elif has_vocolinc_plugs:
+                vc_creds = load_vocolinc_credentials()
+                self.plug_ctrl = VocolincPlugController(
+                    vocolinc_plugs,
+                    username=vc_creds[0] if vc_creds else None,
+                    password=vc_creds[1] if vc_creds else None,
+                )
+            else:
+                controller_type = config(
+                    "LOAD_PLUG_CONTROLLER", default="stub", cast=str
+                ).lower()
+                if controller_type == "real":
+                    self.plug_ctrl = RealPlugController(plugs_from_file)
+                else:
+                    self.plug_ctrl = PlugController(plugs_from_file)
+
+        self.plugs = self.plug_ctrl.plugs  # type: ignore[attr-defined]
+
+        if tesla_ctrl is not None:
+            self.tesla_ctrl = tesla_ctrl
+        elif tesla_config is not None:
+            controller_type = config(
+                "LOAD_TESLA_CONTROLLER", default="stub", cast=str
+            ).lower()
+            if controller_type == "real":
+                self.tesla_ctrl = RealTeslaController(tesla_config)
+            else:
+                self.tesla_ctrl = TeslaController(tesla_config)
+        else:
+            self.tesla_ctrl = None
+
+        cache = nbc_cache or NBCCache(ttl_seconds=50)
+        self.nbc_reader = NBCReader(
+            cache=cache,
+            metrics_fetch=metrics_fetch,
+        )
+
+    @staticmethod
+    def _resolve_enabled() -> bool | tuple[time, time]:
+        """Resolve LOAD_MANAGE_ENABLED from config.
+
+        Reads the raw env var value and parses it using
+        _parse_load_manage_enabled. On parse error, logs the issue
+        and returns False (disabled).
+
+        Returns:
+            Parsed enabled value: True, False, or a time range tuple.
+        """
+        raw_value = config("LOAD_MANAGE_ENABLED", default="False")
+        try:
+            return _parse_load_manage_enabled(raw_value)
+        except ValueError as e:
+            logger.error("%s. Disabling load management.", e)
+            return False
+
+    def is_enabled_at(self, now: datetime) -> bool:
+        """Check if load management is enabled at the given moment.
+
+        Evaluates the enabled setting against the current time in the device
+        timezone. If enabled is True, always returns True. If False, always
+        returns False. If a time range tuple, checks whether now falls within
+        [start, end) — inclusive start, exclusive end.
+
+        Args:
+            now: The current moment (timezone-aware or naive).
+
+        Returns:
+            True if load management should be active at this time.
+        """
+        if isinstance(self.enabled, bool):
+            return self.enabled
+
+        start_time, end_time = self.enabled
+        tz_name = device_config.get_timezone()
+        try:
+            local_tz = pytz.timezone(tz_name)
+        except pytz.exceptions.UnknownTimeZoneError:
+            local_tz = pytz.timezone("America/Los_Angeles")
+
+        if now.tzinfo is None:
+            now_local = local_tz.localize(now)
+        else:
+            now_local = now.astimezone(local_tz)
+
+        current_time = now_local.time()
+        return start_time <= current_time < end_time
+
+    def _disabled_reason(self, source: str) -> str:
+        """Return a human-readable reason string for disabled status.
+
+        Returns:
+            "disabled" when enabled is False, or
+            "outside_time_range(HH:MM-HH:MM)" when outside the configured window.
+        """
+        if isinstance(self.enabled, tuple):
+            start_str = self.enabled[0].strftime("%H:%M")
+            end_str = self.enabled[1].strftime("%H:%M")
+            return f"[{source}] outside_time_range({start_str}-{end_str})"
+        return "disabled"
+
+    def _is_device_in_time_range(
+        self, device_name: str, time_range: tuple[time, time] | None
+    ) -> bool:
+        """Check if a device is within its configured time range.
+
+        Args:
+            device_name: Device name for logging context.
+            time_range: (start, end) tuple from config, or None (always in range).
+
+        Returns:
+            True if the device has no time restriction or current time falls
+            within [start, end). False if outside the configured window.
+        """
+        if time_range is None:
+            return True
+        start_time, end_time = time_range
+        tz_name = device_config.get_timezone()
+        try:
+            local_tz = pytz.timezone(tz_name)
+        except pytz.exceptions.UnknownTimeZoneError:
+            local_tz = pytz.timezone("America/Los_Angeles")
+
+        now_local = datetime.now(timezone.utc).astimezone(local_tz)
+        current_time = now_local.time()
+
+        in_range = start_time <= current_time < end_time
+        if not in_range:
+            logger.debug(
+                "%s outside time range (%s-%s), current %s",
+                device_name,
+                start_time.strftime("%H:%M"),
+                end_time.strftime("%H:%M"),
+                current_time.strftime("%H:%M"),
+            )
+        return in_range
+
+    def _build_candidate_details(
+        self,
+        seconds_remaining: int,
+        tesla_state: TeslaState | None,
+        tesla_error: str | None,
+        tesla_configured: bool,
+    ) -> list[dict[str, Any]]:
+        """Build per-device diagnostics for visibility into decisions.
+
+        Args:
+            seconds_remaining: Seconds left in current quarter-hour.
+            tesla_state: Tesla state if available.
+            tesla_error: Error message if Tesla state fetch failed.
+            tesla_configured: Whether a Tesla controller is configured.
+
+        Returns:
+            List of candidate detail dicts for all plugs and optionally Tesla.
+        """
+        now = datetime.now(timezone.utc)
+        candidate_details: list[dict[str, Any]] = []
+        for name, plug in self.plugs.items():
+            dev_state = self.state.devices.get(name)
+            # For diagnostics, show whether the device can toggle in the
+            # relevant direction: turn-off debounce for devices currently on,
+            # turn-on debounce for devices currently off or unknown.
+            currently_on = dev_state is not None and dev_state.desired_state is True
+            can_toggle = self.state.can_toggle(name, now, turning_on=not currently_on)
+            capacity_wh = StateTracker.watts_to_wh(
+                plug.power_watts, seconds_remaining
+            )
+            detail: dict[str, Any] = {
+                "name": name,
+                "role": plug.role,
+                "power_watts": plug.power_watts,
+                "capacity_wh": round(capacity_wh, 1),
+                "can_toggle": can_toggle,
+            }
+            if not self._is_device_in_time_range(name, plug.time_range):
+                detail["reason"] = "outside_time_range"
+            if dev_state:
+                detail["desired_state"] = dev_state.desired_state
+                detail["actual_state"] = dev_state.actual_state
+            candidate_details.append(detail)
+
+        # Add Tesla to candidate details when configured
+        if tesla_configured:
+            tesla_detail: dict[str, Any] = {
+                "name": "tesla",
+                "role": "flexible",
+                "state_available": tesla_state is not None,
+                "error": tesla_error,
+            }
+            if tesla_state is not None:
+                tesla_detail["is_charging"] = tesla_state.is_charging
+                tesla_detail["current_amps"] = tesla_state.current_amps
+                tesla_detail["soc_percent"] = tesla_state.soc_percent
+                tesla_detail["plugged_in"] = tesla_state.plugged_in
+                tesla_detail["at_home"] = tesla_state.at_home
+                tesla_detail["at_charge_limit"] = tesla_state.at_charge_limit
+            if self.tesla_config and not self._is_device_in_time_range(
+                "tesla", self.tesla_config.time_range
+            ):
+                tesla_detail["reason"] = "outside_time_range"
+            candidate_details.append(tesla_detail)
+
+        return candidate_details
+
+    def _determine_no_action_reason(
+        self,
+        results: list[dict[str, str]],
+        gap_wh: float,
+        seconds_remaining: int,
+        tesla_state: TeslaState | None,
+        tesla_configured: bool,
+        tesla_error: str | None,
+    ) -> str:
+        """Determine specific reason when no actions were taken.
+
+        Args:
+            results: List of executed action results.
+            gap_wh: The Wh gap (positive = surplus, negative = deficit).
+            tesla_state: Tesla state if available.
+            tesla_configured: Whether a Tesla controller is configured.
+            tesla_error: Error message if Tesla state fetch failed.
+
+        Returns:
+            Reason string explaining why no actions were taken.
+        """
+        if results:
+            return "ok"
+
+        now = datetime.now(timezone.utc)
+        gap_positive = gap_wh > 0
+        has_eligible = False
+        has_too_large = False
+
+        for name, plug in self.plugs.items():
+            if not self.state.can_toggle(name, now):
+                continue
+            if not self._is_device_in_time_range(name, plug.time_range):
+                continue
+            dev_state = self.state.devices.get(name)
+            eligible = False
+            if gap_positive:
+                if plug.role == "fixed":
+                    eligible = True
+                elif plug.role == "flexible":
+                    if dev_state is None or dev_state.desired_state is False:
+                        eligible = True
+            else:
+                if plug.role == "flexible":
+                    if dev_state and dev_state.desired_state is True:
+                        eligible = True
+
+            if eligible:
+                has_eligible = True
+                capacity_wh = StateTracker.watts_to_wh(
+                    plug.power_watts, seconds_remaining
+                )
+                abs_gap = abs(gap_wh)
+                if capacity_wh > abs_gap:
+                    has_too_large = True
+
+        # Check Tesla eligibility for turn-off scenarios
+        if not gap_positive and tesla_state is not None:
+            tesla_in_range = self._is_device_in_time_range(
+                "tesla",
+                self.tesla_config.time_range if self.tesla_config else None,
+            )
+            if tesla_in_range and tesla_state.is_charging:
+                has_eligible = True
+
+        if not has_eligible:
+            if tesla_configured and tesla_error is not None:
+                return "no_eligible_tesla_unavailable"
+            return "no_eligible"
+        if has_too_large:
+            return "loads_too_large"
+        return "no_candidates"
+
+    async def _fetch_tesla_state_async(
+        self,
+    ) -> tuple[TeslaState | None, str | None, str | None]:
+        """Fetch Tesla charging state and auth diagnostics (async).
+
+        Returns:
+            Tuple of (tesla_state, tesla_error, tesla_login_url).
+            tesla_login_url is set on TeslaAuthError to provide a
+            re-authentication link.
+        """
+        if self.tesla_ctrl is None:
+            return None, None, None
+        error: str | None = None
+        state = None
+        login_url: str | None = None
+        try:
+            state = await self.tesla_ctrl.get_charging_state()
+        except TeslaAuthError as tae:
+            error = str(tae)
+            login_url = self.tesla_ctrl.get_login_url()
+        return state, error, login_url
+
+    async def _sync_plug_states(self) -> None:
+        """Query actual plug states from controllers and reconcile with tracking.
+
+        Detects external changes (e.g., user manually toggling a plug) by comparing
+        the controller's reported state against our internal desired_state. When they
+        diverge, updates both actual_state and desired_state to match reality so the
+        TetrisEngine makes decisions based on current conditions.
+        """
+        for name in self.plugs:
+            try:
+                actual = await self.plug_ctrl.get_state(name)
+            except Exception as e:
+                logger.warning(
+                    "Failed to sync state for plug %s: %s", name, e
+                )
+                continue
+
+            if actual is None:
+                continue
+
+            dev_state = self.state.devices.get(name)
+            if dev_state is None:
+                # First time seeing this plug's state
+                self.state.devices[name] = DeviceState(
+                    name=name, actual_state=actual, desired_state=actual
+                )
+            else:
+                dev_state.actual_state = actual
+                # Reconcile: if external actor changed the state, match it
+                if dev_state.desired_state != actual:
+                    logger.info(
+                        "Reconciling %s: desired=%s but actual=%s "
+                        "(external change)",
+                        name,
+                        dev_state.desired_state,
+                        actual,
+                    )
+                    dev_state.desired_state = actual
+
+    async def _cycle_async_phase(
+        self,
+        gap_wh: float,
+        adjusted_wh: float,
+        seconds_remaining: int,
+        dry_run: bool,
+        qh_name: str | None = None,
+    ) -> tuple[
+        TeslaState | None,
+        str | None,
+        str | None,
+        list[PendingEffect],
+        list[dict[str, str]],
+        float,
+        float,
+    ]:
+        """Run the async portion of a cycle in a single event loop.
+
+        Syncs plug states from controllers, fetches Tesla state, calls decide()
+        with that state, then executes all resulting actions. Consolidating into
+        one coroutine means one event loop per cycle instead of one per action.
+
+        Tesla amp-change effects carry power_delta_wh=0. After fetching the
+        vehicle state we recompute the in-flight contribution via
+        tesla_inflight_wh() and fold it into corrected_adjusted_wh before
+        calling decide(), so the gap never drifts as seconds_remaining shrinks.
+
+        Args:
+            gap_wh: Pre-computed Wh gap (target - adjusted). Passed in rather
+                than recomputed so decide() and the hysteresis guard use the
+                identical value.
+            adjusted_wh: NBC prediction adjusted for still-pending effects.
+            seconds_remaining: Seconds left in the current quarter-hour.
+            dry_run: When True, log actions without executing them.
+            qh_name: Current quarter-hour name (e.g. "QH1").  Used to
+                auto-expire the Tesla amp-increase settle window on a QH
+                boundary so new-quarter deficits are never suppressed.
+
+        Returns:
+            Tuple of (tesla_state, tesla_error, tesla_login_url,
+            succeeded_effects, results).  succeeded_effects are the
+            PendingEffect objects for actions that executed successfully;
+            the caller commits them to state.pending_effects.  results are
+            the serialisable dicts for the response payload.
+        """
+        # Sync actual plug states before making decisions so the engine sees
+        # external changes (user toggles, other automations, etc.)
+        await self._sync_plug_states()
+
+        tesla_state, tesla_error, tesla_login_url = (
+            await self._fetch_tesla_state_async()
+        )
+
+        # Fold live Tesla in-flight contribution into the gap.  This replaces
+        # the frozen power_delta_wh=0 in any set_amps pending effect with a
+        # value that decays correctly as seconds_remaining shrinks.
+        tesla_reported = tesla_state.current_amps if tesla_state is not None else None
+        inflight_wh = self.state.tesla_inflight_wh(tesla_reported, seconds_remaining)
+        corrected_adjusted_wh = adjusted_wh + inflight_wh
+        corrected_gap_wh = self.target_wh - corrected_adjusted_wh
+        if inflight_wh != 0.0:
+            logger.debug(
+                "[_cycle_async_phase] tesla inflight correction: "
+                "commanded=%s reported=%s inflight=%.1f Wh "
+                "gap %.1f → %.1f Wh",
+                self.state.last_commanded_amps,
+                tesla_reported,
+                inflight_wh,
+                gap_wh,
+                corrected_gap_wh,
+            )
+
+        # Hysteresis guard uses corrected gap so in-flight Tesla draw is counted.
+        if abs(corrected_gap_wh) <= self.engine.HYSTERESIS_WH:
+            return tesla_state, tesla_error, tesla_login_url, [], [], corrected_gap_wh, corrected_adjusted_wh
+
+        # ── Settle-window suppression ──────────────────────────────────────────
+        # After a Tesla amp increase is confirmed the NBC prediction needs a few
+        # cycles to absorb the new load — the Emporia window covers the last
+        # 60 seconds, so some of that history is still at the old amp level.
+        # Combined with solar variability this can produce a large apparent
+        # deficit on the very first post-confirmation cycle, triggering an
+        # unwarranted cascade of plug shutoffs and Tesla stop.
+        #
+        # Suppress turn-off decisions while the settle window is active AND the
+        # apparent deficit is below TESLA_SETTLE_SUPPRESS_WH.  Large genuine
+        # deficits (e.g. new QH, clouds) still fire immediately; the QH-name
+        # check inside is_settling_after_amp_increase() also auto-expires the
+        # window on a QH transition.
+        settle_now = datetime.now(timezone.utc)
+        if (
+            corrected_gap_wh < 0
+            and abs(corrected_gap_wh) < self.engine.TESLA_SETTLE_SUPPRESS_WH
+            and self.state.is_settling_after_amp_increase(settle_now, current_qh=qh_name)
+        ):
+            settle_remaining = (
+                StateTracker.TESLA_SETTLE_SECS
+                - (settle_now - self.state.last_tesla_increase_at).total_seconds()  # type: ignore[operator]
+            )
+            logger.info(
+                "[_cycle_async_phase] suppressing turn-off: settling after Tesla "
+                "amp increase (gap=%.1f Wh, %.0f s left in settle window)",
+                corrected_gap_wh,
+                settle_remaining,
+            )
+            return (
+                tesla_state,
+                tesla_error,
+                tesla_login_url,
+                [],
+                [],
+                corrected_gap_wh,
+                corrected_adjusted_wh,
+            )
+
+        # Filter plugs by per-device time range: only eligible plugs reach the engine.
+        eligible_plugs: dict[str, PlugConfig] = {}
+        for name, plug in self.plugs.items():
+            if self._is_device_in_time_range(name, plug.time_range):
+                eligible_plugs[name] = plug
+
+        # Tesla is only a candidate if within its time range.
+        eligible_tesla: TeslaState | None = tesla_state
+        if (
+            tesla_state is not None
+            and self.tesla_config is not None
+            and not self._is_device_in_time_range(
+                "tesla", self.tesla_config.time_range
+            )
+        ):
+            eligible_tesla = None
+
+        actions = self.engine.decide(
+            predicted_wh=corrected_adjusted_wh,
+            target_wh=self.target_wh,
+            seconds_remaining=seconds_remaining,
+            state=self.state,
+            plugs=eligible_plugs,
+            tesla=eligible_tesla,
+            dry_run=dry_run,
+        )
+
+        succeeded_effects: list[PendingEffect] = []
+        results: list[dict[str, str]] = []
+        for action in actions:
+            if dry_run:
+                logger.info(
+                    "[DRY-RUN] Would execute: %s on %s",
+                    action.action,
+                    action.device_name,
+                )
+                results.append(
+                    {"device": action.device_name, "action": action.action}
+                )
+            else:
+                success = await self._execute_action(action)
+                if success:
+                    succeeded_effects.append(action)
+                    results.append(
+                        {"device": action.device_name, "action": action.action}
+                    )
+
+        return tesla_state, tesla_error, tesla_login_url, succeeded_effects, results, corrected_gap_wh, corrected_adjusted_wh
+
+    @staticmethod
+    def _plug_states_from_candidates(
+        candidate_details: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Extract a compact per-plug state summary for log messages.
+
+        Args:
+            candidate_details: Output of _build_candidate_details.
+
+        Returns:
+            Dict keyed by plug name with desired/actual/can_toggle fields,
+            excluding the tesla entry.
+        """
+        return {
+            c["name"]: {
+                "desired": c.get("desired_state"),
+                "actual": c.get("actual_state"),
+                "can_toggle": c.get("can_toggle", False),
+            }
+            for c in candidate_details
+            if c["name"] != "tesla"
+        }
+
+    def _check_pending_state(
+        self,
+        now_postfetch: datetime,
+        fetched_at: datetime,
+        seconds_remaining: int,
+    ) -> dict[str, Any] | None:
+        """Check for stale NBC data or unconfirmed pending effects.
+
+        Only called when force=False. Returns an early-exit result dict if
+        the cycle should be skipped, or None to continue.
+
+        Stale path: NBC data is older than STALE_THRESHOLD_SECS. Unsafe to
+        act — we don't know whether our last actions are reflected yet.
+        Prunes effects old enough to be safe to discard and skips the cycle.
+
+        Waiting path: Data is fresh enough, but we acted after the last NBC
+        data point and the effect may not yet be visible. Skip to avoid
+        double-counting the load.
+
+        Args:
+            now_postfetch: Timestamp taken after the NBC fetch completed.
+            fetched_at: Timestamp of the underlying NBC API data.
+            seconds_remaining: Seconds left in the current QH (for diag).
+
+        Returns:
+            An early-exit status dict, or None to continue.
+        """
+        tesla_configured = self.tesla_ctrl is not None
+        plugs_configured = list(self.plugs.keys())
+        base_diag: dict[str, Any] = {
+            "gap_wh": None,
+            "hysteresis_wh": self.engine.HYSTERESIS_WH,
+            "seconds_remaining": seconds_remaining,
+            "tesla_configured": tesla_configured,
+            "tesla_state": None,
+            "tesla_error": None,
+            "plugs_configured": plugs_configured,
+        }
+
+        nbc_data_age_secs = (now_postfetch - fetched_at).total_seconds()
+        if (
+            nbc_data_age_secs > StateTracker.STALE_THRESHOLD_SECS
+            and len(self.state.pending_effects) > 0
+        ):
+            # Prune old effects even during stale cycles so the list doesn't
+            # grow unbounded while we wait for fresh data.
+            pruned = self.state.prune_old_effects(fetched_at)
+            if pruned > 0:
+                logger.debug("Pruned %d old pending effects (stale)", pruned)
+            pending_count = len(self.state.pending_effects)
+            candidate_details = self._build_candidate_details(
+                seconds_remaining, None, None, tesla_configured
+            )
+            logger.warning(
+                "NBC data stale (%d pending effects, %s), skipping cycle",
+                pending_count,
+                self._plug_states_from_candidates(candidate_details),
+            )
+            return {
+                "status": "stale_data",
+                "diagnostics": {
+                    **base_diag,
+                    "reason": "stale_data",
+                    "pending_effects_count": pending_count,
+                    "candidates": candidate_details,
+                },
+            }
+
+        nbc_timestamp = fetched_at
+        if nbc_timestamp is not None and self.state.has_pending_effect_since(
+            nbc_timestamp
+        ):
+            pending_count = self.state.pending_since_count(nbc_timestamp)
+            candidate_details = self._build_candidate_details(
+                seconds_remaining, None, None, tesla_configured
+            )
+            logger.info(
+                "Pending effects (%d) not yet reflected, %s; "
+                "waiting for fresh data",
+                pending_count,
+                self._plug_states_from_candidates(candidate_details),
+            )
+            return {
+                "status": "waiting_for_fresh_data",
+                "diagnostics": {
+                    **base_diag,
+                    "reason": "waiting_for_fresh_data",
+                    "pending_effects_count": pending_count,
+                    "candidates": candidate_details,
+                },
+            }
+
+        return None
+
+    def run_cycle(self, force: bool = False) -> dict[str, Any]:  # pylint: disable=too-many-locals
+        """Execute one load management cycle. Returns status dict.
+
+        Thread-safe: acquires lock for entire cycle to prevent race conditions
+        with concurrent endpoint calls.
+
+        The cycle runs as a six-stage pipeline:
+            1. Enabled check — bail early if disabled or outside time window.
+            2. NBC fetch — obtain the current quarter-hour prediction.
+            3. Pending-state check — skip if data is stale or pending effects
+               are not yet reflected in the NBC data.
+            4. Accept fresh data — prune old effects, record fetch timestamp,
+               compute adjusted Wh and gap.
+            5. Async phase (single event loop) — fetch Tesla state, call
+               decide(), execute all actions.
+            6. Commit and return — persist succeeded effects, build result.
+
+        Args:
+            force: If True, bypass stale-data check (debug only).
+
+        Returns:
+            Status dict with keys: status, qh, predicted_wh, target_wh,
+            actions, and diagnostics.
+        """
+        tesla_configured = self.tesla_ctrl is not None
+        plugs_configured = list(self.plugs.keys())
+
+        with self._lock:
+            # ── Stage 1: enabled check ─────────────────────────────────────
+            now = datetime.now(timezone.utc)
+            if not self.is_enabled_at(now):
+                return {
+                    "status": "disabled",
+                    "diagnostics": {
+                        "gap_wh": None,
+                        "hysteresis_wh": self.engine.HYSTERESIS_WH,
+                        "seconds_remaining": None,
+                        "reason": self._disabled_reason("run_cycle"),
+                        "tesla_configured": tesla_configured,
+                        "tesla_state": None,
+                        "tesla_error": None,
+                        "plugs_configured": plugs_configured,
+                    },
+                }
+
+            # ── Stage 2: NBC fetch ─────────────────────────────────────────
+            qh_result = self.nbc_reader.get_current_qh(self.nbc_device)
+            if qh_result is None:
+                return {
+                    "status": "no_incomplete_qh",
+                    "diagnostics": {
+                        "gap_wh": None,
+                        "hysteresis_wh": self.engine.HYSTERESIS_WH,
+                        "seconds_remaining": None,
+                        "reason": "no_incomplete_qh",
+                        "tesla_configured": tesla_configured,
+                        "tesla_state": None,
+                        "tesla_error": None,
+                        "plugs_configured": plugs_configured,
+                    },
+                }
+            qh_name, predicted_wh, seconds_remaining, fetched_at = qh_result
+            now_postfetch = datetime.now(timezone.utc)
+
+            # ── Stage 3: pending-state check ───────────────────────────────
+            if not force:
+                early = self._check_pending_state(
+                    now_postfetch, fetched_at, seconds_remaining
+                )
+                if early is not None:
+                    return early
+
+            # ── Stage 4: accept fresh data, compute gap ────────────────────
+            pruned = self.state.prune_old_effects(fetched_at)
+            if pruned > 0:
+                logger.debug("Pruned %d old pending effects", pruned)
+            self.state.last_nbc_fetch = fetched_at
+            # Adjust prediction with still-pending effects so decide() accounts
+            # for actions already taken this quarter-hour.
+            adjusted_wh = self.state.estimated_current_wh(predicted_wh)
+            gap_wh = self.target_wh - adjusted_wh
+
+            # ── Stage 5: async phase (one event loop for the whole cycle) ──
+            # Single reset_session() call here instead of one per action.
+            if self.tesla_ctrl is not None:
+                self.tesla_ctrl.reset_session()
+            (
+                tesla_state,
+                tesla_error,
+                tesla_login_url,
+                succeeded_effects,
+                results,
+                gap_wh,
+                adjusted_wh,
+            ) = asyncio.run(
+                self._cycle_async_phase(
+                    gap_wh, adjusted_wh, seconds_remaining, self.dry_run, qh_name
+                )
+            )
+
+            # ── Stage 6: commit succeeded effects, build result ────────────
+            for effect in succeeded_effects:
+                self.state.pending_effects.append(effect)
+
+            # Track last commanded amps for tesla_inflight_wh() next cycle.
+            # Also maintain the settle-window state for post-increase damping:
+            # record amp increases so subsequent cycles can suppress premature
+            # turn-off reactions; clear on decreases or charging stop.
+            for effect in succeeded_effects:
+                if effect.device_name == "tesla":
+                    if effect.action == "set_amps":
+                        prev_amps = self.state.last_commanded_amps
+                        new_amps = effect.target_amps
+                        self.state.last_commanded_amps = new_amps
+                        if new_amps is not None and (
+                            prev_amps is None or new_amps > prev_amps
+                        ):
+                            self.state.record_tesla_amp_increase(
+                                effect.timestamp, qh_name=qh_name
+                            )
+                            logger.debug(
+                                "Tesla amp increase recorded: %s → %d A "
+                                "(settle window starts)",
+                                prev_amps,
+                                new_amps,
+                            )
+                        elif (
+                            new_amps is not None
+                            and prev_amps is not None
+                            and new_amps < prev_amps
+                        ):
+                            self.state.clear_tesla_settle()
+                    elif effect.action in ("turn_off", "turn_on"):
+                        self.state.last_commanded_amps = None
+                        self.state.clear_tesla_settle()
+
+            if abs(gap_wh) <= self.engine.HYSTERESIS_WH:
+                return {
+                    "status": "dry-run" if self.dry_run else "ok",
+                    "qh": qh_name,
+                    "predicted_wh": predicted_wh,
+                    "adjusted_wh": adjusted_wh,
+                    "target_wh": self.target_wh,
+                    "actions": [],
+                    "diagnostics": {
+                        "gap_wh": gap_wh,
+                        "hysteresis_wh": self.engine.HYSTERESIS_WH,
+                        "seconds_remaining": seconds_remaining,
+                        "reason": "hysteresis",
+                        "tesla_configured": tesla_configured,
+                        "tesla_state": _tesla_state_to_dict(tesla_state),
+                        "tesla_error": tesla_error,
+                        "tesla_login_url": tesla_login_url,
+                        "plugs_configured": plugs_configured,
+                    },
+                }
+
+            candidate_details = self._build_candidate_details(
+                seconds_remaining, tesla_state, tesla_error, tesla_configured
+            )
+            reason = self._determine_no_action_reason(
+                results,
+                gap_wh,
+                seconds_remaining,
+                tesla_state,
+                tesla_configured,
+                tesla_error,
+            )
+            return {
+                "status": "dry-run" if self.dry_run else "ok",
+                "qh": qh_name,
+                "predicted_wh": predicted_wh,
+                "adjusted_wh": adjusted_wh,
+                "target_wh": self.target_wh,
+                "actions": results,
+                "diagnostics": {
+                    "gap_wh": gap_wh,
+                    "hysteresis_wh": self.engine.HYSTERESIS_WH,
+                    "seconds_remaining": seconds_remaining,
+                    "reason": reason,
+                    "candidates": candidate_details,
+                    "tesla_configured": tesla_configured,
+                    "tesla_state": _tesla_state_to_dict(tesla_state),
+                    "tesla_error": tesla_error,
+                    "tesla_login_url": tesla_login_url,
+                    "plugs_configured": plugs_configured,
+                },
+            }
+
+    async def _execute_action(self, action: PendingEffect) -> bool:
+        """Execute a single pending action against the appropriate controller.
+
+        Args:
+            action: The action to execute.
+
+        Returns:
+            True on success, False on failure.
+        """
+        try:
+            if action.device_name == "tesla":
+                return await self._execute_tesla_action(action)
+            return await self._execute_plug_action(action)
+        except Exception as e:
+            logger.error("Failed to execute action %s: %s", action, e)
+            return False
+
+    async def _execute_plug_action(self, action: PendingEffect) -> bool:
+        """Execute a plug on/off action."""
+        if action.action == "turn_on":
+            return await self.plug_ctrl.set_state(action.device_name, True)
+        if action.action == "turn_off":
+            return await self.plug_ctrl.set_state(action.device_name, False)
+        logger.warning("Unknown plug action: %s", action.action)
+        return False
+
+    async def _execute_tesla_action(self, action: PendingEffect) -> bool:
+        """Execute a Tesla charging action."""
+        if self.tesla_ctrl is None:
+            return False
+
+        if action.action == "turn_on":
+            return await self.tesla_ctrl.start_charging()
+        if action.action == "turn_off":
+            return await self.tesla_ctrl.stop_charging()
+        if action.action == "set_amps":
+            if action.target_amps is None or action.target_amps < 5:
+                return await self.tesla_ctrl.stop_charging()
+            return await self.tesla_ctrl.set_charge_amps(action.target_amps)
+        logger.warning("Unknown Tesla action: %s", action.action)
+        return False
+
+    def close(self) -> None:
+        """Close the LoadManager and release resources.
+
+        Calls close on the Tesla controller to clean up any open aiohttp
+        sessions. Safe to call multiple times.
+        """
+        if self.tesla_ctrl is not None:
+            try:
+                asyncio.run(self.tesla_ctrl.close())
+            except Exception as e:
+                logger.warning("Failed to close Tesla controller: %s", e)
+
+
+# === Backward-compatible re-exports ===
+# All public symbols are imported at the top of this module so that existing
+# `from load_manager import X` statements in tests and app.py continue to work.
+
+__all__ = [
+    # Orchestrator
+    "LoadManager",
+    "TeslaAuthError",
+    # Config loading
+    "load_plugs_from_file",
+    "load_tesla_config",
+    "load_vocolinc_credentials",
+    "load_vocolinc_plugs_from_file",
+    # Re-exported from submodules (backward compat)
+    "AbstractPlugController",
+    "AbstractTeslaController",
+    "CompositePlugController",
+    "DeviceState",
+    "NBCCache",
+    "NBCReader",
+    "PAIRINGS_FILE",
+    "PendingEffect",
+    "PlugAction",
+    "PlugConfig",
+    "PlugController",
+    "RealPlugController",
+    "RealTeslaController",
+    "TESLA_TOKENS_FILE",
+    "TetrisEngine",
+    "TeslaConfig",
+    "TeslaController",
+    "TeslaState",
+    "VocolincPlugController",
+    "_parse_load_manage_enabled",
+    "_tesla_state_to_dict",
+    "load_tesla_tokens",
+    "pair_homekit_accessory",
+    "remove_tesla_tokens",
+    "save_tesla_tokens",
+    "tesla_auth_cli",
+]

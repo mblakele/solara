@@ -71,6 +71,10 @@ variables:
 After setting these credentials, deploy the web service again.
 You should now see live data from your VUE Utility Connect.
 
+For load management features (smart plug and Tesla charging control),
+you'll also need additional environment variables. See [env.example](env.example)
+and [docs/LOADMANAGER.md](docs/LOADMANAGER.md) for the full configuration reference.
+
 ## Local Setup
 
 You can also run this project locally, or adapt these instructions
@@ -94,20 +98,16 @@ Next, install dependencies:
 uv sync
 ```
 
-Next, the local server will need your Emporia account credentials.
-Configure these by creating a `.env` file in your local copy of the
-source code.
+Next, copy `env.example` to `.env` and configure your credentials:
 
-**Never check the `.env` file into source control.**
+```bash
+cp env.example .env
+```
 
-```
-# Never check this file into source control!
-#
-# Enable debug for local development, if desired.
-#DEBUG=True
-VUE_USERNAME=yourEmporiaUsername
-VUE_PASSWORD=yourEmporiaPassword
-```
+Edit `.env` with your Emporia username/password and any optional load management
+settings. See [env.example](env.example) for all available options.
+
+**Never check the `.env` file into source control.** It is listed in `.gitignore`.
 
 Finally, start a local server with:
 
@@ -265,6 +265,24 @@ available in the HTML view. For example you can see projections based
 on the past minute (`1MIN`), but also based on the past 2, 3, 4, 5, 6,
 7, 8, 9, and 10 minutes.  This data may be useful for custom
 integrations.
+
+## Load Management
+
+Solara can automatically control smart plugs and Tesla vehicle charging to
+absorb excess solar energy. The load management engine uses NBC predictions
+to decide when to turn flexible loads on or off, aiming to keep your
+quarter-hour net usage near a configurable target (default: -500 Wh).
+
+Supported devices include HomeKit smart plugs, VOCOlinc smart plugs, and Tesla
+vehicle charging. See [docs/LOADMANAGER.md](docs/LOADMANAGER.md) for full
+configuration details, including Tesla Fleet API OAuth setup.
+
+### Getting Started with Load Management
+
+1. Copy `env.example` to `.env` and configure your devices
+2. Start with `LOAD_MANAGE_DRY_RUN=True` to test without executing actions
+3. Review logs to verify decisions match expectations
+4. Set `LOAD_MANAGE_DRY_RUN=False` when ready for real control
 
 ## Accuracy
 

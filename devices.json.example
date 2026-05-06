@@ -1,0 +1,38 @@
+{
+  "timezone": "America/Los_Angeles",
+  "smartmeter": {
+    "device": "",
+    "target_wh": -500
+  },
+  "plugs": {
+    "homekit": [
+      {
+        "name": "water_heater",
+        "accessory_id": "192.168.1.50",
+        "power_watts": 4500,
+        "role": "flexible",
+        "priority": 10,
+        "time_range": "06:00-22:00"
+      }
+    ],
+    "vocolinc": [
+      {
+        "name": "floor_lamp",
+        "device_name": "LivingRoomLamp",
+        "power_watts": 60,
+        "role": "flexible",
+        "priority": 5
+      }
+    ]
+  },
+  "tesla": {
+    "vehicle_id": "",
+    "redirect_uri": "http://localhost:8000/callback",
+    "home_lat": 37.7749,
+    "home_lon": -122.4194,
+    "home_radius_m": 500,
+    "charge_amps_min": 5,
+    "charge_amps_max": 48,
+    "time_range": "08:00-20:00"
+  }
+}

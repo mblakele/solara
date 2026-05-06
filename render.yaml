@@ -14,3 +14,11 @@ services:
       - key: VUE_PASSWORD
         generateValue: false
         sync: false
+      - key: TIMEZONE
+        value: America/Los_Angeles
+      - key: LOAD_MANAGE_ENABLED
+        value: "False"
+      - key: LOAD_MANAGE_INTERVAL_SECS
+        value: "30"
+      - key: LOAD_TARGET_WH
+        value: "-500"
