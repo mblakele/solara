@@ -66,6 +66,24 @@ class TestApp(unittest.TestCase):
         data = json.loads(response.data)
         self.assertIn("loadManagement", data)
 
+    def test_index_html_time_range_enabled(self):
+        """Index HTML shows time range when enabled is a time-range tuple."""
+        from decouple import config as dc_config
+
+        with mock_config():
+            dc_config.set("LOAD_MANAGE_ENABLED", "06:45-15:00")
+            # Reset LoadManager singleton so it reinitializes with the new config.
+            import app as app_mod
+
+            app_mod._load_manager = None
+            app_mod._load_manager_init_failed = False
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        data = response.data.decode("utf-8")
+        # Should show the time range, not just "yes"
+        self.assertIn("06:45", data)
+        self.assertIn("15:00", data)
+
     def test_index_html_mock(self):
         with mock_config():
             response = self.app.get("/", headers={"Accept": "text/html"})

@@ -187,7 +187,15 @@
   <table>
     <tr>
       <td>Enabled</td>
-      <td class="num">{{ "yes" if load_management.enabled else "no" }}</td>
+      <td class="num">
+        {% if load_management.enabled is sameas false %}
+          no
+        {% elif load_management.enabled is sameas true %}
+          yes
+        {% else %}
+          {{ "%.02d:%02d" % (load_management.enabled[0].hour, load_management.enabled[0].minute) }}–{{ "%.02d:%02d" % (load_management.enabled[1].hour, load_management.enabled[1].minute) }}
+        {% endif %}
+      </td>
     </tr>
     <tr>
       <td>Dry Run</td>
