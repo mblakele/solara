@@ -35,7 +35,7 @@ Before any logic changes, you must demonstrate the need for the change.
 
 ### 2. Phase: GREEN (The Implementation)
 Write only the code necessary to satisfy the failing test.
-- **Action:** Implement the fix or feature in the `src/` directory.
+- **Action:** Implement the fix or feature in the project root directory.
 - **Verification:** Run the specific test again to confirm it passes.
 - **Regression Check:** Run the entire suite using `pytest` to ensure existing functionality remains intact.
 
@@ -67,7 +67,6 @@ Key capabilities:
 |---|---|
 | `pyemvue` | Python client for the Emporia VUE API — fetches real-time smart meter data |
 | `flask` | Web framework for routing, templating, and JSON responses |
-| `python-decouple` | Reads configuration from environment variables or `.env` files |
 | `pytz` | Timezone conversion for displaying timestamps in device-local time |
 | `isodate` | Serializes Python `timedelta` objects to ISO 8601 duration strings |
 | `humps` | Case conversion utilities (camelCase ↔ snake_case) for API data |
@@ -82,6 +81,12 @@ Key capabilities:
 - `LOAD_NBC_DEVICE` — Device name for NBC predictions
 - `LOAD_MANAGE_INTERVAL_SECS` — Seconds between load management cycles (default: 30)
 - Emporia VUE credentials are stored in `.vue-keys.json` rather than environment variables
+
+---
+
+## Project Layout
+
+This is a flat-layout Python project. All source files live at the project root — there is no src/ directory, no packages, and no nested module hierarchy.
 
 ---
 
@@ -102,7 +107,8 @@ project-root
 ├── tests/              # All pytest tests
 ├── templates/          # Jinja2 HTML templates (index, TOU, error pages)
 ├── docs/               # Supplementary documentation (e.g., LOADMANAGER.md)
-├── .opencode/plans/    # Agent planning scratch space (only writable dir during planning)
+├── .opencode/plans/    # Agent planning scratch space (writable during planning)
+├── devices.json        # Local device configuration — never commit
 └── .env                # Local secrets — never commit
 ```
 
@@ -228,7 +234,7 @@ Ensure that file is present and sourced before running.
 - **Imports:** Grouped in this order, each on its own line:
   1. Standard library (`os`, `json`, `datetime`)
   2. Third-party packages (`flask`, `requests`, `pytz`)
-  3. Local project imports (`.utils`, `.models`)
+  3. Local project imports (`from load_manager import ...`, `import metrics`)
 - All code must pass `pylint` clean with no suppressions unless explicitly justified
   in a comment
 
@@ -283,7 +289,7 @@ Ensure that file is present and sourced before running.
 ### 5. Security
 
 - **No hardcoded secrets.** Read all credentials and API keys from environment
-  variables via `decouple.py`. If you find hardcoded secrets,
+  variables via the local `decouple.py` library. If you find hardcoded secrets,
   fix them immediately.
 - **Validate all user input** (URL params, form fields, query strings) before
   use or storage.
