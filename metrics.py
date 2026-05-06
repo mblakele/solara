@@ -2,6 +2,7 @@
 Call Emporia VUE API and marshal predicted usage.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import locale
@@ -20,6 +21,54 @@ from util import CustomJSONProvider, compute_nbc_quarters, custom_json_default, 
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PopulationResult:
+    """Intermediate results from populating one device — no mutation of API objects."""
+
+    per_second_data: List[float]
+    scales: Dict[str, Any]
+    chart_data: List[float]
+    nbc_seconds: List[float]
+    nbc_data_start: datetime
+
+
+@dataclass
+class DeviceMetrics:
+    """Computed metrics for one device, separate from raw pyemvue response."""
+
+    gid: int
+    name: str
+    lag: timedelta
+    per_second_data: List[float]
+    prediction: float
+    prediction_min: float
+    prediction_max: float
+    minute_predicted: float
+    minutes_remaining: float
+    scales: Dict[str, Any]
+    smoothing: Dict[str, float]
+    nbc: Dict[str, Any]
+    timezone: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to dict for JSON/template consumption."""
+        return {
+            "gid": self.gid,
+            "lag": self.lag,
+            "name": self.name,
+            "per_second_data": self.per_second_data,
+            "prediction": round(self.prediction, 14),
+            "prediction_min": round(self.prediction_min, 14),
+            "prediction_max": round(self.prediction_max, 14),
+            "minute_predicted": round(self.minute_predicted, 14),
+            "minutes_remaining": round(self.minutes_remaining, 14),
+            "scales": self.scales,
+            "smoothing": {k: round(v, 14) for k, v in self.smoothing.items()},
+            "timezone": self.timezone,
+            "nbc": self.nbc,
+        }
 
 
 class MetricsCache:
@@ -96,7 +145,7 @@ class MetricsBase:
     without re-logging in on every call.
     """
 
-    device_info: ClassVar[Dict[str, Any]] = {}
+    device_info: ClassVar[Dict[int, Any]] = {}
     json: ClassVar[type] = CustomJSONProvider
     vue: ClassVar[PyEmVue] = PyEmVue()
     vue_auth: ClassVar[Dict[str, Any]] = {}
@@ -217,38 +266,26 @@ class HourlyProjection(MetricsBase):
         self.instant = datetime.now(timezone.utc)
         self.metrics["instant"] = self.instant
 
-        self.populate()
+        # Fetch usage data without mutating device_info
+        population = self.populate()
 
         self.metrics["api_response"]["total"] = sum(
             self.metrics["api_response"].values(), timedelta()
         )
 
-        self.predict()
+        # Compute predictions from population results
+        predictions = self.predict(population)
 
-        self.logger.debug("device %s", self.device_info)
+        # Build metrics from pure computation results
         for gid, vdi in self.device_info.items():
-            device_metrics = {
-                "gid": gid,
-                "lag": vdi.lag,
-                "name": vdi.device_name,
-                "minute_predicted": vdi.minute_predicted,
-                "minutes_remaining": vdi.seconds_remaining / 60.0,
-                "prediction": vdi.prediction,
-                "prediction_min": vdi.prediction_min,
-                "prediction_max": vdi.prediction_max,
-                "chart_data": vdi.chart_data,
-                "scales": vdi.scales,
-                "smoothing": vdi.smoothing,
-                "timezone": vdi.time_zone,
-                "nbc": (
-                    self._compute_nbc(
-                        vdi.nbc_seconds, vdi.nbc_data_start, getattr(vdi, "time_zone", None)
-                    )
-                    if hasattr(vdi, "nbc_seconds")
-                    else None
-                ),
-            }
-            self.metrics["devices"].append(device_metrics)
+            if gid not in population:
+                continue
+            pop_result = population[gid]
+            pred_result = predictions[gid]
+            device_metrics = self._compute_device_metrics(
+                vdi, pop_result, pred_result
+            )
+            self.metrics["devices"].append(device_metrics.to_dict())
 
         self.logger.debug(
             "reporting metrics for %d devices", len(self.metrics["devices"])
@@ -282,13 +319,22 @@ class HourlyProjection(MetricsBase):
         )
         return usage_data_local, usage_data_start_local, chan.channel_num
 
-    def _process_offset_scales(self, dig, usage_data_local, usage_data_end):
-        """
-        Process minute-scale offset data (1MIN–10MIN) and set chart_data.
+    def _process_offset_scales(
+        self, scales: Dict[str, Any], usage_data_local: List[float], usage_data_end: datetime
+    ) -> List[float]:
+        """Process minute-scale offset data (1MIN–10MIN) and return chart_data.
 
         Computes usage for each minute scale from the tail of the dataset
-        and stores results via populate_scale(). Also sets the last 300
-        data points as chart_data on the device info object.
+        and stores results in the provided scales dict. Returns the last 300
+        data points as chart_data without mutating any API objects.
+
+        Args:
+            scales: Dict to populate with minute-scale entries (mutated in-place).
+            usage_data_local: Per-second usage data for the current hour.
+            usage_data_end: End time of the usage data window.
+
+        Returns:
+            Last 300 data points as chart_data.
         """
         usage_data_len = len(usage_data_local)
         usage_minutes = max(1, min(10, usage_data_end.minute))
@@ -305,44 +351,30 @@ class HourlyProjection(MetricsBase):
             scale = str(usm) + "MIN"
             offset_data = usage_data_local[-uss:]
             offset_start = usage_data_end - timedelta(minutes=usm)
-            self.populate_scale(dig, scale, offset_start, offset_data)
-        dig.chart_data = usage_data_local[-300:]
+            scales[scale] = self.data_for_scale(offset_data, offset_start, scale)
+        return usage_data_local[-300:]
 
-    def populate(self) -> None:
-        """Fetch recent data using second granularity to minimize lag."""
+    def populate(self) -> Dict[int, _PopulationResult]:
+        """Fetch recent data using second granularity to minimize lag.
+
+        Returns a dict mapping device gid to PopulationResult without mutating
+        the pyemvue API objects in device_info.
+
+        Returns:
+            Dict of gid -> _PopulationResult for each successfully populated device.
+        """
         chart_start = self.instant - timedelta(
             minutes=self.instant.minute,
             seconds=self.instant.second,
             microseconds=self.instant.microsecond,
         )
+        results: Dict[int, _PopulationResult] = {}
         for vdi in self.device_info.values():
             self.logger.debug("device: %s", vdi)
-            for chan in vdi.channels:
-                self.logger.debug("channel: %s", chan.name)
-                gid = chan.device_gid
-                dig = self.device_info[gid]
-                usage_data_start_local = chart_start  # safe default if fetch fails
-                try:
-                    usage_data_local, usage_data_start_local, _ = (
-                        self._fetch_channel_data(chan, chart_start, self.instant)
-                    )
-                    self.populate_scale(
-                        dig, Scale.HOUR.value, usage_data_start_local, usage_data_local
-                    )
-                    usage_data_end = usage_data_start_local + timedelta(
-                        seconds=len(usage_data_local)
-                    )
-                    self._process_offset_scales(dig, usage_data_local, usage_data_end)
-                    dig.nbc_seconds = usage_data_local
-                    dig.nbc_data_start = usage_data_start_local
-                except (requests.exceptions.RequestException, IOError):
-                    self.logger.exception(
-                        "error fetching device data: skipping %s", vdi.device_name
-                    )
-                    vdi.scales = {}
-                    self.populate_scale(
-                        dig, Scale.HOUR.value, usage_data_start_local, []
-                    )
+            result = self._populate_device(vdi, chart_start)
+            if result is not None:
+                results[vdi.device_gid] = result
+        return results
 
     def populate_scale(
         self, dig: Any, scale: str, data_start: datetime, data: List[float]
@@ -392,56 +424,26 @@ class HourlyProjection(MetricsBase):
         dsi["usage"] = usage
         return dsi
 
-    def predict(self) -> None:
-        """
-        Predict consumption or surplus at end of current hour.
+    def predict(
+        self, population: Dict[int, _PopulationResult]
+    ) -> Dict[int, Dict[str, Any]]:
+        """Predict consumption or surplus at end of current hour.
 
         Uses the minute-scale usage rate to extrapolate remaining
         consumption for the current hour, then computes min/max bounds
         across all available minute scales (1MIN–10MIN).
+
+        Args:
+            population: Results from populate(), mapping gid -> PopulationResult.
+
+        Returns:
+            Dict of gid -> prediction results for each device.
         """
-        for vdi in self.device_info.values():
-            hour_next = (
-                self.instant
-                + timedelta(hours=1)
-                - timedelta(
-                    minutes=self.instant.minute,
-                    seconds=self.instant.second,
-                    microseconds=self.instant.microsecond,
-                )
-            )
-            scales = vdi.scales
-            hour = scales[Scale.HOUR.value]
-            seconds_remaining = (hour_next - hour["instant"]).total_seconds()
-
-            minute_predicted = (
-                seconds_remaining * scales[Scale.MINUTE.value]["usage"] / 60.0
-            )
-            prediction = hour["usage"] + minute_predicted
-
-            vdi.smoothing = {}
-            prediction_min = prediction
-            prediction_max = prediction
-            for scale in scales.keys():
-                if not scale.endswith("MIN"):
-                    continue
-                sval = hour["usage"] + (
-                    seconds_remaining * scales[scale]["usage"] / 60.0
-                )
-                prediction_min = min(sval, prediction_min)
-                prediction_max = max(sval, prediction_max)
-                vdi.smoothing[scale] = sval
-
-            vdi.lag = (
-                self.instant - hour["instant"]
-                if hour["instant"] < self.instant
-                else timedelta(0)
-            )
-            vdi.minute_predicted = minute_predicted
-            vdi.prediction = prediction
-            vdi.prediction_max = prediction_max
-            vdi.prediction_min = prediction_min
-            vdi.seconds_remaining = seconds_remaining
+        predictions: Dict[int, Dict[str, Any]] = {}
+        for gid, pop_result in population.items():
+            pred_result = self._predict_device(pop_result.scales)
+            predictions[gid] = pred_result
+        return predictions
 
     def _compute_nbc(
         self,
@@ -469,6 +471,144 @@ class HourlyProjection(MetricsBase):
         n = max(0, int(elapsed.total_seconds()))
         n = min(n, len(usage_data_local))
         return compute_nbc_quarters(usage_data_local, n)
+
+    def _populate_device(
+        self, vdi: Any, chart_start: datetime
+    ) -> Optional[_PopulationResult]:
+        """Fetch and compute usage data for one device without mutating API objects.
+
+        Args:
+            vdi: The VDeviceUsageInfo object from pyemvue (read-only).
+            chart_start: Start of the chart window.
+
+        Returns:
+            PopulationResult with computed scales, or None on error.
+        """
+        for chan in vdi.channels:
+            usage_data_start_local = chart_start  # safe default if fetch fails
+            try:
+                usage_data_local, usage_data_start_local, _ = (
+                    self._fetch_channel_data(chan, chart_start, self.instant)
+                )
+            except (requests.exceptions.RequestException, IOError):
+                self.logger.exception(
+                    "error fetching device data: skipping %s", vdi.device_name
+                )
+                return None
+
+            scales: Dict[str, Any] = {}
+            scales[Scale.HOUR.value] = self.data_for_scale(
+                usage_data_local, usage_data_start_local, Scale.HOUR.value
+            )
+
+            usage_data_end = usage_data_start_local + timedelta(
+                seconds=len(usage_data_local)
+            )
+            chart_data = self._process_offset_scales(scales, usage_data_local, usage_data_end)
+            return _PopulationResult(
+                per_second_data=usage_data_local,
+                scales=scales,
+                chart_data=chart_data,
+                nbc_seconds=usage_data_local,
+                nbc_data_start=usage_data_start_local,
+            )
+        return None
+
+    def _predict_device(self, scales: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute prediction and smoothing for one device from its scales.
+
+        Args:
+            scales: Computed scale entries (1H, 1MIN-10MIN) from population.
+
+        Returns:
+            Dict with prediction, min/max bounds, smoothing, lag, etc.
+        """
+        hour_next = (
+            self.instant
+            + timedelta(hours=1)
+            - timedelta(
+                minutes=self.instant.minute,
+                seconds=self.instant.second,
+                microseconds=self.instant.microsecond,
+            )
+        )
+        hour = scales[Scale.HOUR.value]
+        seconds_remaining = (hour_next - hour["instant"]).total_seconds()
+
+        minute_predicted = (
+            seconds_remaining * scales[Scale.MINUTE.value]["usage"] / 60.0
+        )
+        prediction = hour["usage"] + minute_predicted
+
+        smoothing: Dict[str, float] = {}
+        prediction_min = prediction
+        prediction_max = prediction
+        for scale in scales.keys():
+            if not scale.endswith("MIN"):
+                continue
+            sval = hour["usage"] + (
+                seconds_remaining * scales[scale]["usage"] / 60.0
+            )
+            prediction_min = min(sval, prediction_min)
+            prediction_max = max(sval, prediction_max)
+            smoothing[scale] = sval
+
+        lag = (
+            self.instant - hour["instant"]
+            if hour["instant"] < self.instant
+            else timedelta(0)
+        )
+
+        return {
+            "lag": lag,
+            "minute_predicted": minute_predicted,
+            "prediction": prediction,
+            "prediction_min": prediction_min,
+            "prediction_max": prediction_max,
+            "seconds_remaining": seconds_remaining,
+            "smoothing": smoothing,
+        }
+
+    def _compute_device_metrics(
+        self,
+        vdi: Any,
+        pop_result: _PopulationResult,
+        pred_result: Dict[str, Any],
+    ) -> DeviceMetrics:
+        """Build a DeviceMetrics from population and prediction results.
+
+        This is a pure constructor that takes raw inputs and returns computed
+        output without mutating any input data.
+
+        Args:
+            vdi: The VDeviceUsageInfo object from pyemvue (read-only metadata).
+            pop_result: Intermediate data from _populate_device.
+            pred_result: Computed predictions from _predict_device.
+
+        Returns:
+            DeviceMetrics instance with all derived fields.
+        """
+        nbc_result = self._compute_nbc(
+            pop_result.nbc_seconds,
+            pop_result.nbc_data_start,
+            getattr(vdi, "time_zone", None),
+        )
+
+        return DeviceMetrics(
+            gid=vdi.device_gid,
+            name=vdi.device_name,
+            lag=pred_result["lag"],
+            per_second_data=pop_result.per_second_data,
+            prediction=pred_result["prediction"],
+            prediction_min=pred_result["prediction_min"],
+            prediction_max=pred_result["prediction_max"],
+            minute_predicted=pred_result["minute_predicted"],
+            minutes_remaining=pred_result["seconds_remaining"] / 60.0,
+            scales=pop_result.scales,
+            smoothing=pred_result["smoothing"],
+            nbc=nbc_result,
+            timezone=getattr(vdi, "time_zone", None) or "",
+        )
 
 
 class TOUReporter(MetricsBase):
