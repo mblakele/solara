@@ -335,7 +335,7 @@ class StateTracker:
     @staticmethod
     def watts_to_wh(power_watts: float, seconds: int) -> float:
         """Convert power in watts over a duration to watt-hours."""
-        return power_watts * seconds / NBCPeriod.PERIOD_SECS
+        return power_watts * seconds / 3600
 
     @staticmethod
     def wh_to_watts(energy_wh: float, seconds: int) -> float:

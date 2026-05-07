@@ -11,6 +11,12 @@ from load_manager import (
     StateTracker,
 )
 
+def test_watts_to_wh():
+    """Test calculation of wh impact of a load in watts."""
+    watts = 300
+    wh = StateTracker.watts_to_wh(watts, 600)
+    assert wh == 50
+
 
 def test_can_toggle_true_when_never_toggled():
     """True when device never toggled."""
