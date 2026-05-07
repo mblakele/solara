@@ -8,6 +8,8 @@ code consistency, maintainability, and adherence to project standards.
 
 ## General Advice
 
+Take time to think things through.
+
 Don't ask whether a bug or error might be pre-existing or might pre-date your changes. Just fix it.
 
 When something is ambiguous or two consecutive attempts have not resolved a
@@ -30,8 +32,15 @@ requires technical precision.
 
 To ensure code quality and prevent regressions, all development must follow a strict **Test-First (Red-Green-Refactor)** workflow. You are prohibited from modifying production code until a failing test has been established. You are prohibited from attempting to diagnose, fix, or design a fix for any bug until a failing test has been written. Test first!
 
+### Mandatory Pre-Code Checklist
+Before writing any production code, confirm:
+1. A failing test exists that reproduces the bug or defines the new behavior.
+2. You have run `pytest` and verified it fails with the correct error/trace.
+
+If either is false, stop and write the test first. Pre-existing plans, designs, or specifications do not exempt you from this requirement — a plan is never a substitute for tests.
+
 ### 1. Phase: RED (The Failing Test)
-Before any logic changes, you must demonstrate the need for the change.
+Before any logic changes, you must demonstrate the need for the change. Pre-existing plans, designs, or specifications do not exempt you from this requirement — write failing tests first even when the plan describes exactly what to build.
 - **For Bug Fixes:** Write a test case that reproduces the reported bug.
 - **For New Features:** Write tests defining the new expected behavior.
 - **Verification:** Run `pytest <test_path>` and confirm it fails. 
@@ -197,6 +206,15 @@ When asked to plan changes, break tasks into subtasks that each fit within a
 files or ~200 lines of code, split it into sequential subtasks and plan them
 separately. Document each subtask as its own file in `.opencode/plans/`.
 
+### Plan Implementation
+
+When implementing a pre-existing plan (written by you or another agent), follow this order:
+1. **Read the plan** — understand what needs to change.
+2. **Write failing tests first** — even if the plan is detailed, a plan is not a substitute for tests.
+3. **Make them pass** — implement production code to satisfy the tests.
+4. **Refactor** — clean up while keeping all tests green.
+Pre-existing plans, designs, or specifications do not exempt you from the test-first requirement. The Red phase must always come first — before any production code changes, even if the plan was written by a human or another agent.
+
 For changes larger than ~20 lines, summarize what will change (files affected,
 functions modified, any data migrations or schema changes) before writing any code.
 
@@ -335,8 +353,8 @@ Ensure that file is present and sourced before running.
 
 ## 🧪 Testing Guidelines
 
-- **Write tests for all new functionality.** A PR with new behavior but no new
-  tests is incomplete.
+**Write tests for all new functionality.** A PR with new behavior but no new
+  tests is incomplete. This includes changes driven by pre-existing plans — a plan file is never a substitute for tests.
 - **Always guard against pollution from `devices.json` and `.env` files** The local `.env` (loaded by `decouple`) may conflict with your test. Consider that and guard against it. Use deferred config in app code, and monkeypatch.setenv in pytest fixtures.
 ```
 # ❌ Evaluated at import — hard to mock
