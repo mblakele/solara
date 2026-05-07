@@ -327,38 +327,41 @@ class RealTeslaController(AbstractTeslaController):
         """Load cached token or refresh to obtain a valid access token.
 
         Reads persisted tokens from `.tesla-tokens.json`. If the access token
-        is expired, attempts to refresh it and saves the updated tokens.
+        is expired or rejected by Tesla's servers, attempts to refresh it and
+        saves the updated tokens.
         Raises RuntimeError if no tokens are available or refresh fails.
         """
         await self._ensure_api()
         assert self._api is not None
 
-        # Check if we already have a valid access token
+        # Use access_token() which makes a real API call and refreshes when
+        # expired. This catches server-side token revocation that the local
+        # expiry check in check_access_token() misses.
         try:
-            status = await self._api.check_access_token()
-            if status is not None:
-                # pylint: disable=protected-access
-                # TeslaFleetOAuth exposes no public getter for access_token.
-                save_tesla_tokens(
-                    refresh_token=self._api.refresh_token,  # type: ignore[attr-defined]
-                    access_token=self._api._access_token,   # type: ignore[attr-defined]
-                    expires=self._api.expires,              # type: ignore[attr-defined]
-                )
-                self._vin = self.config.vehicle_id
-                logger.info(
-                    "Tesla authenticated successfully (cached/refreshed token), vin=%s",
-                    self._vin,
-                )
-                return
-        except BaseException as e:
+            await self._api.access_token()
+        except (ValueError, Exception) as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
-            logger.warning("Tesla access token check failed: %s", e)
+            logger.warning("Tesla access token refresh failed: %s", e)
+            raise RuntimeError(
+                "Tesla OAuth not configured. Visit /api/v1/tesla/auth/initiate "
+                "to perform initial authentication."
+            ) from e
 
-        raise RuntimeError(
-            "Tesla OAuth not configured. Visit /api/v1/tesla/auth/initiate "
-            "to perform initial authentication."
-        )
+        # Save whatever tokens we have (refreshed or original)
+        try:
+            # pylint: disable=protected-access
+            # TeslaFleetOAuth exposes no public getter for access_token.
+            save_tesla_tokens(
+                refresh_token=self._api.refresh_token,  # type: ignore[attr-defined]
+                access_token=self._api._access_token,   # type: ignore[attr-defined]
+                expires=self._api.expires,              # type: ignore[attr-defined]
+            )
+        except Exception as e:
+            logger.warning("Failed to save Tesla tokens: %s", e)
+
+        self._vin = self.config.vehicle_id
+        logger.info("Tesla authenticated successfully (cached/refreshed token), vin=%s", self._vin)
 
     def get_login_url(self, state: str = "solara-login") -> str:
         """Generate the Tesla OAuth authorization URL.
@@ -689,7 +692,7 @@ class RealTeslaController(AbstractTeslaController):
             # Re-raise system-exiting exceptions, log and suppress others.
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
-            if "login_required" in str(e) or "refresh_token" in str(e):
+            if "login_required" in str(e) or "refresh_token" in str(e) or "not authorized" in str(e):
                 raise TeslaAuthError(str(e)) from e
             try:
                 from tesla_fleet_api.exceptions import VehicleOffline

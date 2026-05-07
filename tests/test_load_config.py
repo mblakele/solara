@@ -21,6 +21,7 @@ from load_manager import (
     load_plugs_from_file,
     load_tesla_config,
 )
+from load_models import TeslaAuthError
 import device_config
 from tests.helpers import _make_metrics_with_wh
 
@@ -1002,3 +1003,178 @@ def test_no_action_reason_skips_outside_range_plug(mock_config):
 
     # Heater is the only plug and it's outside range, so no eligible devices
     assert reason == "no_eligible"
+
+
+# --- Tesla token refresh tests ---
+
+
+def test_authenticate_calls_access_token_not_check_access_token(tmp_path):
+    """authenticate() uses access_token() which makes a real API call,
+    not check_access_token() which only checks the local expiry timestamp."""
+    from load_controllers import RealTeslaController, TESLA_TOKENS_FILE
+
+    tokens_path = tmp_path / "tesla-tokens.json"
+    import load_controllers as lc
+
+    original = lc.TESLA_TOKENS_FILE
+    lc.TESLA_TOKENS_FILE = tokens_path
+
+    try:
+        from load_manager import save_tesla_tokens
+
+        future_expires = 9999999999
+        save_tesla_tokens(
+            refresh_token="refresh-abc",
+            access_token="access-def",
+            expires=future_expires,
+            tokens_path=tokens_path,
+        )
+
+        tesla_config = TeslaConfig(
+            client_id="client-id",
+            client_secret="client-secret",
+            redirect_uri="http://localhost/callback",
+            vehicle_id="12345",
+            home_lat=37.0,
+            home_lon=-122.0,
+            home_radius_m=500,
+        )
+
+        controller = RealTeslaController(tesla_config)
+
+        # _ensure_api() creates self._api lazily. Patch it to return a mock API
+        # so we can control what methods get called during authenticate().
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_api_obj = MagicMock()
+        mock_api_obj.check_access_token = AsyncMock(return_value=None)
+        mock_api_obj.access_token = AsyncMock(return_value="new-token")
+
+        with patch.object(controller, "_ensure_api"):
+            controller._api = mock_api_obj  # type: ignore[attr-defined]
+
+            asyncio.run(controller.authenticate())
+
+        # access_token() MUST be called (it does the real API validation)
+        mock_api_obj.access_token.assert_called_once()
+        # check_access_token() MUST NOT be called (it's a no-op local check)
+        mock_api_obj.check_access_token.assert_not_called()
+
+    finally:
+        lc.TESLA_TOKENS_FILE = original
+
+
+def test_get_charging_state_converts_forbidden_to_tesla_auth_error(tmp_path):
+    """When the Tesla API returns 403 Forbidden, get_charging_state() raises
+    TeslaAuthError instead of letting the raw exception propagate."""
+    from load_controllers import RealTeslaController, TESLA_TOKENS_FILE
+    from tesla_fleet_api.exceptions import Forbidden
+
+    tokens_path = tmp_path / "tesla-tokens.json"
+    import load_controllers as lc
+
+    original = lc.TESLA_TOKENS_FILE
+    lc.TESLA_TOKENS_FILE = tokens_path
+
+    try:
+        from load_manager import save_tesla_tokens
+
+        future_expires = 9999999999
+        save_tesla_tokens(
+            refresh_token="refresh-abc",
+            access_token="access-def",
+            expires=future_expires,
+            tokens_path=tokens_path,
+        )
+
+        tesla_config = TeslaConfig(
+            client_id="client-id",
+            client_secret="client-secret",
+            redirect_uri="http://localhost/callback",
+            vehicle_id="12345",
+            home_lat=37.0,
+            home_lon=-122.0,
+            home_radius_m=500,
+        )
+
+        controller = RealTeslaController(tesla_config)
+
+        # Mock _fetch_vehicle_data to raise Forbidden (403)
+        with patch.object(
+            controller, "_fetch_vehicle_data", side_effect=Forbidden({"message": "not authorized"})
+        ):
+            with pytest.raises(TeslaAuthError) as exc_info:
+                asyncio.run(controller.get_charging_state())
+
+            assert "not authorized" in str(exc_info.value).lower()
+
+    finally:
+        lc.TESLA_TOKENS_FILE = original
+
+
+def test_authenticate_saves_refreshed_tokens(tmp_path):
+    """When access_token() refreshes the token, save_tesla_tokens is called with new values."""
+    from load_controllers import RealTeslaController, TESLA_TOKENS_FILE
+
+    tokens_path = tmp_path / "tesla-tokens.json"
+    import load_controllers as lc
+
+    original = lc.TESLA_TOKENS_FILE
+    lc.TESLA_TOKENS_FILE = tokens_path
+
+    try:
+        from load_manager import save_tesla_tokens, load_tesla_tokens
+
+        # Write an old token
+        save_tesla_tokens(
+            refresh_token="old-refresh",
+            access_token="old-access",
+            expires=1000000,  # expired
+            tokens_path=tokens_path,
+        )
+
+        tesla_config = TeslaConfig(
+            client_id="client-id",
+            client_secret="client-secret",
+            redirect_uri="http://localhost/callback",
+            vehicle_id="12345",
+            home_lat=37.0,
+            home_lon=-122.0,
+            home_radius_m=500,
+        )
+
+        controller = RealTeslaController(tesla_config)
+
+        # Patch _ensure_api to skip real API init, then set up a mock _api
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_api_obj = MagicMock()
+        mock_api_obj.access_token = AsyncMock(return_value="new-access")
+
+        with patch.object(controller, "_ensure_api"):
+            controller._api = mock_api_obj  # type: ignore[attr-defined]
+
+            async def mock_access():
+                controller._api.refresh_token = "new-refresh"  # type: ignore[attr-defined]
+                controller._api._access_token = "new-access"  # type: ignore[attr-defined]
+                controller._api.expires = 9999999999  # type: ignore[attr-defined]
+                return "new-access"
+
+            mock_api_obj.access_token.side_effect = mock_access
+
+            # Patch save_tesla_tokens to capture what it's called with
+            with patch("load_controllers.save_tesla_tokens") as mock_save:
+                asyncio.run(controller.authenticate())
+
+            # Verify save_tesla_tokens was called with refreshed values
+            mock_save.assert_called_once()
+            call_kwargs = (
+                mock_save.call_args.kwargs
+                if hasattr(mock_save.call_args, "kwargs")
+                else mock_save.call_args[1]
+            )
+            assert call_kwargs["refresh_token"] == "new-refresh"
+            assert call_kwargs["access_token"] == "new-access"
+
+    finally:
+        lc.TESLA_TOKENS_FILE = original
