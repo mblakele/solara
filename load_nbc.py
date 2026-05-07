@@ -17,6 +17,41 @@ logger = logging.getLogger(__name__)
 class NBCPeriod:
     PERIOD_SECS = 900
 
+    @staticmethod
+    def current_qh_window(now: datetime) -> tuple[datetime, datetime]:
+        """Return (start, end) of the QH window containing ``now``.
+
+        Quarter-hour periods are aligned to hour boundaries:
+
+          - QH1: seconds 0-899   (minutes 0-14)
+          - QH2: seconds 900-1799 (minutes 15-29)
+          - QH3: seconds 1800-2699 (minutes 30-44)
+          - QH4: seconds 2700-3599 (minutes 45-59)
+
+        Args:
+            now: A timezone-aware or naive datetime. Naive datetimes are
+                treated as UTC.
+
+        Returns:
+            Tuple of (window_start, window_end) datetimes in the same
+            timezone as ``now``.  If ``now`` is naive, both boundaries are
+                also naive (UTC).
+        """
+        utc_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        seconds_into_hour = utc_now.hour * 3600 + utc_now.minute * 60 + utc_now.second
+        qh_index = seconds_into_hour // NBCPeriod.PERIOD_SECS  # 0-3
+        qh_start_seconds = qh_index * NBCPeriod.PERIOD_SECS
+
+        # Build the start of this QH window.
+        qh_start = utc_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(seconds=qh_start_seconds)
+        window_end = qh_start + timedelta(seconds=NBCPeriod.PERIOD_SECS)
+
+        # Return in the same "style" as input (naive vs aware).
+        if now.tzinfo is None:
+            return qh_start.replace(tzinfo=None), window_end.replace(tzinfo=None)  # type: ignore[return-value]
+        return qh_start, window_end
+
+
 class NBCCache:
     """Cache for NBC (Non-Bypassable Charges) quarter-hour predictions.
 
@@ -320,7 +355,7 @@ class StateTracker:
     # full on-guard period, which would leave a large deficit in place).
     MIN_TOGGLE_ON_SECS = 60
     MIN_TOGGLE_OFF_SECS = 10
-    STALE_THRESHOLD_SECS = 120
+    STALE_THRESHOLD_SECS = 61
     VOLTAGE = 240
 
     # After a Tesla amp *increase* is confirmed, suppress turn-off decisions for

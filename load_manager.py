@@ -48,7 +48,7 @@ from load_controllers import (  # noqa: F401
     tesla_auth_cli,
 )
 from vocolinc import VOCOlinc  # noqa: F401  # pylint: disable=unused-import
-from load_nbc import NBCCache, NBCReader, StateTracker, TetrisEngine  # noqa: F401
+from load_nbc import NBCPeriod, NBCCache, NBCReader, StateTracker, TetrisEngine  # noqa: F401
 
 
 logger = logging.getLogger(__name__)
@@ -1022,6 +1022,35 @@ class LoadManager:
                     **base_diag,
                     "reason": "stale_data",
                     "pending_effects_count": pending_count,
+                    "candidates": candidate_details,
+                },
+                "sleep_hint": 5.0,
+            }
+
+        # QH boundary check: data_point_at must fall within the current
+        # quarter-hour window.  If it's from a previous QH, act on stale data
+        # — the prediction describes conditions that no longer apply.  This
+        # catches cases where data is <120s old but from a different QH.
+        current_qh_start, _ = NBCPeriod.current_qh_window(now_postfetch)
+        logger.debug("%s", current_qh_start)
+        if data_point_at < current_qh_start:
+            pruned = self.state.prune_old_effects(data_point_at)
+            if pruned > 0:
+                logger.debug("Pruned %d old pending effects (previous QH)", pruned)
+            candidate_details = self._build_candidate_details(
+                seconds_remaining, None, None, tesla_configured
+            )
+            logger.warning(
+                "NBC data from previous QH (%s, %d pending effects), skipping cycle",
+                self._plug_states_from_candidates(candidate_details),
+                len(self.state.pending_effects),
+            )
+            return {
+                "status": "stale_data",
+                "diagnostics": {
+                    **base_diag,
+                    "reason": "previous_qh",
+                    "pending_effects_count": len(self.state.pending_effects),
                     "candidates": candidate_details,
                 },
                 "sleep_hint": 5.0,

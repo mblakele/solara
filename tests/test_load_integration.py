@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -341,7 +341,9 @@ def test_stale_no_pending_effects_proceeds():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    fetched_at = datetime.now(timezone.utc) - timedelta(seconds=130)
+    fixed_now     = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    data_point_at = fixed_now - timedelta(seconds=StateTracker.STALE_THRESHOLD_SECS)
+    fetched_at = data_point_at + timedelta(seconds=10)
     metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
 
@@ -359,12 +361,89 @@ def test_stale_no_pending_effects_proceeds():
         enabled=True,
         dry_run=False,
     )
+    # use fixed now inside LoadManager
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
+
 
     assert len(mgr.state.pending_effects) == 0
-
-    result = mgr.run_cycle()
-
     assert result["status"] != "stale_data"
+
+
+def test_stale_data_from_previous_qh():
+    """Data from previous QH should be treated as stale even if <120s old.
+
+    Regression: the age-based check only fires when data is >120s old, but
+    data from the immediately preceding QH can be only seconds or minutes old.
+
+    The system must NOT make load decisions on this data — turning on a plug
+    based on stale QH1 prediction at 15:02 would waste energy.
+
+    We patch ``datetime.now`` so that both the enabled-check time and
+    now_postfetch are consistent: 15:02 (QH2).  data_point_at is at the
+    very end of QH1 (14:59:30), so age ≈ 150 s — just over the threshold
+    to force QH-boundary detection.
+
+    To keep age strictly under 120 s (so the QH check, not age, fires),
+    we use 15:01 with data_point_at at 14:59:30 → age ≈ 90 s.
+    """
+    plugs: dict[str, PlugConfig] = {}
+    plug_ctrl = PlugController(plugs)
+
+    # Current wall-clock time: start of QH2
+    fixed_now     = datetime(2026, 5, 7, 15, 00, 00, tzinfo=timezone.utc)
+    # data_point_at: end of previous QH
+    data_point_at = fixed_now - timedelta(seconds=1)
+    fetched_at = data_point_at + timedelta(seconds=10)
+
+    metrics_data = _make_metrics_with_wh("main_panel", "QH2", -2000.0)
+    metrics_data["_fetched_at"] = fetched_at
+
+    def metrics_fetch():
+        return metrics_data
+
+    nbc_cache = NBCCache(ttl_seconds=60)
+    mgr = LoadManager(
+        metrics_fetch=metrics_fetch,
+        nbc_cache=nbc_cache,
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=False,
+    )
+
+    # Add a pending effect so the stale-check path is triggered.
+    mgr.state.pending_effects.append(
+        PendingEffect(
+            device_name="plug", action="turn_on",
+            timestamp=fixed_now, power_delta_wh=500.0,
+        )
+    )
+
+    # Patch get_current_qh to return our crafted data_point_at.
+    original_get = mgr.nbc_reader.get_current_qh
+
+    def patched_get(device_name):
+        result = original_get(device_name)
+        if result is not None:
+            qh_name, predicted_wh, seconds_remaining = result[:3]
+            return (qh_name, predicted_wh, seconds_remaining, data_point_at)
+        return None
+
+    mgr.nbc_reader.get_current_qh = patched_get  # type: ignore[method-assign]
+
+    with patch("load_manager.datetime") as mock_dt_cls:
+        mock_dt_cls.now.return_value = fixed_now
+
+        result = mgr.run_cycle()
+
+    assert result["status"] == "stale_data"
+    # Verify the reason indicates QH boundary detection, not age-based stale.
+    assert result["diagnostics"]["reason"] == "previous_qh"
 
 
 # --- Pending effect tests ---

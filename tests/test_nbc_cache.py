@@ -6,10 +6,73 @@ import pytest
 
 from load_manager import (
     NBCCache,
+    NBCPeriod,
     NBCReader,
 )
 
 from tests.helpers import _make_metrics_data
+
+
+# --- NBCPeriod.current_qh_window() unit tests ---
+
+
+def test_current_qh_window_returns_correct_start_and_end():
+    """current_qh_window returns the (start, end) of the QH containing now."""
+    # 15:20 UTC -> QH3 (seconds 900-1799 of the hour)
+    now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    start, end = NBCPeriod.current_qh_window(now)
+
+    assert start == datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+    assert end == datetime(2026, 5, 7, 15, 30, 0, tzinfo=timezone.utc)
+
+
+def test_current_qh_window_midnight_boundary():
+    """current_qh_window wraps correctly at hour boundaries."""
+    # 16:05 UTC -> QH2 (seconds 300-1199 of the hour)
+    now = datetime(2026, 5, 7, 16, 5, 30, tzinfo=timezone.utc)
+    start, end = NBCPeriod.current_qh_window(now)
+
+    assert start == datetime(2026, 5, 7, 16, 0, 0, tzinfo=timezone.utc)
+    assert end == datetime(2026, 5, 7, 16, 15, 0, tzinfo=timezone.utc)
+
+
+def test_current_qh_window_exact_boundary():
+    """Data point exactly at QH boundary is considered in the current window."""
+    # Exactly 15:30 UTC -> QH4 starts at second 2700
+    now = datetime(2026, 5, 7, 15, 30, 0, tzinfo=timezone.utc)
+    start, end = NBCPeriod.current_qh_window(now)
+
+    assert start == datetime(2026, 5, 7, 15, 30, 0, tzinfo=timezone.utc)
+    assert end == datetime(2026, 5, 7, 15, 45, 0, tzinfo=timezone.utc)
+
+
+def test_current_qh_window_naive_datetime():
+    """current_qh_window handles timezone-naive datetimes by treating them as UTC."""
+    now_naive = datetime(2026, 5, 7, 15, 45, 30)
+    start, end = NBCPeriod.current_qh_window(now_naive)
+
+    assert start == datetime(2026, 5, 7, 15, 45, 0)
+    assert end == datetime(2026, 5, 7, 16, 0, 0)
+
+
+def test_current_qh_window_includes_data_point():
+    """A data point within the current QH window is not stale."""
+    now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    start, end = NBCPeriod.current_qh_window(now)
+
+    # Data point at 15:18 is within QH3 (15:15-15:30)
+    data_point_at = datetime(2026, 5, 7, 15, 18, 30, tzinfo=timezone.utc)
+    assert start <= data_point_at < end
+
+
+def test_current_qh_window_excludes_previous():
+    """A data point from the previous QH is outside the current window."""
+    now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    start, end = NBCPeriod.current_qh_window(now)
+
+    # Data point at 15:09 is in QH2 (15:00-15:15), not current QH3
+    data_point_at = datetime(2026, 5, 7, 15, 9, 30, tzinfo=timezone.utc)
+    assert data_point_at < start
 
 
 # --- NBCCache tests ---
