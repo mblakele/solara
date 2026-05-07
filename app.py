@@ -369,7 +369,12 @@ def _get_load_manager():
                         lambda: HourlyProjection(logger).metrics
                     )[0]
 
-                _load_manager = LoadManager(metrics_fetch=metrics_fetch)
+                _load_manager = LoadManager(
+                    metrics_fetch=metrics_fetch,
+                    config_interval_secs=config(
+                        "LOAD_MANAGE_INTERVAL_SECS", default=30, cast=int
+                    ),
+                )
                 logger.info("LoadManager initialized")
             except Exception as e:
                 logger.warning("Failed to initialize LoadManager: %s", e)
@@ -378,11 +383,10 @@ def _get_load_manager():
 
 
 def _load_management_loop() -> None:
-    """Background thread that runs load management cycle every 30 seconds."""
+    """Background thread that runs load management cycle with adaptive sleep."""
     interval_secs_config = config("LOAD_MANAGE_INTERVAL_SECS", default=30, cast=int)
-    interval_secs = interval_secs_config
     logger.info(
-        "Load management background loop started (interval=%ds)", interval_secs
+        "Load management background loop started (interval=%ds)", interval_secs_config
     )
     while True:
         try:
@@ -392,12 +396,15 @@ def _load_management_loop() -> None:
                 with _load_manager_lock:
                     _last_cycle_result = result
                 logger.debug("Load management cycle result: %s", result)
+            interval_secs = interval_secs_config
         except RetryableMetricsException as e:
             interval_secs = interval_secs_config
             logger.warning("Load management cycle retryable: %s", e)
         except Exception as e:
             interval_secs = interval_secs_config
             logger.error("Error in load management loop: %s", e)
+        else:
+            interval_secs = result.get("sleep_hint", interval_secs_config)
         time.sleep(interval_secs)
 
 

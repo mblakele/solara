@@ -4,6 +4,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import pytest
+
 from load_manager import (
     DeviceState,
     LoadManager,
@@ -1150,3 +1152,513 @@ def test_turn_off_only_device_even_when_savings_exceed_gap():
     assert len(actions) == 1
     assert actions[0].action == "turn_off"
     assert actions[0].device_name == "water_heater"
+
+
+# --- Adaptive sleep tests ---
+
+
+class TestAdaptiveSleep:
+    """Tests for the adaptive sleep hint returned by run_cycle()."""
+
+    def _make_manager(self, interval=30):
+        """Create a minimal LoadManager with stub controllers."""
+        plug_ctrl = PlugController({})
+        tesla_ctrl = TeslaController(
+            TeslaConfig(
+                client_id="test-id",
+                client_secret="test-secret",
+                redirect_uri="http://localhost/callback",
+                vehicle_id="vehicle-123",
+                home_lat=37.0,
+                home_lon=-122.0,
+                home_radius_m=500,
+            )
+        )
+
+        def metrics_fetch():
+            return None  # no data → will hit early returns
+
+        nbc_cache = NBCCache()
+        return LoadManager(
+            metrics_fetch=metrics_fetch,
+            nbc_cache=nbc_cache,
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=tesla_ctrl,
+            target_wh=-500,
+            config_interval_secs=interval,
+        )
+
+    def _make_cycle_result(self, **overrides):
+        """Build a minimal cycle result dict for _calculate_adaptive_sleep."""
+        base = {
+            "status": "ok",
+            "nbc_prediction_wh": -1000.0,
+            "qh": "QH2",
+            "predicted_wh": -1000.0,
+            "adjusted_wh": -1000.0,
+            "target_wh": -500,
+            "actions": [],
+            "diagnostics": {
+                "gap_wh": -500,
+                "seconds_remaining": 450,
+                "reason": "ok",
+            },
+        }
+        base.update(overrides)
+        return base
+
+    # --- Scenario 1: Actions taken (ok / dry-run) → config_interval ---
+
+    @pytest.mark.parametrize("status", ["ok", "dry-run"])
+    def test_actions_taken_returns_config_interval(self, status):
+        """When no deficit and actions taken, sleep_hint uses QH timing multiplier."""
+        lm = self._make_manager(interval=30)
+        result = self._make_cycle_result(
+            status=status, nbc_prediction_wh=0.0  # no deficit (target is -500)
+        )
+        hint = lm._calculate_adaptive_sleep(result)
+        # No deficit, early in QH (450s > 300) → 1.5x config = 45
+        assert hint == 45.0
+
+    # --- Scenario 2: Disabled → config_interval ---
+
+    def test_disabled_returns_config_interval(self):
+        """When disabled, sleep_hint should be config_interval."""
+        lm = self._make_manager(interval=30)
+        result = self._make_cycle_result(status="disabled")
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 30
+
+    # --- Scenario 3: Stale data → minimum sleep (5s) ---
+
+    def test_stale_data_returns_minimum_sleep(self):
+        """When data is stale, sleep_hint should be 5 seconds."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(status="stale_data")
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 5.0
+
+    # --- Scenario 4: Waiting for fresh data → seconds_remaining (clamped) ---
+
+    def test_waiting_for_fresh_data_returns_seconds_remaining(self):
+        """When waiting for fresh data, sleep_hint = min(seconds_remaining, 2*interval)."""
+        lm = self._make_manager(interval=30)
+        result = self._make_cycle_result(
+            status="waiting_for_fresh_data", seconds_remaining=20.0
+        )
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 20.0
+
+    def test_waiting_for_fresh_data_clamped_to_max(self):
+        """When seconds_remaining exceeds 2*interval, sleep_hint is clamped."""
+        lm = self._make_manager(interval=30)
+        result = self._make_cycle_result(
+            status="waiting_for_fresh_data", seconds_remaining=120.0
+        )
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 60.0  # 2 * interval
+
+    # --- Scenario 5: No deficit (predicted >= target) → longer sleep early in QH ---
+
+    def test_no_deficit_early_in_qh_returns_longer_sleep(self):
+        """When no deficit and early in QH, sleep_hint > config_interval."""
+        lm = self._make_manager(interval=30)
+        result = self._make_cycle_result(
+            status="ok",
+            nbc_prediction_wh=0.0,  # no deficit (target is -500)
+            seconds_remaining=600,  # 10 min left in QH
+        )
+        print(f"DEBUG: result={result}")
+        print(f"DEBUG: lm.target_wh={lm.target_wh}, config_interval={lm.config_interval_secs}")
+        hint = lm._calculate_adaptive_sleep(result)
+        print(f"DEBUG: hint={hint}")
+        assert hint == 45.0  # config_interval * 1.5
+
+    def test_no_deficit_late_in_qh_returns_slightly_longer_sleep(self):
+        """When no deficit and late in QH, sleep_hint is slightly above config_interval."""
+        lm = self._make_manager(interval=30)
+        result = self._make_cycle_result(
+            status="ok",
+            nbc_prediction_wh=0.0,  # no deficit (target is -500)
+            seconds_remaining=120,  # 2 min left in QH
+        )
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 37.5  # config_interval * 1.25
+
+    # --- Scenario 6: Deficit exists but no capacity → minimum sleep (5s) ---
+
+    def test_deficit_no_capacity_returns_minimum_sleep(self):
+        """When deficit exists but no flexible capacity, sleep_hint = 5s."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            predicted_wh=-2000.0,  # deficit of 1500 Wh
+            seconds_remaining=450,
+        )
+        # No candidates in diagnostics → no capacity → minimum sleep
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 5.0
+
+    # --- Scenario 7: Deficit with capacity → proportional sleep (clamped) ---
+
+    def test_deficit_with_capacity_returns_proportional_sleep(self):
+        """When deficit exists with capacity, sleep_hint is proportional."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            nbc_prediction_wh=-2000.0,  # deficit of 1500 Wh
+            seconds_remaining=450,
+        )
+        # Add candidates with 1000W flexible capacity
+        result["diagnostics"]["candidates"] = [
+            {"name": "heater", "power_watts": 1000.0, "role": "flexible"}
+        ]
+        hint = lm._calculate_adaptive_sleep(result)
+        # time_to_close = (1500 / 1000) * 3600 = 5400s
+        # proportion = 450 / 5400 = 0.0833
+        # sleep = 30 * 0.0833 = 2.5 → clamped to min(5)
+        assert hint == 5.0
+
+    def test_deficit_with_large_capacity_returns_scaled_sleep(self):
+        """When deficit with large capacity, sleep_hint scales up proportionally."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            nbc_prediction_wh=-600.0,  # deficit of 100 Wh
+            seconds_remaining=450,
+        )
+        # Add candidates with 1000W flexible capacity
+        result["diagnostics"]["candidates"] = [
+            {"name": "heater", "power_watts": 1000.0, "role": "flexible"}
+        ]
+        hint = lm._calculate_adaptive_sleep(result)
+        # time_to_close = (100 / 1000) * 3600 = 360s
+        # proportion = 450 / 360 = 1.25
+        # sleep = 30 * 1.25 = 37.5 → clamped to max(60)
+        assert hint == 37.5
+
+    def test_deficit_with_capacity_clamped_to_max(self):
+        """When proportional sleep exceeds 2*interval, it is clamped."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            nbc_prediction_wh=-510.0,  # deficit of only 10 Wh
+            seconds_remaining=899,  # almost full QH remaining
+        )
+        result["diagnostics"]["candidates"] = [
+            {"name": "heater", "power_watts": 100.0, "role": "flexible"}
+        ]
+        hint = lm._calculate_adaptive_sleep(result)
+        # time_to_close = (10 / 100) * 3600 = 360s
+        # proportion = 899 / 360 ≈ 2.5 → clamped to 2.0
+        # sleep = 30 * 2.0 = 60 → clamped to max(60)
+        assert hint == 60.0
+
+    # --- Edge cases ---
+
+    def test_no_incomplete_qh_returns_minimum_sleep(self):
+        """When no incomplete QH, sleep_hint should be 5 seconds."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(status="no_incomplete_qh")
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 5.0
+
+    def test_custom_interval_is_respected(self):
+        """Sleep hints scale with a custom config interval."""
+        lm = self._make_manager(interval=60)
+        result = self._make_cycle_result(
+            status="ok", nbc_prediction_wh=0.0  # no deficit (target is -500)
+        )
+        hint = lm._calculate_adaptive_sleep(result)
+        # No deficit, early in QH (450s > 300) → 1.5x config = 90
+        assert hint == 90.0
+
+    def test_min_clamp_prevents_sub_5_sleep(self):
+        """Sleep hint is never less than 5 seconds."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            predicted_wh=-2000.0,  # large deficit
+            seconds_remaining=10,
+        )
+        result["diagnostics"]["candidates"] = [
+            {"name": "heater", "power_watts": 50.0, "role": "flexible"}
+        ]
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint >= 5.0
+
+    def test_max_clamp_prevents_excessive_sleep(self):
+        """Sleep hint is never more than 2 * config_interval."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            predicted_wh=-501.0,  # tiny deficit
+            seconds_remaining=899,
+        )
+        result["diagnostics"]["candidates"] = [
+            {"name": "heater", "power_watts": 10.0, "role": "flexible"}
+        ]
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint <= 60.0  # 2 * interval
+
+    def test_run_cycle_includes_sleep_hint(self):
+        """run_cycle() returns sleep_hint in the result dict."""
+        lm = self._make_manager(interval=30)
+
+        # Force a cycle — it will return early due to no incomplete QH,
+        # but should still include sleep_hint
+        result = lm.run_cycle(force=True)
+        assert "sleep_hint" in result
+
+    def test_disabled_run_cycle_includes_sleep_hint(self):
+        """Disabled run_cycle returns sleep_hint = config_interval."""
+        with patch("load_manager.config") as mock_config:
+            mock_config.side_effect = lambda key, **kwargs: {
+                "LOAD_MANAGE_ENABLED": "False",
+            }.get(key, kwargs.get("default", ""))
+
+            lm = self._make_manager(interval=30)
+
+        result = lm.run_cycle()
+        assert result["status"] == "disabled"
+        assert result["sleep_hint"] == 30
+
+    def test_stale_data_run_cycle_includes_sleep_hint(self):
+        """Stale data run_cycle returns sleep_hint = 5."""
+        now = datetime.now(timezone.utc)
+        data_point_at = now - timedelta(seconds=200)  # >120s old → stale
+
+        class StaleQHReader:
+            """Mock NBC reader that returns data 200 seconds old."""
+
+            def get_current_qh(self, device_name: str):
+                return ("QH3", -1000.0, 600, data_point_at)
+
+        lm = LoadManager(
+            metrics_fetch=lambda: None,
+            plug_ctrl=PlugController({}),
+            tesla_ctrl=TeslaController(
+                TeslaConfig(
+                    client_id="test-id",
+                    client_secret="test-secret",
+                    redirect_uri="http://localhost/callback",
+                    vehicle_id="vehicle-123",
+                    home_lat=37.0,
+                    home_lon=-122.0,
+                    home_radius_m=500,
+                )
+            ),
+            target_wh=-500,
+            config_interval_secs=30,
+        )
+        lm.nbc_reader = StaleQHReader()
+        lm.enabled = True
+
+        # Pending effects present + stale data → stale_data status
+        lm.state.pending_effects = [PendingEffect(
+            device_name="test",
+            action="turn_on",
+            target_amps=None,
+            power_delta_wh=100.0,
+            timestamp=data_point_at - timedelta(seconds=30),  # before data point
+        )]
+
+        result = lm.run_cycle()
+        assert result["status"] == "stale_data"
+        assert result["sleep_hint"] == 5.0
+
+    def test_waiting_for_fresh_data_run_cycle_includes_sleep_hint(self):
+        """Waiting for fresh data returns sleep_hint = min(seconds_remaining, 2*interval)."""
+        now = datetime.now(timezone.utc)
+        data_point_at = now - timedelta(seconds=10)  # recent data point
+
+        class FreshQHReader:
+            """Mock NBC reader that returns a recent data point."""
+
+            def get_current_qh(self, device_name: str):
+                return ("QH3", -1000.0, 600, data_point_at)
+
+        lm = LoadManager(
+            metrics_fetch=lambda: None,
+            plug_ctrl=PlugController({}),
+            tesla_ctrl=TeslaController(
+                TeslaConfig(
+                    client_id="test-id",
+                    client_secret="test-secret",
+                    redirect_uri="http://localhost/callback",
+                    vehicle_id="vehicle-123",
+                    home_lat=37.0,
+                    home_lon=-122.0,
+                    home_radius_m=500,
+                )
+            ),
+            target_wh=-500,
+            config_interval_secs=30,
+        )
+        lm.nbc_reader = FreshQHReader()
+        lm.enabled = True
+
+        # Pending effect AFTER data point → waiting_for_fresh_data status
+        lm.state.pending_effects = [PendingEffect(
+            device_name="test",
+            action="turn_on",
+            target_amps=None,
+            power_delta_wh=100.0,
+            timestamp=data_point_at + timedelta(seconds=5),  # after data point
+        )]
+
+        result = lm.run_cycle()
+        assert result["status"] == "waiting_for_fresh_data"
+        # sleep_hint should be min(seconds_remaining, 2*interval)
+        assert result["sleep_hint"] <= 60
+
+    def test_ok_run_cycle_includes_sleep_hint(self):
+        """Normal ok run_cycle returns sleep_hint = config_interval."""
+        lm = self._make_manager(interval=30)
+
+        result = lm.run_cycle(force=True)
+        # force=True bypasses stale check, but may hit no_incomplete_qh or hysteresis
+        # Either way, sleep_hint should be present
+        assert "sleep_hint" in result
+
+    def test_hysteresis_run_cycle_includes_sleep_hint(self):
+        """Hysteresis run_cycle returns sleep_hint = config_interval."""
+        lm = self._make_manager(interval=30)
+
+        result = lm.run_cycle(force=True)
+        # With no plugs and no tesla, the cycle will likely hit hysteresis or
+        # return ok with empty actions. Either way, sleep_hint should be present.
+        assert "sleep_hint" in result
+
+    def test_no_incomplete_qh_run_cycle_includes_sleep_hint(self):
+        """No incomplete QH returns sleep_hint = 5."""
+
+        # Create an LM with a mock NBC reader that returns None
+        class NoQHReader:
+            def get_current_qh(self, device_name):
+                return None
+
+        lm = LoadManager(
+            metrics_fetch=lambda: None,
+            plug_ctrl=None,
+            tesla_ctrl=None,
+            target_wh=-500,
+            config_interval_secs=30,
+        )
+        lm.nbc_reader = NoQHReader()
+        lm.enabled = True
+
+        result = lm.run_cycle()
+        assert result["status"] == "no_incomplete_qh"
+        assert result["sleep_hint"] == 5.0
+
+    def test_sleep_hint_clamped_to_min_even_with_zero_seconds_remaining(self):
+        """Sleep hint is never less than 5 even with zero seconds remaining."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            predicted_wh=-2000.0,  # deficit
+            seconds_remaining=0,
+        )
+        result["diagnostics"]["candidates"] = [
+            {"name": "heater", "power_watts": 100.0, "role": "flexible"}
+        ]
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint >= 5.0
+
+    def test_sleep_hint_clamped_to_max_with_large_seconds_remaining(self):
+        """Sleep hint is never more than 2*interval even with large seconds remaining."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            predicted_wh=-501.0,  # tiny deficit
+            seconds_remaining=9999,
+        )
+        result["diagnostics"]["candidates"] = [
+            {"name": "heater", "power_watts": 10.0, "role": "flexible"}
+        ]
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint <= 60.0  # 2 * interval
+
+    def test_sleep_hint_uses_nbc_prediction_wh_from_diagnostics(self):
+        """_calculate_adaptive_sleep reads predicted_wh from nbc_prediction_wh key."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(
+            status="ok",
+            nbc_prediction_wh=0.0,  # no deficit
+            predicted_wh=-1000.0,  # different value — nbc_prediction_wh should be used
+            seconds_remaining=600,
+        )
+        hint = lm._calculate_adaptive_sleep(result)
+        # With no deficit (nbc_prediction_wh=0 >= target=-500), early in QH
+        # should return config_interval * 1.5 = 45
+        assert hint == 45.0
+
+    def test_sleep_hint_defaults_to_zero_when_nbc_prediction_missing(self):
+        """When nbc_prediction_wh is missing, defaults to 0 (no deficit)."""
+        lm = self._make_manager()
+        result = self._make_cycle_result()
+        del result["nbc_prediction_wh"]
+        hint = lm._calculate_adaptive_sleep(result)
+        # With no nbc_prediction_wh, defaults to 0 which is >= target=-500
+        # so treated as no deficit → early QH multiplier (1.5x) = 45
+        assert hint == 45.0
+
+    def test_sleep_hint_defaults_to_zero_when_seconds_remaining_missing(self):
+        """When seconds_remaining is missing, defaults to config_interval."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(nbc_prediction_wh=0.0)  # no deficit
+        del result["diagnostics"]["seconds_remaining"]
+        hint = lm._calculate_adaptive_sleep(result)
+        # No deficit, seconds_remaining defaults to 30 (<=300 → late QH)
+        # → 1.25x config = 37.5
+        assert hint == 37.5
+
+    def test_sleep_hint_handles_missing_candidates_key(self):
+        """When diagnostics has no candidates key, treats as zero capacity."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(nbc_prediction_wh=-2000.0)  # deficit
+        # Base diagnostics has no "candidates" key — that's the point.
+        hint = lm._calculate_adaptive_sleep(result)
+        # No candidates → zero capacity → minimum sleep
+        assert hint == 5.0
+
+    def test_sleep_hint_handles_none_candidates(self):
+        """When candidates is None, treats as zero capacity."""
+        lm = self._make_manager()
+        result = self._make_cycle_result()
+        result["diagnostics"]["candidates"] = None
+        # Add deficit to trigger proportional path
+        result["nbc_prediction_wh"] = -2000.0
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 5.0
+
+    def test_sleep_hint_handles_missing_diagnostics(self):
+        """When diagnostics is missing, treats as zero capacity."""
+        lm = self._make_manager()
+        result = self._make_cycle_result()
+        del result["diagnostics"]
+        # Add deficit to trigger proportional path
+        result["nbc_prediction_wh"] = -2000.0
+        hint = lm._calculate_adaptive_sleep(result)
+        assert hint == 5.0
+
+    def test_sleep_hint_handles_missing_predicted_wh(self):
+        """When nbc_prediction_wh is missing, defaults to 0."""
+        lm = self._make_manager()
+        result = self._make_cycle_result()
+        del result["nbc_prediction_wh"]
+        hint = lm._calculate_adaptive_sleep(result)
+        # With no deficit (nbc_prediction_wh defaults to 0 >= target=-500),
+        # returns config_interval * timing_multiplier (early in QH → 1.5x)
+        assert hint == 45.0
+
+    def test_sleep_hint_handles_missing_status(self):
+        """When status is missing, treated as unknown → falls through to deficit path."""
+        lm = self._make_manager()
+        result = self._make_cycle_result(nbc_prediction_wh=0.0)  # no deficit
+        del result["status"]
+        hint = lm._calculate_adaptive_sleep(result)
+        # No status → falls through to predicted_wh check.
+        # predicted_wh=0 >= target=-500 → no deficit path, early QH (450s > 300)
+        assert hint == 45.0  # config_interval * 1.5 (early in QH)

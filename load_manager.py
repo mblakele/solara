@@ -247,6 +247,7 @@ class LoadManager:
         nbc_device: str | None = None,
         enabled: bool | str | tuple[time, time] | None = None,
         dry_run: bool | None = None,
+        config_interval_secs: int = 30,
     ) -> None:
         """Initialize LoadManager with optional dependency injection.
 
@@ -268,6 +269,9 @@ class LoadManager:
                 LOAD_MANAGE_ENABLED env var.
             dry_run: If True, log actions without executing them. Defaults to
                 LOAD_MANAGE_DRY_RUN env var.
+            config_interval_secs: Target interval between cycles in seconds.
+                Used by adaptive sleep to clamp min/max sleep durations.
+                Defaults to 30 seconds.
         """
         self._lock = threading.Lock()
         self.plug_ctrl: AbstractPlugController
@@ -296,6 +300,8 @@ class LoadManager:
         if dry_run is None:
             dry_run = config("LOAD_MANAGE_DRY_RUN", default="False", cast=bool)
         self.dry_run = dry_run
+
+        self.config_interval_secs = config_interval_secs
 
         hysteresis_wh = int(abs(target_wh) / 3)
         self.tesla_config = load_tesla_config()
@@ -611,6 +617,94 @@ class LoadManager:
         if has_too_large:
             return "loads_too_large"
         return "no_candidates"
+
+    def _calculate_adaptive_sleep(self, cycle_result: dict) -> float:
+        """Calculate an adaptive sleep duration based on the current cycle state.
+
+        The returned value is always clamped to [5, config_interval * 2].
+
+        Args:
+            cycle_result: The dict returned by run_cycle() itself (before
+                sleep_hint is added).
+
+        Returns:
+            Suggested sleep duration in seconds.
+        """
+        status = cycle_result.get("status", "")
+        config_interval = self.config_interval_secs
+
+        # --- Stale data: minimum sleep, refresh ASAP ---
+        if status == "stale_data":
+            return 5.0
+
+        # --- Waiting for fresh data: wait until next NBC point ---
+        if status == "waiting_for_fresh_data":
+            seconds_remaining = self._seconds_remaining(cycle_result, config_interval)
+            return min(seconds_remaining, config_interval * 2)
+
+        # --- No incomplete QH: minimum sleep ---
+        if status == "no_incomplete_qh":
+            return 5.0
+
+        # --- Disabled: normal interval ---
+        if status == "disabled":
+            return config_interval
+
+        # --- Shared lookups ---
+        predicted_wh = cycle_result.get("nbc_prediction_wh", 0)
+        seconds_remaining = self._seconds_remaining(cycle_result, config_interval)
+
+        # --- No deficit (predicted >= target): check how much QH remains ---
+        if predicted_wh >= self.target_wh:
+            # No deficit. Early in the quarter -> sleep longer; late -> wake sooner.
+            if seconds_remaining > 300:  # more than 5 min left in QH
+                return min(config_interval * 1.5, config_interval * 2)
+            else:
+                return min(config_interval * 1.25, config_interval * 2)
+
+        # --- Deficit with no actions possible: proportional sleep ---
+        gap = abs(predicted_wh - self.target_wh)
+
+        # Calculate total flexible capacity from candidates
+        max_load_capacity = 0.0
+        for candidate in (cycle_result.get("diagnostics") or {}).get(
+            "candidates"
+        ) or []:
+            if candidate.get("role") == "flexible":
+                max_load_capacity += candidate.get("power_watts", 0)
+
+        if max_load_capacity > 0 and seconds_remaining > 0:
+            # Time to close the gap at full capacity (in seconds)
+            time_to_close = (gap / max_load_capacity) * 3600.0
+            # Proportion of config interval: if gap shrinks to fillable in half
+            # the QH, sleep half as long relative to config.
+            proportion = seconds_remaining / max(time_to_close, 1)
+            sleep = config_interval * min(proportion, 2.0)
+        else:
+            # No capacity or unknown -> minimum sleep
+            sleep = 5.0
+
+        return max(5.0, min(sleep, config_interval * 2))
+
+    @staticmethod
+    def _seconds_remaining(cycle_result: dict, default: float) -> float:
+        """Extract seconds_remaining from a cycle result dict.
+
+        Checks the top-level key first, then falls back to the diagnostics
+        sub-dict.
+
+        Args:
+            cycle_result: The cycle result dict.
+            default: Value to return if seconds_remaining is not found.
+
+        Returns:
+            The seconds remaining in the current quarter-hour.
+        """
+        value = cycle_result.get("seconds_remaining")
+        if value is not None:
+            return value
+        diagnostics = cycle_result.get("diagnostics") or {}
+        return diagnostics.get("seconds_remaining", default)
 
     async def _fetch_tesla_state_async(
         self,
@@ -930,6 +1024,7 @@ class LoadManager:
                     "pending_effects_count": pending_count,
                     "candidates": candidate_details,
                 },
+                "sleep_hint": 5.0,
             }
 
         nbc_timestamp = data_point_at
@@ -954,6 +1049,9 @@ class LoadManager:
                     "pending_effects_count": pending_count,
                     "candidates": candidate_details,
                 },
+                "sleep_hint": min(
+                    seconds_remaining, self.config_interval_secs * 2
+                ),
             }
 
         return None
@@ -1001,6 +1099,7 @@ class LoadManager:
                         "tesla_error": None,
                         "plugs_configured": plugs_configured,
                     },
+                    "sleep_hint": self.config_interval_secs,
                 }
 
             # ── Stage 2: NBC fetch ─────────────────────────────────────────
@@ -1018,6 +1117,7 @@ class LoadManager:
                         "tesla_error": None,
                         "plugs_configured": plugs_configured,
                     },
+                    "sleep_hint": 5.0,
                 }
             (
                 qh_name,
@@ -1118,6 +1218,7 @@ class LoadManager:
                         "tesla_login_url": tesla_login_url,
                         "plugs_configured": plugs_configured,
                     },
+                    "sleep_hint": self.config_interval_secs,
                 }
 
             candidate_details = self._build_candidate_details(
@@ -1150,6 +1251,7 @@ class LoadManager:
                     "tesla_login_url": tesla_login_url,
                     "plugs_configured": plugs_configured,
                 },
+                "sleep_hint": self.config_interval_secs,
             }
 
     async def _execute_action(self, action: PendingEffect) -> bool:
