@@ -405,6 +405,7 @@ def _load_management_loop() -> None:
             logger.error("Error in load management loop: %s", e)
         else:
             interval_secs = result.get("sleep_hint", interval_secs_config)
+        logger.debug("Load management sleeping %d", interval_secs)
         time.sleep(interval_secs)
 
 
