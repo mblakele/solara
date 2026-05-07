@@ -1032,7 +1032,6 @@ class LoadManager:
         # — the prediction describes conditions that no longer apply.  This
         # catches cases where data is <120s old but from a different QH.
         current_qh_start, _ = NBCPeriod.current_qh_window(now_postfetch)
-        logger.debug("%s", current_qh_start)
         if data_point_at < current_qh_start:
             pruned = self.state.prune_old_effects(data_point_at)
             if pruned > 0:
