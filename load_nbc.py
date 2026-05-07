@@ -587,7 +587,7 @@ class TetrisEngine:
     # Capacity discount applied to turn-on decisions.  A load is only turned on
     # if its discounted capacity fits in the gap, reserving headroom for solar
     # variability and NBC prediction error.  Acts as damping to reduce overshoot.
-    TURN_ON_MARGIN = 0.85
+    TURN_ON_MARGIN = 1.0 # was 0.85 TODO TESTING
     # During the post-amp-increase settle window, suppress turn-off decisions
     # only if the apparent deficit is below this threshold.  Deficits larger
     # than this are treated as genuine even during the settle period (e.g. a
