@@ -1,6 +1,7 @@
 """Tests for StateTracker."""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -10,6 +11,8 @@ from load_manager import (
     PendingEffect,
     StateTracker,
 )
+
+fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 
 def test_watts_to_wh():
     """Test calculation of wh impact of a load in watts."""
@@ -40,37 +43,49 @@ def test_can_toggle_on_true_after_debounce():
 def test_can_toggle_on_false_before_debounce():
     """False before MIN_TOGGLE_ON_SECS elapsed."""
     tracker = StateTracker()
-    tracker.devices["plug"] = DeviceState(
-        name="plug",
-        last_toggle=datetime.now(timezone.utc) - timedelta(seconds=30),
-        actual_state=True,
-    )
-    now = datetime.now(timezone.utc)
-    assert tracker.can_toggle("plug", now) is False
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        tracker.devices["plug"] = DeviceState(
+            name="plug",
+            last_toggle=fixed_now - timedelta(seconds=30),
+            actual_state=True,
+        )
+
+    assert tracker.can_toggle("plug", fixed_now) is False
 
 
 def test_can_toggle_off_true_after_debounce():
     """True after MIN_TOGGLE_OFF_SECS elapsed."""
     tracker = StateTracker()
-    tracker.devices["plug"] = DeviceState(
-        name="plug",
-        last_toggle=datetime.now(timezone.utc) - timedelta(seconds=91),
-        actual_state=False,
-    )
-    now = datetime.now(timezone.utc)
-    assert tracker.can_toggle("plug", now) is True
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        tracker.devices["plug"] = DeviceState(
+            name="plug",
+            last_toggle=fixed_now - timedelta(seconds=91),
+            actual_state=False,
+        )
+
+    assert tracker.can_toggle("plug", fixed_now) is True
 
 
 def test_can_toggle_off_false_before_debounce():
     """False before MIN_TOGGLE_OFF_SECS elapsed."""
     tracker = StateTracker()
-    tracker.devices["plug"] = DeviceState(
-        name="plug",
-        last_toggle=datetime.now(timezone.utc) - timedelta(seconds=30),
-        actual_state=False,
-    )
-    now = datetime.now(timezone.utc)
-    assert tracker.can_toggle("plug", now) is False
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        tracker.devices["plug"] = DeviceState(
+            name="plug",
+            last_toggle=fixed_now - timedelta(seconds=30),
+            actual_state=False,
+        )
+
+    assert tracker.can_toggle("plug", fixed_now) is False
 
 
 def test_has_pending_effect_since():

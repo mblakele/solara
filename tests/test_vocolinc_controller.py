@@ -18,6 +18,8 @@ from load_manager import (
     load_vocolinc_credentials,
 )
 import device_config
+
+fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 import pytest
 
 from tests.helpers import _make_metrics_with_wh
@@ -332,20 +334,25 @@ def test_composite_over_target_turns_off_vocolinc():
                 dry_run=False,
             )
 
-            # Set both devices as ON in state tracker
-            now = datetime.now(timezone.utc)
-            mgr.state.devices["vc_flex"] = DeviceState(
-                name="vc_flex",
-                last_toggle=now - timedelta(seconds=120),
-                desired_state=True,
-            )
-            mgr.state.devices["vc_fixed"] = DeviceState(
-                name="vc_fixed",
-                last_toggle=now - timedelta(seconds=120),
-                desired_state=True,
-            )
+            # Set both devices as ON in state tracker — use fixed timestamps
+            with patch("load_manager.datetime") as mock_dt:
+                mock_dt.now.return_value = fixed_now
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                mgr.state.devices["vc_flex"] = DeviceState(
+                    name="vc_flex",
+                    last_toggle=fixed_now - timedelta(seconds=120),
+                    desired_state=True,
+                )
+                mgr.state.devices["vc_fixed"] = DeviceState(
+                    name="vc_fixed",
+                    last_toggle=fixed_now - timedelta(seconds=120),
+                    desired_state=True,
+                )
 
-            result = mgr.run_cycle()
+            with patch("load_manager.datetime") as mock_dt:
+                mock_dt.now.return_value = fixed_now
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                result = mgr.run_cycle()
 
             action_names = [a["device"] for a in result["actions"]]
             assert "vc_flex" in action_names

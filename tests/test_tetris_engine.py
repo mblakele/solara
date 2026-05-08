@@ -1,6 +1,7 @@
 """Tests for TetrisEngine decision logic."""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -11,6 +12,8 @@ from load_manager import (
     TeslaState,
     TetrisEngine,
 )
+
+fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 
 
 # --- Excess solar (turn on) tests ---
@@ -241,10 +244,15 @@ def test_skip_plug_before_debounce():
     """Skips plug that toggled too recently."""
     engine = TetrisEngine()
     state = StateTracker()
-    state.devices["plug"] = DeviceState(
-        name="plug",
-        last_toggle=datetime.now(timezone.utc) - timedelta(seconds=30),
-    )
+
+    with patch("load_nbc.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        state.devices["plug"] = DeviceState(
+            name="plug",
+            last_toggle=fixed_now - timedelta(seconds=30),
+        )
+
     plugs = {
         "plug": PlugConfig(
             name="plug",
@@ -254,14 +262,17 @@ def test_skip_plug_before_debounce():
         )
     }
 
-    actions = engine.decide(
-        predicted_wh=-2000.0,
-        target_wh=-500.0,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=None,
-    )
+    with patch("load_nbc.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        actions = engine.decide(
+            predicted_wh=-2000.0,
+            target_wh=-500.0,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        )
 
     assert len(actions) == 0
 
