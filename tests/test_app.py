@@ -1,5 +1,6 @@
 import contextlib
 import json
+import os
 import unittest
 from datetime import datetime, timedelta
 from typing import Any
@@ -12,7 +13,16 @@ from app import app
 
 @contextlib.contextmanager
 def mock_config(**overrides: Any):
-    """Patch app.config with default mock values plus any overrides."""
+    """Patch decouple config with default mock values plus any overrides.
+
+    This replaces the old approach of patching app.config (which was a decouple
+    import) with direct patches on the decouple config singleton used by Config.
+
+    Args:
+        overrides: Key-value pairs to set in decouple config (e.g., MOCK=True).
+    """
+    from unittest.mock import patch
+
     defaults = {
         "VUE_USERNAME": None,
         "MOCK_ERROR": False,
@@ -20,12 +30,57 @@ def mock_config(**overrides: Any):
     }
     config_values = {**defaults, **overrides}
 
-    cfg_patch = patch(
-        "app.config",
-        side_effect=lambda key, default=None, cast=str: config_values.get(key, default),
-    )
+    # Patch decouple's config function in the 'config' module where
+    # _decouple_config is imported, since that's where it gets called from.
+
+    class _Undefined:
+        """Sentinel for undefined config values."""
+
+    _UNDEFINED = _Undefined()  # type: ignore[misc]
+
+    import decouple, config as cfg_mod  # noqa: F811
+
+    # Save a reference to the original decouple config function so we can
+    # read from its internal store inside mock_decouple (avoiding recursion).
+    _original_config = decouple.config  # type: ignore[misc]
+
+    def mock_decouple(key, default=_UNDEFINED, cast=None):  # type: ignore[no-untyped-def]
+        import os as _os
+
+        # Check our own defaults/overrides first so they take precedence
+        if key in config_values:
+            val = config_values[key]
+            if cast is not None and val is not None:
+                return cast(val)  # type: ignore[arg-type]
+            if val is None and default is not _UNDEFINED:  # type: ignore[name-defined]
+                return cast(default) if cast is not None else default  # type: ignore[arg-type]
+            return val
+
+        # Check decouple's internal config store for values set via dc_config.set()
+        # inside the mock_config context (e.g. test overrides). This takes priority
+        # over os.environ so tests can override conftest's clean_env values.
+        try:
+            store_val = _original_config(key, default=_UNDEFINED)  # type: ignore[no-untyped-call]
+            if store_val is not _UNDEFINED and default is not _UNDEFINED:  # type: ignore[name-defined]
+                return cast(store_val) if cast is not None else store_val  # type: ignore[arg-type]
+        except decouple.UndefinedValueError:
+            pass
+
+        env_val = _os.environ.get(key)  # type: ignore[attr-defined]
+        if env_val is not None:
+            return cast(env_val) if cast is not None else env_val
+
+        if default is not _UNDEFINED:  # type: ignore[name-defined]
+            return cast(default) if (cast is not None and default is not _UNDEFINED) else default  # type: ignore[arg-type]
+
+        raise decouple.UndefinedValueError(key)  # type: ignore[attr-defined]
+
+
+    cfg_patch = patch.object(cfg_mod, "_decouple_config", side_effect=mock_decouple)
     with cfg_patch:
         yield
+
+
 
 
 class TestApp(unittest.TestCase):

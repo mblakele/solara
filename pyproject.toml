@@ -39,7 +39,7 @@ dev = [
 ]
 
 [tool.mypy]
-files = ["load_manager.py", "app.py"]
+files = ["*.py"]  # was: ["load_manager.py", "app.py"]
 python_version = "3.12"
 warn_return_any = false
 warn_unused_configs = true
@@ -48,6 +48,14 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "vocolinc"
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "mockdata"
+ignore_errors = true  # test data generator, less critical for types
+
+[[tool.mypy.overrides]]
+module = "conftest"
+ignore_errors = true  # test fixtures, less critical for types
 
 [tool.pylint.design]
 max-args = 7

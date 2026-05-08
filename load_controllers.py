@@ -11,13 +11,15 @@ import logging
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast, Literal
 
 import sys
 
 import aiohttp
 from aiohomekit.controller.abstract import AbstractPairing
-from decouple import config
+
+import config as _cfg_mod
+
 
 from load_models import (
     AbstractPlugController,
@@ -280,7 +282,7 @@ class RealTeslaController(AbstractTeslaController):
         from tesla_fleet_api import TeslaFleetOAuth
 
         session = await self._get_session()
-        region = config("TESLA_REGION", default="na", cast=str)  # type: ignore[arg-type]
+        region = cast(Literal["na", "eu", "cn"], _cfg_mod.cfg.tesla_region)
 
         tokens = load_tesla_tokens()
         if tokens is not None:
@@ -374,7 +376,7 @@ class RealTeslaController(AbstractTeslaController):
         """
         from tesla_fleet_api.const import Scope
 
-        region = config("TESLA_REGION", default="na", cast=str)  # type: ignore[arg-type]
+        region = _cfg_mod.cfg.tesla_region
         domain = "auth.tesla.cn" if region == "cn" else "auth.tesla.com"
         scope_str = "+".join(
             [
@@ -735,7 +737,7 @@ async def tesla_auth_cli() -> bool:
     """
     from tesla_fleet_api import TeslaFleetOAuth
 
-    client_id = config("TESLA_CLIENT_ID", default="", cast=str)
+    client_id = _cfg_mod.cfg.tesla_client_id or ""
     if not client_id:
         print(
             "Error: TESLA_CLIENT_ID not set in environment. "
@@ -744,13 +746,13 @@ async def tesla_auth_cli() -> bool:
         return False
 
     session = aiohttp.ClientSession()
-    region = config("TESLA_REGION", default="na", cast=str)  # type: ignore[arg-type]
+    region = cast(Literal["na", "eu", "cn"], _cfg_mod.cfg.tesla_region)
     api = TeslaFleetOAuth(
         session=session,
         region=region,
         client_id=client_id,
-        client_secret=config("TESLA_CLIENT_SECRET", default="", cast=str),
-        redirect_uri=config("TESLA_REDIRECT_URI", default="", cast=str),
+        client_secret=_cfg_mod.cfg.tesla_client_secret or "",
+        redirect_uri=_cfg_mod.cfg.tesla_redirect_uri,
     )
 
     try:
@@ -1049,8 +1051,8 @@ class VocolincPlugController(AbstractPlugController):
         if self._initialized:
             return
 
-        username = self._username or config("VOCOLINC_USERNAME", "")
-        password = self._password or config("VOCOLINC_PASSWORD", "")
+        username = self._username or _cfg_mod.cfg.vocolinc_username
+        password = self._password or _cfg_mod.cfg.vocolinc_password
 
         if not username or not password:
             raise RuntimeError(

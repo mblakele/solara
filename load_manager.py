@@ -16,9 +16,9 @@ from datetime import datetime, time, timezone
 from typing import Any, Callable
 
 import pytz
-from decouple import UndefinedValueError, config
-
 import device_config
+
+from config import cfg as _cfg
 
 from load_models import (  # noqa: F401
     AbstractPlugController,
@@ -82,16 +82,17 @@ def _parse_time(value: str) -> time:
     return time(hour=hour, minute=minute)
 
 
-def _parse_load_manage_enabled(value: str) -> bool | tuple[time, time]:
+def _parse_load_manage_enabled(value: bool | str) -> bool | tuple[time, time]:
     """Parse LOAD_MANAGE_ENABLED value.
 
     Accepts "True", "False" (case-insensitive), or a time range in
     HH:MM-HH:MM 24-hour format (e.g., "06:45-15:00"). A time range means
     load management is active only during that window (inclusive start,
-    exclusive end).
+    exclusive end). Also accepts Python bool values directly.
 
     Args:
-        value: Raw string from the environment variable.
+        value: Raw string from the environment variable, or a Python bool
+            when coming through Config.load_manage_enabled.
 
     Returns:
         True if always enabled, False if never enabled, or a tuple of
@@ -100,6 +101,10 @@ def _parse_load_manage_enabled(value: str) -> bool | tuple[time, time]:
     Raises:
         ValueError: If the value doesn't match any recognized format.
     """
+    # Handle Python bool values directly (from Config.load_manage_enabled).
+    if isinstance(value, bool):
+        return value
+
     if value.strip().lower() in ("true", "1", "yes"):
         return True
     if value.strip().lower() in ("false", "0", "no", ""):
@@ -166,8 +171,8 @@ def load_vocolinc_credentials() -> tuple[str, str] | None:
     Returns:
         Tuple of (username, password) or None if not configured.
     """
-    username = config("VOCOLINC_USERNAME", "").strip()
-    password = config("VOCOLINC_PASSWORD", "").strip()
+    username = _cfg.vocolinc_username
+    password = _cfg.vocolinc_password
     if username and password:
         return (username, password)
     return None
@@ -204,13 +209,17 @@ def load_tesla_config() -> TeslaConfig | None:
     dc = device_config.get_tesla_config()
     if dc is None:
         return None
-    try:
-        client_id = config("TESLA_CLIENT_ID")
-        client_secret = config("TESLA_CLIENT_SECRET")
-    except (UndefinedValueError, ValueError, TypeError):
+
+    client_id = _cfg.tesla_client_id
+    if not client_id:
         return None
 
-    private_key_path = config("TESLA_PRIVATE_KEY_PATH", default=None) or None
+    private_key_path = _cfg.tesla_private_key_path or None
+
+    client_secret: str | None = _cfg.tesla_client_secret
+    if not client_secret:
+        return None
+
     return TeslaConfig(
         client_id=client_id,
         client_secret=client_secret,
@@ -298,7 +307,7 @@ class LoadManager:
         logger.info("LoadManager %s", self.enabled)
 
         if dry_run is None:
-            dry_run = config("LOAD_MANAGE_DRY_RUN", default="False", cast=bool)
+            dry_run = _cfg.dry_run
         self.dry_run = dry_run
 
         self.config_interval_secs = config_interval_secs
@@ -327,9 +336,7 @@ class LoadManager:
 
             # Auto-detect: if both types exist, use composite controller
             if has_homekit_plugs and has_vocolinc_plugs:
-                controller_type = config(
-                    "LOAD_PLUG_CONTROLLER", default="real", cast=str
-                ).lower()
+                controller_type = _cfg.load_plug_controller
                 hk_ctrl = (
                     RealPlugController(plugs_from_file)
                     if controller_type == "real"
@@ -350,9 +357,7 @@ class LoadManager:
                     password=vc_creds[1] if vc_creds else None,
                 )
             else:
-                controller_type = config(
-                    "LOAD_PLUG_CONTROLLER", default="stub", cast=str
-                ).lower()
+                controller_type = _cfg.load_plug_controller
                 if controller_type == "real":
                     self.plug_ctrl = RealPlugController(plugs_from_file)
                 else:
@@ -363,9 +368,7 @@ class LoadManager:
         if tesla_ctrl is not None:
             self.tesla_ctrl = tesla_ctrl
         elif tesla_config is not None:
-            controller_type = config(
-                "LOAD_TESLA_CONTROLLER", default="stub", cast=str
-            ).lower()
+            controller_type = _cfg.load_tesla_controller
             if controller_type == "real":
                 self.tesla_ctrl = RealTeslaController(tesla_config)
             else:
@@ -390,7 +393,7 @@ class LoadManager:
         Returns:
             Parsed enabled value: True, False, or a time range tuple.
         """
-        raw_value = config("LOAD_MANAGE_ENABLED", default="False")
+        raw_value = _cfg.load_manage_enabled  # type: ignore[assignment]
         try:
             return _parse_load_manage_enabled(raw_value)
         except ValueError as e:

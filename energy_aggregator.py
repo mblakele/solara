@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 import pytz
 
-from util import get_timezone
+from config import get_timezone
 
 
 class EnergyDataAggregator:

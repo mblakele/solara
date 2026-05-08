@@ -341,7 +341,7 @@ def test_stale_no_pending_effects_proceeds():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    fixed_now     = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     data_point_at = fixed_now - timedelta(seconds=StateTracker.STALE_THRESHOLD_SECS)
     fetched_at = data_point_at + timedelta(seconds=10)
     metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
@@ -361,7 +361,7 @@ def test_stale_no_pending_effects_proceeds():
         enabled=True,
         dry_run=False,
     )
-    # use fixed now inside LoadManager
+    # use fixed_now inside LoadManager
     with patch("load_manager.datetime") as mock_dt:
         mock_dt.now.return_value = fixed_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
@@ -393,7 +393,7 @@ def test_stale_data_from_previous_qh():
     plug_ctrl = PlugController(plugs)
 
     # Current wall-clock time: start of QH2
-    fixed_now     = datetime(2026, 5, 7, 15, 00, 00, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 5, 7, 15, 00, 00, tzinfo=timezone.utc)
     # data_point_at: end of previous QH
     data_point_at = fixed_now - timedelta(seconds=1)
     fetched_at = data_point_at + timedelta(seconds=10)
@@ -546,8 +546,8 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    now = datetime.now(timezone.utc)
-    fetched_at = now - timedelta(seconds=10)
+    fixed_now = datetime(2026, 5, 7, 15, 10, 00, tzinfo=timezone.utc)
+    fetched_at = fixed_now - timedelta(seconds=10)
     data_point_at = fetched_at - timedelta(seconds=50)  # 60s ago
     effect_time = fetched_at - timedelta(seconds=30)     # 40s ago
 
@@ -580,7 +580,11 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
         )
     )
 
-    result = mgr.run_cycle()
+    # use fixed_now inside LoadManager
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
 
     assert result["status"] == "waiting_for_fresh_data"
 
@@ -1491,11 +1495,10 @@ class TestAdaptiveSleep:
 
     def test_disabled_run_cycle_includes_sleep_hint(self):
         """Disabled run_cycle returns sleep_hint = config_interval."""
-        with patch("load_manager.config") as mock_config:
-            mock_config.side_effect = lambda key, **kwargs: {
-                "LOAD_MANAGE_ENABLED": "False",
-            }.get(key, kwargs.get("default", ""))
+        mock_cfg = MagicMock()
+        mock_cfg.load_manage_enabled = False
 
+        with patch("load_manager._cfg", mock_cfg):
             lm = self._make_manager(interval=30)
 
         result = lm.run_cycle()

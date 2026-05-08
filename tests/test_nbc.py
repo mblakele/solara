@@ -465,21 +465,26 @@ class TestNBCIntegration(unittest.TestCase):
     def _get_mock_index(self, instant_minute: int = 42) -> tuple:
         """Hit the / endpoint in mock mode and return (status, data)."""
 
-        def mock_config(key, default=None, cast=str):
+        import decouple
+        from unittest.mock import patch as _patch
+
+        def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
             values = {
                 "MOCK": True,
                 "VUE_USERNAME": None,
             }
             result = values.get(key, default)
             if cast is bool and isinstance(result, str):
-                return result.lower() in ("true", "1", "yes")
+                return result.lower() in ("true", "1", "yes")  # type: ignore[union-attr]
             return result
 
-        mock_config_patch = patch("app.config", side_effect=mock_config)
-        with mock_config_patch:
+        import config as _cfg_mod  # noqa: F811
+
+        with _patch.object(_cfg_mod, "_decouple_config", side_effect=mock_decouple):
             response = self.app.get(
                 f"/?instant_minute={instant_minute}", headers={"Accept": "application/json"}
             )
+
         data = json.loads(response.data) if response.data else {}
         return response.status_code, data
 
@@ -593,21 +598,26 @@ class TestNBCIntegration(unittest.TestCase):
     def test_tou_endpoint_includes_nbc_via_mock(self):
         """TOU endpoint in mock mode also has NBC data on devices."""
 
-        def mock_config(key, default=None, cast=str):
+        import decouple
+        from unittest.mock import patch as _patch
+
+        def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
             values = {
                 "MOCK": True,
                 "VUE_USERNAME": None,
             }
             result = values.get(key, default)
             if cast is bool and isinstance(result, str):
-                return result.lower() in ("true", "1", "yes")
+                return result.lower() in ("true", "1", "yes")  # type: ignore[union-attr]
             return result
 
-        mock_config_patch = patch("app.config", side_effect=mock_config)
-        with mock_config_patch:
+        import config as _cfg_mod  # noqa: F811
+
+        with _patch.object(_cfg_mod, "_decouple_config", side_effect=mock_decouple):
             response = self.app.get(
                 "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-01T04:00:00"
             )
+
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.data)
 

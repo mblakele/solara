@@ -3,23 +3,22 @@ Utility functions and custom JSON provider for the application.
 """
 
 from datetime import datetime, time as TimeType, timedelta
-from typing import Any, Dict, List
+from typing import Any
 
 import isodate
 from flask.json.provider import DefaultJSONProvider
 
-from decouple import config
-from device_config import get_timezone as _dc_get_timezone
+from config import cfg
 
 
 def get_timezone() -> str:
     """Return the configured timezone, evaluated lazily for testability."""
-    return _dc_get_timezone()
+    return cfg.timezone
 
 
 def is_debug() -> bool:
     """Return whether debug mode is enabled, evaluated lazily for testability."""
-    return config("DEBUG", False, cast=bool)
+    return cfg.debug
 
 
 def custom_json_default(o: object) -> object:
@@ -55,8 +54,8 @@ _QH_QUARTERS: list[tuple[str, int, int]] = [
 
 
 def compute_nbc_quarters(
-    per_second_data: List[float], n: int
-) -> Dict[str, Any]:
+    per_second_data: list[float], n: int
+) -> dict[str, Any]:
     """Compute NBC metrics for each quarter-hour from per-second kWh data.
 
     PG&E bills Non-Bypassable Charges based on net consumption over each
@@ -74,7 +73,7 @@ def compute_nbc_quarters(
         Dict with keys QH1-QH4, each containing NBC metrics or None if the
         quarter has not yet started.
     """
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
     for qh_name, start_idx, end_idx in _QH_QUARTERS:
         if n <= start_idx:
             result[qh_name] = None

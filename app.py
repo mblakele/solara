@@ -31,7 +31,8 @@ from flask import (
 )
 from flask.typing import ResponseReturnValue
 
-from decouple import config
+from config import cfg as _cfg, get_timezone
+
 from metrics import (
     HourlyProjection,
     Metrics,
@@ -40,7 +41,7 @@ from metrics import (
     RetryableMetricsException,
 )
 from mockdata import MetricsMock
-from util import CustomJSONProvider, get_timezone, is_debug
+from util import CustomJSONProvider, is_debug
 
 # global setup
 app = Flask(__name__)
@@ -132,7 +133,7 @@ def _get_model(
     """
     if is_mock_error:
         raise RetryableMetricsException("mock")
-    is_mock = config("VUE_USERNAME", None) is None or force_mock
+    is_mock = _cfg.is_mock_mode or force_mock
     if is_mock:
         if instant_minute is not None:
             return MetricsMock(instant_minute=instant_minute)
@@ -147,11 +148,7 @@ def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = 
     Returns a dict with keys 'buckets' (TOU totals) and 'nbc' (total Wh
     across all 15-minute periods). In mock mode, returns realistic non-zero values.
     """
-    is_mock = (
-        config("VUE_USERNAME", None) is None
-        or force_mock
-        or config("MOCK", default="False", cast=bool)
-    )
+    is_mock = _cfg.is_mock_mode or force_mock
     if is_mock:
         mock = MetricsMock()
         return {"buckets": mock.tou_result, "nbc": mock.nbc_result}
@@ -211,11 +208,10 @@ def index() -> ResponseReturnValue:
     falls back to MetricsMock for deterministic test data.
     """
     logger.debug("index")
-    is_mock_error = config("MOCK_ERROR", default="False", cast=bool)
-    force_mock = config("MOCK", default="False", cast=bool)
+    is_mock_error = _cfg.is_mock_error
 
     # Determine whether to use mock or real data
-    is_mock = config("VUE_USERNAME", None) is None or force_mock
+    is_mock = _cfg.is_mock_mode
 
     if is_mock:
         # Mock mode: use MetricsMock for deterministic test data
@@ -226,7 +222,7 @@ def index() -> ResponseReturnValue:
                 instant_minute = int(instant_minute_str)
             except (ValueError, TypeError):
                 instant_minute = None
-        model = _get_model(logger, is_mock_error, force_mock, instant_minute=instant_minute)
+        model = _get_model(logger, is_mock_error, instant_minute=instant_minute)
         metrics_data = model.metrics
     else:
         # Real mode: use cached metrics to avoid hammering the API
@@ -371,9 +367,7 @@ def _get_load_manager():
 
                 _load_manager = LoadManager(
                     metrics_fetch=metrics_fetch,
-                    config_interval_secs=config(
-                        "LOAD_MANAGE_INTERVAL_SECS", default=30, cast=int
-                    ),
+                    config_interval_secs=_cfg.load_manage_interval_secs,
                 )
                 logger.info("LoadManager initialized")
             except Exception as e:
@@ -384,7 +378,7 @@ def _get_load_manager():
 
 def _load_management_loop() -> None:
     """Background thread that runs load management cycle with adaptive sleep."""
-    interval_secs_config = config("LOAD_MANAGE_INTERVAL_SECS", default=30, cast=int)
+    interval_secs_config = _cfg.load_manage_interval_secs
     logger.info(
         "Load management background loop started (interval=%ds)", interval_secs_config
     )
@@ -417,7 +411,7 @@ def load_manage() -> Response:
     Returns JSON with status, current NBC prediction, pending effects, device states.
     Requires ``X-API-Key`` header matching ``LOAD_MANAGE_API_KEY`` env var when set.
     """
-    required_key = config("LOAD_MANAGE_API_KEY", default="", cast=str)  # type: ignore[arg-type]
+    required_key = _cfg.load_manage_api_key  # type: ignore[arg-type]
     if required_key:
         provided_key = request.headers.get("X-API-Key", "")
         if not provided_key or provided_key != required_key:

@@ -7,30 +7,31 @@ from datetime import datetime, timedelta, timezone
 import json
 import locale
 import logging
-from typing import Any, Callable, ClassVar, Dict, List, Optional
+from typing import Any, Callable, ClassVar, Optional
 
 import requests
-
-
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 
-from decouple import config
-from energy_aggregator import EnergyDataAggregator
 from util import CustomJSONProvider, compute_nbc_quarters, custom_json_default, is_debug
+from energy_aggregator import EnergyDataAggregator
+
+from config import cfg as _cfg
 
 
 logger = logging.getLogger(__name__)
+
+
 
 
 @dataclass
 class _PopulationResult:
     """Intermediate results from populating one device — no mutation of API objects."""
 
-    per_second_data: List[float]
-    scales: Dict[str, Any]
-    chart_data: List[float]
-    nbc_seconds: List[float]
+    per_second_data: list[float]
+    scales: dict[str, Any]
+    chart_data: list[float]
+    nbc_seconds: list[float]
     nbc_data_start: datetime
 
 
@@ -41,18 +42,18 @@ class DeviceMetrics:
     gid: int
     name: str
     lag: timedelta
-    per_second_data: List[float]
+    per_second_data: list[float]
     prediction: float
     prediction_min: float
     prediction_max: float
     minute_predicted: float
     minutes_remaining: float
-    scales: Dict[str, Any]
-    smoothing: Dict[str, float]
-    nbc: Dict[str, Any]
+    scales: dict[str, Any]
+    smoothing: dict[str, float]
+    nbc: dict[str, Any]
     timezone: str
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for JSON/template consumption."""
         return {
             "gid": self.gid,
@@ -82,14 +83,14 @@ class MetricsCache:
     """
 
     def __init__(self, ttl_seconds: int = 30) -> None:
-        self._data: Dict[str, Any] | None = None
+        self._data: dict[str, Any] | None = None
         self._fetched_at: datetime | None = None
         self._ttl = timedelta(seconds=ttl_seconds)
 
     def get_or_fetch(
         self,
-        fetch_func: Callable[[], Dict[str, Any]],
-    ) -> tuple[Dict[str, Any], bool]:
+        fetch_func: Callable[[], dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
         """Return (metrics_data, was_fresh).
 
         Returns cached data if not expired. Otherwise calls fetch_func and
@@ -145,10 +146,10 @@ class MetricsBase:
     without re-logging in on every call.
     """
 
-    device_info: ClassVar[Dict[int, Any]] = {}
+    device_info: ClassVar[dict[int, Any]] = {}
     json: ClassVar[type] = CustomJSONProvider
     vue: ClassVar[PyEmVue] = PyEmVue()
-    vue_auth: ClassVar[Dict[str, Any]] = {}
+    vue_auth: ClassVar[dict[str, Any]] = {}
     vue_keys: ClassVar[str] = ".vue-keys.json"
 
     def __init__(self, logger_next: Optional[logging.Logger] = None) -> None:
@@ -185,8 +186,8 @@ class MetricsBase:
             self.logger.exception("keys failed: will use password")
             try:
                 login_ok = self.vue.login(
-                    username=config("VUE_USERNAME"),
-                    password=config("VUE_PASSWORD"),
+                    username=_cfg.vue_username,
+                    password=_cfg.vue_password,
                     token_storage_file=self.vue_keys,
                 )
             except Exception as inner_ex:
@@ -255,7 +256,7 @@ class HourlyProjection(MetricsBase):
     """
 
     def __init__(self, logger_next: Optional[logging.Logger] = None) -> None:
-        self.metrics: Dict[str, Any] = {
+        self.metrics: dict[str, Any] = {
             "api_response": {},
             "debug": is_debug(),
             "devices": [],
@@ -329,8 +330,8 @@ class HourlyProjection(MetricsBase):
         return usage_data_local, usage_data_start_local, chan.channel_num
 
     def _process_offset_scales(
-        self, scales: Dict[str, Any], usage_data_local: List[float], usage_data_end: datetime
-    ) -> List[float]:
+        self, scales: dict[str, Any], usage_data_local: list[float], usage_data_end: datetime
+    ) -> list[float]:
         """Process minute-scale offset data (1MIN–10MIN) and return chart_data.
 
         Computes usage for each minute scale from the tail of the dataset
@@ -363,7 +364,7 @@ class HourlyProjection(MetricsBase):
             scales[scale] = self.data_for_scale(offset_data, offset_start, scale)
         return usage_data_local[-300:]
 
-    def populate(self) -> Dict[int, _PopulationResult]:
+    def populate(self) -> dict[int, _PopulationResult]:
         """Fetch recent data using second granularity to minimize lag.
 
         Returns a dict mapping device gid to PopulationResult without mutating
@@ -377,7 +378,7 @@ class HourlyProjection(MetricsBase):
             seconds=self.instant.second,
             microseconds=self.instant.microsecond,
         )
-        results: Dict[int, _PopulationResult] = {}
+        results: dict[int, _PopulationResult] = {}
         for vdi in self.device_info.values():
             self.logger.debug("device: %s", vdi)
             result = self._populate_device(vdi, chart_start)
@@ -386,7 +387,7 @@ class HourlyProjection(MetricsBase):
         return results
 
     def populate_scale(
-        self, dig: Any, scale: str, data_start: datetime, data: List[float]
+        self, dig: Any, scale: str, data_start: datetime, data: list[float]
     ) -> None:
         """
         Populate N seconds of usage data for a scale
@@ -403,8 +404,8 @@ class HourlyProjection(MetricsBase):
 
     @staticmethod
     def data_for_scale(
-        data: List[float], data_start: datetime, scale: str
-    ) -> Dict[str, Any]:
+        data: list[float], data_start: datetime, scale: str
+    ) -> dict[str, Any]:
         """Calculate usage statistics for a given scale (hour or minutes).
 
         Args:
@@ -416,7 +417,7 @@ class HourlyProjection(MetricsBase):
             Dict with keys: usage (Wh), seconds, instant, and optionally
                 data/data_len/data_start if DEBUG is enabled.
         """
-        dsi: Dict[str, object] = {}
+        dsi: dict[str, object] = {}
         data_len = len(data)
 
         if is_debug():
@@ -434,8 +435,8 @@ class HourlyProjection(MetricsBase):
         return dsi
 
     def predict(
-        self, population: Dict[int, _PopulationResult]
-    ) -> Dict[int, Dict[str, Any]]:
+        self, population: dict[int, _PopulationResult]
+    ) -> dict[int, dict[str, Any]]:
         """Predict consumption or surplus at end of current hour.
 
         Uses the minute-scale usage rate to extrapolate remaining
@@ -448,7 +449,7 @@ class HourlyProjection(MetricsBase):
         Returns:
             Dict of gid -> prediction results for each device.
         """
-        predictions: Dict[int, Dict[str, Any]] = {}
+        predictions: dict[int, dict[str, Any]] = {}
         for gid, pop_result in population.items():
             pred_result = self._predict_device(pop_result.scales)
             predictions[gid] = pred_result
@@ -456,10 +457,10 @@ class HourlyProjection(MetricsBase):
 
     def _compute_nbc(
         self,
-        usage_data_local: List[float],
+        usage_data_local: list[float],
         usage_data_start_local: datetime,
         device_time_zone: str | None = None,  # pylint: disable=unused-argument
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Compute NBC values for each quarter hour in the current hour.
 
         Delegates to ``compute_nbc_quarters`` in util. Quarter boundaries are
@@ -505,7 +506,7 @@ class HourlyProjection(MetricsBase):
                 )
                 return None
 
-            scales: Dict[str, Any] = {}
+            scales: dict[str, Any] = {}
             scales[Scale.HOUR.value] = self.data_for_scale(
                 usage_data_local, usage_data_start_local, Scale.HOUR.value
             )
@@ -523,7 +524,7 @@ class HourlyProjection(MetricsBase):
             )
         return None
 
-    def _predict_device(self, scales: Dict[str, Any]) -> Dict[str, Any]:
+    def _predict_device(self, scales: dict[str, Any]) -> dict[str, Any]:
         """Compute prediction and smoothing for one device from its scales.
 
         Args:
@@ -549,7 +550,7 @@ class HourlyProjection(MetricsBase):
         )
         prediction = hour["usage"] + minute_predicted
 
-        smoothing: Dict[str, float] = {}
+        smoothing: dict[str, float] = {}
         prediction_min = prediction
         prediction_max = prediction
         for scale in scales.keys():
@@ -582,7 +583,7 @@ class HourlyProjection(MetricsBase):
         self,
         vdi: Any,
         pop_result: _PopulationResult,
-        pred_result: Dict[str, Any],
+        pred_result: dict[str, Any],
     ) -> DeviceMetrics:
         """Build a DeviceMetrics from population and prediction results.
 
@@ -641,7 +642,7 @@ class TOUReporter(MetricsBase):
 
         self.start_date = start_date
         self.end_date = end_date
-        self.tou_result: Optional[Dict[str, float]] = None
+        self.tou_result: Optional[dict[str, float]] = None
         self.nbc_result: Optional[float] = None
 
         self.fetch_usage_data()
@@ -661,7 +662,7 @@ class TOUReporter(MetricsBase):
         The 15MIN scale has a much larger API limit than per-minute data,
         but we still chunk to be safe and handle large date ranges.
         """
-        self.usage_data_list: List[Dict[str, Any]] = []
+        self.usage_data_list: list[dict[str, Any]] = []
         self._fetch_error: Optional[Exception] = None
 
         for vdi in self.device_info.values():
@@ -713,7 +714,7 @@ class TOUReporter(MetricsBase):
         NBC is the sum of all 15-minute period values in Wh across the
         entire reporting period.
         """
-        combined_buckets: Dict[str, float] = {
+        combined_buckets: dict[str, float] = {
             "total": 0.0,
             "peak": 0.0,
             "part_peak": 0.0,

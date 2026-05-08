@@ -10,7 +10,9 @@ from datetime import datetime, timedelta, timezone
 import random
 from typing import Any, Dict, List
 
-from util import compute_nbc_quarters, get_timezone
+from config import get_timezone
+
+from util import compute_nbc_quarters
 
 
 def _generate_hour_seconds(

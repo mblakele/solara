@@ -119,12 +119,15 @@ def test_load_tesla_config_all_vars():
 
 def test_load_tesla_config_missing_vars():
     """Returns None when required vars missing."""
-    with patch("load_manager.config") as mock_config:
-        mock_config.side_effect = [
-            "client-id",  # TESLA_CLIENT_ID
-            UndefinedValueError(),  # TESLA_CLIENT_SECRET - missing
-        ]
 
+    def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+        if key == "TESLA_CLIENT_ID":
+            return ""  # empty client_id means missing
+        if default is not None:
+            return default
+        raise UndefinedValueError(key)
+
+    with patch("config._decouple_config", side_effect=mock_decouple):
         config_result = load_tesla_config()
 
     assert config_result is None
@@ -221,6 +224,16 @@ def test_parse_whitespace_stripped():
     assert start == time(hour=6, minute=45)
 
 
+def test_parse_bool_true():
+    """Accepts a Python bool True (from Config.load_manage_enabled)."""
+    assert _parse_load_manage_enabled(True) is True
+
+
+def test_parse_bool_false():
+    """Accepts a Python bool False (from Config.load_manage_enabled)."""
+    assert _parse_load_manage_enabled(False) is False
+
+
 # --- Load manager time range tests ---
 
 
@@ -259,7 +272,7 @@ def test_is_enabled_at_bool_false():
     assert mgr.is_enabled_at(now) is False
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_is_enabled_at_in_range(mock_config):
     """is_enabled_at returns True when current time is in range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -269,7 +282,7 @@ def test_is_enabled_at_in_range(mock_config):
     assert mgr.is_enabled_at(now) is True
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_is_enabled_at_before_range(mock_config):
     """is_enabled_at returns False when current time is before range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -279,7 +292,7 @@ def test_is_enabled_at_before_range(mock_config):
     assert mgr.is_enabled_at(now) is False
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_is_enabled_at_after_range(mock_config):
     """is_enabled_at returns False when current time is after range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -289,7 +302,7 @@ def test_is_enabled_at_after_range(mock_config):
     assert mgr.is_enabled_at(now) is False
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_is_enabled_at_inclusive_start(mock_config):
     """is_enabled_at returns True exactly at start time."""
     mock_config.return_value = "America/Los_Angeles"
@@ -299,7 +312,7 @@ def test_is_enabled_at_inclusive_start(mock_config):
     assert mgr.is_enabled_at(now) is True
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_is_enabled_at_exclusive_end(mock_config):
     """is_enabled_at returns False exactly at end time."""
     mock_config.return_value = "America/Los_Angeles"
@@ -309,7 +322,7 @@ def test_is_enabled_at_exclusive_end(mock_config):
     assert mgr.is_enabled_at(now) is False
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_run_cycle_disabled_outside_range(mock_config):
     """run_cycle returns disabled when outside time range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -326,7 +339,7 @@ def test_run_cycle_disabled_outside_range(mock_config):
     assert "outside_time_range" in result["diagnostics"]["reason"]
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_run_cycle_enabled_in_range(mock_config):
     """run_cycle proceeds when inside time range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -491,7 +504,7 @@ def test_sync_no_reconciliation_when_states_match():
 # --- Time range midnight wrapping tests ---
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_time_range_wraps_midnight(mock_config):
     """A time range like 22:00-06:00 that wraps midnight always returns False
     with the current simple comparison logic (start <= now < end), since no
@@ -658,7 +671,7 @@ def test_is_device_in_time_range_no_restriction():
     assert mgr._is_device_in_time_range("any_device", None) is True
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_is_device_in_time_range_inside(mock_config):
     """Current time within range returns True."""
     mock_config.return_value = "America/Los_Angeles"
@@ -679,7 +692,7 @@ def test_is_device_in_time_range_inside(mock_config):
     assert result is True
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_is_device_in_time_range_outside(mock_config):
     """Current time outside range returns False."""
     mock_config.return_value = "America/Los_Angeles"
@@ -700,7 +713,7 @@ def test_is_device_in_time_range_outside(mock_config):
     assert result is False
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_candidate_details_shows_outside_range_reason(mock_config):
     """Diagnostics include reason for outside-range device."""
     mock_config.return_value = "America/Los_Angeles"
@@ -746,7 +759,7 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
     assert heater_detail.get("reason") == "outside_time_range"
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_candidate_details_no_reason_when_in_range(mock_config):
     """Diagnostics omit reason when device is inside time range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -792,7 +805,7 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
     assert "reason" not in heater_detail
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_cycle_filters_outside_range_plug(mock_config):
     """Plug outside time range is excluded from engine.decide() call."""
     mock_config.return_value = "America/Los_Angeles"
@@ -843,7 +856,7 @@ def test_cycle_filters_outside_range_plug(mock_config):
     assert call_kwargs["plugs"] == {}
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_cycle_includes_plug_inside_range(mock_config):
     """Plug inside time range is included in engine.decide() call."""
     mock_config.return_value = "America/Los_Angeles"
@@ -892,7 +905,7 @@ def test_cycle_includes_plug_inside_range(mock_config):
     assert "heater" in call_kwargs["plugs"]
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_cycle_filters_outside_range_tesla(mock_config):
     """Tesla outside time range is excluded from engine.decide() call."""
     mock_config.return_value = "America/Los_Angeles"
@@ -957,7 +970,7 @@ def test_cycle_filters_outside_range_tesla(mock_config):
     assert call_kwargs["tesla"] is None
 
 
-@patch("load_manager.config")
+@patch("config._decouple_config")
 def test_no_action_reason_skips_outside_range_plug(mock_config):
     """_determine_no_action_reason skips outside-range plugs when checking eligibility."""
     mock_config.return_value = "America/Los_Angeles"
