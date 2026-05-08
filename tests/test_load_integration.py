@@ -17,7 +17,7 @@ from load_manager import (
     TeslaConfig,
     TeslaController,
     TeslaState,
-    TetrisEngine,
+    GapMinder,
 )
 from tests.helpers import _make_metrics_with_wh
 
@@ -1204,7 +1204,7 @@ def test_turn_off_only_device_even_when_savings_exceed_gap():
     below target, still turn it off — any undershoot is smaller than the
     overshoot from leaving the device on.
     """
-    engine = TetrisEngine(hysteresis_wh=3)
+    engine = GapMinder(hysteresis_wh=3)
     state = StateTracker()
 
     # Water heater is on (confirmed), flexible — the only device available.

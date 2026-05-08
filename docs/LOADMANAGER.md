@@ -9,7 +9,7 @@ Load management runs as a background thread that cycles every N seconds
    (cached with 60s TTL to avoid rate limits)
 2. **State Adjustment**: Adjusts raw prediction with pending effect deltas from
    actions already taken this quarter-hour, so decisions account for loads already toggled
-3. **Decision Engine** (TetrisEngine): Compares adjusted prediction against target Wh,
+3. **GapMinder:** Compares adjusted prediction against target Wh,
    calculates the gap, and uses bin-packing to fit flexible loads into the surplus
 4. **Action Execution**: Turns plugs on/off or adjusts Tesla charging amps
 
@@ -17,7 +17,7 @@ Key components:
 - `LoadManager`: Orchestrator that runs cycles in a background thread
 - `NBCCache`/`NBCReader`: Fetches and caches quarter-hour predictions (60s TTL)
 - `StateTracker`: Tracks device states, pending effects, stale data detection
-- `TetrisEngine`: Decision logic for which loads to toggle
+- `GapMinder`: Decision logic for which loads to toggle
 - Controllers: `RealPlugController` (HomeKit), `VocolincPlugController`,
   `RealTeslaController` — or stub versions for testing
 

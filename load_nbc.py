@@ -614,8 +614,8 @@ class StateTracker:
         }
 
 
-class TetrisEngine:
-    """Fit flexible loads into the NBC surplus gap like tetris pieces."""
+class GapMinder:
+    """Bin-pack flexible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
     MIN_SECONDS_TO_ACT = 60
@@ -636,7 +636,7 @@ class TetrisEngine:
         charge_amps_min: int = 5,
         charge_amps_max: int = 48,
     ) -> None:
-        """Initialize the TetrisEngine.
+        """Initialize the GapMinder.
 
         Args:
             hysteresis_wh: Hysteresis threshold in Wh. When None, defaults to
@@ -716,6 +716,16 @@ class TetrisEngine:
             gap_wh,
             seconds_remaining,
         )
+
+        # Guard: don't turn on plugs near the QH boundary.  A plug turned
+        # on with only a few seconds left will stay through the entire next
+        # quarter-hour, wasting energy that isn't counted toward any surplus.
+        if seconds_remaining < self.MIN_SECONDS_TO_ACT:
+            logger.debug(
+                "[_decide_turn_on] skipped (too little time %d s < %d s)",
+                seconds_remaining, self.MIN_SECONDS_TO_ACT,
+            )
+            return []
 
         candidates: list[tuple[int, str, Any]] = []
         for name, plug in plugs.items():

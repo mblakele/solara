@@ -1,4 +1,4 @@
-"""Tests for TetrisEngine decision logic."""
+"""Tests for GapMinder decision logic."""
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -10,7 +10,7 @@ from load_manager import (
     DeviceState,
     StateTracker,
     TeslaState,
-    TetrisEngine,
+    GapMinder,
 )
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
@@ -21,7 +21,7 @@ fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 
 def test_hysteresis_no_action():
     """No action when within hysteresis margin."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
 
@@ -39,7 +39,7 @@ def test_hysteresis_no_action():
 
 def test_hysteresis_no_action_at_boundary():
     """No action exactly at +/-999 Wh (within margin)."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
 
@@ -59,7 +59,7 @@ def test_hysteresis_custom_value():
     """Custom hysteresis allows action within default margin."""
     # With default hysteresis of 1000, gap=500 would be within margin.
     # With hysteresis=100, gap=500 should trigger action.
-    engine = TetrisEngine(hysteresis_wh=100)
+    engine = GapMinder(hysteresis_wh=100)
     state = StateTracker()
     plugs = {
         "heater": PlugConfig(
@@ -85,13 +85,13 @@ def test_hysteresis_custom_value():
 
 def test_hysteresis_default_value():
     """Default hysteresis is 1000 for backward compatibility."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     assert engine.HYSTERESIS_WH == 1000
 
 
 def test_turn_on_fixed_plug():
     """Turns on fixed plug when gap exists."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs = {
         "water_heater": PlugConfig(
@@ -118,7 +118,7 @@ def test_turn_on_fixed_plug():
 
 def test_turn_on_flexible_plug_off():
     """Turns on flexible plug that's currently off."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     state.devices["pool_pump"] = DeviceState(
         name="pool_pump",
@@ -148,7 +148,7 @@ def test_turn_on_flexible_plug_off():
 
 def test_skip_flexible_plug_already_on():
     """Skips flexible plug already on."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     state.devices["pool_pump"] = DeviceState(
         name="pool_pump",
@@ -177,7 +177,7 @@ def test_skip_flexible_plug_already_on():
 
 def test_priority_ordering():
     """Higher priority (higher number) turns on first."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs = {
         "high_pri": PlugConfig(
@@ -211,7 +211,7 @@ def test_priority_ordering():
 
 def test_bin_pack_multiple_plugs():
     """Fits multiple plugs to fill gap."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs = {
         "small": PlugConfig(
@@ -242,7 +242,7 @@ def test_bin_pack_multiple_plugs():
 
 def test_skip_plug_before_debounce():
     """Skips plug that toggled too recently."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
 
     with patch("load_nbc.datetime") as mock_dt:
@@ -282,7 +282,7 @@ def test_skip_plug_before_debounce():
 
 def test_turn_off_flexible_only():
     """Turns off flexible plugs only, not fixed."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     state.devices["pool_pump"] = DeviceState(
         name="pool_pump",
@@ -323,7 +323,7 @@ def test_turn_off_flexible_only():
 
 def test_remove_lowest_priority_first():
     """Removes lowest priority (lowest number) first."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     state.devices["high_pri"] = DeviceState(
         name="high_pri",
@@ -366,7 +366,7 @@ def test_remove_lowest_priority_first():
 
 def test_skip_off_plugs():
     """Skips plugs that are already off."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs = {
         "pool_pump": PlugConfig(
@@ -394,7 +394,7 @@ def test_skip_off_plugs():
 
 def test_tesla_skip_when_not_at_home():
     """Skips Tesla when not at home."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
     tesla = TeslaState(
@@ -420,7 +420,7 @@ def test_tesla_skip_when_not_at_home():
 
 def test_tesla_skip_when_not_plugged_in():
     """Skips Tesla when not plugged in."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
     tesla = TeslaState(
@@ -446,7 +446,7 @@ def test_tesla_skip_when_not_plugged_in():
 
 def test_tesla_skip_at_charge_limit():
     """Skips Tesla when at charge limit (saturated)."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
     tesla = TeslaState(
@@ -473,7 +473,7 @@ def test_tesla_skip_at_charge_limit():
 def test_decide_tesla_increase_amps_5_8():
     """When predicted_wh < target and Tesla amps can increase,
     the engine should call set_amps with expected value."""
-    engine = TetrisEngine(hysteresis_wh=3)
+    engine = GapMinder(hysteresis_wh=3)
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
     tesla = TeslaState(
@@ -503,7 +503,7 @@ def test_decide_tesla_increase_amps_5_8():
 def test_decide_tesla_increase_amps_7_9():
     """When predicted_wh < target and Tesla amps can increase,
     the engine should call set_amps with expected value."""
-    engine = TetrisEngine(hysteresis_wh=3)
+    engine = GapMinder(hysteresis_wh=3)
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
     tesla = TeslaState(
@@ -533,7 +533,7 @@ def test_decide_tesla_increase_amps_7_9():
 def test_decide_tesla_reduce_below_min_stops_charging():
     """When predicted_wh > target and Tesla amps would drop below min,
     the engine should call stop_charging instead of set_amps."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     # No plugs to turn off — only Tesla is available for reduction
     plugs: dict[str, PlugConfig] = {}
@@ -563,7 +563,7 @@ def test_decide_tesla_reduce_below_min_stops_charging():
 def test_decide_with_plugs_and_tesla_priority_ordering():
     """When both plugs and Tesla are available for excess solar, verify
     plugs turn on first (by priority), then Tesla fills remaining gap."""
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
     plugs = {
         "high_pri": PlugConfig(
@@ -620,7 +620,7 @@ def test_hysteresis_blocks_small_gap_flexible_turn_off():
     over-target cases, this test will fail because the engine turns off
     the pool pump creating a 200 Wh undershoot for a 50 Wh gap.
     """
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
 
     # Pool pump on (flexible), savings ≈ 1500 * 600 / 3600 = 250 Wh
@@ -661,7 +661,7 @@ def test_hysteresis_blocks_small_gap_tesla_reduce():
     over-target cases, this test will fail because the engine calls
     _decide_tesla_reduce() for a 200 Wh gap, potentially thrashing amps.
     """
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
 
     # No flexible plugs on — only Tesla is available
@@ -697,7 +697,7 @@ def test_hysteresis_blocks_small_gap_multiple_flexible():
     over-target cases, this test will fail because the engine turns off
     both plugs (total savings 62.5 Wh) for a 150 Wh gap.
     """
-    engine = TetrisEngine()
+    engine = GapMinder()
     state = StateTracker()
 
     # Two small flexible devices on
@@ -742,3 +742,141 @@ def test_hysteresis_blocks_small_gap_multiple_flexible():
     # Hysteresis blocks entirely since abs_gap (150) < HYSTERESIS_WH (1000)
     # and no oversized device would benefit from bypass.
     assert len(actions) == 0
+
+
+# --- QH boundary guards (near-end-of-quarter-hour skip) ---
+
+
+def test_turn_on_skipped_when_seconds_remaining_below_min():
+    """Skips plug turn-on when fewer than MIN_SECONDS_TO_ACT remain in QH.
+
+    Near the end of a quarter-hour, turning on a plug wastes energy because
+    it will stay on through the QH boundary and draw power not counted toward
+    any surplus.  The same MIN_SECONDS_TO_ACT guard that protects Tesla actions
+    should also protect plug turn-on decisions.
+
+    Regression test for: jackery turned on with 21 s remaining in QH3,
+    then left running through the entire next quarter-hour.
+    """
+    engine = GapMinder()
+    state = StateTracker()
+
+    plugs = {
+        "jackery": PlugConfig(
+            name="jackery",
+            accessory_id="j1",
+            power_watts=270.0,
+            role="flexible",
+        ),
+    }
+
+    with patch("load_nbc.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        actions = engine.decide(
+            predicted_wh=-2000.0,  # big surplus: gap = -1500 Wh
+            target_wh=-500.0,
+            seconds_remaining=21,  # only 21 s left in QH3
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        )
+
+    assert len(actions) == 0
+
+
+def test_turn_on_allowed_when_seconds_remaining_above_min():
+    """Allows plug turn-on when enough time remains in the QH."""
+    engine = GapMinder()
+    state = StateTracker()
+
+    plugs = {
+        "heater": PlugConfig(
+            name="heater",
+            accessory_id="h1",
+            power_watts=4500.0,
+            role="fixed",
+        ),
+    }
+
+    with patch("load_nbc.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        actions = engine.decide(
+            predicted_wh=-2000.0,  # big surplus: gap = -1500 Wh
+            target_wh=-500.0,
+            seconds_remaining=600,  # plenty of time left (10 min)
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        )
+
+    assert len(actions) == 1
+    assert actions[0].action == "turn_on"
+
+
+def test_turn_off_not_affected_by_min_seconds_guard():
+    """Turn-off decisions are NOT blocked by MIN_SECONDS_TO_ACT.
+
+    Turning off a device near the QH boundary is always safe — it saves
+    energy regardless of how much time remains.  Only turn-on needs the guard.
+    """
+    engine = GapMinder()
+    state = StateTracker()
+    state.devices["pool_pump"] = DeviceState(
+        name="pool_pump",
+        desired_state=True,
+    )
+
+    plugs = {
+        "pool_pump": PlugConfig(
+            name="pool_pump",
+            accessory_id="p1",
+            power_watts=1500.0,
+            role="flexible",
+        ),
+    }
+
+    with patch("load_nbc.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        actions = engine.decide(
+            predicted_wh=2000.0,  # deficit: gap = -2500 Wh (exceeds hysteresis)
+            target_wh=-500.0,
+            seconds_remaining=21,  # only 21 s left — turn-off should still fire
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        )
+
+    assert len(actions) == 1
+    assert actions[0].action == "turn_off"
+
+
+def test_turn_on_at_exact_min_seconds_boundary():
+    """Turn-on is allowed when seconds_remaining equals MIN_SECONDS_TO_ACT exactly."""
+    engine = GapMinder()
+    state = StateTracker()
+
+    plugs = {
+        "heater": PlugConfig(
+            name="heater",
+            accessory_id="h1",
+            power_watts=4500.0,
+            role="fixed",
+        ),
+    }
+
+    with patch("load_nbc.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        actions = engine.decide(
+            predicted_wh=-2000.0,  # big surplus: gap = -1500 Wh
+            target_wh=-500.0,
+            seconds_remaining=60,  # exactly MIN_SECONDS_TO_ACT (1 min)
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        )
+
+    assert len(actions) == 1

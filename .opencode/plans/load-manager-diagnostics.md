@@ -28,7 +28,7 @@ and Load Manager operational state on the index endpoint.
 
 - `run_cycle()` returns early with minimal status on: disabled, no
   incomplete QH, stale data, waiting for fresh data.
-- `TetrisEngine.decide()` returns `[]` silently when the gap is within
+- `GapMinder.decide()` returns `[]` silently when the gap is within
   hysteresis (1000 Wh), no candidates are available, or the Tesla amp-
   change threshold is not met.
 - The index endpoint did not read `_last_cycle_result` or
@@ -43,7 +43,7 @@ and Load Manager operational state on the index endpoint.
 | Component | File | Role |
 |---|---|---|
 | `LoadManager.run_cycle()` | `load_manager.py` ~L2194 | Executes one cycle, returns status dict |
-| `TetrisEngine.decide()` | `load_manager.py` ~L485 | Bin-packs flexible loads into surplus gap |
+| `GapMinder.decide()` | `load_manager.py` ~L485 | Bin-packs flexible loads into surplus gap |
 | `StateTracker` | `load_manager.py` ~L433 | In-memory device state & pending effects |
 | `_build_load_management_payload()` | `app.py` ~L264 | Serializes Load Manager state for index |
 | Index endpoint | `app.py` ~L171 | Serves HTML/JSON with metrics + load mgmt |
@@ -59,7 +59,8 @@ LoadManager.run_cycle()  [every 30s, background thread]
     └─ normal path
          ├─ NBCReader.get_current_qh() → predicted_wh, seconds_remaining
          ├─ TeslaController.get_charging_state() → tesla_state (optional)
-         ├─ TetrisEngine.decide() → actions[]
+          ├─ GapMinder.decide() → actions[]
+
          ├─ execute actions (or dry-run log only)
          └─ returns {status, qh, predicted_wh, target_wh, actions, diagnostics}
               │

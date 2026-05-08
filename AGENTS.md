@@ -136,7 +136,7 @@ project-root
 - timezones in `util.py`
 
 ### Actions Generation Flow
-- TetrisEngine.decide() generates actions as a list of PendingEffect objects
+- GapMinder.decide() generates actions as a list of PendingEffect objects
 - In run_cycle(), raw NBC predictions are adjusted with pending effect deltas via
   `estimated_current_wh()` before being passed to decide() — this accounts for
   actions already taken this quarter-hour without waiting for fresh API data

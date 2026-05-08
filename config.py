@@ -115,7 +115,7 @@ class Config:
     @property
     def dry_run(self) -> bool:
         """Return True when load management is in dry-run mode."""
-        return _decouple_config("LOAD_MANAGE_DRY_RUN", default="True", cast=bool)
+        return _decouple_config("LOAD_MANAGE_DRY_RUN", default=False, cast=bool)
 
     @property
     def vue_username(self) -> Optional[str]:

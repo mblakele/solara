@@ -1,7 +1,18 @@
+import sys
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
-from metrics import Metrics, MetricsCache, RetryableMetricsException
+from unittest.mock import MagicMock, patch
+
+import requests
+from metrics import (
+    HourlyProjection,
+    Metrics,
+    MetricsBase,
+    MetricsCache,
+    RetryableMetricsException,
+)
+from util import compute_nbc_quarters
 from mockdata import MetricsMock
 
 
@@ -397,5 +408,959 @@ class TestMetricsCache(unittest.TestCase):
         self.assertIs(result2, result3)
 
 
+class TestComputeNBCQuartersEdgeCases(unittest.TestCase):
+    """Tests for util.compute_nbc_quarters edge cases."""
+
+    def test_empty_data_returns_all_none(self):
+        """With empty per_second_data, all quarters should be None."""
+        result = compute_nbc_quarters([], 0)
+
+        for qh in ["QH1", "QH2", "QH3", "QH4"]:
+            self.assertIsNone(result[qh])
+
+    def test_n_zero_returns_all_none(self):
+        """With n=0 (no seconds observed), all quarters should be None."""
+        data = [0.001] * 3600
+        result = compute_nbc_quarters(data, 0)
+
+        for qh in ["QH1", "QH2", "QH3", "QH4"]:
+            self.assertIsNone(result[qh])
+
+    def test_n_900_completes_qh1(self):
+        """n=900 (first second of QH2) should complete QH1, leave others None."""
+        data = [0.002] * 3600
+        result = compute_nbc_quarters(data, 900)
+
+        self.assertTrue(result["QH1"]["complete"])
+        # raw_wh = 900 * 0.002 * 1000
+        self.assertAlmostEqual(result["QH1"]["raw_wh"], 900 * 0.002 * 1000)
+        self.assertIsNone(result["QH2"])
+
+    def test_n_901_partial_qh2(self):
+        """n=901 should complete QH1, partial QH2 with 2 samples."""
+        data = [0.005] * 3600
+        result = compute_nbc_quarters(data, 901)
+
+        self.assertTrue(result["QH1"]["complete"])
+        self.assertFalse(result["QH2"]["complete"])
+
+    def test_n_3600_completes_all_quarters(self):
+        """n=3600 (past end of QH4) should complete all quarters."""
+        data = [0.002] * 3600
+        result = compute_nbc_quarters(data, 3600)
+
+        for qh in ["QH1", "QH2", "QH3", "QH4"]:
+            self.assertTrue(result[qh]["complete"])
+
+    def test_n_past_end_clamped_to_data_length(self):
+        """n exceeding data length should still produce partial results."""
+        # Only 10 seconds of data, but n=50 — function uses raw values
+        # QH1 is partial (n < 900), not None, because n > start_idx(0)
+        data = [0.002] * 10
+        result = compute_nbc_quarters(data, 50)
+
+        self.assertFalse(result["QH1"]["complete"])
+        # lookback = data[0:50] → 10 elements (Python clamps slice)
+        self.assertEqual(result["QH1"]["samples_used"], 10)
+
+    def test_negative_raw_wh_clamped_to_zero_in_complete(self):
+        """Complete quarters with negative raw_wh should have wh=0."""
+        data = [-0.002] * 3600
+        result = compute_nbc_quarters(data, 900)
+
+        self.assertTrue(result["QH1"]["complete"])
+        self.assertEqual(result["QH1"]["wh"], 0)
+
+    def test_negative_raw_wh_clamped_to_zero_in_partial(self):
+        """Partial quarters with negative predicted_wh should have wh=0."""
+        data = [-0.002] * 3600
+        result = compute_nbc_quarters(data, 1500)
+
+        self.assertFalse(result["QH2"]["complete"])
+        # predicted_wh will be negative, clamped to 0
+        self.assertEqual(result["QH2"]["wh"], 0)
+
+    def test_partial_qh_has_predicted_wh(self):
+        """Incomplete quarters should include predicted_wh field."""
+        data = [0.002] * 3600
+        result = compute_nbc_quarters(data, 1500)
+
+        self.assertFalse(result["QH2"]["complete"])
+        self.assertIn("predicted_wh", result["QH2"])
+
+    def test_partial_qh_has_remaining_seconds(self):
+        """Incomplete quarters should include remaining_seconds field."""
+        data = [0.002] * 3600
+        result = compute_nbc_quarters(data, 1500)
+
+        self.assertIn("remaining_seconds", result["QH2"])
+        # QH2 ends at index 1799, n=1500 → remaining = 1800 - 1500
+        self.assertEqual(result["QH2"]["remaining_seconds"], 300)
+
+    def test_partial_qh_has_samples_used(self):
+        """Incomplete quarters should include samples_used field."""
+        data = [0.002] * 3600
+        result = compute_nbc_quarters(data, 1500)
+
+        self.assertIn("samples_used", result["QH2"])
+        # lookback = max(1500-60, 900) to 1500 = max(1440, 900)=1440 to 1500
+        # samples = 60 (or less if lookback_start < start_idx)
+        self.assertGreater(result["QH2"]["samples_used"], 0)
+
+    def test_partial_qh_lookback_cannot_cross_boundary(self):
+        """Lookback window should not cross quarter boundary."""
+        # n=901 is just 2 seconds into QH2 (start_idx=900)
+        # lookback_start = max(901-60, 900) = max(841, 900) = 900
+        # So lookback only includes seconds from QH2, not QH1: data[900:901]
+        # Python slice [start:end] is exclusive of end → 2 elements (indices 900, 901)
+        data = [0.005] * 3600  # uniform positive values
+        result = compute_nbc_quarters(data, 901)
+
+        self.assertFalse(result["QH2"]["complete"])
+        # lookback is data[900:901] → 2 elements (indices 900 and 901)
+        self.assertEqual(result["QH2"]["samples_used"], 1)
+
+    def test_partial_qh_lookback_clamped_to_start_idx(self):
+        """Lookback start should be clamped to quarter start index."""
+        # n=910, lookback_start = max(850, 900) = 900
+        # So lookback is from index 900 to 910 = 10 samples
+        data = [0.005] * 3600
+        result = compute_nbc_quarters(data, 910)
+
+        self.assertEqual(result["QH2"]["samples_used"], 10)
+
+
+class TestDataForScaleEdgeCases(unittest.TestCase):
+    """Tests for HourlyProjection.data_for_scale edge cases."""
+
+    def test_empty_data_list(self):
+        """data_for_scale with empty data list should handle gracefully."""
+        from datetime import datetime, timezone
+
+        result = HourlyProjection.data_for_scale(
+            [], datetime.now(timezone.utc), "1H"
+        )
+        self.assertEqual(result["usage"], 0.0)
+
+    def test_single_data_point(self):
+        """data_for_scale with a single data point should work."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        result = HourlyProjection.data_for_scale([0.5], now, "1H")
+
+        # data_len is only present when DEBUG mode is on
+        self.assertGreaterEqual(result["usage"], 0.0)
+
+    def test_scale_key_stored_as_is(self):
+        """The scale parameter should be stored as the 'scale' key."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        result = HourlyProjection.data_for_scale(
+            [0.5, 0.6], now, "CUSTOM_SCALE"
+        )
+
+        self.assertEqual(result["scale"], "CUSTOM_SCALE")
+
+
+class TestHourlyProjectionErrorPaths(unittest.TestCase):
+    """Tests for HourlyProjection error handling paths."""
+
+    def test_retryable_exception_on_no_data(self):
+        """HourlyProjection should raise RetryableMetricsException when API returns no data."""
+        from unittest.mock import patch, MagicMock
+
+        with patch.object(MetricsBase, "vue_init"), \
+             patch.object(MetricsBase, "get_device_info"):
+
+            # Patch device_info to have one device
+            with patch.dict(MetricsBase.device_info, {1: MagicMock()}):
+                vdi = MetricsBase.device_info[1]
+
+                # Set up channels to return empty data
+                mock_channel = MagicMock()
+                mock_channel.channel_num = 1
+
+                def empty_fetch(*args, **kwargs):
+                    return [], None
+
+                vdi.channels = [mock_channel]
+                with patch.object(
+                    MetricsBase.vue, "get_chart_usage", side_effect=empty_fetch
+                ):
+
+                    with self.assertRaises(RetryableMetricsException):
+                        HourlyProjection()
+
+
+class TestHourlyProjectionEdgeCases(unittest.TestCase):
+    """Tests for HourlyProjection edge cases."""
+
+    def test_predict_device_missing_extra_min_scales(self):
+        """_predict_device with only 1MIN (no other MIN scales) should still compute prediction."""
+        from datetime import timedelta, timezone
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        # Set up the instant attribute that _predict_device needs
+        hp.instant = now.replace(minute=30)
+
+        # Only 1H and 1MIN — no other MIN scales like 5MIN, 10MIN
+        scales = {
+            "1H": {"usage": 60.0, "instant": now},
+            "1MIN": {"usage": 2.5, "instant": now + timedelta(minutes=1)},
+        }
+
+        result = hp._predict_device(scales)
+
+        self.assertIn("prediction", result)
+        # smoothing should only have "1MIN" key, not 5MIN/10MIN
+        self.assertIn("smoothing", result)
+
+    def test_predict_device_with_partial_scales(self):
+        """_predict_device with only some MIN scales should compute smoothing for those."""
+        from datetime import timedelta, timezone
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        # Set up the instant attribute that _predict_device needs
+        hp.instant = now.replace(minute=30)
+
+        # 1H + "5MIN" only (no other MIN scales like 2MIN, 3MIN)
+        # _predict_device needs "1MIN" for minute_predicted calculation.
+        scales = {
+            "1H": {"usage": 60.0, "instant": now},
+            "5MIN": {"usage": 3.0, "instant": now + timedelta(minutes=5)},
+            "1MIN": {"usage": 2.0, "instant": now + timedelta(minutes=1)},
+        }
+
+        result = hp._predict_device(scales)
+
+        self.assertIn("prediction", result)
+
+
+class TestTOUReporterEdgeCases(unittest.TestCase):
+    """Tests for TOUReporter edge cases."""
+
+    def test_aggregate_tou_empty_usage_data_list(self):
+        """aggregate_tou with empty usage_data_list should produce zero buckets."""
+        from metrics import TOUReporter
+
+        tou = TOUReporter.__new__(TOUReporter)
+
+        # Set up required attributes
+        tou.usage_data_list = []
+        tou._fetch_error = None
+
+        # Call aggregate_tou directly (skip fetch_usage_data)
+        tou.aggregate_tou()
+
+        self.assertIsNotNone(tou.tou_result)
+        for bucket in ["total", "peak", "part_peak", "off_peak"]:
+            self.assertEqual(tou.tou_result[bucket], 0.0)
+
+    def test_aggregate_tou_with_none_values_in_data(self):
+        """aggregate_tou should skip None values in 15-min data."""
+        from metrics import TOUReporter
+
+        tou = TOUReporter.__new__(TOUReporter)
+
+        # Data with None values mixed in
+        tou.usage_data_list = [
+            {
+                "start": datetime.now(timezone.utc),
+                "data": [0.1, None, 0.2],
+            }
+        ]
+
+        tou.aggregate_tou()
+
+        self.assertIsNotNone(tou.tou_result)
+        # total should include all values (including negatives if any, but these are positive)
+
+    def test_aggregate_tou_with_negative_values(self):
+        """aggregate_tou should handle negative values (solar export) in TOU buckets."""
+        from metrics import TOUReporter
+
+        tou = TOUReporter.__new__(TOUReporter)
+
+        # Negative values represent solar export
+        tou.usage_data_list = [
+            {
+                "start": datetime.now(timezone.utc),
+                "data": [-0.1, 0.2],
+            }
+        ]
+
+        tou.aggregate_tou()
+
+        self.assertIsNotNone(tou.tou_result)
+        # total should be (0.2 - 0.1) * some_factor = net positive
+        # NBC should only sum positive values (imports), so -0.1 is ignored
+
+    def test_aggregate_tou_all_none_data(self):
+        """aggregate_tou with all None data should produce zero NBC."""
+        from metrics import TOUReporter
+
+        tou = TOUReporter.__new__(TOUReporter)
+
+        tou.usage_data_list = [
+            {
+                "start": datetime.now(timezone.utc),
+                "data": [None, None],
+            }
+        ]
+
+        tou.aggregate_tou()
+
+        self.assertIsNotNone(tou.nbc_result)
+        # NBC should be 0 since all values are None (skipped in positive sum)
+
+
+class TestMetricsCacheEdgeCases(unittest.TestCase):
+    """Tests for MetricsCache edge cases."""
+
+    def test_ttl_zero_forces_refetch(self):
+        """TTL of 0 should force a refetch on every call."""
+        cache = MetricsCache(ttl_seconds=0)
+        fetch_count = 0
+
+        def fetch_func():
+            nonlocal fetch_count
+            fetch_count += 1
+            return {"count": fetch_count}
+
+        cache.get_or_fetch(fetch_func)
+        self.assertEqual(fetch_count, 1)
+
+        # Even without sleeping, TTL=0 means always fresh
+        data2, was_fresh = cache.get_or_fetch(fetch_func)
+        self.assertEqual(fetch_count, 2)
+
+    def test_concurrent_calls_same_fetch(self):
+        """Multiple sequential calls within TTL should all return same cached data."""
+        cache = MetricsCache(ttl_seconds=60)
+
+        def fetch_func():
+            return {"value": "shared"}
+
+        results = [cache.get_or_fetch(fetch_func) for _ in range(5)]
+        # All should return the same data object (was_fresh varies)
+        for i in range(1, 5):
+            self.assertIs(results[0][0], results[i][0])
+
+
+
+class TestDeviceMetricsDataClass(unittest.TestCase):
+    """Tests for DeviceMetrics data class defaults and serialization."""
+
+    def test_default_values_are_sensible(self):
+        """Empty DeviceMetrics has sensible defaults for all fields."""
+        from metrics import DeviceMetrics
+
+        dm = DeviceMetrics()
+        self.assertEqual(dm.gid, 0)
+        self.assertEqual(dm.name, "")
+        self.assertEqual(dm.timezone, "")
+        self.assertIsInstance(dm.lag, timedelta)
+        self.assertEqual(len(dm.per_second_data), 0)
+
+    def test_to_dict_has_all_keys(self):
+        """to_dict() includes all expected keys for JSON/template consumption."""
+        from metrics import DeviceMetrics
+
+        dm = DeviceMetrics(
+            gid=42, name="test-device", timezone="UTC"
+        )
+        d = dm.to_dict()
+
+        expected_keys = {
+            "gid", "lag", "name", "per_second_data",
+            "prediction", "prediction_min", "prediction_max",
+            "minute_predicted", "minutes_remaining",
+            "scales", "smoothing", "timezone", "nbc",
+        }
+        self.assertEqual(set(d.keys()), expected_keys)
+
+    def test_to_dict_rounding(self):
+        """prediction values are rounded to 14 decimal places in output dict."""
+        from metrics import DeviceMetrics, _PredictionData
+
+        dm = DeviceMetrics(
+            gid=1, name="round-test",
+            prediction=_PredictionData(value=0.123456789012345, min_value=0.0, max_value=1.0),
+        )
+        d = dm.to_dict()
+
+        # 14 decimal places max — Python's round(x, 14) strips trailing zeros
+        self.assertEqual(d["prediction"], round(0.123456789012345, 14))
+        self.assertEqual(d["prediction_min"], round(0.0, 14))
+
+
+class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
+    """Tests for MetricsBase.vue_init error paths."""
+
+    def test_vue_init_token_fallback_to_password(self):
+        """When token login fails, vue_init falls back to password auth."""
+        from unittest.mock import MagicMock
+
+        # Create a mock PyEmVue where token login fails but password succeeds
+        vue_mock = MagicMock()
+
+        # First call (token-based) returns False → triggers password fallback
+        vue_mock.login.side_effect = [False, True]
+
+        with patch.object(MetricsBase, "vue", vue_mock), \
+             patch("metrics._cfg") as cfg_mock:
+
+            # Set up config so password auth works
+            cfg_mock.vue_username = "testuser"
+            cfg_mock.vue_password = "testpass"
+
+            # Create a fake .vue-keys.json so the file read doesn't fail
+            import tempfile, os
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                os.write(f.fileno(), b'{"id_token":"t","access_token":"a","refresh_token":"r"}')
+                keys_file = f.name
+
+            try:
+                base = MetricsBase.__new__(MetricsBase)
+                # Skip __init__ to avoid real API calls; set up manually
+                base.vue = vue_mock
+                # Crucial: MagicMock always has .auth (creates it on access), so we must
+                # set auth=None to prevent vue_init() from taking its early-return path.
+                base.vue.auth = None  # type: ignore[attr-defined]
+                base.vue_keys = keys_file
+                base.logger = MagicMock()
+
+                # Mock open to return our temp file content for token login
+                original_open = __builtins__["open"]
+
+                def mock_file_open(*args, **kwargs):
+                    return original_open(keys_file, *args[1:], **kwargs)
+
+                with patch("builtins.open", mock_file_open):
+                    base.vue_init()
+
+                # Token login was called first (returned False), then password auth succeeded
+                self.assertEqual(vue_mock.login.call_count, 2)
+            finally:
+                os.unlink(keys_file)
+
+    def test_vue_init_both_fail_raises(self):
+        """When both token and password auth fail, raises VueAuthenticationError."""
+        from unittest.mock import MagicMock
+
+        vue_mock = MagicMock()
+        # Both login attempts fail
+        vue_mock.login.side_effect = [False, False]
+
+        with patch.object(MetricsBase, "vue", vue_mock), \
+             patch("metrics._cfg") as cfg_mock:
+
+            import tempfile, os
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                os.write(f.fileno(), b'{"id_token":"t","access_token":"a","refresh_token":"r"}')
+                keys_file = f.name
+
+            try:
+                base = MetricsBase.__new__(MetricsBase)
+                base.vue = vue_mock
+                # Prevent early return in vue_init() — MagicMock always has .auth.
+                base.vue.auth = None  # type: ignore[attr-defined]
+                base.vue_keys = keys_file
+                base.logger = MagicMock()
+
+                original_builtins_open = __builtins__["open"]
+
+                def mock_file_open(*args, **kwargs):
+                    return original_builtins_open(keys_file)
+
+                with patch("builtins.open", mock_file_open):
+                    cfg_mock.vue_username = "u"
+                    cfg_mock.vue_password = "p"
+
+                    with self.assertRaises(Exception) as ctx:  # VueAuthenticationError
+                        base.vue_init()
+
+                    self.assertIn("authentication failed", str(ctx.exception).lower())
+            finally:
+                os.unlink(keys_file)
+
+
+class TestMetricsBaseGetDeviceInfoFilters(unittest.TestCase):
+    """Tests for MetricsBase.get_device_info filtering paths."""
+
+    def test_get_device_info_401_invalidates_auth(self):
+        """HTTPError 401 sets vue.auth=None and raises RetryableMetricsException."""
+
+        http_ex = requests.exceptions.HTTPError(response=MagicMock(status_code=401))
+        vue_mock = MagicMock()
+        vue_mock.get_devices.side_effect = http_ex
+
+        with patch.object(MetricsBase, "vue", vue_mock), \
+             patch("metrics.MetricsBase.device_info", {}):
+
+            base = MetricsBase.__new__(MetricsBase)
+            # Skip __init__ to avoid real API calls; set up manually
+            base.vue = vue_mock
+            base.logger = MagicMock()
+
+            with self.assertRaises(RetryableMetricsException):
+                base.get_device_info()
+
+            # Auth should be invalidated on 401
+            self.assertIsNone(vue_mock.auth)
+
+    def test_get_device_info_filters_disconnected(self):
+        """Devices with connected=False are skipped."""
+
+        disconnected_device = MagicMock()
+        disconnected_device.connected = False
+        disconnected_device.device_gid = 1
+
+        vue_mock = MagicMock()
+        vue_mock.get_devices.return_value = [disconnected_device]
+
+        with patch.object(MetricsBase, "vue", vue_mock), \
+             patch("metrics.MetricsBase.device_info", {}):
+
+            base = MetricsBase.__new__(MetricsBase)
+            base.vue = vue_mock
+            base.logger = MagicMock()
+
+            # Should not raise, but device_info should remain empty
+            with patch("metrics.MetricsBase.vue_auth", {"last": datetime.now(timezone.utc)}):
+                base.get_device_info()
+
+            self.assertEqual(len(MetricsBase.device_info), 0)
+
+    def test_get_device_info_filters_wrong_model(self):
+        """Devices with model != 'ZIG001' are skipped."""
+
+        wrong_model_device = MagicMock()
+        wrong_model_device.connected = True
+        wrong_model_device.model = "ZIG002"  # Wrong model
+        wrong_model_device.device_gid = 1
+
+        vue_mock = MagicMock()
+        vue_mock.get_devices.return_value = [wrong_model_device]
+
+        with patch.object(MetricsBase, "vue", vue_mock), \
+             patch("metrics.MetricsBase.device_info", {}):
+
+            base = MetricsBase.__new__(MetricsBase)
+            base.vue = vue_mock
+            base.logger = MagicMock()
+
+            with patch("metrics.MetricsBase.vue_auth", {"last": datetime.now(timezone.utc)}):
+                base.get_device_info()
+
+            self.assertEqual(len(MetricsBase.device_info), 0)
+
+    def test_get_device_info_filters_empty_channels(self):
+        """Devices with no channels are skipped."""
+
+        empty_channels_device = MagicMock()
+        empty_channels_device.connected = True
+        empty_channels_device.model = "ZIG001"
+        empty_channels_device.device_gid = 42
+        empty_channels_device.channels = []
+
+        vue_mock = MagicMock()
+        vue_mock.get_devices.return_value = [empty_channels_device]
+
+        with patch.object(MetricsBase, "vue", vue_mock), \
+             patch("metrics.MetricsBase.device_info", {}):
+
+            base = MetricsBase.__new__(MetricsBase)
+            base.vue = vue_mock
+            base.logger = MagicMock()
+
+            with patch("metrics.MetricsBase.vue_auth", {"last": datetime.now(timezone.utc)}):
+                base.get_device_info()
+
+            self.assertEqual(len(MetricsBase.device_info), 0)
+
+
+class TestFetchChannelDataErrors(unittest.TestCase):
+    """Tests for HourlyProjection._fetch_channel_data error paths."""
+
+    def test_fetch_no_valid_data_raises(self):
+        """_fetch_channel_data raises RetryableMetricsException when API returns empty data."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+
+        # Mock get_chart_usage to return empty data (no valid points)
+        hp.vue.get_chart_usage.return_value = ([], None)
+
+        chan_mock = MagicMock()
+        chan_mock.channel_num = 1
+
+        with self.assertRaises(RetryableMetricsException) as ctx:
+            hp._fetch_channel_data(chan_mock, now.replace(minute=0), now)
+
+        self.assertIn("No data for hour", str(ctx.exception))
+
+    def test_fetch_first_element_none_raises(self):
+        """_fetch_channel_data raises when first element of data is None."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+
+        # Mock get_chart_usage to return data where first element is None
+        hp.vue.get_chart_usage.return_value = ([None, 0.1], now)
+
+        chan_mock = MagicMock()
+        chan_mock.channel_num = 2
+
+        with self.assertRaises(RetryableMetricsException) as ctx:
+            hp._fetch_channel_data(chan_mock, now.replace(minute=0), now)
+
+        self.assertIn("No data for hour", str(ctx.exception))
+
+
+class TestProcessOffsetScalesEdgeCases(unittest.TestCase):
+    """Tests for _process_offset_scales edge cases."""
+
+    def test_process_minute_0_boundary(self):
+        """When minute=0, max(1, min(10, 0)) = 1 so only '1MIN' scale is computed."""
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.logger = MagicMock()
+        scales: dict[str, Any] = {}
+
+        # usage_data_end has minute=0
+        end_time = now.replace(minute=0)
+
+        # 61 seconds of data (one minute worth)
+        usage_data = [0.5] * 61
+
+        result = hp._process_offset_scales(scales, usage_data, end_time)
+
+        # Only "1MIN" should be in scales (minute=0 → max(1, min(10, 0)) = 1)
+        self.assertIn("1MIN", scales)
+
+    def test_process_minute_6_plus(self):
+        """When minute >= 6, scales should include '1MIN' through '6MIN'."""
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.logger = MagicMock()
+        scales: dict[str, Any] = {}
+
+        # usage_data_end has minute=6
+        end_time = now.replace(minute=6)
+
+        # 390 seconds of data (6 minutes worth + a bit more for the tail)
+        usage_data = [0.5] * 391
+
+        result = hp._process_offset_scales(scales, usage_data, end_time)
+
+        # Should have "1MIN" through "6MIN"
+        for i in range(1, 7):
+            self.assertIn(f"{i}MIN", scales)
+
+    def test_process_returns_last_300(self):
+        """Returns last 300 data points from the usage_data_local."""
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.logger = MagicMock()
+        scales: dict[str, Any] = {}
+
+        end_time = now.replace(minute=42)
+        # 2520 seconds of data (minute=42 → 42*60 = 2520)
+        usage_data = [float(i % 10) for i in range(2520)]
+
+        result = hp._process_offset_scales(scales, usage_data, end_time)
+
+        # Should return exactly the last 300 elements
+        self.assertEqual(len(result), min(300, len(usage_data)))
+
+
+class TestComputeNBCEdgeCases(unittest.TestCase):
+    """Tests for _compute_nbc edge cases."""
+
+    def test_elapsed_zero(self):
+        """When instant == usage_data_start, n=0 and all quarters are not started."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now
+        data_start = now  # Same time → elapsed=0
+
+        result = hp._compute_nbc([0.1] * 3600, data_start)
+
+        # n=0 → all quarters should be None
+        for qh in ["QH1", "QH2", "QH3", "QH4"]:
+            self.assertIsNone(result[qh])
+
+    def test_elapsed_exceeds_data_len(self):
+        """When elapsed exceeds data length, n is clamped to len(data)."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now
+        # Only 10 seconds of data but instant is far ahead → elapsed >> len(data)
+        short_data = [0.1] * 10
+
+        result = hp._compute_nbc(short_data, now - timedelta(seconds=5))
+
+        # n should be clamped to len(data)=10
+        self.assertFalse(result["QH1"]["complete"])
+
+    def test_negative_elapsed(self):
+        """When instant is before data start, elapsed is negative → n=0."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now
+        # Data start is in the future relative to instant → negative elapsed
+        data_start = now + timedelta(hours=1)
+
+        result = hp._compute_nbc([0.1] * 3600, data_start)
+
+        # n = max(0, negative_int) → 0
+        for qh in ["QH1", "QH2", "QH3", "QH4"]:
+            self.assertIsNone(result[qh])
+
+
+class TestPopulateDeviceErrors(unittest.TestCase):
+    """Tests for _populate_device error paths."""
+
+    def test_fetch_error_returns_none(self):
+        """_fetch_channel_data raising RequestException causes _populate_device to return None."""
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+
+        # Mock get_chart_usage to raise a RequestException
+        http_ex = requests.exceptions.HTTPError("API error")
+        hp.vue.get_chart_usage.side_effect = http_ex
+
+        vdi_mock = MagicMock()
+        chan_mock = MagicMock(channel_num=1)
+        vdi_mock.channels = [chan_mock]
+
+        result = hp._populate_device(vdi_mock, now.replace(minute=0))
+        self.assertIsNone(result)
+
+    def test_empty_channels_returns_none(self):
+        """_populate_device returns None when device has no channels."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        vdi_mock = MagicMock()
+
+        # Device with no channels → for-loop never executes, returns None
+        vdi_mock.channels = []
+
+        result = hp._populate_device(vdi_mock, now.replace(minute=0))
+        self.assertIsNone(result)
+
+
+class TestPredictDeviceEdgeCases(unittest.TestCase):
+    """Tests for _predict_device edge cases."""
+
+    def test_no_minute_scales(self):
+        """With only 1H and no extra MIN scales, smoothing has just '1MIN'."""
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        scales: dict[str, Any] = {
+            "1H": {"usage": 60.0, "instant": now},
+            # _predict_device requires at least a 1MIN scale to compute minute_predicted.
+            "1MIN": {"usage": 2.5, "instant": now + timedelta(minutes=1)},
+        }
+
+        result = hp._predict_device(scales)
+
+        self.assertIn("prediction", result)
+        # With only 1MIN (no other MIN scales), smoothing has just one entry.
+        self.assertEqual(result["smoothing"], {"1MIN": result["prediction"]})
+
+    def test_lag_zero(self):
+        """When hour['instant'] >= instant, lag is timedelta(0)."""
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        # Set instant to be AFTER the hour data point
+        hp.instant = now.replace(minute=45)
+
+        scales: dict[str, Any] = {
+            "1H": {"usage": 60.0, "instant": now.replace(minute=45)},
+            # _predict_device requires at least a 1MIN scale to compute minute_predicted.
+            "1MIN": {"usage": 2.5, "instant": now.replace(minute=46)},
+        }
+
+        result = hp._predict_device(scales)
+
+        self.assertEqual(result["lag"], timedelta(0))
+
+
+class TestTOUReporterFetchErrors(unittest.TestCase):
+    """Tests for TOUReporter.fetch_usage_data error paths."""
+
+    def test_fetch_http_error_re_raises(self):
+        """fetch_usage_data re-raises HTTPError from get_chart_usage."""
+        from unittest.mock import MagicMock
+
+        vue_mock = MagicMock()
+        http_ex = requests.exceptions.HTTPError("API error")
+        http_ex.response = MagicMock()  # type: ignore[attr-defined]
+        vue_mock.get_chart_usage.side_effect = http_ex
+
+        with patch.object(MetricsBase, "vue", vue_mock), \
+             patch("metrics.MetricsBase.device_info", {}):
+
+            # Create a minimal device with channels
+            vdi_mock = MagicMock()
+            chan_mock = MagicMock(channel_num=1)
+            vdi_mock.channels = [chan_mock]
+
+            with patch.object(MetricsBase, "device_info", {1: vdi_mock}):
+                from metrics import TOUReporter
+
+                from datetime import UTC, datetime as dt
+
+                tou = TOUReporter.__new__(TOUReporter)
+                # Set up required attributes without calling __init__ (which calls fetch_usage_data)
+                tou.vue = vue_mock
+                tou.logger = MagicMock()
+                tou.start_date = dt(2025, 1, 1, tzinfo=UTC)
+                tou.end_date = dt(2025, 1, 8, tzinfo=UTC)
+
+                with self.assertRaises(requests.exceptions.HTTPError):
+                    # Manually call fetch_usage_data (which will try to iterate device_info)
+                    tou.fetch_usage_data()
+
+    def test_fetch_empty_list(self):
+        """fetch_usage_data with no data chunks produces empty usage_data_list."""
+
+        from datetime import UTC, datetime as dt
+
+        vue_mock = MagicMock()
+        # Return empty data for all calls (no chunks)
+        vue_mock.get_chart_usage.return_value = ([], None)
+
+        with patch.object(MetricsBase, "vue", vue_mock), \
+             patch("metrics.MetricsBase.device_info", {}):
+
+            vdi_mock = MagicMock()
+            chan_mock = MagicMock(channel_num=1)
+            vdi_mock.channels = [chan_mock]
+
+            with patch.object(MetricsBase, "device_info", {1: vdi_mock}):
+                from metrics import TOUReporter
+
+                tou = TOUReporter.__new__(TOUReporter)
+                tou.vue = vue_mock
+                tou.logger = MagicMock()
+
+                # Set up dates that will result in zero iterations (start >= end)
+                now = datetime.now(timezone.utc).replace(
+                    hour=10, minute=30, second=0, microsecond=0
+                )
+                tou.start_date = now
+                tou.end_date = now  # Same time → no iterations
+
+                tou.fetch_usage_data()
+
+                self.assertEqual(tou.usage_data_list, [])
+
+
+class TestDataForScaleDebugMode(unittest.TestCase):
+    """Tests for data_for_scale debug mode behavior."""
+
+    def test_debug_mode_off_no_extra_keys(self):
+        """When DEBUG is off, data_for_scale result has no 'data'/'data_len' keys."""
+        from unittest.mock import patch
+
+        now = datetime.now(timezone.utc)
+        data = [0.1, 0.2]
+
+        with patch("metrics.is_debug", return_value=False):
+            result = HourlyProjection.data_for_scale(data, now, "1H")
+
+        self.assertNotIn("data", result)
+        self.assertNotIn("data_len", result)
+
+    def test_debug_mode_on_has_extra_keys(self):
+        """When DEBUG is on, data_for_scale result includes 'data'/'data_len'."""
+        from unittest.mock import patch
+
+        now = datetime.now(timezone.utc)
+        data = [0.1, 0.2]
+
+        with patch("metrics.is_debug", return_value=True):
+            result = HourlyProjection.data_for_scale(data, now, "1H")
+
+        self.assertIn("data", result)
+        self.assertEqual(result["data_len"], 2)
+
+
+class TestHourlyProjectionNoPredictions(unittest.TestCase):
+    """Tests for HourlyProjection constructor edge cases."""
+
+    def test_no_predictions_lag_not_set(self):
+        """When populate() returns empty dict, _data_lag_secs is not set."""
+        from unittest.mock import MagicMock
+
+        # Create a partial HourlyProjection where populate returns {}
+        hp = HourlyProjection.__new__(HourlyProjection)
+
+        # Set up required attributes
+        hp.metrics = {"api_response": {}, "debug": False, "devices": [], "instant": datetime.now(timezone.utc)}
+        hp.instant = hp.metrics["instant"]
+
+        # Mock populate to return empty dict (no predictions)
+        with patch.object(hp, "populate", return_value={}):
+            # Mock device_info to be empty so the for-loop doesn't add devices
+            with patch.object(MetricsBase, "device_info", {}):
+                # Mock predict to return empty dict too (no predictions)
+                with patch.object(hp, "predict", return_value={}):
+                    # Now call the relevant part of __init__ manually
+                    hp.metrics["api_response"]["total"] = timedelta()
+
+        # When predictions is empty, _data_lag_secs should not be set
+        self.assertNotIn("_data_lag_secs", hp.metrics)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

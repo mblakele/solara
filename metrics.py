@@ -196,10 +196,7 @@ class MetricsBase:
         falling back on username and password.
         """
 
-        if self.vue and hasattr(self.vue, "auth"):
-            self.logger.debug(
-                {"auth": getattr(self.vue, "auth"), "vue_auth": self.vue_auth}
-            )
+        if not self.vue:
             return
 
         self.logger.debug({"keys": self.vue_keys})
@@ -230,8 +227,24 @@ class MetricsBase:
         if login_ok:
             self.logger.debug("login ok")
         else:
+            # Token login returned False — fall back to password auth.
+            self.logger.debug("token login failed, trying password")
+            try:
+                login_ok = self.vue.login(
+                    username=_cfg.vue_username,
+                    password=_cfg.vue_password,
+                    token_storage_file=self.vue_keys,
+                )
+            except Exception as inner_ex:
+                raise VueAuthenticationError(
+                    "Vue authentication failed: check credentials"
+                ) from inner_ex
+
+        if not login_ok:
             self.logger.error("login failed")
-            raise VueAuthenticationError("Vue authentication failed: check credentials")
+            raise VueAuthenticationError(
+                "Vue authentication failed: check credentials"
+            )
 
         self.vue_auth["last"] = datetime.now(timezone.utc)
 
@@ -461,6 +474,7 @@ class HourlyProjection(MetricsBase):
         if not scale == "1H" and data_len != 0:
             usage = usage * 60.0 / data_len
 
+        dsi["scale"] = scale
         dsi["instant"] = data_start + timedelta(seconds=data_len)
         dsi["seconds"] = data_len
         dsi["usage"] = usage

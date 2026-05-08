@@ -64,7 +64,7 @@ from load_models import (  # noqa: F401
     _tesla_state_to_dict,
 )
 
-from load_nbc import NBCPeriod, NBCCache, NBCReader, StateTracker, TetrisEngine  # noqa: F401
+from load_nbc import NBCPeriod, NBCCache, NBCReader, StateTracker, GapMinder  # noqa: F401
 
 from vocolinc import VOCOlinc  # noqa: F401, W0611 (re-exported for test patching)
 
@@ -83,7 +83,7 @@ class LoadManagerConfig:
         nbc_cache: Cache instance for NBC predictions; creates NBCCache(50s) if None.
         plug_ctrl: Plug controller instance; auto-detected from env when None.
         tesla_ctrl: Tesla controller instance; loaded from config when None.
-        engine: TetrisEngine instance; created with defaults if None.
+        engine: GapMinder instance; created with defaults if None.
         target_wh: Target Wh per QH (defaults to smartmeter.target_wh in devices.json).
         nbc_device: Device name for NBC readings (defaults to smartmeter.device in devices.json).
         enabled: Whether load management is active. Accepts True/False, or a time range tuple.
@@ -96,7 +96,7 @@ class LoadManagerConfig:
     nbc_cache: NBCCache | None = None
     plug_ctrl: AbstractPlugController | None = None
     tesla_ctrl: AbstractTeslaController | None = None
-    engine: TetrisEngine | None = None
+    engine: GapMinder | None = None
     target_wh: int | None = None
     nbc_device: str | None = None
     enabled: bool | tuple[Any, Any] | None = None  # type: ignore[type-arg]
@@ -116,7 +116,7 @@ logger = logging.getLogger(__name__)
 class LoadManager:
     """Top-level orchestrator that runs the load management loop.
 
-    Wires together NBCReader+Cache, StateTracker, controllers, and TetrisEngine
+    Wires together NBCReader+Cache, StateTracker, controllers, and GapMinder
     to execute one load management cycle per call. Thread-safe via internal lock.
 
     Accepts either a single LoadManagerConfig object or individual keyword
@@ -164,7 +164,7 @@ class LoadManager:
             plug_ctrl: Plug controller instance. If None, selected via
                 LOAD_PLUG_CONTROLLER env var (real or stub).
             tesla_ctrl: Tesla controller instance. If None, loaded from env.
-            engine: TetrisEngine instance. If None, creates default.
+            engine: GapMinder instance. If None, creates default.
             target_wh: Target Wh per QH. Defaults to smartmeter.target_wh in
                 devices.json.
             nbc_device: Device name for NBC readings. Defaults to
@@ -243,7 +243,7 @@ class LoadManager:
         if engine is not None:
             self.engine = engine
         else:
-            self.engine = TetrisEngine(
+            self.engine = GapMinder(
                 hysteresis_wh=hysteresis_wh,
                 charge_amps_min=tesla_config.charge_amps_min if tesla_config else 5,
                 charge_amps_max=tesla_config.charge_amps_max if tesla_config else 48,
@@ -662,7 +662,7 @@ class LoadManager:
         Detects external changes (e.g., user manually toggling a plug) by comparing
         the controller's reported state against our internal desired_state. When they
         diverge, updates both actual_state and desired_state to match reality so the
-        TetrisEngine makes decisions based on current conditions.
+        GapMinder makes decisions based on current conditions.
         """
         for name in self.plugs:
             try:
@@ -1293,7 +1293,7 @@ __all__ = [
     "RealPlugController",
     "RealTeslaController",
     "TESLA_TOKENS_FILE",
-    "TetrisEngine",
+    "GapMinder",
     "TeslaConfig",
     "TeslaController",
     "TeslaState",

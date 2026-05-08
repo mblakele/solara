@@ -92,11 +92,12 @@ class TestConfigClass:
         assert cfg.debug is True
 
     def test_dry_run_default(self):
-        """Returns True when LOAD_MANAGE_DRY_RUN is not set (default)."""
+        """Returns False when LOAD_MANAGE_DRY_RUN is not set (default)."""
+
         from config import Config
 
         cfg = Config()
-        assert cfg.dry_run is True
+        assert cfg.dry_run is False, f"Expected dry_run=False by default but got {cfg.dry_run}"
 
     def test_dry_run_disabled(self):
         """Returns False when LOAD_MANAGE_DRY_RUN=False."""

@@ -105,7 +105,7 @@ interface.
 using `getattr(ctrl, "plugs", {})`. The merged dictionary is exposed as
 `self.plugs` so the rest of `LoadManager` sees a unified view.
 
-**Rationale:** The `TetrisEngine`, `StateTracker`, and action execution code
+**Rationale:** The `GapMinder`, `StateTracker`, and action execution code
 all iterate over `LoadManager.plugs`. Keeping a single merged dict avoids
 duplicating iteration logic throughout the codebase.
 

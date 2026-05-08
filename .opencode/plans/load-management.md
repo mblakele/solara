@@ -19,7 +19,7 @@
 │  │  └──────┬──────┘ └────┬─────┘ └──────┬──────┘ │   │
 │  │         │              │              │         │   │
 │  │  ┌───────────────────────────────────────────┐ │   │
-│  │  │  TetrisEngine + StateTracker + NBC Cache  │ │   │
+│  │  │  GapMinder + StateTracker + NBC Cache    │ │   │
 │  │  └───────────────────────────────────────────┘ │   │
 │  └────────────────────────────────────────────────┘   │
 └───────────────────────────────────────────────────────┘
@@ -197,13 +197,13 @@ class StateTracker:
         """Return Wh this load can contribute if turned on for remaining QH seconds."""
 ```
 
-### TetrisEngine (renamed from LoadDecisionEngine)
+### GapMinder (renamed from TetrisEngine)
 
 The core algorithm is a **bin-packing-style** fit: given a surplus gap (negative = excess solar to consume), try loads in priority order until the gap is filled or no more loads available.
 
 ```python
-class TetrisEngine:
-    """Fit flexible loads into the NBC surplus gap like tetris pieces."""
+class GapMinder:
+    """Bin-pack flexible loads to fill (or reduce) the NBC surplus/deficit gap."""
     
     HYSTERESIS_WH = 1000
     MIN_TOGGLE_SECS = 60
@@ -334,7 +334,7 @@ class LoadManager:
         self.plug_ctrl = PlugController(load_plugs_from_env())
         tesla_config = load_tesla_config_from_env()
         self.tesla_ctrl = TeslaController(tesla_config) if tesla_config else None
-        self.engine = TetrisEngine()
+        self.engine = GapMinder()
         self.target_wh = config("LOAD_TARGET_WH", default=-500, cast=int)
         self.nbc_device = config("LOAD_NBC_DEVICE", default="", cast=str)
         self.enabled = config("LOAD_MANAGE_ENABLED", default="False", cast=bool)
@@ -417,13 +417,13 @@ class LoadManager:
 | 1.2 | Implement `NBCCache` | TTL-based cache with QH-change detection. `get_or_fetch()` returns cached or triggers fresh fetch. Mock-friendly interface. | ~50 |
 | 1.3 | Implement `NBCReader` | Parse metrics → find device by name → extract incomplete QH → return `(qh_name, predicted_wh, seconds_remaining)`. Handle edge cases: all complete, none started, device not found. | ~60 |
 | 1.4 | Implement `StateTracker` | Full implementation: `is_stale()`, `has_pending_effect_since()`, `estimated_current_wh()`, `can_toggle()`, `get_load_capacity_wh()`. | ~80 |
-| 1.5 | Implement `TetrisEngine.decide()` — excess solar path | Gap calculation, hysteresis check, build candidate list (fixed + flexible OFF plugs), sort by priority, bin-pack loads into gap. Tesla amp adjustment for residual gap. | ~120 |
-| 1.6 | Implement `TetrisEngine.decide()` — over-target path | Build removable candidates (flexible ON plugs only), sort by priority, remove loads to fill gap. Tesla amp reduction or stop. | ~80 |
+| 1.5 | Implement `GapMinder.decide()` — excess solar path | Gap calculation, hysteresis check, build candidate list (fixed + flexible OFF plugs), sort by priority, bin-pack loads into gap. Tesla amp adjustment for residual gap. | ~120 |
+| 1.6 | Implement `GapMinder.decide()` — over-target path | Build removable candidates (flexible ON plugs only), sort by priority, remove loads to fill gap. Tesla amp reduction or stop. | ~80 |
 | 1.7 | Config loading functions | `load_plugs_from_env()`: parse `LOAD_PLUG_<NAME>=id:watts:role[:priority]` pattern from decouple config. `load_tesla_config_from_env()`: return `TeslaConfig` or `None`. Validate roles, handle missing optional fields. | ~60 |
 | 1.8 | **Tests**: NBCReader unit tests | Test with MetricsMock at minute=10 (QH1 incomplete), 25 (QH2), 42 (QH3), 60 (all complete). Test device name filtering. Test None returns. | ~100 |
 | 1.9 | **Tests**: StateTracker unit tests | Stale detection boundaries, pending effect tracking with multiple effects, estimated Wh accuracy, debounce edge cases (< 60s, exactly 60s, > 60s). | ~80 |
-| 1.10 | **Tests**: TetrisEngine — excess solar | Various gap sizes vs load capacities. Priority ordering. Hysteresis boundary (no action at ±999 Wh, action at ±1001 Wh). Tesla amp calculation for residual gap. | ~120 |
-| 1.11 | **Tests**: TetrisEngine — over target | Turn off flexible only (not fixed). Priority ordering for removal. Partial removal with Tesla amp reduction. | ~80 |
+| 1.10 | **Tests**: GapMinder — excess solar | Various gap sizes vs load capacities. Priority ordering. Hysteresis boundary (no action at ±999 Wh, action at ±1001 Wh). Tesla amp calculation for residual gap. | ~120 |
+| 1.11 | **Tests**: GapMinder — over target | Turn off flexible only (not fixed). Priority ordering for removal. Partial removal with Tesla amp reduction. | ~80 |
 | 1.12 | **Tests**: Config loading | Valid/invalid ENV formats, missing optional priority defaults to 0, role validation, TeslaConfig None when no keys set. | ~60 |
 
 **Done when:** All Phase 1 tests pass. `uv run pylint load_manager.py` clean. `uv run mypy load_manager.py` clean.
@@ -451,7 +451,7 @@ class LoadManager:
 
 | # | Task | Details | Est. Lines |
 |---|------|---------|------------|
-| 3.1 | Implement `LoadManager.__init__()` and `run_cycle()` | Wire together NBCReader+Cache, StateTracker, stub controllers, TetrisEngine. Use `asyncio.run()` for async calls. Return status dict. | ~80 |
+| 3.1 | Implement `LoadManager.__init__()` and `run_cycle()` | Wire together NBCReader+Cache, StateTracker, stub controllers, GapMinder. Use `asyncio.run()` for async calls. Return status dict. | ~80 |
 | 3.2 | **Integration test**: Excess solar scenario | MetricsMock minute=42 (QH3 incomplete, negative predicted). Stub plugs + Tesla available. Verify correct "turn on" actions in priority order. | ~60 |
 | 3.3 | **Integration test**: Over-target scenario | Positive predicted > target. Verify "turn off" only for flexible plugs. Fixed plugs untouched. | ~50 |
 | 3.4 | **Integration test**: Tesla safety gates | `is_at_home=False` → no Tesla actions. `is_plugged_in=False` → no start_charging. `at_charge_limit=True` → Tesla skipped as candidate. | ~60 |
