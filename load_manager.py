@@ -9,29 +9,32 @@ for backward compatibility.
 from __future__ import annotations
 
 import asyncio
-import logging
-import re
-import threading
+from dataclasses import dataclass
 from datetime import datetime, time, timezone
+import logging
+import threading
+
+# Third-party imports.
 from typing import Any, Callable
 
 import pytz
+
+# First-party local imports — LoadManagerConfig references their types, so they must
+# appear before the dataclass definition below.
 import device_config
 
 from config import cfg as _cfg
-
-from load_models import (  # noqa: F401
-    AbstractPlugController,
-    AbstractTeslaController,
-    DeviceState,
-    PendingEffect,
-    PlugAction,
-    PlugConfig,
-    TeslaAuthError,
-    TeslaConfig,
-    TeslaState,
-    _tesla_state_to_dict,
+from config_loader import (  # noqa: F401
+    _parse_load_manage_enabled,
 )
+
+from config_loader import (  # runtime imports — also re-exported via __all__
+    load_plugs_from_file,
+    load_tesla_config,
+    load_vocolinc_credentials,
+    load_vocolinc_plugs_from_file,
+)
+
 from load_controllers import (  # noqa: F401
     CompositePlugController,
     PAIRINGS_FILE,
@@ -47,192 +50,64 @@ from load_controllers import (  # noqa: F401
     save_tesla_tokens,
     tesla_auth_cli,
 )
-from vocolinc import VOCOlinc  # noqa: F401  # pylint: disable=unused-import
+
+from load_models import (  # noqa: F401
+    AbstractPlugController,
+    AbstractTeslaController,
+    DeviceState,
+    PendingEffect,
+    PlugAction,
+    PlugConfig,
+    TeslaAuthError,
+    TeslaConfig,
+    TeslaState,
+    _tesla_state_to_dict,
+)
+
 from load_nbc import NBCPeriod, NBCCache, NBCReader, StateTracker, TetrisEngine  # noqa: F401
+
+from vocolinc import VOCOlinc  # noqa: F401, W0611 (re-exported for test patching)
+
+
+@dataclass(frozen=True)
+class LoadManagerConfig:
+    """Configuration for LoadManager initialization.
+
+    Groups related parameters to reduce __init__ argument count from 10
+    down to a single config object. All fields have sensible defaults so
+    production code can pass an empty LoadManagerConfig() and rely on env
+    vars / devices.json for the rest.
+
+    Attributes:
+        metrics_fetch: Callable that returns fresh metrics data, or None to load from env.
+        nbc_cache: Cache instance for NBC predictions; creates NBCCache(50s) if None.
+        plug_ctrl: Plug controller instance; auto-detected from env when None.
+        tesla_ctrl: Tesla controller instance; loaded from config when None.
+        engine: TetrisEngine instance; created with defaults if None.
+        target_wh: Target Wh per QH (defaults to smartmeter.target_wh in devices.json).
+        nbc_device: Device name for NBC readings (defaults to smartmeter.device in devices.json).
+        enabled: Whether load management is active. Accepts True/False, or a time range tuple.
+            Defaults to LOAD_MANAGE_ENABLED env var parsed via _parse_load_manage_enabled.
+        dry_run: If True, log actions without executing them (defaults to LOAD_MANAGE_DRY_RUN).
+        config_interval_secs: Target interval between cycles in seconds (default 30).
+    """
+
+    metrics_fetch: Callable[[], dict[str, Any] | None] | None = None
+    nbc_cache: NBCCache | None = None
+    plug_ctrl: AbstractPlugController | None = None
+    tesla_ctrl: AbstractTeslaController | None = None
+    engine: TetrisEngine | None = None
+    target_wh: int | None = None
+    nbc_device: str | None = None
+    enabled: bool | tuple[Any, Any] | None = None  # type: ignore[type-arg]
+    dry_run: bool | None = None
+    config_interval_secs: int = 30
+
+# Re-exported for backward compatibility.
 
 
 logger = logging.getLogger(__name__)
 
-
-# === Time-range parsing helpers ===
-
-_TIME_RANGE_RE = re.compile(r"^(\d{1,2}:\d{2})-(\d{1,2}:\d{2})$")
-
-
-def _parse_time(value: str) -> time:
-    """Parse a HH:MM string into a datetime.time object.
-
-    Args:
-        value: Time string in HH:MM 24-hour format.
-
-    Returns:
-        A timezone-naive time object.
-
-    Raises:
-        ValueError: If the string is not a valid HH:MM time.
-    """
-    parts = value.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid time format: {value!r}, expected HH:MM")
-    hour, minute = int(parts[0]), int(parts[1])
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError(
-            f"Time out of range: {value!r}, hour must be 0-23, minute 0-59"
-        )
-    return time(hour=hour, minute=minute)
-
-
-def _parse_load_manage_enabled(value: bool | str) -> bool | tuple[time, time]:
-    """Parse LOAD_MANAGE_ENABLED value.
-
-    Accepts "True", "False" (case-insensitive), or a time range in
-    HH:MM-HH:MM 24-hour format (e.g., "06:45-15:00"). A time range means
-    load management is active only during that window (inclusive start,
-    exclusive end). Also accepts Python bool values directly.
-
-    Args:
-        value: Raw string from the environment variable, or a Python bool
-            when coming through Config.load_manage_enabled.
-
-    Returns:
-        True if always enabled, False if never enabled, or a tuple of
-        (start_time, end_time) for time-range mode.
-
-    Raises:
-        ValueError: If the value doesn't match any recognized format.
-    """
-    # Handle Python bool values directly (from Config.load_manage_enabled).
-    if isinstance(value, bool):
-        return value
-
-    if value.strip().lower() in ("true", "1", "yes"):
-        return True
-    if value.strip().lower() in ("false", "0", "no", ""):
-        return False
-
-    match = _TIME_RANGE_RE.match(value.strip())
-    if match is not None:
-        start = _parse_time(match.group(1))
-        end = _parse_time(match.group(2))
-        return (start, end)
-
-    raise ValueError(
-        f"Invalid LOAD_MANAGE_ENABLED value: {value!r}. "
-        'Expected True/False or a time range like "06:45-15:00"'
-    )
-
-
-def _parse_device_time_range(value: str | None) -> tuple[time, time] | None:
-    """Parse a device-level time range string like '10:00-15:00'.
-
-    Args:
-        value: Raw string from devices.json, or None if not configured.
-
-    Returns:
-        Tuple of (start_time, end_time) or None if not configured.
-        Logs warning and returns None on parse error (device loads without
-        time restriction).
-    """
-    if value is None:
-        return None
-    match = _TIME_RANGE_RE.match(value.strip())
-    if match is None:
-        logger.warning("Invalid device time range %r, ignoring", value)
-        return None
-    return (_parse_time(match.group(1)), _parse_time(match.group(2)))
-
-
-# === Config loading functions ===
-
-
-def load_plugs_from_file() -> dict[str, PlugConfig]:
-    """Load HomeKit plug configurations from devices.json."""
-    plugs: dict[str, PlugConfig] = {}
-    for entry in device_config.get_homekit_plugs():
-        name = entry["name"].lower()
-        role = entry.get("role", "flexible")
-        if role not in ("flexible", "fixed"):
-            logger.warning("Invalid role %s for plug %s", role, name)
-            continue
-        plugs[name] = PlugConfig(
-            name=name,
-            accessory_id=entry["accessory_id"],
-            power_watts=float(entry["power_watts"]),
-            role=role,  # type: ignore
-            priority=int(entry.get("priority", 0)),
-            time_range=_parse_device_time_range(entry.get("time_range")),
-        )
-    return plugs
-
-
-def load_vocolinc_credentials() -> tuple[str, str] | None:
-    """Load VOCOlinc username and password from environment variables.
-
-    Returns:
-        Tuple of (username, password) or None if not configured.
-    """
-    username = _cfg.vocolinc_username
-    password = _cfg.vocolinc_password
-    if username and password:
-        return (username, password)
-    return None
-
-
-def load_vocolinc_plugs_from_file() -> dict[str, PlugConfig]:
-    """Load VOCOlinc plug configurations from devices.json."""
-    plugs: dict[str, PlugConfig] = {}
-    for entry in device_config.get_vocolinc_plugs():
-        name = entry["name"].lower()
-        role = entry.get("role", "flexible")
-        if role not in ("flexible", "fixed"):
-            logger.warning("Invalid role %s for VOCOlinc plug %s", role, name)
-            continue
-        plugs[name] = PlugConfig(
-            name=name,
-            accessory_id=entry["device_name"],
-            power_watts=float(entry["power_watts"]),
-            role=role,  # type: ignore
-            priority=int(entry.get("priority", 0)),
-            controller_type="vocolinc",
-            time_range=_parse_device_time_range(entry.get("time_range")),
-        )
-    return plugs
-
-
-def load_tesla_config() -> TeslaConfig | None:
-    """Load Tesla configuration.
-
-    Secrets (client_id, client_secret) come from environment variables via
-    decouple. Device settings (vehicle_id, GPS coords, charge limits) come
-    from devices.json.
-    """
-    dc = device_config.get_tesla_config()
-    if dc is None:
-        return None
-
-    client_id = _cfg.tesla_client_id
-    if not client_id:
-        return None
-
-    private_key_path = _cfg.tesla_private_key_path or None
-
-    client_secret: str | None = _cfg.tesla_client_secret
-    if not client_secret:
-        return None
-
-    return TeslaConfig(
-        client_id=client_id,
-        client_secret=client_secret,
-        redirect_uri=dc["redirect_uri"],
-        vehicle_id=dc["vehicle_id"],
-        home_lat=float(dc.get("home_lat", 0)),
-        home_lon=float(dc.get("home_lon", 0)),
-        home_radius_m=float(dc.get("home_radius_m", 500)),
-        charge_amps_min=int(dc.get("charge_amps_min", 5)),
-        charge_amps_max=int(dc.get("charge_amps_max", 48)),
-        private_key_path=private_key_path,
-        time_range=_parse_device_time_range(dc.get("time_range")),
-    )
 
 
 # === LoadManager Orchestrator ===
@@ -243,26 +118,49 @@ class LoadManager:
 
     Wires together NBCReader+Cache, StateTracker, controllers, and TetrisEngine
     to execute one load management cycle per call. Thread-safe via internal lock.
+
+    Accepts either a single LoadManagerConfig object or individual keyword
+    arguments for backward compatibility with existing callers.
+
+    Usage::
+
+        # New style — single config object
+        mgr = LoadManager(LoadManagerConfig(dry_run=True))
+
+        # Legacy style — individual kwargs (still supported)
+        mgr = LoadManager(dry_run=True, config_interval_secs=60)
+
     """
 
-    def __init__(  # pylint: disable=too-many-locals
+    # pylint: disable=too-many-locals, too-many-statements
+    def __init__(  # noqa: C901
         self,
-        metrics_fetch: Callable[[], dict[str, Any] | None] | None = None,
-        nbc_cache: NBCCache | None = None,
-        plug_ctrl: AbstractPlugController | None = None,
-        tesla_ctrl: AbstractTeslaController | None = None,
-        engine: TetrisEngine | None = None,
-        target_wh: int | None = None,
-        nbc_device: str | None = None,
-        enabled: bool | str | tuple[time, time] | None = None,
-        dry_run: bool | None = None,
-        config_interval_secs: int = 30,
+        config: LoadManagerConfig | None = None,
+        **kwargs: Any,  # type: ignore[assignment]
     ) -> None:
+
         """Initialize LoadManager with optional dependency injection.
 
+        Accepts a single `LoadManagerConfig` object containing all settings,
+        or individual keyword arguments for backward compatibility with existing
+        callers.
+
+        Usage::
+
+            # New style — single config object (recommended)
+            mgr = LoadManager(LoadManagerConfig(dry_run=True))
+
+            # Legacy style — individual kwargs (still supported)
+            mgr = LoadManager(dry_run=True, config_interval_secs=60)
+
         Args:
+            config: Optional LoadManagerConfig dataclass containing all settings.
+                When provided, overrides individual kwargs entirely.
+
+        **Backward-compatible keyword arguments** (deprecated in favour of
+        ``LoadManagerConfig``):
+
             metrics_fetch: Callable that returns fresh metrics data.
-            nbc_cache: Cache instance for NBC predictions.
             plug_ctrl: Plug controller instance. If None, selected via
                 LOAD_PLUG_CONTROLLER env var (real or stub).
             tesla_ctrl: Tesla controller instance. If None, loaded from env.
@@ -282,6 +180,33 @@ class LoadManager:
                 Used by adaptive sleep to clamp min/max sleep durations.
                 Defaults to 30 seconds.
         """
+
+        # ── Resolve config from either a LoadManagerConfig object or legacy kwargs
+        if config is not None:
+            # Primary path — use the LoadManagerConfig object directly.
+            metrics_fetch = config.metrics_fetch  # type: ignore[assignment]
+            nbc_cache = config.nbc_cache
+            plug_ctrl = config.plug_ctrl  # type: ignore[assignment]
+            tesla_ctrl = config.tesla_ctrl  # type: ignore[assignment]
+            engine = config.engine  # type: ignore[assignment]
+            target_wh = config.target_wh
+            nbc_device = config.nbc_device  # type: ignore[assignment]
+            enabled = config.enabled  # type: ignore[assignment]
+            dry_run = config.dry_run
+            interval_secs = config.config_interval_secs  # type: ignore[assignment]
+        else:
+            # Legacy path — accept individual kwargs for backward compatibility.
+            metrics_fetch = kwargs.get("metrics_fetch")  # type: ignore[assignment]
+            nbc_cache = kwargs.get("nbc_cache")  # type: ignore[assignment]
+            plug_ctrl = kwargs.get("plug_ctrl")  # type: ignore[assignment]
+            tesla_ctrl = kwargs.get("tesla_ctrl")  # type: ignore[assignment]
+            engine = kwargs.get("engine")  # type: ignore[assignment]
+            target_wh = kwargs.get("target_wh", None)  # type: ignore[assignment]
+            nbc_device = kwargs.get("nbc_device", None)  # type: ignore[assignment]
+            enabled = kwargs.get("enabled")  # type: ignore[assignment]
+            dry_run = kwargs.get("dry_run", None)  # type: ignore[assignment]
+            interval_secs = kwargs.get("config_interval_secs", 30)
+
         self._lock = threading.Lock()
         self.plug_ctrl: AbstractPlugController
         self.tesla_ctrl: AbstractTeslaController | None
@@ -310,7 +235,7 @@ class LoadManager:
             dry_run = _cfg.dry_run
         self.dry_run = dry_run
 
-        self.config_interval_secs = config_interval_secs
+        self.config_interval_secs = interval_secs  # type: ignore[assignment]
 
         hysteresis_wh = int(abs(target_wh) / 3)
         self.tesla_config = load_tesla_config()
@@ -662,8 +587,8 @@ class LoadManager:
             # No deficit. Early in the quarter -> sleep longer; late -> wake sooner.
             if seconds_remaining > 300:  # more than 5 min left in QH
                 return min(config_interval * 1.5, config_interval * 2)
-            else:
-                return min(config_interval * 1.25, config_interval * 2)
+
+            return min(config_interval * 1.25, config_interval * 2)
 
         # --- Deficit with no actions possible: proportional sleep ---
         gap = abs(predicted_wh - self.target_wh)

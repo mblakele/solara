@@ -20,6 +20,7 @@ dependencies = [
 ]
 
 [tool.pytest.ini_options]
+addopts = "--cov=. --cov-report=term-missing"
 testpaths = ["tests"]
 filterwarnings = [
     "ignore:module 'sre_parse' is deprecated:DeprecationWarning",
@@ -33,6 +34,7 @@ package = false
 [dependency-groups]
 dev = [
     "pylint>=4.0.5",
+    "pytest-cov>=5.0",
     "pytest>=9.0.2",
     "types-pytz>=2024.1",
     "types-requests>=2.32",
@@ -56,6 +58,10 @@ ignore_errors = true  # test data generator, less critical for types
 [[tool.mypy.overrides]]
 module = "conftest"
 ignore_errors = true  # test fixtures, less critical for types
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true  # test code, less critical for types
 
 [tool.pylint.design]
 max-args = 7

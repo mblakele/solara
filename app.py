@@ -8,9 +8,9 @@ for solar self-consumption optimization.
 
 import asyncio
 import atexit
-import html
+
 import logging
-import secrets
+
 import sys
 import threading
 import time
@@ -25,7 +25,6 @@ from flask import (
     Response,
     abort,
     make_response,
-    redirect,
     render_template,
     request,
 )
@@ -43,10 +42,17 @@ from metrics import (
 from mockdata import MetricsMock
 from util import CustomJSONProvider, is_debug
 
+
 # global setup
+from tesla_oauth import bp  # noqa: PLC0415
+
 app = Flask(__name__)
 app.logger.handlers.clear()
 app.logger.propagate = True
+
+# Register Tesla OAuth routes.
+app.register_blueprint(bp)
+
 
 def camelize(obj: object) -> object:
     """Convert snake_case keys to camelCase recursively."""
@@ -481,170 +487,6 @@ def load_status() -> Response:
 
     return _json_response(camelize(payload))
 
-
-# === Tesla OAuth Endpoints ===
-
-# In-memory CSRF state store: maps random state token → expiry timestamp.
-# Single-process; gunicorn must be run with a single worker for Tesla OAuth.
-_oauth_states: dict[str, float] = {}
-
-
-@app.route("/api/v1/tesla/auth/initiate")
-def tesla_auth_initiate() -> ResponseReturnValue:
-    """Initiate Tesla OAuth flow.
-
-    Returns JSON with the authorization URL, or HTML with an auto-redirect
-    when the client accepts text/html. The callback will be handled at /callback.
-    """
-    from load_manager import (
-        RealTeslaController,
-        load_tesla_config,
-        load_tesla_tokens,
-    )
-
-    tesla_config = load_tesla_config()
-    if tesla_config is None:
-        return abort(503, "Tesla Fleet API not configured in .env")
-
-    # Check if already authenticated
-    tokens = load_tesla_tokens()
-
-    if tokens and tokens.get("expires", 0) > time.time():
-        valid_until = datetime.fromtimestamp(
-            tokens["expires"], tz=pytz.UTC
-        ).isoformat()
-        if request.accept_mimetypes.accept_html:
-            return (
-                "<h1>Already Authenticated</h1>"
-                f"<p>Tesla token valid until {html.escape(valid_until)}.</p>"
-            )
-        return _json_response({
-            "authenticated": True,
-            "message": f"Already authenticated. Token valid until: {valid_until}",
-        })
-
-    state_token = secrets.token_urlsafe(32)
-    _oauth_states[state_token] = time.time() + 600  # expire in 10 minutes
-
-    try:
-        controller = RealTeslaController(tesla_config)
-        login_url = controller.get_login_url(state=state_token)
-    except Exception as e:
-        logger.error("Failed to generate Tesla login URL: %s", e)
-        _oauth_states.pop(state_token, None)
-        return abort(500, f"Failed to generate login URL: {e}")
-
-    if request.accept_mimetypes.accept_html:
-        return redirect(login_url)
-
-    return _json_response({
-        "authenticated": False,
-        "loginUrl": login_url,
-        "message": "Open this URL in your browser to authorize Tesla access.",
-    })
-
-
-@app.route("/callback")
-def tesla_auth_callback() -> ResponseReturnValue:
-    """Handle OAuth callback from Tesla.
-
-    Receives the authorization code, exchanges it for tokens, and persists them.
-    Returns a success page on completion.
-    """
-    from load_manager import (
-        RealTeslaController,
-        save_tesla_tokens,
-        load_tesla_config,
-    )
-
-    state = request.args.get("state", "")
-    state_expiry = _oauth_states.pop(state, None)
-    if not state or state_expiry is None or time.time() > state_expiry:
-        return (
-            "<h1>Tesla Auth Failed</h1>"
-            "<p>Invalid or expired state parameter. "
-            "Please restart the authentication flow.</p>",
-            400,
-        )
-
-    code = request.args.get("code")
-    if not code:
-        return (
-            "<h1>Tesla Auth Failed</h1><p>No authorization code received. "
-            "Please try again.</p>",
-            400,
-        )
-
-    tesla_config = load_tesla_config()
-    if tesla_config is None:
-        return (
-            "<h1>Tesla Auth Failed</h1><p>Tesla Fleet API not configured.</p>",
-            503,
-        )
-
-    async def _exchange():
-        controller = RealTeslaController(tesla_config)
-        await controller.exchange_code(code)
-        # pylint: disable=protected-access
-        # RealTeslaController internals needed to persist OAuth tokens.
-        await controller._ensure_api()
-        assert controller._api is not None
-        save_tesla_tokens(
-            refresh_token=controller._api.refresh_token,
-            access_token=controller._api._access_token,
-            expires=controller._api.expires,
-        )
-
-    try:
-        asyncio.run(_exchange())
-    except Exception as e:
-        logger.error("Tesla OAuth token exchange failed: %s", e)
-        return (
-            f"<h1>Tesla Auth Failed</h1>"
-            f"<p>Token exchange error: {html.escape(str(e))}</p>",
-            500,
-        )
-
-    return (
-        "<h1>Tesla Authentication Successful!</h1>"
-        "<p>You can close this tab or navigate away.</p>"
-        "<p>Your Tesla is now configured for load management.</p>"
-    )
-
-
-@app.route("/api/v1/tesla/status")
-def tesla_status() -> Response:
-    """Check Tesla authentication status.
-
-    Returns whether a valid token exists and its expiration time.
-    """
-    from load_manager import load_tesla_tokens, load_tesla_config
-
-    tesla_config = load_tesla_config()
-    if tesla_config is None:
-        return _json_response({
-            "configured": False,
-            "authenticated": False,
-            "message": "Tesla Fleet API not configured in .env",
-        })
-
-    tokens = load_tesla_tokens()
-    if tokens is None:
-        return _json_response({
-            "configured": True,
-            "authenticated": False,
-            "message": "Not authenticated. Visit /api/v1/tesla/auth/initiate to begin.",
-        })
-
-    expired = tokens.get("expires", 0) <= time.time()
-    return _json_response({
-        "configured": True,
-        "authenticated": not expired,
-        "tokenExpired": expired,
-        "expiresAt": datetime.fromtimestamp(
-            tokens["expires"], tz=pytz.UTC
-        ).isoformat(),
-    })
 
 
 if __name__ == "__main__":

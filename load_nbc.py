@@ -1024,9 +1024,6 @@ class TetrisEngine:
             )
             return None
 
-        power_delta = StateTracker.delta_amps_to_wh(
-            target_amps - current_amps, seconds_remaining
-        )
         return PendingEffect(
             device_name="tesla",
             action="set_amps",

@@ -2,6 +2,8 @@
 Call Emporia VUE API and marshal predicted usage.
 """
 
+import dataclasses
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -35,23 +37,53 @@ class _PopulationResult:
     nbc_data_start: datetime
 
 
+@dataclass(frozen=True)
+class _PredictionData:
+    """Aggregated prediction values for a device."""
+
+    value: float
+    min_value: float
+    max_value: float
+
+
+@dataclass(frozen=True)
+class _MinuteData:
+    """Per-minute prediction and remaining time."""
+
+    predicted: float
+    minutes_remaining: float
+
+
 @dataclass
 class DeviceMetrics:
     """Computed metrics for one device, separate from raw pyemvue response."""
 
-    gid: int
-    name: str
-    lag: timedelta
-    per_second_data: list[float]
-    prediction: float
-    prediction_min: float
-    prediction_max: float
-    minute_predicted: float
-    minutes_remaining: float
-    scales: dict[str, Any]
-    smoothing: dict[str, float]
-    nbc: dict[str, Any]
-    timezone: str
+    gid: int = 0
+    name: str = ""
+    lag: timedelta = dataclasses.field(  # type: ignore[assignment]
+        default_factory=timedelta, repr=False
+    )
+    per_second_data: list[float] = dataclasses.field(  # type: ignore[assignment]
+        default_factory=list, repr=False
+    )
+    prediction: _PredictionData = dataclasses.field(  # type: ignore[assignment]
+        default_factory=lambda: _PredictionData(value=0.0, min_value=0.0, max_value=0.0),
+        repr=False,
+    )
+    minute_data: _MinuteData = dataclasses.field(  # type: ignore[assignment]
+        default_factory=lambda: _MinuteData(predicted=0.0, minutes_remaining=0.0),
+        repr=False,
+    )
+    scales: dict[str, Any] = dataclasses.field(  # type: ignore[assignment]
+        default_factory=dict, repr=False
+    )
+    smoothing: dict[str, float] = dataclasses.field(  # type: ignore[assignment]
+        default_factory=dict, repr=False
+    )
+    nbc: dict[str, Any] = dataclasses.field(  # type: ignore[assignment]
+        default_factory=dict, repr=False
+    )
+    timezone: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for JSON/template consumption."""
@@ -60,11 +92,11 @@ class DeviceMetrics:
             "lag": self.lag,
             "name": self.name,
             "per_second_data": self.per_second_data,
-            "prediction": round(self.prediction, 14),
-            "prediction_min": round(self.prediction_min, 14),
-            "prediction_max": round(self.prediction_max, 14),
-            "minute_predicted": round(self.minute_predicted, 14),
-            "minutes_remaining": round(self.minutes_remaining, 14),
+            "prediction": round(self.prediction.value, 14),
+            "prediction_min": round(self.prediction.min_value, 14),
+            "prediction_max": round(self.prediction.max_value, 14),
+            "minute_predicted": round(self.minute_data.predicted, 14),
+            "minutes_remaining": round(self.minute_data.minutes_remaining, 14),
             "scales": self.scales,
             "smoothing": {k: round(v, 14) for k, v in self.smoothing.items()},
             "timezone": self.timezone,
@@ -609,11 +641,15 @@ class HourlyProjection(MetricsBase):
             name=vdi.device_name,
             lag=pred_result["lag"],
             per_second_data=pop_result.per_second_data,
-            prediction=pred_result["prediction"],
-            prediction_min=pred_result["prediction_min"],
-            prediction_max=pred_result["prediction_max"],
-            minute_predicted=pred_result["minute_predicted"],
-            minutes_remaining=pred_result["seconds_remaining"] / 60.0,
+            prediction=_PredictionData(
+                value=pred_result["prediction"],
+                min_value=pred_result["prediction_min"],
+                max_value=pred_result["prediction_max"],
+            ),
+            minute_data=_MinuteData(
+                predicted=pred_result["minute_predicted"],
+                minutes_remaining=pred_result["seconds_remaining"] / 60.0,
+            ),
             scales=pop_result.scales,
             smoothing=pred_result["smoothing"],
             nbc=nbc_result,
