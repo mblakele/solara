@@ -66,6 +66,28 @@ class NBCCache:
         self._ttl = timedelta(seconds=ttl_seconds)
         self._seconds_remaining_at_fetch: int | None = None
 
+    def _adaptive_ttl(self, seconds_remaining: int | None = None) -> timedelta:
+        """Return effective TTL based on time remaining in the quarter-hour.
+
+        Near QH boundaries (last 30s), use a shorter TTL to catch transitions
+        sooner. Mid-quarter, keep the full configured TTL (default 60s).
+
+        Args:
+            seconds_remaining: Seconds left in the current QH. If None, uses full TTL.
+
+        Returns:
+            Effective TTL as timedelta; minimum 10 seconds.
+        """
+        if seconds_remaining is None:
+            return self._ttl
+
+        # Near QH boundary (last 30s): use shorter TTL to catch transitions
+        if seconds_remaining <= 30:
+            return timedelta(seconds=max(10, int(self._ttl.total_seconds() * 0.25)))
+
+        # Mid-quarter: use full TTL
+        return self._ttl
+
     def get_or_fetch(
         self,
         _device_name: str,
@@ -92,11 +114,15 @@ class NBCCache:
         """
         now = datetime.now(timezone.utc)
 
+        effective_ttl: timedelta = self._ttl
+        if (self._seconds_remaining_at_fetch is not None and current_qh == self._cached_qh):
+            effective_ttl = self._adaptive_ttl(self._seconds_remaining_at_fetch)
+
         if (
             self._cache is not None
             and self._cached_at is not None
             and self._cached_qh == current_qh
-            and now - self._cached_at < self._ttl
+            and now - self._cached_at < effective_ttl
         ):
             return self._cache, False
 
@@ -118,6 +144,9 @@ class NBCCache:
     def is_valid(self, now: datetime) -> tuple[bool, str | None]:
         """Check if cache has a valid (non-expired) entry.
 
+        Uses adaptive TTL based on seconds remaining in the QH to detect
+        boundary transitions sooner.
+
         Args:
             now: Current timestamp to check against TTL.
 
@@ -127,9 +156,12 @@ class NBCCache:
         if (
             self._cache is not None
             and self._cached_at is not None
-            and (now - self._cached_at) < self._ttl
         ):
-            return True, self._cached_qh
+            effective_ttl: timedelta = self._ttl
+            if (self._seconds_remaining_at_fetch is not None):
+                effective_ttl = self._adaptive_ttl(self._seconds_remaining_at_fetch)
+            if now - self._cached_at < effective_ttl:
+                return True, self._cached_qh
         return False, None
 
     def has_qh_likely_ended(self, now: datetime) -> bool:
@@ -180,17 +212,19 @@ class NBCReader:
         self.metrics_fetch = metrics_fetch
 
     def get_current_qh(
-        self, device_name: str
+        self, device_name: str, force: bool = False
     ) -> tuple[str, float, int, datetime] | None:
         """Return (qh_name, predicted_wh, seconds_remaining, data_point_at) for QH.
 
-        Uses cache to avoid redundant API calls. Returns None if all quarters
+        Uses cache to avoid redundant API calls unless ``force`` is True, in
+        which case a fresh fetch always occurs. Returns None if all quarters
         are complete or no data available. The data_point_at timestamp is the
         time of the most recent per-second data point (fetched_at minus API
         lag), which is what stale detection and waiting detection use.
 
         Args:
             device_name: Name of the VUE device to query.
+            force: When True, bypass cache and always fetch fresh data from the API.
 
         Returns:
             Tuple of (qh_name, predicted_wh in Wh, seconds remaining in QH,
@@ -210,6 +244,21 @@ class NBCReader:
                     "_fetched_at", datetime.now(timezone.utc)
                 )
             return parsed
+
+        # When force=True, bypass cache entirely and always fetch fresh data.
+        if force:
+            cached = _fetch_and_parse()
+            if cached is None:
+                return None
+            fetched_at = cached.get("_fetched_at", datetime.now(timezone.utc))
+            data_lag_secs: float = cached.get("_data_lag_secs", 0.0)
+            data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
+            return (  # type: ignore[return-value]
+                cached.get("qh_name"),
+                cached.get("predicted_wh", 0),
+                cached.get("seconds_remaining", 0),
+                data_point_at,
+            )
 
         current_qh: str | None = None
         pre_fetched: dict[str, Any] | None = None

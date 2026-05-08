@@ -176,8 +176,9 @@ project-root
   Emporia API lag. Min toggle interval: 60 seconds.
 
 ### Key Architecture
-- LoadManager orchestrates cycles every 30 seconds via background thread
-- NBCReader + NBCCache fetches quarter-hour predictions (60s TTL)
+- LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
+  The optional `force=True` parameter bypasses the stale-data check and always fetches fresh NBC data from API.
+- NBCReader + NBCCache fetches quarter-hour predictions (60s TTL) with `get_current_qh(device_name, force=False)`
 - Controllers: PlugController (stub) / RealPlugController (aiohomekit), TeslaController (stub) / RealTeslaController (tesla-fleet-api)
 - Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>:<role>[:<priority>] env vars
 

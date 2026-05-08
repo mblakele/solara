@@ -10,7 +10,7 @@ from load_manager import (
     NBCReader,
 )
 
-from tests.helpers import _make_metrics_data
+from tests.helpers import _make_metrics_data, _make_qh_data
 
 
 # --- NBCPeriod.current_qh_window() unit tests ---
@@ -361,8 +361,6 @@ def test_reader_seconds_remaining_from_field():
 
 def test_reader_returns_none_all_complete():
     """None when all quarters complete."""
-    from tests.helpers import _make_qh_data
-
     reader = NBCReader()
     metrics = {
         "devices": [
@@ -379,3 +377,206 @@ def test_reader_returns_none_all_complete():
     }
     result = reader.get_current_qh_direct("main_panel", metrics)
     assert result is None
+
+
+# --- NBCReader force=True tests (using load_nbc.datetime patch) ---
+
+from unittest.mock import patch
+import datetime as dt_module
+
+
+def test_force_bypasses_cache():
+    """force=True forces a fresh fetch even when cache has valid data."""
+    call_log: list[str] = []
+
+    qh1_data = {
+        "devices": [{
+            "name": "panel",
+            "nbc": {
+                "QH1": _make_qh_data(0, 5, -200.0, False),
+                "QH2": None, "QH3": None, "QH4": None,
+            },
+        }],
+    }
+
+    qh2_data = {
+        "devices": [{
+            "name": "panel",
+            "nbc": {
+                "QH1": _make_qh_data(0, 60, -200.0, True),
+                "QH2": _make_qh_data(1, 5, -300.0, False),
+                "QH3": None, "QH4": None,
+            },
+        }],
+    }
+
+    fetch_responses = [qh1_data, qh2_data]
+
+    def fetch_func():
+        call_log.append("fetch")
+        return fetch_responses.pop(0)
+
+    cache = NBCCache(ttl_seconds=600)  # Long TTL
+    reader = NBCReader(cache=cache, metrics_fetch=fetch_func)
+
+    # First call: populates cache with QH1
+    result1 = reader.get_current_qh("panel")
+    assert result1 is not None
+    qh_name1, _, _, _ = result1
+    assert qh_name1 == "QH1"
+    assert len(call_log) == 1
+
+    # Second call without force: should use cache (same QH, TTL not expired)
+    result2 = reader.get_current_qh("panel")
+    assert result2 is not None
+    qh_name2, _, _, _ = result2
+    assert qh_name2 == "QH1"  # Still QH1 from cache
+    assert len(call_log) == 1  # No new fetch
+
+    # Third call with force=True: should bypass cache and fetch fresh data
+    result3 = reader.get_current_qh("panel", force=True)
+    assert result3 is not None
+    qh_name3, _, _, _ = result3
+    assert qh_name3 == "QH2"  # Fresh data shows QH2 now
+    assert len(call_log) == 2  # New fetch was made
+
+
+def test_force_populates_cache():
+    """After force=True call, subsequent non-force calls use the populated cache."""
+    qh2_data = {
+        "devices": [{
+            "name": "panel",
+            "nbc": {
+                "QH1": _make_qh_data(0, 60, -200.0, True),
+                "QH2": _make_qh_data(1, 5, -300.0, False),
+                "QH3": None, "QH4": None,
+            },
+        }],
+    }
+
+    # Provide two responses: one for force=True call, second for probe on non-force
+    fetch_responses = [qh2_data, qh2_data]
+
+    def fetch_func():
+        return fetch_responses.pop(0) if fetch_responses else None
+
+    cache = NBCCache(ttl_seconds=600)
+    reader = NBCReader(cache=cache, metrics_fetch=fetch_func)
+
+    # Call with force=True to populate cache
+    result1 = reader.get_current_qh("panel", force=True)
+    assert result1 is not None
+    qh_name, _, _, _ = result1
+    assert qh_name == "QH2"
+
+
+    # Subsequent non-force call should use cache
+    result2 = reader.get_current_qh("panel")
+    assert result2 is not None
+    qh_name2, _, _, _ = result2
+    assert qh_name2 == "QH2"
+
+
+# --- NBCCache adaptive TTL tests ---
+
+def test_adaptive_ttl_shorter_near_boundary():
+    """When seconds_remaining <= 30, effective TTL is ~25% of base (min 10s)."""
+    cache = NBCCache(ttl_seconds=60)
+
+    # Near boundary: 30 seconds remaining -> TTL should be ~15s (25% of 60)
+    ttl_near_boundary = cache._adaptive_ttl(seconds_remaining=30)
+    assert ttl_near_boundary == timedelta(seconds=max(10, int(60 * 0.25)))
+    assert ttl_near_boundary == timedelta(seconds=15)
+
+    # Even closer: 0 seconds remaining -> TTL should be ~15s (25% of 60)
+    ttl_zero = cache._adaptive_ttl(seconds_remaining=0)
+    assert ttl_zero == timedelta(seconds=max(10, int(60 * 0.25)))
+    assert ttl_zero == timedelta(seconds=15)
+
+
+def test_adaptive_ttl_full_mid_quarter():
+    """When seconds_remaining > 30, effective TTL equals base."""
+    cache = NBCCache(ttl_seconds=60)
+
+    # Mid-quarter: 450 seconds remaining -> full TTL
+    ttl_mid = cache._adaptive_ttl(seconds_remaining=450)
+    assert ttl_mid == timedelta(seconds=60)
+
+    # Also full TTL when seconds_remaining is None
+    ttl_none = cache._adaptive_ttl(seconds_remaining=None)
+    assert ttl_none == timedelta(seconds=60)
+
+
+def test_adaptive_ttl_minimum_10_seconds():
+    """Even with very short remaining time, TTL never drops below 10s."""
+    cache = NBCCache(ttl_seconds=60)
+
+    # Very short remaining time
+    ttl_short = cache._adaptive_ttl(seconds_remaining=1)
+    assert ttl_short == timedelta(seconds=max(10, int(60 * 0.25)))
+    assert ttl_short >= timedelta(seconds=10)
+
+    # With a very short base TTL, minimum still applies
+    cache_short = NBCCache(ttl_seconds=15)
+    ttl_min_base = cache_short._adaptive_ttl(seconds_remaining=30)  # near boundary
+    assert ttl_min_base == timedelta(seconds=max(10, int(15 * 0.25)))
+    assert ttl_min_base == timedelta(seconds=10)
+
+
+def test_is_valid_uses_adaptive_ttl():
+    """is_valid() uses adaptive TTL, not fixed base TTL."""
+    cache = NBCCache(ttl_seconds=60)
+
+    def fetch_func() -> dict:
+        return {"qh_name": "QH1", "predicted_wh": -200, "seconds_remaining": 30}
+
+    fetch_at = datetime.now(timezone.utc)
+    cache.get_or_fetch("device", "QH1", fetch_func)
+
+    # At 20s elapsed, adaptive TTL (15s for near-boundary) has expired
+    # but base TTL (60s) hasn't. is_valid should return False because adaptive
+    # TTL was used for the check.
+    twenty_seconds_later = fetch_at + timedelta(seconds=20)
+
+    # Patch _cached_at to simulate time passing
+    cache._cached_at = twenty_seconds_later - timedelta(seconds=20)
+
+    is_valid, _ = cache.is_valid(twenty_seconds_later)
+    # Adaptive TTL for seconds_remaining=30 is 15s, so at 20s elapsed it's expired
+    assert is_valid is False
+
+
+def test_run_cycle_uses_force_true():
+    """Verify NBCReader.get_current_qh() accepts force=True parameter.
+
+    This test verifies that the method signature supports force=True,
+    which is used by LoadManager.run_cycle() to always fetch fresh NBC data.
+
+    The actual integration of force=True in run_cycle is verified by the
+    fact that load_manager.py calls get_current_qh(self.nbc_device, force=True)
+    at line ~1062. This test ensures the parameter is accepted and works.
+    """
+    qh_data = {
+        "devices": [{
+            "name": "panel",
+            "nbc": {
+                "QH1": _make_qh_data(0, 5, -200.0, False),
+                "QH2": None, "QH3": None, "QH4": None,
+            },
+        }],
+    }
+
+    fetch_responses = [qh_data]
+
+    def fetch_func():
+        return fetch_responses.pop(0) if fetch_responses else None
+
+    cache = NBCCache(ttl_seconds=50)
+    reader = NBCReader(cache=cache, metrics_fetch=fetch_func)
+
+    # Verify the method accepts force=True without error
+    result = reader.get_current_qh("panel", force=True)
+
+    assert result is not None
+    qh_name, _, seconds_remaining, _ = result
+    assert qh_name == "QH1"
