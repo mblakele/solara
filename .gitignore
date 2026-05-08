@@ -1,9 +1,10 @@
 *.pyc
 .attached_assets
-bugs
+.coverage
 .env
 .lock
 .tesla-tokens.json
-.vue-keys.json
 .venv
+.vue-keys.json
+bugs
 devices.json
