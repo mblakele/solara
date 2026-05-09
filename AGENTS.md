@@ -111,7 +111,8 @@ project-root
 ├── conftest.py         # Pytest shared fixtures & configuration
 ├── energy_aggregator.py # TOU (time-of-use) energy aggregation logic
 ├── load_manager.py     # OAuth handling & load-shedding management
-├── metrics.py          # NBC (net-billing-cycle) calculation metrics
+├── metrics.py          # NBC (net-billing-cycle) calculation metrics, EnergyCache with
+                       # per-second sample storage, incremental fetch merging, and pruning
 ├── mockdata.py         # Test data generation utilities
 ├── util.py             # Shared utilities (JSON helpers, timezone handling)
 ├── pyproject.toml      # Project metadata, dependencies & script entrypoints
@@ -127,7 +128,7 @@ project-root
 
 ## Key entry points
 
-- NBC calculation in `metrics.py`
+- NBC calculation in `metrics.py` (EnergyCache with incremental fetch, sample merging, and pruning)
 - TOU in `energy_aggregator.py`
 - json in `util.py`
 - oauth in `load_manager.py`
@@ -175,10 +176,25 @@ project-root
   The threshold is 120 seconds from the most recent per-second data point, accounting for
   Emporia API lag. Min toggle interval: 60 seconds.
 
+### EnergyCache & Incremental Fetch
+- `EnergyCache` (metrics.py) stores per-second energy samples with metadata:
+  - `_samples`: list[float] — per-second Wh values
+  - `_data_start`: datetime — start time of the sample window
+  - `_sample_count`, `_last_sample_at`: metadata for diagnostics
+- `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that returns
+  only new samples since the last data point. Returns `None` on API error.
+- `_merge_samples(existing, new_data)`: merges new samples into existing cache, updating
+  metadata. Handles overlapping and non-overlapping data ranges.
+- `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent
+  unbounded memory growth. Called automatically by `get_or_fetch()`.
+- `get_or_fetch(fetcher, force=False)`: returns cached data if valid (within TTL), otherwise
+  calls the fetcher. When an incremental fetcher is available, it merges new samples into
+  existing cache instead of replacing them entirely.
+
 ### Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
   The optional `force=True` parameter bypasses the stale-data check and always fetches fresh NBC data from API.
-- NBCReader + NBCCache fetches quarter-hour predictions (60s TTL) with `get_current_qh(device_name, force=False)`
+- EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`
 - Controllers: PlugController (stub) / RealPlugController (aiohomekit), TeslaController (stub) / RealTeslaController (tesla-fleet-api)
 - Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>:<role>[:<priority>] env vars
 

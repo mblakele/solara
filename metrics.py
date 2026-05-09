@@ -3,6 +3,7 @@ Call Emporia VUE API and marshal predicted usage.
 """
 
 import dataclasses
+import threading
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -153,6 +154,338 @@ class MetricsCache:
         """Clear the cache."""
         self._data = None
         self._fetched_at = None
+
+
+
+def _build_incremental_fetch(
+    energy_cache: "EnergyCache",
+    vue: PyEmVue,
+    device_gid: int,
+    now: datetime | None = None,
+) -> Callable[[], dict[str, Any] | None]:
+    """Build a callable for incremental partial-range API fetches.
+
+    Returns a zero-argument function that can be passed to
+    ``energy_cache.get_or_fetch()``. The callable checks whether the cache
+    already has samples and, if so, computes a partial-range API call that
+    fetches only new data since the last sample. Old samples (older than
+    3600s) are pruned after merging.
+
+    On the first call (no existing samples), a full-range fetch is performed
+    covering the current hour up to ``now``.
+
+    Args:
+        energy_cache: The EnergyCache instance storing per-second samples.
+        vue: A PyEmVue client instance for API calls.
+        device_gid: The group ID (device identifier) to fetch data for.
+        now: Current time. Defaults to ``datetime.now(timezone.utc)``.
+
+    Returns:
+        A callable that returns a dict with ``per_second_data`` and
+        ``data_start``, or None on API error.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    def fetcher() -> dict[str, Any] | None:
+        """Fetch incremental per-second data and merge into cache.
+
+        Returns:
+            Dict with merged samples on success, None on error.
+        """
+        # Determine the start time for this fetch.
+        if energy_cache._samples is None or len(energy_cache._samples) == 0:  # pylint: disable=W0212
+            # First fetch — get data for the current hour.
+            chart_start = now.replace(minute=0, second=0, microsecond=0)
+            start_time = chart_start
+        else:
+            # Incremental fetch — start from the last sample time.
+            if energy_cache._data_start is None:  # pylint: disable=W0212
+                # Should not happen, but fall back to full fetch.
+                chart_start = now.replace(minute=0, second=0, microsecond=0)
+                start_time = chart_start
+            else:
+                last_sample_idx = len(energy_cache._samples) - 1  # pylint: disable=W0212
+                start_time = energy_cache._data_start + timedelta(  # pylint: disable=W0212
+                    seconds=last_sample_idx
+                )
+
+        try:
+            usage_data, data_start = vue.get_chart_usage(
+                device_gid,
+                start_time,
+                now,
+                scale=Scale.SECOND.value,
+                unit=Unit.KWH.value,
+            )
+
+            if usage_data is None or len(usage_data) == 0:
+                return None
+
+            # Return dict compatible with EnergyCache.get_or_fetch().
+            return {
+                "per_second_data": list(usage_data),
+                "data_start": data_start,
+            }
+
+        except (requests.exceptions.RequestException, IOError):
+            logger.exception(
+                "error fetching incremental data for device %d", device_gid
+            )
+            return None
+
+    return fetcher
+
+
+class EnergyCache:
+    """Unified cache for per-second energy samples with sliding-window semantics.
+
+    Stores raw kWh/second data points in a time-ordered list keyed by device name
+    (currently only one device is used). Supports incremental partial-range fetches:
+    when new data arrives, old points older than 3600s are pruned and only the
+    delta is fetched from pyemvue.
+
+    Thread-safe via internal lock for concurrent access between Flask and
+    LoadManager background threads.
+
+    Attributes:
+        _samples: Per-second data points, one float per second (kWh). Ordered by time.
+        _data_start: Timestamp of the first sample in _samples.
+        _last_fetch_at: When data was last fetched from API (for TTL/stale checks).
+        _ttl_seconds: Maximum age of cached data before forcing a refresh.
+        _sample_count: Number of samples in _samples (cached for incremental fetch).
+        _last_sample_at: Timestamp of the last sample in _samples.
+    """
+
+    def __init__(self, ttl_seconds: int = 30) -> None:
+        self._samples: list[float] | None = None
+        self._data_start: datetime | None = None  # start time of first sample
+        self._last_fetch_at: datetime | None = None
+        self._ttl_seconds = ttl_seconds
+        self._lock = threading.Lock()
+        # Sample metadata for incremental fetch tracking.
+        self._sample_count: int | None = None  # number of samples in _samples
+        self._last_sample_at: datetime | None = None  # time of last sample in _samples
+        # Full result dict from the most recent fetch (for non-incremental callers).
+        self._data: dict[str, Any] | None = None
+
+    def is_valid(self, now: datetime | None = None) -> bool:
+        """Check if cache has non-expired data.
+
+        Args:
+            now: Current time for TTL check. Defaults to datetime.now(timezone.utc).
+
+        Returns:
+            True if cache has data and it hasn't expired.
+        """
+        with self._lock:
+            if now is None:
+                now = datetime.now(timezone.utc)
+            if self._samples is None or len(self._samples) == 0:
+                return False
+            if self._last_fetch_at is None:
+                return False
+            elapsed = now - self._last_fetch_at
+            return elapsed.total_seconds() < self._ttl_seconds
+
+    def get_or_fetch(
+        self, fetch_func: Callable[[], dict[str, Any] | None], force: bool = False
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Return (metrics_dict_or_none, was_fresh).
+
+        If cache is valid and force=False: return cached data with was_fresh=False.
+        Otherwise calls fetch_func() (which should do an incremental or full API call),
+        stores the result, and returns was_fresh=True.
+
+        The fetch_func may return either:
+          - A full metrics dict (e.g. HourlyProjection.metrics) — stored as-is in
+            ``_data`` and returned directly to the caller.
+          - An incremental dict with "per_second_data" and "data_start" keys — the
+            per-second samples are merged into ``_samples`` for use by callers that
+            need raw data (e.g. NBCReader).
+
+        Args:
+            fetch_func: Callable that returns fresh data dict.
+            force: When True, bypass cache and always fetch.
+
+        Returns:
+            Tuple of (metrics_dict_or_none, was_fresh).
+        """
+        with self._lock:
+            now = datetime.now(timezone.utc)
+
+            # Check if cache is valid (non-expired data exists).
+            if not force and self._is_valid_unlocked(now):
+                return self._build_result(), False
+
+            # Fetch fresh data.
+            result = fetch_func()
+
+            if result is not None:
+                # Store the full result dict for non-incremental callers.
+                self._data = result
+
+                new_samples = result.get("per_second_data", [])
+
+                # Merge with existing samples (incremental fetch path).
+                if self._samples is not None and len(self._samples) > 0:
+                    # Append new samples to existing ones.
+                    self._samples = list(self._samples) + list(new_samples)
+
+                elif new_samples:
+                    self._samples = list(new_samples)
+
+                # Update data_start if we have samples.
+                if self._samples and "data_start" in result:
+                    # If we already have samples, compute the true start time.
+                    if self._data_start is not None:
+                        # New samples are appended, so start time doesn't change.
+                        pass
+                    else:
+                        self._data_start = result["data_start"]
+
+                # Prune old samples older than 3600s from now.
+                if self._samples:
+                    cutoff = now - timedelta(seconds=3600)
+                    # Determine the time of each sample to know which are old.
+                    if self._data_start is not None:
+                        # Compute how many samples are before the cutoff.
+                        old_count = 0
+                        for i, _ in enumerate(self._samples):
+                            sample_time = self._data_start + timedelta(seconds=i)
+                            if sample_time < cutoff:
+                                old_count += 1
+                            else:
+                                break
+                        if old_count > 0:
+                            self._samples = self._samples[old_count:]
+                            if self._data_start is not None:
+                                self._data_start = (
+                                    self._data_start + timedelta(seconds=old_count)
+                                )
+
+                # Update sample metadata.
+                if self._samples:
+                    self._sample_count = len(self._samples)
+                    if self._data_start is not None:
+                        self._last_sample_at = (
+                            self._data_start + timedelta(seconds=len(self._samples) - 1)
+                        )
+
+                self._last_fetch_at = now
+            else:
+                result = None  # Ensure we store None on failure.
+
+            return (result, True) if result is not None else (None, True)
+
+    def _is_valid_unlocked(self, now: datetime | None = None) -> bool:
+        """Check if cache has non-expired data (caller must hold lock).
+
+        Args:
+            now: Current time for TTL check. Defaults to datetime.now(timezone.utc).
+
+        Returns:
+            True if cache has data and it hasn't expired.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        # Cache is valid if we have either raw samples or a full result dict.
+        has_data = (
+            self._samples is not None and len(self._samples) > 0
+        ) or (self._data is not None)
+        if not has_data:
+            return False
+        if self._last_fetch_at is None:
+            return False
+        elapsed = now - self._last_fetch_at
+        return elapsed.total_seconds() < self._ttl_seconds
+
+    def _build_result(self) -> dict[str, Any] | None:
+        """Build the result dict from cached data (caller must hold lock).
+
+        Returns the full result dict stored by the most recent fetch.
+        Falls back to building a dict from raw samples when no full result is cached.
+
+        Returns:
+            Cached metrics dict, or a dict with per_second_data and data_start
+            built from raw samples, or None if no cached data exists.
+        """
+        # Return the full result dict if available (non-incremental path).
+        if self._data is not None:
+            return self._data
+
+        # Fall back to building from raw samples (incremental path).
+        if self._samples is None:
+            return None
+
+        result: dict[str, Any] = {
+            "per_second_data": self._samples,
+        }
+
+        if self._data_start is not None:
+            result["data_start"] = self._data_start
+
+        return result
+
+    def get_current_qh(self) -> dict[str, Any] | None:
+        """Extract current incomplete QH prediction from cached samples.
+
+        Computes NBC quarters on demand and returns the same structure that
+        NBCCache.get_or_fetch() would return: {qh_name, predicted_wh, seconds_remaining}.
+
+        Returns:
+            Dict with QH prediction info or None if no cached data.
+        """
+        with self._lock:
+            samples = self._samples
+
+        if samples is None or len(samples) == 0:
+            return None
+
+        # Determine how many seconds of data we have.
+        n = len(samples)
+
+        # Compute NBC quarters from raw samples.
+        data_start = self._data_start if self._data_start else datetime.now(timezone.utc)
+        nbc = compute_nbc_quarters(samples, min(n, len(samples)))
+
+        # Find the first incomplete QH.
+        qh_order = ["QH1", "QH2", "QH3", "QH4"]
+        for qh_name in qh_order:
+            qh_data = nbc.get(qh_name)
+            if qh_data is None:
+                continue
+            if not qh_data.get("complete", True):
+                return {
+                    "qh_name": qh_name,
+                    "predicted_wh": qh_data.get("predicted_wh", 0),
+                    "seconds_remaining": qh_data.get("remaining_seconds", 900 - n % 900),
+                    "data_start": data_start,
+                }
+
+        # All quarters complete — return the last one.
+        for qh_name in reversed(qh_order):
+            qh_data = nbc.get(qh_name)
+            if qh_data is not None and qh_data.get("complete", False):
+                return {
+                    "qh_name": qh_name,
+                    "predicted_wh": qh_data.get("wh", 0),
+                    "seconds_remaining": 0,
+                    "data_start": data_start,
+                }
+
+        return None
+
+    def invalidate(self) -> None:
+        """Clear the cache."""
+        with self._lock:
+            self._samples = None
+            self._data_start = None
+            self._last_fetch_at = None
+            self._sample_count = None
+            self._last_sample_at = None
+            self._data = None
+
 
 
 class VueAuthenticationError(Exception):

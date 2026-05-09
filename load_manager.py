@@ -64,9 +64,14 @@ from load_models import (  # noqa: F401
     _tesla_state_to_dict,
 )
 
-from load_nbc import NBCPeriod, NBCCache, NBCReader, StateTracker, GapMinder  # noqa: F401
+from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder  # noqa: F401
 
-from vocolinc import VOCOlinc  # noqa: F401, W0611 (re-exported for test patching)
+from metrics import EnergyCache
+
+from vocolinc import VOCOlinc  # pylint: disable=W0611
+
+# Re-exported for test patching — pylint complains about unused import but it's
+# intentionally exposed so tests can monkey-patch vocolinc.VOCOlinc.
 
 
 @dataclass(frozen=True)
@@ -80,7 +85,7 @@ class LoadManagerConfig:
 
     Attributes:
         metrics_fetch: Callable that returns fresh metrics data, or None to load from env.
-        nbc_cache: Cache instance for NBC predictions; creates NBCCache(50s) if None.
+        energy_cache: Shared EnergyCache for per-second samples; creates default if None.
         plug_ctrl: Plug controller instance; auto-detected from env when None.
         tesla_ctrl: Tesla controller instance; loaded from config when None.
         engine: GapMinder instance; created with defaults if None.
@@ -93,7 +98,7 @@ class LoadManagerConfig:
     """
 
     metrics_fetch: Callable[[], dict[str, Any] | None] | None = None
-    nbc_cache: NBCCache | None = None
+    energy_cache: EnergyCache | None = None
     plug_ctrl: AbstractPlugController | None = None
     tesla_ctrl: AbstractTeslaController | None = None
     engine: GapMinder | None = None
@@ -185,7 +190,7 @@ class LoadManager:
         if config is not None:
             # Primary path — use the LoadManagerConfig object directly.
             metrics_fetch = config.metrics_fetch  # type: ignore[assignment]
-            nbc_cache = config.nbc_cache
+            energy_cache = config.energy_cache
             plug_ctrl = config.plug_ctrl  # type: ignore[assignment]
             tesla_ctrl = config.tesla_ctrl  # type: ignore[assignment]
             engine = config.engine  # type: ignore[assignment]
@@ -197,7 +202,7 @@ class LoadManager:
         else:
             # Legacy path — accept individual kwargs for backward compatibility.
             metrics_fetch = kwargs.get("metrics_fetch")  # type: ignore[assignment]
-            nbc_cache = kwargs.get("nbc_cache")  # type: ignore[assignment]
+            energy_cache = kwargs.get("energy_cache")  # type: ignore[assignment]
             plug_ctrl = kwargs.get("plug_ctrl")  # type: ignore[assignment]
             tesla_ctrl = kwargs.get("tesla_ctrl")  # type: ignore[assignment]
             engine = kwargs.get("engine")  # type: ignore[assignment]
@@ -301,11 +306,14 @@ class LoadManager:
         else:
             self.tesla_ctrl = None
 
-        cache = nbc_cache or NBCCache(ttl_seconds=50)
         self.nbc_reader = NBCReader(
-            cache=cache,
-            metrics_fetch=metrics_fetch,
+            energy_cache=energy_cache,
         )
+
+        # Wire the metrics fetch callable into the NBCReader so that
+        # run_cycle(force=True) can trigger a fresh API fetch.
+        if metrics_fetch is not None:
+            self.nbc_reader._metrics_fetch = metrics_fetch  # noqa: SLF001
 
     @staticmethod
     def _resolve_enabled() -> bool | tuple[time, time]:
@@ -1059,7 +1067,7 @@ class LoadManager:
                 }
 
             # ── Stage 2: NBC fetch ─────────────────────────────────────────
-            qh_result = self.nbc_reader.get_current_qh(self.nbc_device, force=force)
+            qh_result = self.nbc_reader.get_current_qh(force=force)
             if qh_result is None:
                 return {
                     "status": "no_incomplete_qh",
@@ -1283,7 +1291,6 @@ __all__ = [
     "AbstractTeslaController",
     "CompositePlugController",
     "DeviceState",
-    "NBCCache",
     "NBCReader",
     "PAIRINGS_FILE",
     "PendingEffect",

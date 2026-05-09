@@ -33,9 +33,9 @@ from flask.typing import ResponseReturnValue
 from config import cfg as _cfg, get_timezone
 
 from metrics import (
+    EnergyCache,
     HourlyProjection,
     Metrics,
-    MetricsCache,
     TOUReporter,
     RetryableMetricsException,
 )
@@ -210,7 +210,7 @@ def error_retryable(e: RetryableMetricsException) -> Response:
 def index() -> ResponseReturnValue:
     """Main index endpoint serving HTML or JSON based on Accept header.
 
-    Uses MetricsCache to avoid hammering the pyemvue API. In mock mode,
+    Uses EnergyCache to avoid hammering the pyemvue API. In mock mode,
     falls back to MetricsMock for deterministic test data.
     """
     logger.debug("index")
@@ -232,7 +232,7 @@ def index() -> ResponseReturnValue:
         metrics_data = model.metrics
     else:
         # Real mode: use cached metrics to avoid hammering the API
-        metrics_data, was_fresh = _metrics_cache.get_or_fetch(
+        metrics_data, was_fresh = _energy_cache.get_or_fetch(
             lambda: HourlyProjection(logger).metrics
         )
         if was_fresh:
@@ -317,10 +317,9 @@ def tou() -> ResponseReturnValue:
 
 # === Load Management State ===
 
-# Shared caches to avoid hammering the pyemvue API.
-# MetricsCache TTL (29s) undershoots the load management cycle interval.
-# NBCCache TTL should be configured longer, as NBC predictions change slowly.
-_metrics_cache = MetricsCache(ttl_seconds=29)
+# Shared cache to avoid hammering the pyemvue API.
+# EnergyCache TTL (30s) undershoots the load management cycle interval.
+_energy_cache = EnergyCache(ttl_seconds=30)
 
 _load_manager = None
 _load_manager_lock = threading.Lock()
@@ -367,7 +366,7 @@ def _get_load_manager():
                 from load_manager import LoadManager
 
                 def metrics_fetch():
-                    return _metrics_cache.get_or_fetch(
+                    return _energy_cache.get_or_fetch(
                         lambda: HourlyProjection(logger).metrics
                     )[0]
 

@@ -7,7 +7,6 @@ from unittest.mock import patch
 from decouple import config
 
 from load_manager import (
-    NBCCache,
     AbstractPlugController,
     CompositePlugController,
     DeviceState,
@@ -18,6 +17,8 @@ from load_manager import (
     load_vocolinc_credentials,
 )
 import device_config
+
+from metrics import EnergyCache
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 import pytest
@@ -283,7 +284,7 @@ def test_composite_turns_on_both_types():
                 metrics_fetch=lambda: _make_metrics_with_wh(
                     "main_panel", "QH3", -8000.0
                 ),
-                nbc_cache=NBCCache(ttl_seconds=60),
+                energy_cache=EnergyCache(),
                 target_wh=-500,
                 nbc_device="main_panel",
                 enabled=True,
@@ -327,7 +328,7 @@ def test_composite_over_target_turns_off_vocolinc():
                 metrics_fetch=lambda: _make_metrics_with_wh(
                     "main_panel", "QH2", 2000.0
                 ),
-                nbc_cache=NBCCache(ttl_seconds=60),
+                energy_cache=EnergyCache(),
                 target_wh=-500,
                 nbc_device="main_panel",
                 enabled=True,

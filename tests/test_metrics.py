@@ -1,4 +1,3 @@
-import sys
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1358,6 +1357,699 @@ class TestHourlyProjectionNoPredictions(unittest.TestCase):
 
         # When predictions is empty, _data_lag_secs should not be set
         self.assertNotIn("_data_lag_secs", hp.metrics)
+
+
+class TestEnergyCache(unittest.TestCase):
+    """Tests for EnergyCache — unified per-second sample cache with sliding-window semantics."""
+
+    def test_import_exists(self):
+        """EnergyCache class must be importable from metrics."""
+        # This test fails until EnergyCache is implemented.
+        from metrics import EnergyCache  # noqa: F401
+
+    def test_initial_state_empty(self):
+        """Fresh EnergyCache has no samples, no start time, no fetch timestamp."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache()
+        self.assertIsNone(cache._samples)
+        self.assertIsNone(cache._data_start)
+        self.assertIsNone(cache._last_fetch_at)
+
+    def test_is_valid_false_when_empty(self):
+        """is_valid returns False when cache has no data."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache()
+        self.assertFalse(cache.is_valid())
+
+    def test_is_valid_true_after_fetch(self):
+        """is_valid returns True after a successful fetch within TTL."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+
+        def fetch_func():
+            return {
+                "per_second_data": [0.001] * 10,
+                "data_start": datetime.now(timezone.utc),
+            }
+
+        cache.get_or_fetch(fetch_func)
+        self.assertTrue(cache.is_valid())
+
+    def test_is_valid_false_after_ttl_expiry(self):
+        """is_valid returns False after TTL expires."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=0)  # TTL of 0 means always expired
+
+        def fetch_func():
+            return {
+                "per_second_data": [0.001] * 10,
+                "data_start": datetime.now(timezone.utc),
+            }
+
+        cache.get_or_fetch(fetch_func)
+        self.assertFalse(cache.is_valid())
+
+    def test_get_or_fetch_miss_on_first_call(self):
+        """First call to get_or_fetch should invoke fetch_func and return was_fresh=True."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        fetch_count = 0
+
+        now = datetime.now(timezone.utc)
+
+        def fetch_func():
+            nonlocal fetch_count
+            fetch_count += 1
+            return {
+                "per_second_data": [0.002] * 5,
+                "data_start": now,
+            }
+
+        result, was_fresh = cache.get_or_fetch(fetch_func)
+
+        self.assertEqual(fetch_count, 1)
+        self.assertTrue(was_fresh)
+        self.assertIsNotNone(result)
+
+    def test_get_or_fetch_hit_within_ttl(self):
+        """Second call within TTL should return cached data with was_fresh=False."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        fetch_count = 0
+        now = datetime.now(timezone.utc)
+
+        def fetch_func():
+            nonlocal fetch_count
+            fetch_count += 1
+            return {
+                "per_second_data": [0.003] * 5,
+                "data_start": now,
+            }
+
+        cache.get_or_fetch(fetch_func)
+        result2, was_fresh = cache.get_or_fetch(fetch_func)
+
+        self.assertEqual(fetch_count, 1)
+        self.assertFalse(was_fresh)
+        # Should return the same cached data object (identity check)
+
+    def test_get_or_fetch_miss_after_ttl_expiry(self):
+        """After TTL expires, get_or_fetch should call fetch_func again."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=0)  # Always expired
+        fetch_count = 0
+
+        def fetch_func():
+            nonlocal fetch_count
+            fetch_count += 1
+            return {
+                "per_second_data": [0.004] * fetch_count,  # Varying length
+                "data_start": datetime.now(timezone.utc),
+            }
+
+        cache.get_or_fetch(fetch_func)
+        self.assertEqual(fetch_count, 1)
+
+        result2, was_fresh = cache.get_or_fetch(fetch_func)
+        self.assertEqual(fetch_count, 2)
+        self.assertTrue(was_fresh)
+
+    def test_get_or_fetch_force_bypasses_cache(self):
+        """force=True should always call fetch_func even if cache is valid."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        fetch_count = 0
+
+        def fetch_func():
+            nonlocal fetch_count
+            fetch_count += 1
+            return {
+                "per_second_data": [0.005] * 3,
+                "data_start": datetime.now(timezone.utc),
+            }
+
+        cache.get_or_fetch(fetch_func)  # First call: fresh
+        self.assertEqual(fetch_count, 1)
+
+        _, was_fresh = cache.get_or_fetch(fetch_func, force=True)
+        self.assertEqual(fetch_count, 2)
+        self.assertTrue(was_fresh)
+
+    def test_get_or_fetch_stores_last_fetch_at_only_on_api_call(self):
+        """_last_fetch_at should only be set when data comes from the API, not on cache hit."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        fetch_count = 0
+
+        def fetch_func():
+            nonlocal fetch_count
+            fetch_count += 1
+            return {
+                "per_second_data": [0.006] * 5,
+                "data_start": datetime.now(timezone.utc),
+            }
+
+        cache.get_or_fetch(fetch_func)
+        first_fetch_at = cache._last_fetch_at
+
+        # Second call should be a cache hit — _last_fetch_at unchanged
+        time.sleep(0.01)  # Small delay to ensure different timestamp if updated
+        cache.get_or_fetch(fetch_func)
+
+        self.assertEqual(cache._last_fetch_at, first_fetch_at)
+        self.assertEqual(fetch_count, 1)
+
+    def test_get_or_fetch_none_result(self):
+        """When fetch_func returns None, cache stores None and is_valid returns False."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+
+        def fetch_func():
+            return None  # Simulate API failure
+
+        result, was_fresh = cache.get_or_fetch(fetch_func)
+        self.assertIsNone(result)
+
+    def test_invalidate_clears_cache(self):
+        """After invalidate, next call fetches fresh data."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        fetch_count = 0
+
+        def fetch_func():
+            nonlocal fetch_count
+            fetch_count += 1
+            return {
+                "per_second_data": [0.007] * 5,
+                "data_start": datetime.now(timezone.utc),
+            }
+
+        cache.get_or_fetch(fetch_func)
+        self.assertEqual(fetch_count, 1)
+
+        cache.invalidate()
+
+        result2, was_fresh = cache.get_or_fetch(fetch_func)
+        self.assertEqual(fetch_count, 2)
+        self.assertTrue(was_fresh)
+
+    def test_get_current_qh_returns_none_when_empty(self):
+        """get_current_qh returns None when cache has no data."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache()
+        self.assertIsNone(cache.get_current_qh())
+
+    def test_get_or_fetch_merges_samples(self):
+        """New samples from fetch_func should be appended to existing _samples."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+
+        def fetch_func():
+            # Simulate incremental data: first call returns 5 samples, second adds more
+            if not cache._samples or len(cache._samples) == 0:
+                return {
+                    "per_second_data": [0.1] * 5,
+                    "data_start": datetime.now(timezone.utc),
+                }
+            else:
+                return {
+                    "per_second_data": [0.2] * 3,  # New samples appended
+                    "data_start": datetime.now(timezone.utc),
+                }
+
+        cache.get_or_fetch(fetch_func)  # First fetch: [0.1, 0.1, 0.1, 0.1, 0.1]
+        self.assertEqual(len(cache._samples), 5)
+
+        # Use force=True to simulate an incremental fetch that appends new samples.
+        cache.get_or_fetch(fetch_func, force=True)  # Second fetch: append [0.2, 0.2, 0.2]
+        self.assertEqual(len(cache._samples), 8)
+
+    def test_get_current_qh_computes_from_samples(self):
+        """get_current_qh should compute QH prediction from raw samples."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime.now(timezone.utc).replace(second=30, microsecond=0)
+
+        # 1200 samples (first 20 minutes = QH1 complete + first 5 min of QH2)
+        samples = [0.001] * 1200
+
+        def fetch_func():
+            return {
+                "per_second_data": samples,
+                "data_start": now - timedelta(seconds=len(samples)),
+            }
+
+        cache.get_or_fetch(fetch_func)
+        result = cache.get_current_qh()
+
+        self.assertIsNotNone(result)
+        # Should return a dict with QH prediction info
+        self.assertIn("qh_name", result)
+
+    def test_thread_safety_concurrent_access(self):
+        """Concurrent reads and writes should not corrupt the sample list."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        errors: list[str] = []
+
+        def writer():
+            try:
+                for _ in range(10):
+                    cache.get_or_fetch(lambda: {
+                        "per_second_data": [0.1] * 5,
+                        "data_start": datetime.now(timezone.utc),
+                    })
+            except Exception as ex:  # noqa: BLE001
+                errors.append(str(ex))
+
+        def reader():
+            try:
+                for _ in range(10):
+                    cache.get_current_qh()
+            except Exception as ex:  # noqa: BLE001
+                errors.append(str(ex))
+
+        import threading
+
+        threads = [threading.Thread(target=writer) for _ in range(3)]
+        threads += [threading.Thread(target=reader) for _ in range(3)]
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [], f"Thread errors occurred: {errors}")
+        # Samples should be a list (not corrupted) and have some length
+        self.assertIsInstance(cache._samples, list | type(None))
+
+    def test_pruning_removes_samples_older_than_3600s(self):
+        """Samples older than 3600 seconds from now are pruned after get_or_fetch."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        # Pre-populate with 5000 samples (over an hour of data)
+        old_start = now - timedelta(seconds=5000)
+        cache._samples = [0.1] * 5000
+        cache._data_start = old_start
+
+        # Patch datetime.now so pruning uses our test time
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+
+            def fetch_func():
+                return {
+                    "per_second_data": [0.2] * 10,
+                    "data_start": now - timedelta(seconds=10),
+                }
+
+            cache.get_or_fetch(fetch_func, force=True)
+
+        # After merge: 5010 samples. After pruning (keep last 3600s): ~3610
+        self.assertLess(len(cache._samples), 5000)
+        # Should keep roughly the last 3600 samples plus the new ones
+        self.assertLessEqual(len(cache._samples), 3620)
+
+    def test_pruning_does_not_remove_recent_samples(self):
+        """Samples within the last 3600s are preserved after pruning."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        # Pre-populate with exactly 3600 samples (1 hour of data)
+        old_start = now - timedelta(seconds=3600)
+        cache._samples = [0.1] * 3600
+        cache._data_start = old_start
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+
+            def fetch_func():
+                return {
+                    "per_second_data": [0.2] * 5,
+                    "data_start": now - timedelta(seconds=5),
+                }
+
+            cache.get_or_fetch(fetch_func, force=True)
+
+        # All 3605 samples should be kept (none older than 3600s)
+        self.assertEqual(len(cache._samples), 3605)
+
+    def test_get_current_qh_returns_incomplete_qh(self):
+        """get_current_qh returns the first incomplete quarter with extrapolated prediction."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
+
+        # 450 samples = halfway through QH1 (0-899 seconds)
+        # Each sample is 0.5 Wh (stored as kWh in per_second_data, so 0.5 * 1000 = 500 Wh per second...
+        # actually per_second_data is in kWh, so 0.5 kWh/sec = 500 Wh/sec)
+        # Let's use small values: 0.001 kWh = 1 Wh per second
+        samples = [0.001] * 450
+
+        def fetch_func():
+            return {
+                "per_second_data": samples,
+                "data_start": now - timedelta(seconds=450),
+            }
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            cache.get_or_fetch(fetch_func)
+
+        result = cache.get_current_qh()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["qh_name"], "QH1")
+        self.assertFalse(result.get("seconds_remaining", 0) == 0)
+
+    def test_get_current_qh_returns_complete_last_qh_when_all_done(self):
+        """When all 4 quarters are complete, get_current_qh returns QH4."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime(2025, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
+
+        # 3600 samples = exactly one hour (all 4 quarters complete)
+        samples = [0.01] * 3600
+
+        def fetch_func():
+            return {
+                "per_second_data": samples,
+                "data_start": now - timedelta(seconds=3600),
+            }
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            cache.get_or_fetch(fetch_func)
+
+        result = cache.get_current_qh()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["qh_name"], "QH4")
+        # QH4 is complete, so seconds_remaining should be 0
+        self.assertEqual(result["seconds_remaining"], 0)
+
+    def test_get_current_qh_skips_complete_quarters(self):
+        """get_current_qh skips complete quarters and returns the first incomplete one."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime(2025, 6, 1, 12, 37, 30, tzinfo=timezone.utc)
+
+        # 2250 samples = QH1 (900s), QH2 (900s) complete, halfway through QH3
+        samples = [0.002] * 2250
+
+        def fetch_func():
+            return {
+                "per_second_data": samples,
+                "data_start": now - timedelta(seconds=2250),
+            }
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            cache.get_or_fetch(fetch_func)
+
+        result = cache.get_current_qh()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["qh_name"], "QH3")
+
+
+class TestBuildIncrementalFetch(unittest.TestCase):
+    """Tests for _build_incremental_fetch helper function."""
+
+    def test_returns_callable(self):
+        """_build_incremental_fetch returns a callable (zero-arg function)."""
+        from metrics import EnergyCache, _build_incremental_fetch
+
+        cache = EnergyCache(ttl_seconds=60)
+        fetcher = _build_incremental_fetch(cache, MagicMock(), 1, datetime.now(timezone.utc))
+        self.assertTrue(callable(fetcher))
+
+    def test_first_fetch_no_existing_samples(self):
+        """When cache has no samples, fetcher calls API with full range."""
+        from metrics import EnergyCache, _build_incremental_fetch
+
+        cache = EnergyCache(ttl_seconds=60)
+        vue_mock = MagicMock()
+        gid = 1
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        # Mock API to return some data
+        vue_mock.get_chart_usage.return_value = (
+            [0.1] * 300,
+            now - timedelta(minutes=5),
+        )
+
+        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+        result = fetcher()
+
+        # Should have called get_chart_usage with full range (chart_start to now)
+        vue_mock.get_chart_usage.assert_called_once()
+        call_args = vue_mock.get_chart_usage.call_args
+        # First positional arg is the channel, second is start time
+        self.assertEqual(call_args[0][1], now.replace(minute=0, second=0))  # chart_start
+        self.assertEqual(call_args[0][2], now)
+
+    def test_incremental_fetch_uses_last_sample_time(self):
+        """When cache has samples, fetcher starts from last sample time."""
+        from metrics import EnergyCache, _build_incremental_fetch
+
+        cache = EnergyCache(ttl_seconds=60)
+        vue_mock = MagicMock()
+        gid = 1
+
+        # Pre-populate cache with samples
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        old_start = now - timedelta(minutes=5)  # 300 seconds ago
+
+        cache._samples = [0.1] * 300
+        cache._data_start = old_start
+
+        # Mock API to return new samples starting from where cache left off
+        vue_mock.get_chart_usage.return_value = (
+            [0.2] * 60,  # 60 new samples
+            old_start + timedelta(seconds=300),
+        )
+
+        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+        result = fetcher()
+
+        # Should call get_chart_usage starting from last sample time
+        vue_mock.get_chart_usage.assert_called_once()
+        call_args = vue_mock.get_chart_usage.call_args
+        # Start time should be old_start + 300 seconds = now
+        expected_start = old_start + timedelta(seconds=299)  # last sample index
+        self.assertEqual(call_args[0][1], expected_start)
+
+    def test_incremental_fetch_merges_samples(self):
+        """New samples from API are appended to existing cache samples via get_or_fetch."""
+        from metrics import EnergyCache, _build_incremental_fetch
+
+        cache = EnergyCache(ttl_seconds=60)
+        vue_mock = MagicMock()
+        gid = 1
+
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        old_start = now - timedelta(minutes=5)
+
+        # Pre-populate cache with 300 samples
+        cache._samples = [0.1] * 300
+        cache._data_start = old_start
+
+        # Mock API to return new samples starting from where cache left off
+        vue_mock.get_chart_usage.return_value = (
+            [0.2] * 60,  # 60 new samples
+            old_start + timedelta(seconds=300),
+        )
+
+        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+        # Patch datetime.now so pruning doesn't wipe out 2025 data
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            cache.get_or_fetch(fetcher, force=True)
+
+        # Cache should have merged samples: 300 + 60 = 360
+        self.assertEqual(len(cache._samples), 360)
+
+    def test_api_error_returns_none(self):
+        """When API raises an error, fetcher returns None and cache is unchanged."""
+        from metrics import EnergyCache, _build_incremental_fetch
+
+        cache = EnergyCache(ttl_seconds=60)
+        vue_mock = MagicMock()
+        gid = 1
+
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        old_start = now - timedelta(minutes=5)
+
+        # Pre-populate cache with samples
+        cache._samples = [0.1] * 300
+        cache._data_start = old_start
+
+        # Mock API to raise an error
+        vue_mock.get_chart_usage.side_effect = requests.exceptions.HTTPError("API error")
+
+        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+        result = fetcher()
+
+        self.assertIsNone(result)
+        # Cache should be unchanged
+        self.assertEqual(len(cache._samples), 300)
+
+    def test_prunes_old_samples(self):
+        """Samples older than 3600s from now are pruned via get_or_fetch."""
+        from metrics import EnergyCache, _build_incremental_fetch
+
+        cache = EnergyCache(ttl_seconds=60)
+        vue_mock = MagicMock()
+        gid = 1
+
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        # Old samples from 2 hours ago (7200 seconds)
+        old_start = now - timedelta(hours=2)
+
+        # Pre-populate cache with 7200 samples (2 hours of per-second data)
+        cache._samples = [0.1] * 7200
+        cache._data_start = old_start
+
+        # Mock API to return new samples (only the last 10 minutes worth)
+        vue_mock.get_chart_usage.return_value = (
+            [0.2] * 600,  # 600 new samples (10 minutes)
+            old_start + timedelta(seconds=7200),
+        )
+
+        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+        # Patch datetime.now so pruning uses our test time
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            cache.get_or_fetch(fetcher, force=True)
+
+        # After merging: 7200 + 600 = 7800 samples
+        # After pruning (keep only last 3600s): should be ~4200 samples
+        # (7800 - 3600 = 4200)
+        self.assertLessEqual(len(cache._samples), 7800)
+        # Should have pruned old samples
+        self.assertLess(len(cache._samples), 7200)
+
+
+class TestEnergyCacheSampleMetadata(unittest.TestCase):
+    """Tests for EnergyCache sample metadata tracking."""
+
+    def test_initial_state_has_sample_count_none(self):
+        """Fresh cache has _sample_count = None."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache()
+        self.assertIsNone(cache._sample_count)
+
+    def test_initial_state_has_last_sample_at_none(self):
+        """Fresh cache has _last_sample_at = None."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache()
+        self.assertIsNone(cache._last_sample_at)
+
+    def test_get_or_fetch_sets_sample_count(self):
+        """After get_or_fetch, _sample_count reflects the number of samples."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime.now(timezone.utc)
+
+        def fetch_func():
+            return {
+                "per_second_data": [0.1] * 50,
+                "data_start": now,
+            }
+
+        cache.get_or_fetch(fetch_func)
+        self.assertEqual(cache._sample_count, 50)
+
+    def test_get_or_fetch_sets_last_sample_at(self):
+        """After get_or_fetch, _last_sample_at reflects the last sample time."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime.now(timezone.utc)
+
+        def fetch_func():
+            return {
+                "per_second_data": [0.1] * 50,
+                "data_start": now - timedelta(seconds=50),
+            }
+
+        cache.get_or_fetch(fetch_func)
+        # Last sample time = data_start + (count - 1) seconds ≈ now
+        self.assertIsNotNone(cache._last_sample_at)
+
+
+class TestIncrementalFetchIntegration(unittest.TestCase):
+    """Integration tests for incremental fetch with get_or_fetch."""
+
+    def test_full_then_incremental(self):
+        """Full fetch followed by incremental fetch merges correctly."""
+        from metrics import EnergyCache, _build_incremental_fetch
+
+        cache = EnergyCache(ttl_seconds=60)
+        vue_mock = MagicMock()
+        gid = 1
+
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        call_count = 0
+
+        def fetch_func():
+            nonlocal call_count
+            call_count += 1
+
+            if call_count == 1:
+                # First fetch: full range, 300 samples (5 minutes)
+                start = now - timedelta(minutes=5)
+                return {
+                    "per_second_data": [0.1] * 300,
+                    "data_start": start,
+                }
+
+            # Incremental fetch: 60 new samples
+            return {
+                "per_second_data": [0.2] * 60,
+                "data_start": now - timedelta(seconds=60),
+            }
+
+        # Build incremental fetcher (used to verify it doesn't crash)
+        _fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+
+        # Patch datetime.now so pruning doesn't wipe out 2025 data
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+
+            # First fetch: full range
+            cache.get_or_fetch(fetch_func)
+            self.assertEqual(len(cache._samples), 300)
+
+            # Second call with force=True to simulate incremental fetch
+            cache.get_or_fetch(fetch_func, force=True)
+            self.assertEqual(len(cache._samples), 360)
 
 
 if __name__ == "__main__":

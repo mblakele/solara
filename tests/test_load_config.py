@@ -9,7 +9,6 @@ import pytest
 from decouple import UndefinedValueError, config
 
 from load_manager import (
-    NBCCache,
     AbstractPlugController,
     DeviceState,
     LoadManager,
@@ -23,6 +22,7 @@ from load_manager import (
 )
 from load_models import TeslaAuthError
 import device_config
+from metrics import EnergyCache
 from tests.helpers import _make_metrics_with_wh
 
 
@@ -245,10 +245,10 @@ def _make_manager_with_enabled(
     plug_ctrl = PlugController(plugs)
     metrics_data = _make_metrics_with_wh("main_panel", "QH3", predicted_wh)
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = EnergyCache()
     return LoadManager(
         metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,

@@ -5,8 +5,7 @@
 Load management runs as a background thread that cycles every N seconds
 (configured via `LOAD_MANAGE_INTERVAL_SECS`, default 30s). Each cycle:
 
-1. **NBC Prediction**: Fetches quarter-hour energy prediction from the Emporia VUE API
-   (cached with 60s TTL to avoid rate limits)
+1. **NBC Prediction**: Reads quarter-hour energy prediction from `EnergyCache`, a sliding-window cache of per-second samples in `metrics.py`
 2. **State Adjustment**: Adjusts raw prediction with pending effect deltas from
    actions already taken this quarter-hour, so decisions account for loads already toggled
 3. **GapMinder:** Compares adjusted prediction against target Wh,
@@ -15,7 +14,7 @@ Load management runs as a background thread that cycles every N seconds
 
 Key components:
 - `LoadManager`: Orchestrator that runs cycles in a background thread
-- `NBCCache`/`NBCReader`: Fetches and caches quarter-hour predictions (60s TTL)
+- `EnergyCache`/`NBCReader`: Stores per-second samples in a sliding window; NBCReader reads QH predictions from it
 - `StateTracker`: Tracks device states, pending effects, stale data detection
 - `GapMinder`: Decision logic for which loads to toggle
 - Controllers: `RealPlugController` (HomeKit), `VocolincPlugController`,

@@ -1,20 +1,45 @@
 """
-NBC cache/reader, device state tracking, and the bin-packing decision engine.
+NBC reader, device state tracking, and the bin-packing decision engine.
+
+NBCReader reads current quarter-hour predictions from a shared EnergyCache
+instance instead of maintaining its own NBCCache layer. NBC quarters are
+computed on demand from raw per-second samples via util.compute_nbc_quarters().
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
 
 from load_models import DeviceState, PendingEffect, TeslaState
+
+# Deferred import to avoid circular dependency with metrics module.
+_energy_cache_type: Any = None
+
+
+def _get_energy_cache_type() -> Any:
+    """Return the EnergyCache class, importing lazily to avoid circular deps."""
+    global _energy_cache_type
+    if _energy_cache_type is None:
+        from metrics import EnergyCache  # type: ignore[assignment]
+        _energy_cache_type = EnergyCache
+    return _energy_cache_type
 
 
 logger = logging.getLogger(__name__)
 
 
 class NBCPeriod:
+    """A fixed-length quarter-hour period within an NBC cycle.
+
+    Each period is 900 seconds (15 minutes) long and is used to align
+    NBC predictions into hourly windows for load management decisions.
+
+    Attributes:
+        PERIOD_SECS: Duration of each period in seconds (always 900).
+    """
+
     PERIOD_SECS = 900
 
     @staticmethod
@@ -52,302 +77,128 @@ class NBCPeriod:
         return qh_start, window_end
 
 
-class NBCCache:
-    """Cache for NBC (Non-Bypassable Charges) quarter-hour predictions.
-
-    Historical quarters don't change, so we only refetch when the current
-    incomplete quarter changes or the cache TTL expires.
-    """
-
-    def __init__(self, ttl_seconds: int = 60) -> None:
-        self._cache: dict[str, Any] | None = None
-        self._cached_at: datetime | None = None
-        self._cached_qh: str | None = None
-        self._ttl = timedelta(seconds=ttl_seconds)
-        self._seconds_remaining_at_fetch: int | None = None
-
-    def _adaptive_ttl(self, seconds_remaining: int | None = None) -> timedelta:
-        """Return effective TTL based on time remaining in the quarter-hour.
-
-        Near QH boundaries (last 30s), use a shorter TTL to catch transitions
-        sooner. Mid-quarter, keep the full configured TTL (default 60s).
-
-        Args:
-            seconds_remaining: Seconds left in the current QH. If None, uses full TTL.
-
-        Returns:
-            Effective TTL as timedelta; minimum 10 seconds.
-        """
-        if seconds_remaining is None:
-            return self._ttl
-
-        # Near QH boundary (last 30s): use shorter TTL to catch transitions
-        if seconds_remaining <= 30:
-            return timedelta(seconds=max(10, int(self._ttl.total_seconds() * 0.25)))
-
-        # Mid-quarter: use full TTL
-        return self._ttl
-
-    def get_or_fetch(
-        self,
-        _device_name: str,
-        current_qh: str | None,
-        fetch_func: Callable[[], dict[str, Any] | None],
-        pre_fetched: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any] | None, bool]:
-        """Return (data, was_fresh).
-
-        Returns cached data if: not expired AND same incomplete QH as before.
-        Otherwise uses pre_fetched (if available) or calls fetch_func and
-        returns fresh data.
-
-        Args:
-            _device_name: Name of the device (reserved for future use).
-            current_qh: Current incomplete quarter-hour name, or None.
-            fetch_func: Callable that returns fresh parsed NBC data.
-            pre_fetched: Already-fetched parsed data to reuse when cache
-                is invalid, avoiding a redundant API call.
-
-        Returns:
-            Tuple of (parsed_nbc_data, was_fresh). was_fresh is True when
-            fetch_func was actually called.
-        """
-        now = datetime.now(timezone.utc)
-
-        effective_ttl: timedelta = self._ttl
-        if (self._seconds_remaining_at_fetch is not None and current_qh == self._cached_qh):
-            effective_ttl = self._adaptive_ttl(self._seconds_remaining_at_fetch)
-
-        if (
-            self._cache is not None
-            and self._cached_at is not None
-            and self._cached_qh == current_qh
-            and now - self._cached_at < effective_ttl
-        ):
-            return self._cache, False
-
-        fresh_data: dict[str, Any] | None
-        if pre_fetched is not None:
-            fresh_data = pre_fetched
-        else:
-            fresh_data = fetch_func()
-
-        self._cache = fresh_data
-        self._cached_at = now
-        self._cached_qh = current_qh
-        self._seconds_remaining_at_fetch = (
-            fresh_data.get("seconds_remaining") if fresh_data is not None else None
-        )
-
-        return fresh_data, True
-
-    def is_valid(self, now: datetime) -> tuple[bool, str | None]:
-        """Check if cache has a valid (non-expired) entry.
-
-        Uses adaptive TTL based on seconds remaining in the QH to detect
-        boundary transitions sooner.
-
-        Args:
-            now: Current timestamp to check against TTL.
-
-        Returns:
-            Tuple of (is_valid, cached_qh_name). If not valid, qh_name is None.
-        """
-        if (
-            self._cache is not None
-            and self._cached_at is not None
-        ):
-            effective_ttl: timedelta = self._ttl
-            if (self._seconds_remaining_at_fetch is not None):
-                effective_ttl = self._adaptive_ttl(self._seconds_remaining_at_fetch)
-            if now - self._cached_at < effective_ttl:
-                return True, self._cached_qh
-        return False, None
-
-    def has_qh_likely_ended(self, now: datetime) -> bool:
-        """Return True if the cached QH has likely ended by wall-clock time.
-
-        Compares elapsed seconds since the last fetch against the
-        seconds_remaining that was recorded at fetch time. When elapsed >=
-        seconds_remaining the quarter has almost certainly rolled over, so the
-        caller should treat the cache as invalid and probe for a fresh QH name
-        even if the TTL has not yet expired.
-
-        Args:
-            now: Current timestamp to compare against the fetch time.
-
-        Returns:
-            True when the cached QH is likely complete; False when any
-            required attribute is missing or the QH is still in progress.
-        """
-        if (
-            self._cached_at is None
-            or self._seconds_remaining_at_fetch is None
-        ):
-            return False
-        elapsed = (now - self._cached_at).total_seconds()
-        return elapsed >= self._seconds_remaining_at_fetch
-
-    def invalidate(self) -> None:
-        """Clear the cache."""
-        self._cache = None
-        self._cached_at = None
-        self._cached_qh = None
-        self._seconds_remaining_at_fetch = None
-
-
 class NBCReader:
-    """Reads current QH predicted_wh from metrics for a specific device.
+    """Reads current QH predicted_wh from cached energy samples.
 
-    Uses NBCCache to avoid redundant API calls. Accepts a fetch callable
-    that returns fresh metrics data when cache misses occur.
+    Reads directly from EnergyCache instead of wrapping a fetch callable
+    and using NBCCache. NBC quarters are computed on demand from raw samples.
+
+    Attributes:
+        energy_cache: Shared EnergyCache instance for reading cached per-second data.
+        device_name: Name of the VUE device to query (for future multi-device support).
     """
 
     def __init__(
-        self,
-        cache: NBCCache | None = None,
-        metrics_fetch: Callable[[], dict[str, Any] | None] | None = None,
+        self, energy_cache: Any | None = None, device_name: str = ""
     ) -> None:
-        self.cache = cache or NBCCache(ttl_seconds=50)
-        self.metrics_fetch = metrics_fetch
-
-    def get_current_qh(
-        self, device_name: str, force: bool = False
-    ) -> tuple[str, float, int, datetime] | None:
-        """Return (qh_name, predicted_wh, seconds_remaining, data_point_at) for QH.
-
-        Uses cache to avoid redundant API calls unless ``force`` is True, in
-        which case a fresh fetch always occurs. Returns None if all quarters
-        are complete or no data available. The data_point_at timestamp is the
-        time of the most recent per-second data point (fetched_at minus API
-        lag), which is what stale detection and waiting detection use.
+        """Initialize NBCReader with an optional EnergyCache and device name.
 
         Args:
-            device_name: Name of the VUE device to query.
+            energy_cache: Shared EnergyCache instance for reading cached per-second data.
+                When None, creates a default EnergyCache(ttl_seconds=30).
+            device_name: Name of the VUE device to query. Defaults to empty string.
+        """
+        EnergyCacheType = _get_energy_cache_type()
+        self.energy_cache: Any = energy_cache or EnergyCacheType(ttl_seconds=30)
+        self.device_name = device_name
+        # Callable injected by LoadManager to fetch raw metrics data.
+        self._metrics_fetch: Any | None = None
+
+    def get_current_qh(
+        self, force: bool = False, now: datetime | None = None
+    ) -> tuple[str, float, int, datetime] | None:
+        """Return (qh_name, predicted_wh, seconds_remaining, data_point_at).
+
+        Uses EnergyCache.get_current_qh() to extract QH prediction from cached
+        per-second samples. When force=True, bypasses cache and triggers a fresh
+        fetch via ``_metrics_fetch`` if available.
+
+        Args:
             force: When True, bypass cache and always fetch fresh data from the API.
+            now: Current time for TTL check. Defaults to ``datetime.now(timezone.utc)``.
 
         Returns:
             Tuple of (qh_name, predicted_wh in Wh, seconds remaining in QH,
             data_point_at), or None if no incomplete QH available.
         """
-        if self.metrics_fetch is None:
-            return None
-        fetch = self.metrics_fetch
+        if now is None:
+            now = datetime.now(timezone.utc)
 
-        def _fetch_and_parse() -> dict[str, Any] | None:
-            metrics_data = fetch()
-            if metrics_data is None:
+        # Fast path: cache is valid — read directly from it.
+        if not force and self.energy_cache.is_valid(now=now):
+            qh_data = self.energy_cache.get_current_qh()
+            if qh_data is None:
                 return None
-            parsed = self._parse_metrics(device_name, metrics_data)
-            if parsed is not None:
-                parsed["_fetched_at"] = metrics_data.get(
-                    "_fetched_at", datetime.now(timezone.utc)
-                )
-            return parsed
-
-        # When force=True, bypass cache entirely and always fetch fresh data.
-        if force:
-            cached = _fetch_and_parse()
-            if cached is None:
-                return None
-            fetched_at = cached.get("_fetched_at", datetime.now(timezone.utc))
-            data_lag_secs: float = cached.get("_data_lag_secs", 0.0)
+            fetched_at = self.energy_cache._last_fetch_at  # pylint: disable=W0212
+            if fetched_at is None:
+                fetched_at = now
+            data_lag_secs: float = getattr(
+                self.energy_cache, "_data_lag_secs", 0.0
+            )
             data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
             return (  # type: ignore[return-value]
-                cached.get("qh_name"),
-                cached.get("predicted_wh", 0),
-                cached.get("seconds_remaining", 0),
+                qh_data["qh_name"],
+                qh_data.get("predicted_wh", 0),
+                qh_data.get("seconds_remaining", 0),
                 data_point_at,
             )
 
-        current_qh: str | None = None
-        pre_fetched: dict[str, Any] | None = None
-        now = datetime.now(timezone.utc)
-        cache_valid, cached_qh = self.cache.is_valid(now)
-        if cache_valid and not self.cache.has_qh_likely_ended(now):
-            current_qh = cached_qh
-        else:
-            probe = fetch()
-            if probe is not None:
-                current_qh = self._find_incomplete_qh(probe, device_name)
-                pre_fetched = self._parse_metrics(device_name, probe)
-                if pre_fetched is not None:
-                    pre_fetched["_fetched_at"] = probe.get(
-                        "_fetched_at", datetime.now(timezone.utc)
-                    )
+        # Try to fetch fresh data via _metrics_fetch when the cache is not valid.
+        if hasattr(self, "_metrics_fetch") and self._metrics_fetch is not None:
+            metrics_data = self._metrics_fetch()
+            if metrics_data is None:
+                return None
+            parsed = self._parse_metrics(self.device_name, metrics_data)
+            if parsed is None:
+                return None
+            fetched_at = parsed.get("_fetched_at", now)
+            data_lag_secs = parsed.get("_data_lag_secs", 0.0)
+            data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
+            return (  # type: ignore[return-value]
+                parsed["qh_name"],
+                parsed.get("predicted_wh", 0),
+                parsed.get("seconds_remaining", 0),
+                data_point_at,
+            )
 
-        cached, _ = self.cache.get_or_fetch(
-            device_name, current_qh, _fetch_and_parse, pre_fetched=pre_fetched
-        )
-        if cached is None:
-            return None
-        fetched_at = cached.get("_fetched_at", now)
-        data_lag_secs: float = cached.get("_data_lag_secs", 0.0)
-        # Derive the actual data-point timestamp so callers don't need to
-        # recompute it from fetched_at + lag.
-        data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
-        return (  # type: ignore[return-value]
-            cached.get("qh_name"),
-            cached.get("predicted_wh", 0),
-            cached.get("seconds_remaining", 0),
-            data_point_at,
-        )
+        # force=True but no fetch callable: fall back to reading from cache.
+        if force:
+            qh_data = self.energy_cache.get_current_qh()
+            if qh_data is None:
+                return None
+            fetched_at = self.energy_cache._last_fetch_at  # pylint: disable=W0212
+            if fetched_at is None:
+                fetched_at = now
+            data_lag_secs = qh_data.get("_data_lag_secs", 0.0)
+            data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
+            return (  # type: ignore[return-value]
+                qh_data["qh_name"],
+                qh_data.get("predicted_wh", 0),
+                qh_data.get("seconds_remaining", 0),
+                data_point_at,
+            )
+
+        return None
 
     def get_current_qh_direct(
-        self, device_name: str, metrics_data: dict[str, Any] | None
+        self, metrics_data: dict[str, Any] | None
     ) -> tuple[str, float, int] | None:
         """Parse metrics data directly without cache.
 
-        Useful for testing with injected mock data.
+        Useful for testing with injected mock data. Unchanged from current
+        implementation except device_name is no longer needed (first device found).
 
         Args:
-            device_name: Name of the VUE device to query.
             metrics_data: The raw metrics dict from HourlyProjection, or None.
 
         Returns:
             Tuple of (qh_name, predicted_wh in Wh, seconds remaining in QH),
             or None if no incomplete QH available.
         """
-        result = self._parse_metrics(device_name, metrics_data)
+        result = self._parse_metrics(self.device_name, metrics_data)
         if result is None:
             return None
         return result["qh_name"], result["predicted_wh"], result["seconds_remaining"]
-
-    def _find_incomplete_qh(
-        self, metrics_data: dict[str, Any], device_name: str
-    ) -> str | None:
-        """Find the name of the first incomplete QH for a device.
-
-        Args:
-            metrics_data: The raw metrics dict from HourlyProjection.
-            device_name: Name of the VUE device to query.
-
-        Returns:
-            QH name (e.g., "QH1") or None if all quarters are complete.
-        """
-        devices = metrics_data.get("devices", [])
-        target_device = None
-        for dev in devices:
-            if dev.get("name") == device_name:
-                target_device = dev
-                break
-
-        if target_device is None:
-            return None
-
-        nbc = target_device.get("nbc")
-        if nbc is None:
-            return None
-
-        qh_order = ["QH1", "QH2", "QH3", "QH4"]
-        for qh_name in qh_order:
-            qh_data = nbc.get(qh_name)
-            if qh_data is None:
-                continue
-            if not qh_data.get("complete", True):
-                return qh_name
-
-        return None
 
     def _parse_metrics(
         self, device_name: str, metrics_data: dict[str, Any] | None
@@ -355,7 +206,7 @@ class NBCReader:
         """Parse metrics data and extract incomplete QH info.
 
         Args:
-            device_name: Name of the VUE device to query.
+            device_name: Name of the VUE device to query (reserved for future use).
             metrics_data: The raw metrics dict from HourlyProjection, or None.
 
         Returns:
@@ -371,6 +222,10 @@ class NBCReader:
                 target_device = dev
                 break
 
+        if target_device is None and devices:
+            # No device name match — use the first device with NBC data.
+            target_device = devices[0] if devices else None
+
         if target_device is None:
             return None
 
@@ -379,6 +234,8 @@ class NBCReader:
             return None
 
         qh_order = ["QH1", "QH2", "QH3", "QH4"]
+        last_complete: dict[str, Any] | None = None
+
         for qh_name in qh_order:
             qh_data = nbc.get(qh_name)
             if qh_data is None:
@@ -392,8 +249,19 @@ class NBCReader:
                     "seconds_remaining": seconds_remaining,
                     "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
                 }
+            # Track the last complete QH as a fallback.
+            predicted_wh = qh_data.get("predicted_wh", qh_data.get("wh", 0))
+            seconds_remaining = qh_data.get(
+                "remaining_seconds", NBCPeriod.PERIOD_SECS - 1
+            )
+            last_complete = {
+                "qh_name": qh_name,
+                "predicted_wh": predicted_wh,
+                "seconds_remaining": seconds_remaining,
+                "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
+            }
 
-        return None
+        return last_complete
 
 
 class StateTracker:

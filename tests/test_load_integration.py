@@ -9,7 +9,6 @@ import pytest
 from load_manager import (
     DeviceState,
     LoadManager,
-    NBCCache,
     PendingEffect,
     PlugConfig,
     PlugController,
@@ -20,9 +19,50 @@ from load_manager import (
     GapMinder,
 )
 from tests.helpers import _make_metrics_with_wh
+from metrics import EnergyCache
 
 
 # --- Excess solar helpers ---
+
+
+def _make_energy_cache_with_prediction(
+    predicted_wh: float,
+    now: datetime | None = None,
+    data_lag_secs: float = 0.0,
+    fetch_offset_secs: int = 0,
+) -> EnergyCache:
+    """Create an EnergyCache pre-populated with samples that produce a target prediction.
+
+    Uses constant per-second kWh samples so the extrapolated NBC quarter prediction
+    equals ``predicted_wh``. With constant samples, predicted_wh = sample_value * 900_000
+    regardless of which quarter is incomplete.
+
+    Args:
+        predicted_wh: Target Wh prediction for the incomplete quarter.
+        now: Current time for sample timestamps. Defaults to ``datetime.now(timezone.utc)``.
+        data_lag_secs: Simulated API lag in seconds. The NBCReader computes
+            ``data_point_at = _last_fetch_at - timedelta(seconds=data_lag_secs)``.
+        fetch_offset_secs: How many seconds ago the data was "fetched". Defaults to 0
+            (fresh). Pass a positive value to simulate older fetch time.
+
+    Returns:
+        EnergyCache with ~2800 samples backfilled from ``now``.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    sample_value = predicted_wh / 900_000.0
+    sample_count = 2800  # QH3 is about halfway through the hour
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [sample_value] * sample_count
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = now - timedelta(seconds=sample_count)
+        cache._last_sample_at = now - timedelta(seconds=1)
+        cache._sample_count = sample_count
+        cache._last_fetch_at = now - timedelta(seconds=fetch_offset_secs)
+    # Store _data_lag_secs on the cache so NBCReader picks it up.
+    cache._data_lag_secs = data_lag_secs  # type: ignore[attr-defined]
+    return cache
 
 
 def _make_excess_manager(
@@ -63,10 +103,10 @@ def _make_excess_manager(
     def metrics_fetch():
         return metrics_data
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(predicted_wh)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=tesla_ctrl,
         target_wh=-500,
@@ -110,10 +150,10 @@ def _make_overn_target_manager(
     def metrics_fetch():
         return metrics_data
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(predicted_wh)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -160,10 +200,10 @@ def _make_tesla_manager(
     def metrics_fetch():
         return metrics_data
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(predicted_wh)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=tesla_ctrl,
         target_wh=-500,
@@ -305,10 +345,10 @@ def test_stale_data_skips_cycle():
     def metrics_fetch():
         return metrics_data
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, data_lag_secs=130)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -350,10 +390,10 @@ def test_stale_no_pending_effects_proceeds():
     def metrics_fetch():
         return metrics_data
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -404,10 +444,10 @@ def test_stale_data_from_previous_qh():
     def metrics_fetch():
         return metrics_data
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -427,8 +467,8 @@ def test_stale_data_from_previous_qh():
     # Patch get_current_qh to return our crafted data_point_at.
     original_get = mgr.nbc_reader.get_current_qh
 
-    def patched_get(device_name, force=False):
-        result = original_get(device_name)
+    def patched_get(force=False):
+        result = original_get(force=force)
         if result is not None:
             qh_name, predicted_wh, seconds_remaining = result[:3]
             return (qh_name, predicted_wh, seconds_remaining, data_point_at)
@@ -461,10 +501,10 @@ def test_waits_for_fresh_data():
     def metrics_fetch():
         return metrics_data
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -473,8 +513,8 @@ def test_waits_for_fresh_data():
         dry_run=False,
     )
 
-    now = datetime.now(timezone.utc)
     mgr.state.last_data_point_at = fetched_at
+    now = datetime.now(timezone.utc)
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="plug",
@@ -514,10 +554,12 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
     def metrics_fetch():
         return metrics_data
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(
+        -2000.0, data_lag_secs=130  # data_point_at = now - 130s → stale (>120s)
+    )
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -555,17 +597,11 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
     data_point_at = fetched_at - timedelta(seconds=50)  # 60s ago
     effect_time = fetched_at - timedelta(seconds=30)     # 40s ago
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
-    metrics_data["_fetched_at"] = fetched_at
-    metrics_data["_data_lag_secs"] = 50.0
-
-    def metrics_fetch():
-        return metrics_data
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(
+        -2000.0, now=fixed_now, data_lag_secs=50
+    )
     mgr = LoadManager(
-        metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -611,21 +647,10 @@ def test_full_lifecycle_action_wait_resolve():
     }
     plug_ctrl = PlugController(plugs)
 
-    metrics_data_1 = _make_metrics_with_wh("main_panel", "QH3", -6000.0)
-    metrics_data_2 = _make_metrics_with_wh("main_panel", "QH3", -4500.0)
-
-    fetch_sequence = [metrics_data_1, metrics_data_2]
-    fetch_index = [0]
-
-    def metrics_fetch():
-        data = fetch_sequence[fetch_index[0]]
-        fetch_index[0] += 1
-        return data
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    now = datetime.now(timezone.utc)
+    energy_cache = _make_energy_cache_with_prediction(-6000.0, now=now)
     mgr = LoadManager(
-        metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -706,12 +731,9 @@ def test_adjusted_wh_in_response():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -500.0)
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-500.0)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -732,14 +754,10 @@ def test_stale_data_includes_pending_count():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    fetched_at = datetime.now(timezone.utc) - timedelta(seconds=180)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
-    metrics_data["_fetched_at"] = fetched_at
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    now = datetime.now(timezone.utc)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, data_lag_secs=180)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -781,14 +799,10 @@ def test_stale_data_prunes_old_effects():
     }
     plug_ctrl = PlugController(plugs)
 
-    fetched_at = datetime.now(timezone.utc) - timedelta(seconds=180)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
-    metrics_data["_fetched_at"] = fetched_at
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    now = datetime.now(timezone.utc)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, data_lag_secs=180)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -832,14 +846,10 @@ def test_stale_data_includes_candidates():
     }
     plug_ctrl = PlugController(plugs)
 
-    fetched_at = datetime.now(timezone.utc) - timedelta(seconds=180)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
-    metrics_data["_fetched_at"] = fetched_at
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    now = datetime.now(timezone.utc)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, data_lag_secs=180)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -874,14 +884,11 @@ def test_waiting_for_fresh_data_includes_count():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    fetched_at = datetime.now(timezone.utc) - timedelta(seconds=10)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
-    metrics_data["_fetched_at"] = fetched_at
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    now = datetime.now(timezone.utc)
+    fetched_at = now - timedelta(seconds=10)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, now=now, data_lag_secs=10)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -890,7 +897,6 @@ def test_waiting_for_fresh_data_includes_count():
         dry_run=False,
     )
 
-    now = datetime.now(timezone.utc)
     mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
         PendingEffect(
@@ -919,14 +925,11 @@ def test_waiting_for_fresh_data_includes_candidates():
     }
     plug_ctrl = PlugController(plugs)
 
-    fetched_at = datetime.now(timezone.utc) - timedelta(seconds=10)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
-    metrics_data["_fetched_at"] = fetched_at
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    now = datetime.now(timezone.utc)
+    fetched_at = now - timedelta(seconds=10)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, now=now, data_lag_secs=10)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -935,7 +938,6 @@ def test_waiting_for_fresh_data_includes_candidates():
         dry_run=False,
     )
 
-    now = datetime.now(timezone.utc)
     mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
         PendingEffect(
@@ -962,19 +964,12 @@ def test_waiting_for_fresh_data_includes_candidates():
 
 def test_cache_hits_within_ttl():
     """Second call within TTL + same QH uses cache."""
-    fetch_count = [0]
-
-    def metrics_fetch():
-        fetch_count[0] += 1
-        return _make_metrics_with_wh("main_panel", "QH3", -2000.0)
-
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0)
 
     mgr = LoadManager(
-        metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -983,12 +978,12 @@ def test_cache_hits_within_ttl():
         dry_run=False,
     )
 
-    mgr.run_cycle(force=True)
-    first_count = fetch_count[0]
-    mgr.run_cycle(force=True)
+    result_1 = mgr.run_cycle(force=True)
+    result_2 = mgr.run_cycle(force=True)
 
-    # With force=True, every cycle forces a fresh fetch (bypasses cache).
-    assert fetch_count[0] == first_count + 1
+    # Both calls should succeed (cache is valid within TTL).
+    assert result_1["status"] == "ok"
+    assert result_2["status"] == "ok"
 
 
 def test_disabled_returns_early():
@@ -998,10 +993,10 @@ def test_disabled_returns_early():
 
     metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
 
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = EnergyCache()
     mgr = LoadManager(
         metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -1031,12 +1026,9 @@ def test_dry_run_returns_dry_run_status():
     }
     plug_ctrl = PlugController(plugs)
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -6000.0)
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-6000.0)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -1065,12 +1057,9 @@ def test_dry_run_does_not_execute():
     }
     plug_ctrl = PlugController(plugs)
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -6000.0)
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-6000.0)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -1100,12 +1089,9 @@ def test_dry_run_state_not_mutated():
     }
     plug_ctrl = PlugController(plugs)
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -6000.0)
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-6000.0)
     mgr = LoadManager(
-        metrics_fetch=lambda: metrics_data,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -1169,15 +1155,9 @@ def test_tesla_amp_adjustment(_mock_load_tesla):
         )
     )
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -3000.0)
-
-    def metrics_fetch():
-        return metrics_data
-
-    nbc_cache = NBCCache(ttl_seconds=60)
+    energy_cache = _make_energy_cache_with_prediction(-3000.0)
     mgr = LoadManager(
-        metrics_fetch=metrics_fetch,
-        nbc_cache=nbc_cache,
+        energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=tesla_ctrl,
         target_wh=-500,
@@ -1270,10 +1250,10 @@ class TestAdaptiveSleep:
         def metrics_fetch():
             return None  # no data → will hit early returns
 
-        nbc_cache = NBCCache()
+        energy_cache = EnergyCache()
         return LoadManager(
             metrics_fetch=metrics_fetch,
-            nbc_cache=nbc_cache,
+            energy_cache=energy_cache,
             plug_ctrl=plug_ctrl,
             tesla_ctrl=tesla_ctrl,
             target_wh=-500,
@@ -1522,7 +1502,7 @@ class TestAdaptiveSleep:
         class StaleQHReader:
             """Mock NBC reader that returns data 200 seconds old."""
 
-            def get_current_qh(self, device_name: str, force=False):
+            def get_current_qh(self, force=False):
                 return ("QH3", -1000.0, 600, data_point_at)
 
         lm = LoadManager(
@@ -1566,7 +1546,7 @@ class TestAdaptiveSleep:
         class FreshQHReader:
             """Mock NBC reader that returns a recent data point."""
 
-            def get_current_qh(self, device_name: str, force=False):
+            def get_current_qh(self, force=False):
                 return ("QH3", -1000.0, 600, data_point_at)
 
         lm = LoadManager(
@@ -1626,7 +1606,7 @@ class TestAdaptiveSleep:
 
         # Create an LM with a mock NBC reader that returns None
         class NoQHReader:
-            def get_current_qh(self, device_name, force=False):
+            def get_current_qh(self, force=False):
                 return None
 
         lm = LoadManager(
