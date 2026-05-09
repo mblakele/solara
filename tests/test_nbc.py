@@ -627,5 +627,129 @@ class TestNBCIntegration(unittest.TestCase):
                 self.assertIn("nbc", device)
 
 
+class TestComputeNBCQuartersForWindow(unittest.TestCase):
+    """Tests for compute_nbc_quarters_for_window() — cross-hour NBC selection.
+
+    The function takes per-second data and observation counts for two consecutive
+    hours, computes NBC quarters for each hour independently, then selects the 4
+    most recent non-None quarters and relabels them QH1–QH4 in chronological order.
+    """
+
+    def _make_data(self, seconds_count: int, value: float) -> list[float]:
+        """Return a list of `seconds_count` identical kWh/second values."""
+        return [value] * seconds_count
+
+    def test_all_four_from_current_hour(self):
+        """At minute 50: prev has 4 quarters, curr has 3 complete + partial QH4 → most recent 4."""
+        from util import compute_nbc_quarters_for_window
+
+        # Previous hour: fully complete (3600s, low consumption)
+        prev_data = self._make_data(3600, 0.001)
+        # Current hour: minute 50 → n=3000, QH1–QH3 complete, QH4 partial
+        curr_data = self._make_data(3000, 0.002)
+
+        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 3000)
+
+        # All 4 quarters should be non-None
+        for qh in ("QH1", "QH2", "QH3", "QH4"):
+            self.assertIsNotNone(result[qh])
+
+        # 8 total quarters (4 prev + 4 curr), most recent 4 = all from current hour
+        # All predicted to 1800 Wh (0.002 * 900)
+        for qh in ("QH1", "QH2", "QH3"):
+            self.assertAlmostEqual(result[qh]["wh"], 1800.0, places=1)
+            self.assertTrue(result[qh]["complete"])
+        # QH4 is partial (300s observed, predicted to 1800)
+        self.assertAlmostEqual(result["QH4"]["wh"], 1800.0, places=1)
+        self.assertFalse(result["QH4"]["complete"])
+
+    def test_two_from_each_hour_at_minute_30(self):
+        """At minute 30: prev has 4, curr has 2 → most recent 4 = prev_QH3-4 + curr_QH1-2."""
+        from util import compute_nbc_quarters_for_window
+
+        # Previous hour: fully complete (3600s, low consumption)
+        prev_data = self._make_data(3600, 0.001)
+        # Current hour: minute 30 → n=1800, QH1–QH2 complete
+        curr_data = self._make_data(1800, 0.002)
+
+        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 1800)
+
+        # Should have exactly 4 quarters (6 total, most recent 4 selected)
+        self.assertEqual(len([v for v in result.values() if v is not None]), 4)
+
+        # 6 total quarters (4 prev + 2 curr), most recent 4 = prev_QH3-4 + curr_QH1-2
+        # prev_QH3, QH4: 0.001 * 900 = 900 Wh
+        self.assertAlmostEqual(result["QH1"]["wh"], 900.0, places=1)
+        self.assertTrue(result["QH1"]["complete"])
+        self.assertAlmostEqual(result["QH2"]["wh"], 900.0, places=1)
+        self.assertTrue(result["QH2"]["complete"])
+
+        # curr_QH1, QH2: 0.002 * 900 = 1800 Wh
+        self.assertAlmostEqual(result["QH3"]["wh"], 1800.0, places=1)
+        self.assertTrue(result["QH3"]["complete"])
+        self.assertAlmostEqual(result["QH4"]["wh"], 1800.0, places=1)
+        self.assertTrue(result["QH4"]["complete"])
+
+    def test_three_from_current_one_from_prev(self):
+        """At minute 20: prev has 4, curr has 1 complete + partial QH2 → most recent 4."""
+        from util import compute_nbc_quarters_for_window
+
+        # Previous hour: fully complete (3600s, low consumption)
+        prev_data = self._make_data(3600, 0.001)
+        # Current hour: minute 20 → n=1200, QH1 complete (900s), QH2 partial
+        curr_data = self._make_data(1200, 0.003)
+
+        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 1200)
+
+        # Should have 4 quarters: prev_QH3-4 + curr_QH1 + partial curr_QH2
+        non_none = [v for v in result.values() if v is not None]
+        self.assertEqual(len(non_none), 4)
+
+    def test_all_four_incomplete(self):
+        """At minute 10: prev has 4, curr has <1 → most recent 4 = prev_QH1-4."""
+        from util import compute_nbc_quarters_for_window
+
+        # Previous hour: fully complete (3600s)
+        prev_data = self._make_data(3600, 0.001)
+        # Current hour: minute 10 → n=600, only QH1 partial
+        curr_data = self._make_data(600, 0.002)
+
+        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 600)
+
+        # Should have at most 4 quarters (prev_QH1-4, since curr only has partial QH1)
+        non_none = [v for v in result.values() if v is not None]
+        self.assertLessEqual(len(non_none), 4)
+
+    def test_prev_hour_empty(self):
+        """Previous hour has no data → only current hour quarters shown."""
+        from util import compute_nbc_quarters_for_window
+
+        prev_data: list[float] = []
+        curr_data = self._make_data(1800, 0.002)
+
+        result = compute_nbc_quarters_for_window(prev_data, curr_data, 0, 1800)
+
+        # Should have at most 2 quarters from current hour (QH1, QH2)
+        non_none = [v for v in result.values() if v is not None]
+        self.assertLessEqual(len(non_none), 2)
+
+    def test_chronological_order(self):
+        """QH1 should be oldest, QH4 newest."""
+        from util import compute_nbc_quarters_for_window
+
+        # Previous hour: distinct values so we can verify ordering
+        prev_data = self._make_data(3600, 0.001)
+        # Current hour: distinct values
+        curr_data = self._make_data(3600, 0.005)
+
+        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 3600)
+
+        # All quarters from current hour should have higher wh values
+        for qh in ("QH1", "QH2", "QH3", "QH4"):
+            self.assertIsNotNone(result[qh])
+            # Current hour data: 0.005 kWh/s * 900s = 4500 Wh per quarter
+            self.assertGreater(result[qh]["wh"], 4000)
+
+
 if __name__ == "__main__":
     unittest.main()

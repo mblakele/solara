@@ -123,3 +123,56 @@ def compute_nbc_quarters(
             }
 
     return result
+
+
+def compute_nbc_quarters_for_window(
+    prev_hour_data: list[float],
+    current_hour_data: list[float],
+    n_prev: int,
+    n_current: int,
+) -> dict[str, Any]:
+    """Compute NBC metrics for the most recent 4 quarter-hour periods across two hours.
+
+    Takes per-second data and observation counts for both the previous and current
+    hours, computes NBC quarters for each hour independently, then selects the 4 most
+    recent non-None quarters and relabels them QH1–QH4 in chronological order.
+
+    Args:
+        prev_hour_data: Per-second kWh values for the previous hour (up to 3600).
+        current_hour_data: Per-second kWh values for the current hour (up to 3600).
+        n_prev: Number of seconds observed in the previous hour (typically 3600).
+        n_current: Number of seconds observed so far in the current hour.
+
+    Returns:
+        Dict with keys QH1-QH4 (most recent 4 non-None quarters, oldest first).
+    """
+    prev_result: dict[str, Any] = {}
+    if prev_hour_data and n_prev > 0:
+        prev_result = compute_nbc_quarters(prev_hour_data, n_prev)
+
+    curr_result: dict[str, Any] = {}
+    if current_hour_data and n_current > 0:
+        curr_result = compute_nbc_quarters(current_hour_data, n_current)
+
+    # Collect all non-None quarters in chronological order:
+    # prev QH1, prev QH2, prev QH3, prev QH4, curr QH1, curr QH2, curr QH3, curr QH4
+    all_quarters: list[Any] = []
+    for qh in ("QH1", "QH2", "QH3", "QH4"):
+        if prev_result.get(qh) is not None:
+            all_quarters.append(prev_result[qh])
+    for qh in ("QH1", "QH2", "QH3", "QH4"):
+        if curr_result.get(qh) is not None:
+            all_quarters.append(curr_result[qh])
+
+    # Take the 4 most recent (from end of list)
+    selected = all_quarters[-4:] if len(all_quarters) > 4 else list(all_quarters)
+
+    # Build result dict with QH1–QH4 labels
+    result: dict[str, Any] = {}
+    for i, qh_name in enumerate(("QH1", "QH2", "QH3", "QH4")):
+        if i < len(selected):
+            result[qh_name] = selected[i]
+        else:
+            result[qh_name] = None
+
+    return result
