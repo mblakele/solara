@@ -87,37 +87,7 @@
         {{ vd.lag }}
       </td>
     </tr>
-    {% if vd.nbc %}
-    {% set qh_labels = [("QH4", ":45–:59"), ("QH3", ":30–:44"), ("QH2", ":15–:29"), ("QH1", ":00–:14")] %}
-    {% for qh_key, qh_label in qh_labels %}
-    {% set qh = vd.nbc[qh_key] %}
-    {% if qh is not none %}
-    <tr>
-      <td class="op">{{ qh_key }}</td>
-      <td class="num">
-        {% if qh is none %}
-          —
-        {% elif not qh.complete %}
-          {{ "%.0f" % (qh.raw_wh) }}&nbsp;/&nbsp;{{ "%.0f" % (qh.predicted_wh) }}
-        {% else %}
-          {{ "%.0f" % (qh.raw_wh) }}
-        {% endif %}
-      </td>
-      <td class="note">
-        {% if not qh.complete %}
-          Wh now / predicted
-        {% else %}
-          Wh
-        {% endif %}
-      </td>
-    </tr>
-    {% endif %}
-    {% endfor %}
-    {% endif %}
     {% if vd.clock_boundary_nbc and vd.clock_boundary_nbc.get("window_labels") %}
-    <tr>
-      <td colspan="3" class="section-title">Clock-Boundary NBC Quarters</td>
-    </tr>
     {% for qh_key in ["QH1", "QH2", "QH3", "QH4"] %}
     {% set qh = vd.clock_boundary_nbc.get(qh_key) %}
     {% if qh is not none and qh is not false %}
@@ -152,16 +122,6 @@
         {{ "%.0f" % (vd.scales["1MIN"].usage) }}</td>
         {% endif %}
       <td class="note">Wh, latest minute</td>
-    </tr>
-    <tr>
-      <td class="op"></td>
-      <td class="num">{{ "%.0f" % (vd.scales["1H"].usage) }}</td>
-      <td class="note">Wh, hour so far</td>
-    </tr>
-    <tr>
-      <td class="op"></td>
-      <td class="num"><b>{{ "%.0f" % (vd.prediction) }}</b></td>
-      <td class="note">Wh, predicted total</td>
     </tr>
     <tr>
       <td colspan="3" class="note">
