@@ -12,6 +12,7 @@ import locale
 import logging
 from typing import Any, Callable, ClassVar, Optional
 
+import pytz
 import requests
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
@@ -647,7 +648,7 @@ class HourlyProjection(MetricsBase):
 
         super().__init__(logger_next)
 
-        self.instant = datetime.now(timezone.utc)
+        self.instant = datetime.now(pytz.timezone(_cfg.timezone))
         self.metrics["instant"] = self.instant
 
         # Fetch usage data without mutating device_info
