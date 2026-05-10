@@ -751,5 +751,210 @@ class TestComputeNBCQuartersForWindow(unittest.TestCase):
             self.assertGreater(result[qh]["wh"], 4000)
 
 
+class TestComputeClockBoundaryNBCQuarters(unittest.TestCase):
+    """Tests for compute_clock_boundary_nbc_quarters() — clock-boundary NBC selection.
+
+    The function takes per-second data and observation counts for two consecutive
+    hours, determines the 4 most recent 15-minute clock-boundary windows based on
+    wall-clock time, and computes NBC metrics for each window.
+    """
+
+    def _make_data(self, seconds_count: int, value: float) -> list[float]:
+        """Return a list of `seconds_count` identical kWh/second values."""
+        return [value] * seconds_count
+
+    def test_all_four_current_hour_at_minute_50(self):
+        """At minute 50: all 4 windows fall within the current hour."""
+        from util import compute_clock_boundary_nbc_quarters
+
+        # Previous hour: fully complete (3600s, low consumption)
+        prev_data = self._make_data(3600, 0.001)
+        # Current hour: minute 50 → n=3000, data covers 0–2999
+        curr_data = self._make_data(3000, 0.002)
+        now = datetime(2026, 1, 1, 9, 50, 30, tzinfo=timezone.utc)
+
+        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
+
+        # All 4 quarters should be non-None
+        for qh in ("QH1", "QH2", "QH3", "QH4"):
+            self.assertIsNotNone(result[qh])
+
+        # QH1 (09:35–09:50) is incomplete, predicted ~1800 Wh
+        self.assertFalse(result["QH1"]["complete"])
+        self.assertAlmostEqual(result["QH1"]["wh"], 1800.0, places=1)
+
+        # QH2–QH4 (09:20–09:35, 09:05–09:20, 08:50–09:05) are complete
+        for qh in ("QH2", "QH3", "QH4"):
+            self.assertTrue(result[qh]["complete"])
+            self.assertAlmostEqual(result[qh]["wh"], 1800.0, places=1)
+
+        # window_labels should be present
+        self.assertIn("window_labels", result)
+        for qh in ("QH1", "QH2", "QH3", "QH4"):
+            self.assertIn(qh, result["window_labels"])
+
+    def test_two_from_each_hour_at_minute_30(self):
+        """At minute 30: QH1 is current incomplete window, QH2–QH3 from curr hour,
+        QH4 from prev hour."""
+        from util import compute_clock_boundary_nbc_quarters
+
+        prev_data = self._make_data(3600, 0.001)
+        curr_data = self._make_data(1800, 0.002)
+        now = datetime(2026, 1, 1, 9, 30, 45, tzinfo=timezone.utc)
+
+        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
+
+        # All 4 quarters should be dicts
+        qh_values = [result[k] for k in ("QH1", "QH2", "QH3", "QH4")]
+        non_none = [v for v in qh_values if isinstance(v, dict)]
+        self.assertEqual(len(non_none), 4)
+
+        # QH1 (09:30–09:45) incomplete, no data → wh=0
+        self.assertFalse(result["QH1"]["complete"])
+        self.assertEqual(result["QH1"]["wh"], 0)
+
+        # QH2 (09:15–09:30) complete, 0.002 * 900 = 1800 Wh
+        self.assertTrue(result["QH2"]["complete"])
+        self.assertAlmostEqual(result["QH2"]["wh"], 1800.0, places=1)
+
+        # QH3 (09:00–09:15) complete, 0.002 * 900 = 1800 Wh
+        self.assertTrue(result["QH3"]["complete"])
+        self.assertAlmostEqual(result["QH3"]["wh"], 1800.0, places=1)
+
+        # QH4 (08:45–09:00) complete, 0.001 * 900 = 900 Wh
+        self.assertTrue(result["QH4"]["complete"])
+        self.assertAlmostEqual(result["QH4"]["wh"], 900.0, places=1)
+
+    def test_three_curr_one_prev_at_minute_20(self):
+        """At minute 20: 3 from current hour + 1 from previous hour."""
+        from util import compute_clock_boundary_nbc_quarters
+
+        prev_data = self._make_data(3600, 0.001)
+        curr_data = self._make_data(1200, 0.003)
+        now = datetime(2026, 1, 1, 9, 20, 30, tzinfo=timezone.utc)
+
+        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
+
+        # Should have exactly 4 quarters (QH1–QH4)
+        qh_values = [result[k] for k in ("QH1", "QH2", "QH3", "QH4")]
+        non_none = [v for v in qh_values if isinstance(v, dict)]
+        self.assertEqual(len(non_none), 4)
+
+        # QH1 (09:15–09:30) incomplete, predicted ~2700 Wh (0.003 * 900)
+        self.assertFalse(result["QH1"]["complete"])
+        self.assertAlmostEqual(result["QH1"]["wh"], 2700.0, places=1)
+
+        # QH2 (09:00–09:15) complete, 0.003 * 900 = 2700 Wh
+        self.assertTrue(result["QH2"]["complete"])
+        self.assertAlmostEqual(result["QH2"]["wh"], 2700.0, places=1)
+
+        # QH3 (08:45–09:00) complete, 0.001 * 900 = 900 Wh
+        self.assertTrue(result["QH3"]["complete"])
+        self.assertAlmostEqual(result["QH3"]["wh"], 900.0, places=1)
+
+        # QH4 (08:30–08:45) complete, 0.001 * 900 = 900 Wh
+        self.assertTrue(result["QH4"]["complete"])
+        self.assertAlmostEqual(result["QH4"]["wh"], 900.0, places=1)
+
+    def test_chronological_order_qh1_oldest(self):
+        """QH1 should be oldest window, QH4 newest."""
+        from util import compute_clock_boundary_nbc_quarters
+
+        prev_data = self._make_data(3600, 0.001)
+        curr_data = self._make_data(3600, 0.005)
+        now = datetime(2026, 1, 1, 9, 59, 30, tzinfo=timezone.utc)
+
+        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
+
+        # All quarters from current hour should have higher wh values
+        for qh in ("QH1", "QH2", "QH3", "QH4"):
+            self.assertIsNotNone(result[qh])
+            # Current hour data: 0.005 kWh/s * 900s = 4500 Wh per quarter
+            self.assertGreater(result[qh]["wh"], 4000)
+
+    def test_negative_values_clamped_to_zero(self):
+        """Solar export (negative values) → wh clamped to 0."""
+        from util import compute_clock_boundary_nbc_quarters
+
+        prev_data = self._make_data(3600, -0.0005)
+        curr_data = self._make_data(3600, -0.0005)
+        now = datetime(2026, 1, 1, 9, 50, 30, tzinfo=timezone.utc)
+
+        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
+
+        for qh in ("QH1", "QH2", "QH3", "QH4"):
+            self.assertIsNotNone(result[qh])
+            # raw_wh should be negative, wh clamped to 0
+            self.assertLess(result[qh]["raw_wh"], 0)
+            self.assertEqual(result[qh]["wh"], 0)
+
+    def test_window_labels_format(self):
+        """window_labels should contain human-readable time ranges."""
+        from util import compute_clock_boundary_nbc_quarters
+
+        prev_data = self._make_data(3600, 0.001)
+        curr_data = self._make_data(3600, 0.002)
+        now = datetime(2026, 1, 1, 9, 37, 0, tzinfo=timezone.utc)
+
+        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
+
+        labels = result["window_labels"]
+        # QH1 should be the most recent window (09:30–09:45)
+        self.assertIn("QH1", labels)
+        # Labels should contain time strings like "09:30–09:45"
+        self.assertRegex(labels["QH1"], r"\d{2}:\d{2}")
+
+    def test_prev_hour_empty(self):
+        """Previous hour has no data → QH3/QH4 have wh=0, QH1/QH2 from current hour."""
+        from util import compute_clock_boundary_nbc_quarters
+
+        prev_data: list[float] = []
+        curr_data = self._make_data(1800, 0.002)
+        now = datetime(2026, 1, 1, 9, 30, 45, tzinfo=timezone.utc)
+
+        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
+
+        # All 4 quarters are dicts (wh=0 for missing data windows)
+        qh_values = [result[k] for k in ("QH1", "QH2", "QH3", "QH4")]
+        non_none = [v for v in qh_values if isinstance(v, dict)]
+        self.assertEqual(len(non_none), 4)
+
+        # QH1 (09:30–09:45) incomplete, no data → wh=0
+        self.assertFalse(result["QH1"]["complete"])
+        self.assertEqual(result["QH1"]["wh"], 0)
+
+        # QH2 (09:15–09:30) complete, 0.002 * 900 = 1800 Wh
+        self.assertTrue(result["QH2"]["complete"])
+        self.assertAlmostEqual(result["QH2"]["wh"], 1800.0, places=1)
+
+        # QH3 (09:00–09:15) complete, 0.002 * 900 = 1800 Wh
+        self.assertTrue(result["QH3"]["complete"])
+        self.assertAlmostEqual(result["QH3"]["wh"], 1800.0, places=1)
+
+        # QH4 (08:45–09:00) no prev data → wh=0, complete=False
+        self.assertFalse(result["QH4"]["complete"])
+        self.assertEqual(result["QH4"]["wh"], 0)
+
+    def test_incomplete_extrapolation_accuracy(self):
+        """Incomplete quarter: predicted_wh should be rate * 900."""
+        from util import compute_clock_boundary_nbc_quarters
+
+        prev_data = self._make_data(3600, 0.001)
+        # Current hour: minute 25 → n=1500, QH1 (09:15–09:30) has 600s observed
+        curr_data = self._make_data(1500, 0.004)
+        now = datetime(2026, 1, 1, 9, 25, 30, tzinfo=timezone.utc)
+
+        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
+
+        # QH1 (09:15–09:30): 600s observed out of 900, remaining = 300
+        qh1 = result["QH1"]
+        self.assertFalse(qh1["complete"])
+        # raw_wh: 600 * 0.004 * 1000 = 2400 Wh
+        self.assertAlmostEqual(qh1["raw_wh"], 2400.0, places=1)
+        # predicted: rate = 0.004, remaining = ~300s
+        # predicted_wh ≈ 2400 + 0.004 * 300 * 1000 = 2400 + 1200 = 3600
+        self.assertGreater(qh1["predicted_wh"], qh1["raw_wh"])
+
+
 if __name__ == "__main__":
     unittest.main()

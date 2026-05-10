@@ -36,6 +36,7 @@ class _PopulationResult:
     chart_data: list[float]
     nbc_seconds: list[float]
     nbc_data_start: datetime
+    prev_hour_data: list[float] = dataclasses.field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,9 @@ class DeviceMetrics:
     nbc: dict[str, Any] = dataclasses.field(  # type: ignore[assignment]
         default_factory=dict, repr=False
     )
+    clock_boundary_nbc: dict[str, Any] = dataclasses.field(  # type: ignore[assignment]
+        default_factory=dict, repr=False
+    )
     timezone: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -102,6 +106,7 @@ class DeviceMetrics:
             "smoothing": {k: round(v, 14) for k, v in self.smoothing.items()},
             "timezone": self.timezone,
             "nbc": self.nbc,
+            "clock_boundary_nbc": self.clock_boundary_nbc,
         }
 
 
@@ -894,12 +899,32 @@ class HourlyProjection(MetricsBase):
                 seconds=len(usage_data_local)
             )
             chart_data = self._process_offset_scales(scales, usage_data_local, usage_data_end)
+
+            # Fetch previous hour data for clock-boundary NBC quarters
+            prev_hour_start = chart_start - timedelta(hours=1)
+            prev_hour_data: list[float] = []
+            try:
+                prev_usage, _ = self.vue.get_chart_usage(
+                    chan,
+                    prev_hour_start,
+                    chart_start,
+                    scale=Scale.SECOND.value,
+                    unit=Unit.KWH.value,
+                )
+                if prev_usage and len(prev_usage) > 0 and prev_usage[0] is not None:
+                    prev_hour_data = prev_usage
+            except (requests.exceptions.RequestException, IOError):
+                self.logger.debug(
+                    "could not fetch previous hour data for %s", vdi.device_name
+                )
+
             return _PopulationResult(
                 per_second_data=usage_data_local,
                 scales=scales,
                 chart_data=chart_data,
                 nbc_seconds=usage_data_local,
                 nbc_data_start=usage_data_start_local,
+                prev_hour_data=prev_hour_data,
             )
         return None
 
@@ -983,6 +1008,22 @@ class HourlyProjection(MetricsBase):
             getattr(vdi, "time_zone", None),
         )
 
+        # Compute clock-boundary NBC quarters for the 4 most recent 15-min windows
+        from util import compute_clock_boundary_nbc_quarters
+
+        clock_boundary_nbc = {}
+        if pop_result.prev_hour_data:
+            try:
+                clock_boundary_nbc = compute_clock_boundary_nbc_quarters(
+                    pop_result.prev_hour_data,
+                    pop_result.nbc_seconds,
+                    self.instant,
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                self.logger.debug(
+                    "clock-boundary NBC computation failed for %s", vdi.device_name
+                )
+
         return DeviceMetrics(
             gid=vdi.device_gid,
             name=vdi.device_name,
@@ -1000,6 +1041,7 @@ class HourlyProjection(MetricsBase):
             scales=pop_result.scales,
             smoothing=pred_result["smoothing"],
             nbc=nbc_result,
+            clock_boundary_nbc=clock_boundary_nbc,
             timezone=getattr(vdi, "time_zone", None) or "",
         )
 

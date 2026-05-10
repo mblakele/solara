@@ -10,6 +10,7 @@ from metrics import (
     MetricsBase,
     MetricsCache,
     RetryableMetricsException,
+    _PopulationResult,
 )
 from util import compute_nbc_quarters
 from mockdata import MetricsMock
@@ -781,6 +782,7 @@ class TestDeviceMetricsDataClass(unittest.TestCase):
             "prediction", "prediction_min", "prediction_max",
             "minute_predicted", "minutes_remaining",
             "scales", "smoothing", "timezone", "nbc",
+            "clock_boundary_nbc",
         }
         self.assertEqual(set(d.keys()), expected_keys)
 
@@ -2050,6 +2052,197 @@ class TestIncrementalFetchIntegration(unittest.TestCase):
             # Second call with force=True to simulate incremental fetch
             cache.get_or_fetch(fetch_func, force=True)
             self.assertEqual(len(cache._samples), 360)
+
+
+class TestClockBoundaryNBC(unittest.TestCase):
+    """Tests for clock-boundary NBC quarter computation in metrics."""
+
+    def test_populate_device_fetches_prev_hour_data(self):
+        """_populate_device calls get_chart_usage for previous hour data."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        hp.instant = now
+        hp.metrics = {"api_response": {}, "debug": False, "devices": [], "instant": now}
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+
+        # Mock current hour data (30 minutes = 1800 seconds)
+        curr_data = [0.001] * 1800
+        # Mock previous hour data (full hour = 3600 seconds)
+        prev_data = [0.002] * 3600
+
+        def get_chart_usage_side_effect(chan, start, end, scale=None, unit=None):
+            if start.hour == 12:
+                return curr_data, now.replace(minute=0)
+            # prev hour (11:00-12:00)
+            return prev_data, now.replace(hour=11, minute=0)
+
+        hp.vue.get_chart_usage.side_effect = get_chart_usage_side_effect
+
+        vdi_mock = MagicMock()
+        chan_mock = MagicMock(channel_num=1)
+        vdi_mock.channels = [chan_mock]
+
+        result = hp._populate_device(vdi_mock, now.replace(minute=0))
+        self.assertIsNotNone(result)
+
+        # Verify prev_hour_data was fetched (3600 samples from previous hour)
+        self.assertEqual(len(result.prev_hour_data), 3600)
+
+    def test_populate_device_handles_prev_hour_api_error(self):
+        """_populate_device returns prev_hour_data=[] when previous hour API call fails."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        hp.instant = now
+        hp.metrics = {"api_response": {}, "debug": False, "devices": [], "instant": now}
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+
+        # Mock current hour data succeeds, previous hour fails
+        curr_data = [0.001] * 1800
+
+        def get_chart_usage_side_effect(chan, start, end, scale=None, unit=None):
+            if start.hour == 12:
+                return curr_data, now.replace(minute=0)
+            raise requests.exceptions.RequestException("API error")
+
+        hp.vue.get_chart_usage.side_effect = get_chart_usage_side_effect
+
+        vdi_mock = MagicMock()
+        chan_mock = MagicMock(channel_num=1)
+        vdi_mock.channels = [chan_mock]
+
+        result = hp._populate_device(vdi_mock, now.replace(minute=0))
+        self.assertIsNotNone(result)
+
+        # prev_hour_data should be empty list when API fails
+        self.assertEqual(result.prev_hour_data, [])
+
+    def test_compute_device_metrics_includes_clock_boundary_nbc(self):
+        """_compute_device_metrics computes clock_boundary_nbc when prev_hour_data is available."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        hp.instant = now
+        hp.logger = MagicMock()
+
+        # Create population result with prev_hour_data
+        pop_result = _PopulationResult(
+            per_second_data=[0.001] * 1800,
+            scales={"1H": {"usage": 1.8}},
+            chart_data=[0.001] * 1800,
+            nbc_seconds=[0.001] * 1800,
+            nbc_data_start=now.replace(minute=0),
+            prev_hour_data=[0.002] * 3600,
+        )
+
+        vdi_mock = MagicMock()
+        vdi_mock.device_gid = 123
+        vdi_mock.device_name = "TestDevice"
+        vdi_mock.time_zone = "America/Los_Angeles"
+
+        pred_result = {
+            "lag": 5,
+            "prediction": -900.0,
+            "prediction_min": -1000.0,
+            "prediction_max": -800.0,
+            "minute_predicted": 15.0,
+            "seconds_remaining": 900,
+            "smoothing": {"1MIN": 14.5},
+        }
+
+        device_metrics = hp._compute_device_metrics(vdi_mock, pop_result, pred_result)
+        self.assertIsNotNone(device_metrics.clock_boundary_nbc)
+
+        # Should have QH1-QH4 keys and window_labels
+        self.assertIn("QH1", device_metrics.clock_boundary_nbc)
+        self.assertIn("window_labels", device_metrics.clock_boundary_nbc)
+
+    def test_compute_device_metrics_empty_clock_boundary_nbc_without_prev_hour(self):
+        """_compute_device_metrics returns empty clock_boundary_nbc when no prev_hour_data."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        hp.instant = now
+        hp.logger = MagicMock()
+
+        # Create population result WITHOUT prev_hour_data (empty list)
+        pop_result = _PopulationResult(
+            per_second_data=[0.001] * 1800,
+            scales={"1H": {"usage": 1.8}},
+            chart_data=[0.001] * 1800,
+            nbc_seconds=[0.001] * 1800,
+            nbc_data_start=now.replace(minute=0),
+        )
+
+        vdi_mock = MagicMock()
+        vdi_mock.device_gid = 123
+        vdi_mock.device_name = "TestDevice"
+        vdi_mock.time_zone = "America/Los_Angeles"
+
+        pred_result = {
+            "lag": 5,
+            "prediction": -900.0,
+            "prediction_min": -1000.0,
+            "prediction_max": -800.0,
+            "minute_predicted": 15.0,
+            "seconds_remaining": 900,
+            "smoothing": {"1MIN": 14.5},
+        }
+
+        device_metrics = hp._compute_device_metrics(vdi_mock, pop_result, pred_result)
+        # Should be empty dict when no prev_hour_data
+        self.assertEqual(device_metrics.clock_boundary_nbc, {})
+
+    def test_device_metrics_to_dict_includes_clock_boundary_nbc(self):
+        """DeviceMetrics.to_dict() includes clock_boundary_nbc."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        hp.instant = now
+        hp.logger = MagicMock()
+
+        pop_result = _PopulationResult(
+            per_second_data=[0.001] * 1800,
+            scales={"1H": {"usage": 1.8}},
+            chart_data=[0.001] * 1800,
+            nbc_seconds=[0.001] * 1800,
+            nbc_data_start=now.replace(minute=0),
+            prev_hour_data=[0.002] * 3600,
+        )
+
+        vdi_mock = MagicMock()
+        vdi_mock.device_gid = 123
+        vdi_mock.device_name = "TestDevice"
+        vdi_mock.time_zone = "America/Los_Angeles"
+
+        pred_result = {
+            "lag": 5,
+            "prediction": -900.0,
+            "prediction_min": -1000.0,
+            "prediction_max": -800.0,
+            "minute_predicted": 15.0,
+            "seconds_remaining": 900,
+            "smoothing": {"1MIN": 14.5},
+        }
+
+        device_metrics = hp._compute_device_metrics(vdi_mock, pop_result, pred_result)
+        d = device_metrics.to_dict()
+
+        self.assertIn("clock_boundary_nbc", d)
+        self.assertIn("QH1", d["clock_boundary_nbc"])
 
 
 if __name__ == "__main__":

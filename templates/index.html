@@ -33,6 +33,11 @@
   div.metrics td.num {
       text-align: right;
   }
+  tr.section-title td {
+      font-weight: bold;
+      padding-top: 0.5em;
+      border-top: 1px solid #ccc;
+  }
   div.load-management {
       margin-top: 1em;
       font-size: 1em;
@@ -104,6 +109,29 @@
         {% else %}
           Wh
         {% endif %}
+      </td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+    {% endif %}
+    {% if vd.clock_boundary_nbc and vd.clock_boundary_nbc.get("window_labels") %}
+    <tr>
+      <td colspan="3" class="section-title">Clock-Boundary NBC Quarters</td>
+    </tr>
+    {% for qh_key in ["QH1", "QH2", "QH3", "QH4"] %}
+    {% set qh = vd.clock_boundary_nbc.get(qh_key) %}
+    {% if qh is not none and qh is not false %}
+    <tr>
+      <td class="op">{{ qh_key }}</td>
+      <td class="num">
+        {% if not qh.complete %}
+          {{ "%.0f" % (qh.raw_wh) }}&nbsp;/&nbsp;{{ "%.0f" % (qh.predicted_wh) }}
+        {% else %}
+          {{ "%.0f" % (qh.raw_wh) }}
+        {% endif %}
+      </td>
+      <td class="note">
+        {{ vd.clock_boundary_nbc["window_labels"].get(qh_key, "") }}
       </td>
     </tr>
     {% endif %}
