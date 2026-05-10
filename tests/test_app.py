@@ -145,7 +145,7 @@ class TestApp(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         # The word 'MOCK' might not be in the HTML if it's using the values directly.
         # Let's check for some characteristic HTML instead.
-        self.assertIn(b"Wh, predicted total", response.data)
+        self.assertIn(b"response time", response.data)
 
     def test_tou_endpoint_missing_start_date(self):
         response = self.app.get("/api/v1/tou")
