@@ -294,6 +294,7 @@ def _compute_window_wh(
             "wh": 0,
             "complete": is_complete,
             "raw_wh": 0,
+            "predicted_wh": 0,
         }
 
     slice_data = data[start_idx:end_idx + 1]
@@ -304,6 +305,7 @@ def _compute_window_wh(
             "wh": max(0, raw_wh),
             "complete": True,
             "raw_wh": raw_wh,
+            "predicted_wh": raw_wh,
         }
 
     # Incomplete window — extrapolate from lookback rate.

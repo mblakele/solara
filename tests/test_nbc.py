@@ -956,5 +956,55 @@ class TestComputeClockBoundaryNBCQuarters(unittest.TestCase):
         self.assertGreater(qh1["predicted_wh"], qh1["raw_wh"])
 
 
+class TestComputeWindowWhPredictedWh(unittest.TestCase):
+    """Tests for _compute_window_wh() — ensures predicted_wh is always present.
+
+    The index template accesses qh.predicted_wh for incomplete quarters.
+    This property must hold for ALL branches of _compute_window_wh().
+    """
+
+    def test_complete_window_has_predicted_wh(self):
+        """Complete window (900s) must include predicted_wh key."""
+        from util import _compute_window_wh
+
+        data = [0.001] * 900
+        result = _compute_window_wh(data, 0, 899)
+
+        self.assertTrue(result["complete"])
+        self.assertIn("predicted_wh", result)
+        self.assertAlmostEqual(result["predicted_wh"], 900.0, places=1)
+
+    def test_incomplete_window_has_predicted_wh(self):
+        """Incomplete window must include predicted_wh key."""
+        from util import _compute_window_wh
+
+        data = [0.002] * 900
+        result = _compute_window_wh(data, 0, 499)
+
+        self.assertFalse(result["complete"])
+        self.assertIn("predicted_wh", result)
+        self.assertGreater(result["predicted_wh"], 0)
+
+    def test_empty_data_has_predicted_wh(self):
+        """Empty data / out-of-order indices must include predicted_wh key."""
+        from util import _compute_window_wh
+
+        result = _compute_window_wh([], 500, 400)
+
+        self.assertFalse(result["complete"])
+        self.assertIn("predicted_wh", result)
+        self.assertEqual(result["predicted_wh"], 0)
+
+    def test_zero_length_window_has_predicted_wh(self):
+        """Zero-length slice must include predicted_wh key."""
+        from util import _compute_window_wh
+
+        result = _compute_window_wh([0.001], 100, 99)
+
+        self.assertFalse(result["complete"])
+        self.assertIn("predicted_wh", result)
+        self.assertEqual(result["predicted_wh"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

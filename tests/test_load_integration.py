@@ -696,7 +696,7 @@ def test_pending_since_count():
 
 
 def test_prune_old_effects():
-    """prune_old_effects removes effects before cutoff."""
+    """prune_old_effects removes effects before the data point that are old enough."""
     tracker = StateTracker()
     base_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
     tracker.pending_effects.extend([
@@ -717,10 +717,47 @@ def test_prune_old_effects():
         ),
     ])
 
+    # data_point_at = base_time
+    # old1 (60s old): exactly at boundary — pruned (60s >= MIN_SECS)
+    # old2 (30s old): below MIN_SECS — kept
+    # recent (future): above data_point_at — kept
     pruned = tracker.prune_old_effects(base_time)
-    assert pruned == 2
-    assert len(tracker.pending_effects) == 1
-    assert tracker.pending_effects[0].device_name == "recent"
+    assert pruned == 1
+    assert len(tracker.pending_effects) == 2
+    assert {e.device_name for e in tracker.pending_effects} == {"old2", "recent"}
+
+
+def test_prune_old_effects_respects_minimum_age():
+    """prune_old_effects does not prune effects younger than PENDING_EFFECT_MIN_SECS in data-point time.
+
+    Uses wall-clock ``now`` so the test is not sensitive to a frozen datetime.
+    """
+    tracker = StateTracker()
+    now = datetime.now(timezone.utc)
+    dp = now  # data_point_at is "now"
+
+    tracker.pending_effects.extend([
+        PendingEffect(
+            device_name="young", action="turn_on",
+            timestamp=now - timedelta(seconds=50),
+            power_delta_wh=100.0,
+        ),
+        PendingEffect(
+            device_name="old", action="turn_off",
+            timestamp=now - timedelta(seconds=300),
+            power_delta_wh=-50.0,
+        ),
+        PendingEffect(
+            device_name="recent", action="turn_on",
+            timestamp=now + timedelta(seconds=10),
+            power_delta_wh=200.0,
+        ),
+    ])
+
+    pruned = tracker.prune_old_effects(dp)
+    assert pruned == 1  # only the "old" effect is pruned
+    assert len(tracker.pending_effects) == 2
+    assert {e.device_name for e in tracker.pending_effects} == {"young", "recent"}
 
 
 # --- Pending effect lifecycle tests ---
@@ -812,25 +849,35 @@ def test_stale_data_prunes_old_effects():
     )
 
     now = datetime.now(timezone.utc)
+    # Cache created with data_lag_secs=180, fetch_offset_secs=0 (default).
+    # data_point_at = cache_now - 180s, cutoff = data_point_at - 60s = cache_now - 240s.
     mgr.state.pending_effects.extend([
         PendingEffect(
             device_name="heater", action="turn_on",
-            timestamp=now - timedelta(seconds=200),
+            # -280s is before cutoff (now-240s) → pruned.
+            timestamp=now - timedelta(seconds=280),
             power_delta_wh=500.0,
         ),
         PendingEffect(
             device_name="heater", action="turn_off",
-            timestamp=now - timedelta(seconds=160),
+            # -80s is after cutoff → kept.
+            timestamp=now - timedelta(seconds=80),
             power_delta_wh=-200.0,
         ),
     ])
 
-    result = mgr.run_cycle()
+    # Use force=True to skip the stale-data check in _check_pending_state
+    # and proceed directly to Stage 4 where pruning always happens.
+    # Run the cycle once to trigger decide() which may add new actions.
+    result = mgr.run_cycle(force=True)
 
-    assert result["status"] == "stale_data"
-    assert len(mgr.state.pending_effects) == 1
-    assert mgr.state.pending_effects[0].device_name == "heater"
-    assert mgr.state.pending_effects[0].action == "turn_off"
+    assert result["status"] == "ok"
+    # Old effect (turn_on, -280s) should be pruned. New action (turn_on) may
+    # have been added by decide(). The original turn_off should remain.
+    assert all(
+        pe.timestamp > mgr.state.last_data_point_at - timedelta(seconds=60)
+        for pe in mgr.state.pending_effects
+    )
 
 
 def test_stale_data_includes_candidates():

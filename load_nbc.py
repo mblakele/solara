@@ -132,10 +132,10 @@ class NBCReader:
             fetched_at = self.energy_cache._last_fetch_at  # pylint: disable=W0212
             if fetched_at is None:
                 fetched_at = now
-            data_lag_secs: float = getattr(
+            lag_secs = getattr(
                 self.energy_cache, "_data_lag_secs", 0.0
             )
-            data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
+            data_point_at = fetched_at - timedelta(seconds=lag_secs)
             return (  # type: ignore[return-value]
                 qh_data["qh_name"],
                 qh_data.get("predicted_wh", 0),
@@ -169,8 +169,10 @@ class NBCReader:
             fetched_at = self.energy_cache._last_fetch_at  # pylint: disable=W0212
             if fetched_at is None:
                 fetched_at = now
-            data_lag_secs = qh_data.get("_data_lag_secs", 0.0)
-            data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
+            lag_secs = getattr(
+                self.energy_cache, "_data_lag_secs", 0.0
+            )
+            data_point_at = fetched_at - timedelta(seconds=lag_secs)
             return (  # type: ignore[return-value]
                 qh_data["qh_name"],
                 qh_data.get("predicted_wh", 0),
@@ -273,6 +275,7 @@ class StateTracker:
     MIN_TOGGLE_ON_SECS = 60
     MIN_TOGGLE_OFF_SECS = 10
     STALE_THRESHOLD_SECS = 61
+    PENDING_EFFECT_MIN_SECS = 60
     VOLTAGE = 240
 
     # After a Tesla amp *increase* is confirmed, suppress turn-off decisions for
@@ -453,22 +456,29 @@ class StateTracker:
             if eff.timestamp > nbc_timestamp
         )
 
-    def prune_old_effects(self, cutoff: datetime) -> int:
-        """Remove pending effects older than the cutoff timestamp.
+    def prune_old_effects(self, data_point_at: datetime) -> int:
+        """Remove pending effects eligible for pruning based on data-point age.
 
-        Effects before a fresh NBC fetch are already reflected in that data,
-        so they no longer serve a purpose and would cause unbounded list growth.
+        Pruning requires both:
+          1. effect timestamp <= data_point_at  (effect was created before the data point)
+          2. data_point_at - effect timestamp >= 60s  (effect is old enough in data time)
+
+        Condition 2 replaces the wall-clock age check used previously. Using
+        data_point_at for both checks ensures consistency: the effect has had
+        at least 60 seconds of data-point time to propagate through the Emporia
+        API's sliding window and appear in the latest 1-min NBC prediction.
 
         Args:
-            cutoff: Only keep effects with timestamp >= this value.
+            data_point_at: Timestamp of the most recent per-second data point.
 
         Returns:
             Number of effects removed.
         """
+        min_age_cutoff = data_point_at - timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
         before = len(self.pending_effects)
         self.pending_effects = [
             eff for eff in self.pending_effects
-            if eff.timestamp > cutoff
+            if eff.timestamp > min_age_cutoff
         ]
         return before - len(self.pending_effects)
 
