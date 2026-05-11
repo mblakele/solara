@@ -126,7 +126,7 @@ project-root
 └── .env                # Local secrets — never commit
 ```
 
-## Key entry points
+### Key entry points
 
 - NBC calculation in `metrics.py` (EnergyCache with incremental fetch, sample merging, and pruning;
   clock-boundary quarter-hour computation via `compute_clock_boundary_nbc_quarters`)
