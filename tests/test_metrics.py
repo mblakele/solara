@@ -9,7 +9,6 @@ from metrics import (
     HourlyProjection,
     Metrics,
     MetricsBase,
-    MetricsCache,
     RetryableMetricsException,
     _PopulationResult,
 )
@@ -280,151 +279,6 @@ class TestMetrics(unittest.TestCase):
         self.assertGreater(nbc_b["QH1"]["wh"], 0)
         self.assertFalse(nbc_b["QH3"]["complete"])
         self.assertIn("predicted_wh", nbc_b["QH3"])
-
-
-class TestMetricsCache(unittest.TestCase):
-    """Tests for MetricsCache."""
-
-    def test_cache_miss_on_first_call(self):
-        """First call should fetch fresh data and return was_fresh=True."""
-        cache = MetricsCache(ttl_seconds=60)
-        fetch_count = 0
-
-        def fetch_func():
-            nonlocal fetch_count
-            fetch_count += 1
-            return {"key": "value"}
-
-        data, was_fresh = cache.get_or_fetch(fetch_func)
-
-        self.assertEqual(fetch_count, 1)
-        self.assertTrue(was_fresh)
-        self.assertEqual(data["key"], "value")
-
-    def test_cache_hit_within_ttl(self):
-        """Second call within TTL returns cached data with was_fresh=False."""
-        cache = MetricsCache(ttl_seconds=60)
-        fetch_count = 0
-
-        def fetch_func():
-            nonlocal fetch_count
-            fetch_count += 1
-            return {"key": "value"}
-
-        cache.get_or_fetch(fetch_func)
-        data, was_fresh = cache.get_or_fetch(fetch_func)
-
-        self.assertEqual(fetch_count, 1)
-        self.assertFalse(was_fresh)
-        self.assertEqual(data["key"], "value")
-
-    def test_cache_miss_ttl_expired(self):
-        """Call after TTL expiry fetches fresh data."""
-        cache = MetricsCache(ttl_seconds=0)
-        fetch_count = 0
-
-        def fetch_func():
-            nonlocal fetch_count
-            fetch_count += 1
-            return {"count": fetch_count}
-
-        cache.get_or_fetch(fetch_func)
-        time.sleep(0.05)
-        data, was_fresh = cache.get_or_fetch(fetch_func)
-
-        self.assertEqual(fetch_count, 2)
-        self.assertTrue(was_fresh)
-        self.assertEqual(data["count"], 2)
-
-    def test_invalidate_clears_cache(self):
-        """After invalidate, next call fetches fresh data."""
-        cache = MetricsCache(ttl_seconds=60)
-        fetch_count = 0
-
-        def fetch_func():
-            nonlocal fetch_count
-            fetch_count += 1
-            return {"count": fetch_count}
-
-        cache.get_or_fetch(fetch_func)
-        self.assertEqual(fetch_count, 1)
-
-        cache.invalidate()
-
-        data, was_fresh = cache.get_or_fetch(fetch_func)
-        self.assertEqual(fetch_count, 2)
-        self.assertTrue(was_fresh)
-        self.assertEqual(data["count"], 2)
-
-    def test_fetched_at_in_data(self):
-        """Fresh fetch stores _fetched_at timestamp in returned data."""
-        cache = MetricsCache(ttl_seconds=60)
-
-        def fetch_func():
-            return {"key": "value"}
-
-        before_fetch = datetime.now(timezone.utc)
-        data, was_fresh = cache.get_or_fetch(fetch_func)
-        after_fetch = datetime.now(timezone.utc)
-
-        self.assertTrue(was_fresh)
-        self.assertIn("_fetched_at", data)
-        fetched_at = data["_fetched_at"]
-        self.assertGreaterEqual(fetched_at, before_fetch)
-        self.assertLessEqual(fetched_at, after_fetch)
-        self.assertEqual(data["key"], "value")
-
-    def test_fetched_at_preserved_on_cache_hit(self):
-        """Cache hit returns the original _fetched_at from when data was fetched."""
-        cache = MetricsCache(ttl_seconds=60)
-
-        def fetch_func():
-            return {"key": "value"}
-
-        # First call: fresh fetch
-        data1, _ = cache.get_or_fetch(fetch_func)
-        original_fetched_at = data1["_fetched_at"]
-
-        time.sleep(0.05)
-
-        # Second call: cache hit — _fetched_at should be unchanged
-        data2, was_fresh = cache.get_or_fetch(fetch_func)
-        self.assertFalse(was_fresh)
-        self.assertEqual(data2["_fetched_at"], original_fetched_at)
-
-    def test_fetched_at_updated_on_refetch(self):
-        """After TTL expiry and refetch, _fetched_at is updated."""
-        cache = MetricsCache(ttl_seconds=0)
-
-        def fetch_func():
-            return {"key": "value"}
-
-        data1, _ = cache.get_or_fetch(fetch_func)
-        original_fetched_at = data1["_fetched_at"]
-
-        time.sleep(0.05)
-
-        data2, was_fresh = cache.get_or_fetch(fetch_func)
-        self.assertTrue(was_fresh)
-        self.assertGreater(data2["_fetched_at"], original_fetched_at)
-
-    def test_multiple_calls_same_ttl(self):
-        """Multiple calls within TTL all return same cached reference."""
-        cache = MetricsCache(ttl_seconds=60)
-        fetch_count = 0
-
-        def fetch_func():
-            nonlocal fetch_count
-            fetch_count += 1
-            return {"count": fetch_count}
-
-        result1, _ = cache.get_or_fetch(fetch_func)
-        result2, _ = cache.get_or_fetch(fetch_func)
-        result3, _ = cache.get_or_fetch(fetch_func)
-
-        self.assertEqual(fetch_count, 1)
-        self.assertIs(result1, result2)
-        self.assertIs(result2, result3)
 
 
 class TestComputeNBCQuartersEdgeCases(unittest.TestCase):
@@ -737,40 +591,6 @@ class TestTOUReporterEdgeCases(unittest.TestCase):
 
         self.assertIsNotNone(tou.nbc_result)
         # NBC should be 0 since all values are None (skipped in positive sum)
-
-
-class TestMetricsCacheEdgeCases(unittest.TestCase):
-    """Tests for MetricsCache edge cases."""
-
-    def test_ttl_zero_forces_refetch(self):
-        """TTL of 0 should force a refetch on every call."""
-        cache = MetricsCache(ttl_seconds=0)
-        fetch_count = 0
-
-        def fetch_func():
-            nonlocal fetch_count
-            fetch_count += 1
-            return {"count": fetch_count}
-
-        cache.get_or_fetch(fetch_func)
-        self.assertEqual(fetch_count, 1)
-
-        # Even without sleeping, TTL=0 means always fresh
-        data2, was_fresh = cache.get_or_fetch(fetch_func)
-        self.assertEqual(fetch_count, 2)
-
-    def test_concurrent_calls_same_fetch(self):
-        """Multiple sequential calls within TTL should all return same cached data."""
-        cache = MetricsCache(ttl_seconds=60)
-
-        def fetch_func():
-            return {"value": "shared"}
-
-        results = [cache.get_or_fetch(fetch_func) for _ in range(5)]
-        # All should return the same data object (was_fresh varies)
-        for i in range(1, 5):
-            self.assertIs(results[0][0], results[i][0])
-
 
 
 class TestDeviceMetricsDataClass(unittest.TestCase):

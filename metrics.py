@@ -114,58 +114,6 @@ class DeviceMetrics:
         }
 
 
-class MetricsCache:
-    """Cache for HourlyProjection metrics data.
-
-    Caches the full metrics dict for a configurable TTL. Callers get either
-    a fresh fetch or a cached copy depending on TTL expiry. The fetch
-    timestamp is stored in the returned data under the ``_fetched_at`` key
-    so downstream consumers can distinguish real API fetch time from cache
-    hit time.
-    """
-
-    def __init__(self, ttl_seconds: int = 30) -> None:
-        self._data: dict[str, Any] | None = None
-        self._fetched_at: datetime | None = None
-        self._ttl = timedelta(seconds=ttl_seconds)
-
-    def get_or_fetch(
-        self,
-        fetch_func: Callable[[], dict[str, Any]],
-    ) -> tuple[dict[str, Any], bool]:
-        """Return (metrics_data, was_fresh).
-
-        Returns cached data if not expired. Otherwise calls fetch_func and
-        caches the result.
-
-        Args:
-            fetch_func: Callable that returns a fresh metrics dict.
-
-        Returns:
-            Tuple of (metrics_data, was_fresh). ``was_fresh`` is True when
-            fetch_func was actually called.
-        """
-        now = datetime.now(timezone.utc)
-        if (
-            self._data is not None
-            and self._fetched_at is not None
-            and (now - self._fetched_at) < self._ttl
-        ):
-            return self._data, False
-
-        fresh = fetch_func()
-        fresh["_fetched_at"] = now
-        self._data = fresh
-        self._fetched_at = now
-        return fresh, True
-
-    def invalidate(self) -> None:
-        """Clear the cache."""
-        self._data = None
-        self._fetched_at = None
-
-
-
 def _build_incremental_fetch(
     energy_cache: "EnergyCache",
     vue: PyEmVue,
@@ -193,54 +141,32 @@ def _build_incremental_fetch(
         A callable that returns a dict with ``per_second_data`` and
         ``data_start``, or None on API error.
     """
-    if now is None:
-        now = datetime.now(timezone.utc)
 
     def fetcher() -> dict[str, Any] | None:
-        """Fetch incremental per-second data and merge into cache.
+        effective_now = now if now is not None else datetime.now(timezone.utc)
 
-        Returns:
-            Dict with merged samples on success, None on error.
-        """
-        # Determine the start time for this fetch.
-        if energy_cache._samples is None or len(energy_cache._samples) == 0:  # pylint: disable=W0212
-            # First fetch — get data for the current hour.
-            chart_start = now.replace(minute=0, second=0, microsecond=0)
-            start_time = chart_start
+        if energy_cache._samples is None or len(energy_cache._samples) == 0:
+            start_time = effective_now.replace(minute=0, second=0, microsecond=0)
         else:
-            # Incremental fetch — start from the last sample time.
-            if energy_cache._data_start is None:  # pylint: disable=W0212
-                # Should not happen, but fall back to full fetch.
-                chart_start = now.replace(minute=0, second=0, microsecond=0)
-                start_time = chart_start
+            if energy_cache._data_start is None:
+                start_time = effective_now.replace(minute=0, second=0, microsecond=0)
             else:
-                last_sample_idx = len(energy_cache._samples) - 1  # pylint: disable=W0212
-                start_time = energy_cache._data_start + timedelta(  # pylint: disable=W0212
-                    seconds=last_sample_idx
-                )
+                last_sample_idx = len(energy_cache._samples)
+                start_time = energy_cache._data_start + timedelta(seconds=last_sample_idx)
 
         try:
             usage_data, data_start = vue.get_chart_usage(
                 device_gid,
                 start_time,
-                now,
+                effective_now,
                 scale=Scale.SECOND.value,
                 unit=Unit.KWH.value,
             )
-
-            if usage_data is None or len(usage_data) == 0:
+            if not usage_data:
                 return None
-
-            # Return dict compatible with EnergyCache.get_or_fetch().
-            return {
-                "per_second_data": list(usage_data),
-                "data_start": data_start,
-            }
-
+            return {"per_second_data": list(usage_data), "data_start": data_start}
         except (requests.exceptions.RequestException, IOError):
-            logger.exception(
-                "error fetching incremental data for device %d", device_gid
-            )
+            logger.exception("error fetching incremental data for device %d", device_gid)
             return None
 
     return fetcher
