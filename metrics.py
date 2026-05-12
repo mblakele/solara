@@ -92,12 +92,14 @@ class DeviceMetrics:
     timezone: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to dict for JSON/template consumption."""
+        """Serialize to dict for JSON/template consumption.
+
+        per_second_data is truncated to the latest 300 samples for compact output.
+        """
         return {
             "gid": self.gid,
             "lag": self.lag,
             "name": self.name,
-            "per_second_data": self.per_second_data,
             "prediction": round(self.prediction.value, 14),
             "prediction_min": round(self.prediction.min_value, 14),
             "prediction_max": round(self.prediction.max_value, 14),
@@ -108,6 +110,7 @@ class DeviceMetrics:
             "timezone": self.timezone,
             "nbc": self.nbc,
             "clock_boundary_nbc": self.clock_boundary_nbc,
+            "per_second_data": self.per_second_data[-300:],
         }
 
 

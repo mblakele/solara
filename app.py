@@ -71,6 +71,30 @@ def camelize(obj: object) -> object:
     return obj
 
 
+def _trim_output_device(device: dict[str, Any]) -> dict[str, Any]:
+    """Truncate per_second_data to 300 samples and move it to the end of the dict.
+
+    Called on device dicts before they are sent to the template or JSON endpoint,
+    ensuring the output is compact and debug-friendly.
+
+    Args:
+        device: A device dict from mock data or production to_dict().
+
+    Returns:
+        New dict with per_second_data truncated to last 300 and moved to end.
+    """
+    data = device.get("per_second_data", [])
+    trimmed = list(data[-300:]) if len(data) > 300 else data
+    # Build ordered dict with per_second_data last.
+    ordered: dict[str, Any] = {}
+    for k, v in device.items():
+        if k == "per_second_data":
+            continue
+        ordered[k] = v
+    ordered["per_second_data"] = trimmed
+    return ordered
+
+
 # The template_folder and static_folder default to 'templates' and 'static'
 # relative to the application path. Using the default root structure.
 
@@ -239,6 +263,9 @@ def index() -> ResponseReturnValue:
             logger.debug("Fetched fresh metrics for index endpoint")
         else:
             logger.debug("Serving cached metrics for index endpoint")
+
+    # Truncate and reorder per_second_data in each device for compact output.
+    metrics_data["devices"] = [_trim_output_device(d) for d in metrics_data.get("devices", [])]
 
     # Gather load management state for display
     load_management = _build_load_management_payload()

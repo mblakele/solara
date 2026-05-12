@@ -428,5 +428,73 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
 
 
+class TestTrimOutputDevice(unittest.TestCase):
+    """Tests for the _trim_output_device helper in app.py."""
+
+    def test_truncates_to_300_samples(self):
+        """_trim_output_device truncates per_second_data to 300 samples."""
+        import app as app_mod
+
+        device = {
+            "gid": 1,
+            "name": "test-device",
+            "per_second_data": list(range(1000)),
+            "prediction": 42.0,
+        }
+        result = app_mod._trim_output_device(device)
+
+        self.assertEqual(len(result["per_second_data"]), 300)
+        self.assertEqual(result["per_second_data"][0], 700)
+        self.assertEqual(result["per_second_data"][-1], 999)
+
+    def test_keeps_short_arrays_unchanged(self):
+        """_trim_output_device keeps arrays shorter than 300 unchanged."""
+        import app as app_mod
+
+        device = {
+            "gid": 1,
+            "name": "short-device",
+            "per_second_data": list(range(50)),
+            "prediction": 42.0,
+        }
+        result = app_mod._trim_output_device(device)
+
+        self.assertEqual(len(result["per_second_data"]), 50)
+        self.assertEqual(result["per_second_data"], list(range(50)))
+
+    def test_moves_per_second_data_to_end(self):
+        """_trim_output_device places per_second_data as the last key."""
+        import app as app_mod
+
+        device = {
+            "gid": 1,
+            "name": "order-device",
+            "per_second_data": [1, 2, 3],
+            "prediction": 42.0,
+            "scales": {},
+            "nbc": {},
+        }
+        result = app_mod._trim_output_device(device)
+
+        keys = list(result.keys())
+        self.assertEqual(keys[-1], "per_second_data")
+        # Verify other keys are in their original relative order.
+        self.assertEqual(keys[:-1], ["gid", "name", "prediction", "scales", "nbc"])
+
+    def test_empty_per_second_data(self):
+        """_trim_output_device handles empty per_second_data gracefully."""
+        import app as app_mod
+
+        device = {
+            "gid": 1,
+            "name": "empty-device",
+            "per_second_data": [],
+            "prediction": 42.0,
+        }
+        result = app_mod._trim_output_device(device)
+
+        self.assertEqual(len(result["per_second_data"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
