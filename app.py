@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytz
@@ -263,6 +263,16 @@ def index() -> ResponseReturnValue:
             logger.debug("Fetched fresh metrics for index endpoint")
         else:
             logger.debug("Serving cached metrics for index endpoint")
+
+    # Recalculate lag from cached value + elapsed time since cache was stored.
+    # The cached lag reflects data age at fetch time; since then data has
+    # continued aging, so we add elapsed seconds to keep the display fresh.
+    fetched_at = metrics_data.get("_fetched_at")
+    if fetched_at is not None:
+        elapsed = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+        for d in metrics_data.get("devices", []):
+            cached_lag = d.get("lag", timedelta(0))
+            d["lag"] = timedelta(seconds=cached_lag.total_seconds() + elapsed)
 
     # Truncate and reorder per_second_data in each device for compact output.
     metrics_data["devices"] = [_trim_output_device(d) for d in metrics_data.get("devices", [])]

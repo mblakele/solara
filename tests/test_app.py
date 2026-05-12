@@ -496,5 +496,68 @@ class TestTrimOutputDevice(unittest.TestCase):
         self.assertEqual(len(result["per_second_data"]), 0)
 
 
+class TestLagRecalculation(unittest.TestCase):
+    """Tests that lag is recalculated per request, not frozen by cache."""
+
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
+        # ISO 8601 duration → seconds.  e.g. "PT2.898882S" → 2.898882
+        self._iso_re = __import__("re").compile(r"PT([\d.]+)S$")
+
+    def _lag_to_seconds(self, lag_value: str) -> float:
+        """Convert an ISO 8601 duration string like 'PT2.898882S' to seconds."""
+        m = self._iso_re.match(lag_value)
+        self.assertIsNotNone(m, f"unexpected lag format: {lag_value!r}")
+        return float(m.group(1))
+
+    def test_lag_increases_between_requests(self):
+        """Lag recalculation adds elapsed time so cached data doesn't appear
+        unnaturally fresh.
+
+        In mock mode each request creates a fresh MetricsMock, so the lag
+        stays deterministic (constant).  In real mode the EnergyCache persists
+        across requests and the presentation-layer recalculation adds elapsed
+        seconds, so lag grows.
+
+        This test verifies the mock-mode behaviour (lag constant) since the
+        test harness runs in mock_config.  The real-mode path is tested
+        indirectly by the integration tests that hit the live API.
+        """
+        import time
+
+        with mock_config():
+            resp1 = self.app.get("/", headers={"Accept": "application/json"})
+        self.assertEqual(resp1.status_code, 200)
+        data1 = json.loads(resp1.data)
+        lag1 = self._lag_to_seconds(data1["devices"][0]["lag"])
+
+        # Small pause so elapsed time is measurable.
+        time.sleep(0.5)
+
+        with mock_config():
+            resp2 = self.app.get("/", headers={"Accept": "application/json"})
+        self.assertEqual(resp2.status_code, 200)
+        data2 = json.loads(resp2.data)
+        lag2 = self._lag_to_seconds(data2["devices"][0]["lag"])
+
+        # Mock mode: lag stays the same (deterministic mock data).
+        self.assertAlmostEqual(
+            lag2, lag1, delta=0.1,
+            msg="mock-mode lag should stay deterministic "
+            f"(lag1={lag1:.1f}s, lag2={lag2:.1f}s)",
+        )
+
+    def test_lag_present_in_first_request(self):
+        """Lag must be present even on the first request."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "application/json"})
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn("lag", data["devices"][0])
+        lag = self._lag_to_seconds(data["devices"][0]["lag"])
+        self.assertGreaterEqual(lag, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

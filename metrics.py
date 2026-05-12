@@ -381,6 +381,14 @@ class EnergyCache:
                             self._data_start + timedelta(seconds=len(self._samples) - 1)
                         )
 
+                psd = result.get("per_second_data")
+                if psd:
+                    logger.debug(
+                        "EnergyCache fetched %d data points (cache now has %d samples)",
+                        len(psd),
+                        len(self._samples or []),
+                    )
+
                 self._last_fetch_at = now
             else:
                 result = None  # Ensure we store None on failure.

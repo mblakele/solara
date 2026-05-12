@@ -1,3 +1,4 @@
+import logging
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,24 @@ from metrics import (
 )
 from util import compute_nbc_quarters
 from mockdata import MetricsMock
+
+
+class _LogCapture(logging.Handler):
+    """Minimal logging handler that captures formatted log records for assertions."""
+
+    def __init__(self):
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    @property
+    def text(self) -> str:
+        return " ".join(r.getMessage() for r in self.records)
+
+    def clear(self) -> None:
+        self.records = []
 
 
 class TestTOUReporterAggregate(unittest.TestCase):
@@ -1820,6 +1839,64 @@ class TestEnergyCache(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result["qh_name"], "QH3")
+
+    def test_get_or_fetch_logs_data_point_count(self):
+        """get_or_fetch logs the number of fresh data points when fetching."""
+        import logging
+
+        from metrics import EnergyCache
+
+        handler = _LogCapture()
+        logger = logging.getLogger("metrics")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            cache = EnergyCache(ttl_seconds=60)
+
+            def fetch_func():
+                return {
+                    "per_second_data": [0.001] * 42,
+                    "data_start": datetime.now(timezone.utc),
+                }
+
+            cache.get_or_fetch(fetch_func)
+
+            assert "fetched" in handler.text
+            assert "42" in handler.text
+            assert "now has 42 samples" in handler.text
+        finally:
+            logger.removeHandler(handler)
+
+    def test_get_or_fetch_does_not_log_on_cache_hit(self):
+        """get_or_fetch should not log a fetch message when serving cached data."""
+        import logging
+
+        from metrics import EnergyCache
+
+        handler = _LogCapture()
+        logger = logging.getLogger("metrics")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            cache = EnergyCache(ttl_seconds=60)
+            now = datetime.now(timezone.utc)
+
+            def fetch_func():
+                return {
+                    "per_second_data": [0.001] * 42,
+                    "data_start": now,
+                }
+
+            # First call — should log the fetch
+            cache.get_or_fetch(fetch_func)
+            handler.clear()
+
+            # Second call — should serve from cache, no new fetch log
+            cache.get_or_fetch(fetch_func)
+            assert "fetched" not in handler.text
+            assert "now has" not in handler.text
+        finally:
+            logger.removeHandler(handler)
 
 
 class TestBuildIncrementalFetch(unittest.TestCase):
