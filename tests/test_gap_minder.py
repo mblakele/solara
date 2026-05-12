@@ -66,7 +66,7 @@ def test_hysteresis_custom_value():
             name="heater",
             accessory_id="abc123",
             power_watts=1000.0,
-            role="fixed",
+            role="flexible",
         )
     }
 
@@ -89,8 +89,8 @@ def test_hysteresis_default_value():
     assert engine.HYSTERESIS_WH == 1000
 
 
-def test_turn_on_fixed_plug():
-    """Turns on fixed plug when gap exists."""
+def test_turn_on_flexible_plug():
+    """Turns on flexible plug when gap exists."""
     engine = GapMinder()
     state = StateTracker()
     plugs = {
@@ -98,7 +98,7 @@ def test_turn_on_fixed_plug():
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="fixed",
+            role="flexible",
         )
     }
 
@@ -184,14 +184,14 @@ def test_priority_ordering():
             name="high_pri",
             accessory_id="abc",
             power_watts=1000.0,
-            role="fixed",
+            role="flexible",
             priority=20,
         ),
         "low_pri": PlugConfig(
             name="low_pri",
             accessory_id="def",
             power_watts=1000.0,
-            role="fixed",
+            role="flexible",
             priority=10,
         ),
     }
@@ -218,13 +218,13 @@ def test_bin_pack_multiple_plugs():
             name="small",
             accessory_id="a",
             power_watts=500.0,
-            role="fixed",
+            role="flexible",
         ),
         "med": PlugConfig(
             name="med",
             accessory_id="b",
             power_watts=1000.0,
-            role="fixed",
+            role="flexible",
         ),
     }
 
@@ -570,7 +570,7 @@ def test_decide_with_plugs_and_tesla_priority_ordering():
             name="high_pri",
             accessory_id="a",
             power_watts=1000.0,
-            role="fixed",
+            role="flexible",
             priority=20,
         ),
         "low_pri": PlugConfig(
@@ -795,7 +795,7 @@ def test_turn_on_allowed_when_seconds_remaining_above_min():
             name="heater",
             accessory_id="h1",
             power_watts=4500.0,
-            role="fixed",
+            role="flexible",
         ),
     }
 
@@ -863,7 +863,7 @@ def test_turn_on_at_exact_min_seconds_boundary():
             name="heater",
             accessory_id="h1",
             power_watts=4500.0,
-            role="fixed",
+            role="flexible",
         ),
     }
 

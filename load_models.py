@@ -185,11 +185,22 @@ class DeviceState:
 
 @dataclass
 class PendingEffect:
-    """A pending action with expected power impact."""
+    """A pending action with expected power impact.
+
+    Attributes:
+        device_name: Name of the device the action targets.
+        action: The action type — "turn_on", "turn_off", or "set_amps".
+        timestamp: Wall clock time when the effect was created.
+        data_point_at: The NBC data-point-at timestamp at creation time.
+            Used alongside timestamp for dual-pruning checks.
+        power_delta_wh: Expected watt-hour impact of the action.
+        target_amps: Target amps for "set_amps" actions; None otherwise.
+    """
 
     device_name: str
     action: Literal["turn_on", "turn_off", "set_amps"]
     timestamp: datetime
+    data_point_at: datetime
     power_delta_wh: float
     target_amps: int | None = None  # Target amps for set_amps actions
 

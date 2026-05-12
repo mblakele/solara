@@ -81,7 +81,7 @@ def _make_excess_manager(
             name="pool_pump",
             accessory_id="xyz789",
             power_watts=1500.0,
-            role="fixed",
+            role="flexible",
             priority=10,
         ),
     }
@@ -361,7 +361,9 @@ def test_stale_data_skips_cycle():
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="plug", action="turn_on",
-            timestamp=now, power_delta_wh=500.0,
+            timestamp=now,
+            data_point_at=now - timedelta(seconds=20),
+            power_delta_wh=500.0,
         )
     )
 
@@ -461,7 +463,7 @@ def test_stale_data_from_previous_qh():
         PendingEffect(
             device_name="plug", action="turn_on",
             timestamp=fixed_now, power_delta_wh=500.0,
-        )
+            data_point_at=fixed_now - timedelta(seconds=20))
     )
 
     # Patch get_current_qh to return our crafted data_point_at.
@@ -520,6 +522,7 @@ def test_waits_for_fresh_data():
             device_name="plug",
             action="turn_on",
             timestamp=now,
+            data_point_at=now - timedelta(seconds=20),
             power_delta_wh=500.0,
         )
     )
@@ -572,7 +575,9 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="plug", action="turn_on",
-            timestamp=now, power_delta_wh=500.0,
+            timestamp=now,
+            data_point_at=now - timedelta(seconds=20),
+            power_delta_wh=500.0,
         )
     )
 
@@ -616,6 +621,7 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
             device_name="plug",
             action="turn_on",
             timestamp=effect_time,
+            data_point_at=effect_time - timedelta(seconds=20),
             power_delta_wh=500.0,
         )
     )
@@ -676,16 +682,19 @@ def test_pending_since_count():
         PendingEffect(
             device_name="a", action="turn_on",
             timestamp=base_time - timedelta(seconds=60),
+            data_point_at=base_time - timedelta(seconds=80),
             power_delta_wh=100.0,
         ),
         PendingEffect(
             device_name="b", action="turn_on",
             timestamp=base_time + timedelta(seconds=30),
+            data_point_at=base_time + timedelta(seconds=10),
             power_delta_wh=200.0,
         ),
         PendingEffect(
             device_name="c", action="turn_off",
             timestamp=base_time + timedelta(seconds=60),
+            data_point_at=base_time + timedelta(seconds=40),
             power_delta_wh=-150.0,
         ),
     ])
@@ -703,16 +712,19 @@ def test_prune_old_effects():
         PendingEffect(
             device_name="old1", action="turn_on",
             timestamp=base_time - timedelta(seconds=60),
+            data_point_at=base_time - timedelta(seconds=80),
             power_delta_wh=100.0,
         ),
         PendingEffect(
             device_name="old2", action="turn_off",
             timestamp=base_time - timedelta(seconds=30),
+            data_point_at=base_time - timedelta(seconds=50),
             power_delta_wh=-50.0,
         ),
         PendingEffect(
             device_name="recent", action="turn_on",
             timestamp=base_time + timedelta(seconds=10),
+            data_point_at=base_time - timedelta(seconds=10),
             power_delta_wh=200.0,
         ),
     ])
@@ -740,16 +752,19 @@ def test_prune_old_effects_respects_minimum_age():
         PendingEffect(
             device_name="young", action="turn_on",
             timestamp=now - timedelta(seconds=50),
+            data_point_at=now - timedelta(seconds=70),
             power_delta_wh=100.0,
         ),
         PendingEffect(
             device_name="old", action="turn_off",
             timestamp=now - timedelta(seconds=300),
+            data_point_at=now - timedelta(seconds=320),
             power_delta_wh=-50.0,
         ),
         PendingEffect(
             device_name="recent", action="turn_on",
             timestamp=now + timedelta(seconds=10),
+            data_point_at=now - timedelta(seconds=10),
             power_delta_wh=200.0,
         ),
     ])
@@ -808,11 +823,13 @@ def test_stale_data_includes_pending_count():
         PendingEffect(
             device_name="plug", action="turn_on",
             timestamp=now - timedelta(seconds=60),
+            data_point_at=now - timedelta(seconds=80),
             power_delta_wh=500.0,
         ),
         PendingEffect(
             device_name="plug2", action="turn_off",
             timestamp=now - timedelta(seconds=30),
+            data_point_at=now - timedelta(seconds=50),
             power_delta_wh=-200.0,
         ),
     ])
@@ -856,12 +873,14 @@ def test_stale_data_prunes_old_effects():
             device_name="heater", action="turn_on",
             # -280s is before cutoff (now-240s) → pruned.
             timestamp=now - timedelta(seconds=280),
+            data_point_at=now - timedelta(seconds=300),
             power_delta_wh=500.0,
         ),
         PendingEffect(
             device_name="heater", action="turn_off",
             # -80s is after cutoff → kept.
             timestamp=now - timedelta(seconds=80),
+            data_point_at=now - timedelta(seconds=100),
             power_delta_wh=-200.0,
         ),
     ])
@@ -909,7 +928,9 @@ def test_stale_data_includes_candidates():
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="heater", action="turn_on",
-            timestamp=now, power_delta_wh=500.0,
+            timestamp=now,
+            data_point_at=now - timedelta(seconds=20),
+            power_delta_wh=500.0,
         )
     )
 
@@ -949,6 +970,7 @@ def test_waiting_for_fresh_data_includes_count():
         PendingEffect(
             device_name="plug", action="turn_on",
             timestamp=fixed_now,
+            data_point_at=fixed_now - timedelta(seconds=20),
             power_delta_wh=500.0,
         )
     )
@@ -993,6 +1015,7 @@ def test_waiting_for_fresh_data_includes_candidates():
         PendingEffect(
             device_name="heater", action="turn_on",
             timestamp=fixed_now,
+            data_point_at=fixed_now - timedelta(seconds=20),
             power_delta_wh=500.0,
         )
     )
@@ -1179,7 +1202,7 @@ def test_tesla_amp_adjustment(_mock_load_tesla):
             name="small_plug",
             accessory_id="abc",
             power_watts=500.0,
-            role="fixed",
+            role="flexible",
             priority=10,
         ),
     }
@@ -1585,6 +1608,7 @@ class TestAdaptiveSleep:
             target_amps=None,
             power_delta_wh=100.0,
             timestamp=data_point_at - timedelta(seconds=30),  # before data point
+            data_point_at=data_point_at - timedelta(seconds=50),
         )]
 
         result = lm.run_cycle()
@@ -1629,6 +1653,7 @@ class TestAdaptiveSleep:
             target_amps=None,
             power_delta_wh=100.0,
             timestamp=data_point_at + timedelta(seconds=5),  # after data point
+            data_point_at=data_point_at - timedelta(seconds=15),
         )]
 
         with patch("load_manager.datetime") as mock_dt:

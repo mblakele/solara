@@ -264,7 +264,7 @@ def test_composite_turns_on_both_types():
         "plugs": {
             "homekit": [
                 {"name": "hk_heater", "accessory_id": "hk123",
-                 "power_watts": 4500, "role": "fixed", "priority": 10},
+                 "power_watts": 4500, "role": "flexible", "priority": 10},
             ],
             "vocolinc": [
                 {"name": "vc_pump", "device_name": "vc_pump",

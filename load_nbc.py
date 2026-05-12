@@ -443,42 +443,67 @@ class StateTracker:
         return elapsed < self.TESLA_SETTLE_SECS
 
     def has_pending_effect_since(self, nbc_timestamp: datetime) -> bool:
-        """Return True if we took an action AFTER the last NBC data point."""
+        """Return True if we took an action after the NBC timestamp by either measure.
+
+        Checks both the wall clock timestamp and the data-point-at timestamp so
+        that effects recorded with a future data-point-at are still detected.
+
+        Args:
+            nbc_timestamp: The NBC data-point-at timestamp to compare against.
+
+        Returns:
+            True if any effect has either timestamp after ``nbc_timestamp``.
+        """
         for effect in self.pending_effects:
-            if effect.timestamp > nbc_timestamp:
+            if effect.timestamp > nbc_timestamp or effect.data_point_at > nbc_timestamp:
                 return True
         return False
 
     def pending_since_count(self, nbc_timestamp: datetime) -> int:
-        """Return the number of effects taken after the given timestamp."""
+        """Return the number of effects taken after the given timestamp by either measure.
+
+        Args:
+            nbc_timestamp: The NBC data-point-at timestamp to compare against.
+
+        Returns:
+            Count of effects whose wall clock or data-point-at timestamp is
+            after ``nbc_timestamp``.
+        """
         return sum(
             1 for eff in self.pending_effects
-            if eff.timestamp > nbc_timestamp
+            if eff.timestamp > nbc_timestamp or eff.data_point_at > nbc_timestamp
         )
 
-    def prune_old_effects(self, data_point_at: datetime) -> int:
-        """Remove pending effects eligible for pruning based on data-point age.
+    def prune_old_effects(
+        self, data_point_at: datetime, now: datetime | None = None
+    ) -> int:
+        """Remove pending effects eligible for pruning based on dual age checks.
 
-        Pruning requires both:
-          1. effect timestamp <= data_point_at  (effect was created before the data point)
-          2. data_point_at - effect timestamp >= 60s  (effect is old enough in data time)
+        An effect is pruned when it is over 60 seconds old by **both** measures:
+          1. wall clock age:  now - effect.timestamp >= 60s
+          2. data-point age:  effect.data_point_at <= data_point_at - 60s
+        (If ``data_point_at`` is unknown, only the wall-clock check applies.)
 
-        Condition 2 replaces the wall-clock age check used previously. Using
-        data_point_at for both checks ensures consistency: the effect has had
-        at least 60 seconds of data-point time to propagate through the Emporia
-        API's sliding window and appear in the latest 1-min NBC prediction.
+        This dual-criteria pruning ensures effects are not pruned prematurely
+        when the Emporia API reports old/stale data (small ``data_lag_secs``)
+        while wall-clock time has advanced, and prevents effects from lingering
+        when data is fresh but the wall clock has not moved forward enough.
 
         Args:
             data_point_at: Timestamp of the most recent per-second data point.
+            now: Current wall clock time. Defaults to ``datetime.now(timezone.utc)``.
 
         Returns:
             Number of effects removed.
         """
-        min_age_cutoff = data_point_at - timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
+        if now is None:
+            now = datetime.now(timezone.utc)
+        wall_cutoff = now - timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
+        dp_cutoff = data_point_at - timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
         before = len(self.pending_effects)
         self.pending_effects = [
             eff for eff in self.pending_effects
-            if eff.timestamp > min_age_cutoff
+            if eff.timestamp > wall_cutoff or eff.data_point_at > dp_cutoff
         ]
         return before - len(self.pending_effects)
 
@@ -528,6 +553,7 @@ class StateTracker:
                 "device_name": eff.device_name,
                 "action": eff.action,
                 "timestamp": eff.timestamp.isoformat(),
+                "data_point_at": eff.data_point_at.isoformat(),
                 "power_delta_wh": eff.power_delta_wh,
             } for eff in self.pending_effects],
             "last_data_point_at": (self.last_data_point_at.isoformat()
@@ -586,6 +612,7 @@ class GapMinder:
         plugs: dict[str, Any],
         tesla: TeslaState | None,
         dry_run: bool = False,
+        data_point_at: datetime | None = None,
     ) -> list[PendingEffect]:
         """Decide what actions to take based on the predicted Wh and target Wh.
 
@@ -598,6 +625,9 @@ class GapMinder:
             tesla: Current Tesla state, if available.
             dry_run: When True, skip mutating state.devices so subsequent
                 dry-run cycles re-evaluate instead of seeing stale desired_state.
+            data_point_at: The NBC data-point-at timestamp. Used by
+                created ``PendingEffect`` objects for dual-pruning checks.
+                Defaults to the current wall clock time.
 
         Returns:
             List of PendingEffect objects representing actions to take.
@@ -609,86 +639,72 @@ class GapMinder:
             return []
 
         now = datetime.now(timezone.utc)
+        dp_at = data_point_at if data_point_at is not None else now
 
         if gap > 0:
             return self._decide_turn_on(
-                gap, seconds_remaining, state, plugs, tesla, now, dry_run
+                gap, seconds_remaining, state, plugs, tesla, now, dry_run, dp_at
             )
 
         return self._decide_turn_off(
-            abs(gap), seconds_remaining, state, plugs, tesla, now, dry_run
+            abs(gap), seconds_remaining, state, plugs, tesla, now, dry_run, dp_at
         )
 
     def _decide_turn_on(
         self,
-        gap_wh: float,
+        gap: float,
         seconds_remaining: int,
         state: StateTracker,
         plugs: dict[str, Any],
         tesla: TeslaState | None,
         now: datetime,
         dry_run: bool = False,
+        dp_at: datetime | None = None,
     ) -> list[PendingEffect]:
-        """Turn on loads to fill the surplus gap.
+        """Turn on flexible loads to absorb excess solar.
+
+        Args:
+            gap: The Wh surplus to absorb.
+            seconds_remaining: Seconds left in the current quarter-hour.
+            state: The current state tracker.
+            plugs: Dictionary of plug configurations.
+            tesla: Current Tesla state, if available.
+            now: Current wall clock time.
+            dp_at: NBC data-point-at timestamp for pending effects.
 
         Returns:
-            List of PendingEffect actions. Logs debug details for each
-            plug evaluated so the caller can understand rejections.
+            List of PendingEffect objects.
         """
+        remaining_gap = gap
         actions: list[PendingEffect] = []
-        remaining_gap = gap_wh
 
-        logger.debug(
-            "[_decide_turn_on] gap=%.1f Wh, seconds_remaining=%d",
-            gap_wh,
-            seconds_remaining,
-        )
-
-        # Guard: don't turn on plugs near the QH boundary.  A plug turned
-        # on with only a few seconds left will stay through the entire next
-        # quarter-hour, wasting energy that isn't counted toward any surplus.
-        if seconds_remaining < self.MIN_SECONDS_TO_ACT:
-            logger.debug(
-                "[_decide_turn_on] skipped (too little time %d s < %d s)",
-                seconds_remaining, self.MIN_SECONDS_TO_ACT,
-            )
-            return []
-
+        # Collect eligible flexible loads that are currently off
         candidates: list[tuple[int, str, Any]] = []
+
         for name, plug in plugs.items():
+            if plug.role != "flexible":
+                logger.debug(
+                    "[_decide_turn_on] %s: skipped (not flexible)",
+                    name,
+                )
+                continue
             if not state.can_toggle(name, now, turning_on=True):
                 logger.debug(
                     "[_decide_turn_on] %s: skipped (debounce)",
                     name,
                 )
                 continue
-
+            if seconds_remaining < self.MIN_SECONDS_TO_ACT:
+                logger.debug(
+                    "[_decide_turn_on] %s: skipped (too little time: %d s)",
+                    name,
+                    seconds_remaining,
+                )
+                continue
             dev_state = state.devices.get(name)
-
-            if plug.role == "fixed":
-                if dev_state is None or dev_state.desired_state is False:
-                    candidates.append((plug.priority, name, plug))
-                    logger.debug(
-                        "[_decide_turn_on] %s: eligible (fixed, off)",
-                        name,
-                    )
-                else:
-                    logger.debug(
-                        "[_decide_turn_on] %s: skipped (already on)",
-                        name,
-                    )
-            elif plug.role == "flexible":
-                if dev_state is None or dev_state.desired_state is False:
-                    candidates.append((plug.priority, name, plug))
-                    logger.debug(
-                        "[_decide_turn_on] %s: eligible (flexible, off)",
-                        name,
-                    )
-                else:
-                    logger.debug(
-                        "[_decide_turn_on] %s: skipped (already on)",
-                        name,
-                    )
+            if dev_state and dev_state.desired_state is True:
+                continue  # already on
+            candidates.append((plug.priority, name, plug))
 
         # Higher priority number = more important; sort descending so most
         # important eligible plugs are turned on first.
@@ -715,6 +731,7 @@ class GapMinder:
                         device_name=name,
                         action="turn_on",
                         timestamp=now,
+                        data_point_at=dp_at or now,
                         power_delta_wh=capacity,
                     )
                 )
@@ -732,7 +749,9 @@ class GapMinder:
                     capacity,
                     remaining_gap,
                 )
-                tesla_action = self._decide_tesla_amps(remaining_gap, seconds_remaining, tesla, now)
+                tesla_action = self._decide_tesla_amps(
+                    remaining_gap, seconds_remaining, tesla, now, dp_at
+                )
                 if tesla_action:
                     actions.append(tesla_action)
                 remaining_gap = 0
@@ -754,7 +773,7 @@ class GapMinder:
                 remaining_gap,
             )
             tesla_action = self._decide_tesla_amps(
-                remaining_gap, seconds_remaining, tesla, now
+                remaining_gap, seconds_remaining, tesla, now, dp_at
             )
             if tesla_action:
                 actions.append(tesla_action)
@@ -770,6 +789,7 @@ class GapMinder:
         tesla: TeslaState | None,
         now: datetime,
         dry_run: bool = False,
+        dp_at: datetime | None = None,
     ) -> list[PendingEffect]:
         """Turn off loads to reduce consumption.
 
@@ -777,9 +797,22 @@ class GapMinder:
           1. Reduce Tesla charge amps (partial, no stop).
           2. Disable plugs in priority order (lowest-priority first).
           3. Stop Tesla charging if a deficit still remains.
+
+        Args:
+            gap_wh: Wh reduction needed.
+            seconds_remaining: Seconds left in the current quarter-hour.
+            state: The current state tracker.
+            plugs: Dictionary of plug configurations.
+            tesla: Current Tesla state, if available.
+            now: Current wall clock time.
+            dp_at: NBC data-point-at timestamp for pending effects.
+
+        Returns:
+            List of PendingEffect objects.
         """
         actions: list[PendingEffect] = []
         remaining_reduction = gap_wh
+        dp = dp_at or now
 
         logger.debug(
             "[_decide_turn_off] gap=%.1f Wh, seconds_remaining=%d",
@@ -800,6 +833,7 @@ class GapMinder:
                 tesla,
                 now,
                 stop_allowed=False,
+                dp_at=dp,
             )
             if tesla_action:
                 actions.append(tesla_action)
@@ -870,6 +904,7 @@ class GapMinder:
                     device_name=name,
                     action="turn_off",
                     timestamp=now,
+                    data_point_at=dp,
                     power_delta_wh=-savings,
                 )
             )
@@ -893,6 +928,7 @@ class GapMinder:
                     device_name="tesla",
                     action="turn_off",
                     timestamp=now,
+                    data_point_at=dp,
                     power_delta_wh=-remaining_reduction,
                 )
             )
@@ -917,8 +953,20 @@ class GapMinder:
         seconds_remaining: int,
         tesla: TeslaState,
         now: datetime,
+        dp_at: datetime | None = None,
     ) -> PendingEffect | None:
-        """Adjust Tesla charge amps to fill residual gap."""
+        """Adjust Tesla charge amps to fill residual gap.
+
+        Args:
+            gap_wh: Wh surplus to absorb.
+            seconds_remaining: Seconds left in the current quarter-hour.
+            tesla: Current Tesla state.
+            now: Current wall clock time.
+            dp_at: NBC data-point-at timestamp for pending effects.
+
+        Returns:
+            PendingEffect for set_amps, or None if no action needed.
+        """
         if not tesla.plugged_in or not tesla.at_home:
             logger.debug(
                 "[_decide_tesla_amps] skipped: plugged_in=%s at_home=%s",
@@ -965,6 +1013,7 @@ class GapMinder:
             device_name="tesla",
             action="set_amps",
             timestamp=now,
+            data_point_at=dp_at or now,
             power_delta_wh=0.0,  # recomputed live via tesla_inflight_wh each cycle
             target_amps=target_amps,
         )
@@ -976,6 +1025,7 @@ class GapMinder:
         tesla: TeslaState,
         now: datetime,
         stop_allowed: bool = True,
+        dp_at: datetime | None = None,
     ) -> PendingEffect | None:
         """Reduce Tesla charge amps, or stop charging if amps can't be reduced further.
 
@@ -987,6 +1037,7 @@ class GapMinder:
             stop_allowed: When False, return None instead of issuing a turn_off
                 command. Used when the caller wants amps-only reduction and will
                 handle stopping as a separate last-resort step.
+            dp_at: NBC data-point-at timestamp for pending effects.
         """
         current_amps = tesla.current_amps
         if current_amps is None or current_amps <= 5:
@@ -1001,6 +1052,7 @@ class GapMinder:
                 device_name="tesla",
                 action="turn_off",
                 timestamp=now,
+                data_point_at=dp_at or now,
                 power_delta_wh=-reduce_wh,
             )
 
@@ -1032,6 +1084,7 @@ class GapMinder:
                 device_name="tesla",
                 action="turn_off",
                 timestamp=now,
+                data_point_at=dp_at or now,
                 power_delta_wh=-reduce_wh,
             )
 
@@ -1058,6 +1111,7 @@ class GapMinder:
             device_name="tesla",
             action="set_amps",
             timestamp=now,
+            data_point_at=dp_at or now,
             power_delta_wh=power_delta,
             target_amps=new_amps,
         )

@@ -96,6 +96,7 @@ def test_has_pending_effect_since():
             device_name="plug",
             action="turn_on",
             timestamp=datetime(2025, 1, 1, 0, 0, 30, tzinfo=timezone.utc),
+            data_point_at=datetime(2025, 1, 1, 0, 0, 10, tzinfo=timezone.utc),
             power_delta_wh=100.0,
         )
     )
@@ -105,11 +106,13 @@ def test_has_pending_effect_since():
 def test_estimated_current_wh_adds_pending():
     """Adds pending effect delta to NBC prediction."""
     tracker = StateTracker()
+    now = datetime.now(timezone.utc)
     tracker.pending_effects.append(
         PendingEffect(
             device_name="plug",
             action="turn_on",
-            timestamp=datetime.now(timezone.utc),
+            timestamp=now,
+            data_point_at=now - timedelta(seconds=20),
             power_delta_wh=200.0,
         )
     )
@@ -127,15 +130,18 @@ def test_estimated_current_wh_no_pending():
 def test_estimated_current_wh_multiple_effects():
     """Sums all pending effect deltas."""
     tracker = StateTracker()
+    now = datetime.now(timezone.utc)
     tracker.pending_effects.extend([
         PendingEffect(
             device_name="a", action="turn_on",
-            timestamp=datetime.now(timezone.utc),
+            timestamp=now,
+            data_point_at=now - timedelta(seconds=20),
             power_delta_wh=200.0,
         ),
         PendingEffect(
             device_name="b", action="turn_off",
-            timestamp=datetime.now(timezone.utc),
+            timestamp=now,
+            data_point_at=now - timedelta(seconds=20),
             power_delta_wh=-100.0,
         ),
     ])

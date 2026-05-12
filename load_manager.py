@@ -710,6 +710,7 @@ class LoadManager:
         seconds_remaining: int,
         dry_run: bool,
         qh_name: str | None = None,
+        data_point_at: datetime | None = None,
     ) -> tuple[
         TeslaState | None,
         str | None,
@@ -843,6 +844,7 @@ class LoadManager:
             plugs=eligible_plugs,
             tesla=eligible_tesla,
             dry_run=dry_run,
+            data_point_at=data_point_at,
         )
 
         succeeded_effects: list[PendingEffect] = []
@@ -1100,7 +1102,7 @@ class LoadManager:
                     return early
 
             # ── Stage 4: accept fresh data, compute gap ────────────────────
-            pruned = self.state.prune_old_effects(data_point_at)
+            pruned = self.state.prune_old_effects(data_point_at, now=now_postfetch)
             if pruned > 0:
                 logger.debug("Pruned %d old pending effects", pruned)
             self.state.last_data_point_at = data_point_at
@@ -1123,7 +1125,8 @@ class LoadManager:
                 adjusted_wh,
             ) = asyncio.run(
                 self._cycle_async_phase(
-                    gap_wh, adjusted_wh, seconds_remaining, self.dry_run, qh_name
+                    gap_wh, adjusted_wh, seconds_remaining, self.dry_run, qh_name,
+                    data_point_at=data_point_at,
                 )
             )
 

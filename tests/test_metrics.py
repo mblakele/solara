@@ -1846,7 +1846,7 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         vue_mock.get_chart_usage.assert_called_once()
         call_args = vue_mock.get_chart_usage.call_args
         # Start time should be old_start + 300 seconds = now
-        expected_start = old_start + timedelta(seconds=299)  # last sample index
+        expected_start = old_start + timedelta(seconds=300)  # next sample after last one
         self.assertEqual(call_args[0][1], expected_start)
 
     def test_incremental_fetch_merges_samples(self):
