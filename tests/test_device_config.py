@@ -57,11 +57,11 @@ def test_load_valid_file(tmp_path):
         "plugs": {
             "homekit": [
                 {"name": "heater", "accessory_id": "hk123",
-                 "power_watts": 4500, "role": "flexible", "priority": 10}
+                 "power_watts": 4500, "priority": 10}
             ],
             "vocolinc": [
                 {"name": "lamp", "device_name": "LivingRoomLamp",
-                 "power_watts": 60, "role": "fixed"}
+                 "power_watts": 60}
             ]
         },
         "tesla": {

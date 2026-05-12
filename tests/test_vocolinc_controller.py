@@ -34,7 +34,6 @@ def vocolinc_ctrl_plugs():
             name="lamp",
             accessory_id="living_room_lamp",
             power_watts=100.0,
-            role="flexible",
             controller_type="vocolinc",
         ),
     }
@@ -86,7 +85,7 @@ def test_loads_valid_plug():
         "plugs": {
             "vocolinc": [
                 {"name": "water_heater", "device_name": "floor_lamp",
-                 "power_watts": 4500, "role": "flexible", "priority": 10},
+                 "power_watts": 4500, "priority": 10},
             ]
         }
     }):
@@ -97,7 +96,6 @@ def test_loads_valid_plug():
     wh = plugs["water_heater"]
     assert wh.accessory_id == "floor_lamp"
     assert wh.power_watts == 4500.0
-    assert wh.role == "flexible"
     assert wh.priority == 10
     assert wh.controller_type == "vocolinc"
 
@@ -108,7 +106,7 @@ def test_default_priority_zero():
         "plugs": {
             "vocolinc": [
                 {"name": "test", "device_name": "device",
-                 "power_watts": 1000, "role": "flexible"},
+                 "power_watts": 100},
             ]
         }
     }):
@@ -124,9 +122,9 @@ def test_controller_type_is_vocolinc():
         "plugs": {
             "vocolinc": [
                 {"name": "a", "device_name": "dev1",
-                 "power_watts": 500, "role": "fixed"},
+                 "power_watts": 500},
                 {"name": "b", "device_name": "dev2",
-                 "power_watts": 1000, "role": "flexible"},
+                 "power_watts": 1000},
             ]
         }
     }):
@@ -137,28 +135,12 @@ def test_controller_type_is_vocolinc():
         assert plug.controller_type == "vocolinc"
 
 
-def test_invalid_role_is_skipped():
-    """Plugs with invalid role are skipped."""
-    with patch("device_config._load", return_value={
-        "plugs": {
-            "vocolinc": [
-                {"name": "bad", "device_name": "dev",
-                 "power_watts": 500, "role": "invalid"},
-            ]
-        }
-    }):
-        device_config.reload()
-        plugs = load_vocolinc_plugs_from_file()
-
-    assert len(plugs) == 0
-
-
 def test_invalid_format_is_skipped():
     """Plugs with too few parts are skipped."""
     with patch("device_config._load", return_value={
         "plugs": {
             "vocolinc": [
-                {"name": "bad"},  # missing device_name, power_watts, role
+                {"name": "bad"},  # missing device_name, power_watts
             ]
         }
     }):
@@ -173,9 +155,9 @@ def test_multiple_plugs_loaded():
         "plugs": {
             "vocolinc": [
                 {"name": "heater", "device_name": "heater_dev",
-                 "power_watts": 4500, "role": "fixed", "priority": 10},
+                 "power_watts": 4500, "priority": 10},
                 {"name": "pump", "device_name": "pump_dev",
-                 "power_watts": 1500, "role": "flexible", "priority": 20},
+                 "power_watts": 1500, "priority": 20},
             ]
         }
     }):
@@ -264,11 +246,11 @@ def test_composite_turns_on_both_types():
         "plugs": {
             "homekit": [
                 {"name": "hk_heater", "accessory_id": "hk123",
-                 "power_watts": 4500, "role": "flexible", "priority": 10},
+                 "power_watts": 1500},
             ],
             "vocolinc": [
                 {"name": "vc_pump", "device_name": "vc_pump",
-                 "power_watts": 1500, "role": "flexible", "priority": 20},
+                 "power_watts": 1000},
             ]
         }
     }):
@@ -310,9 +292,9 @@ def test_composite_over_target_turns_off_vocolinc():
         "plugs": {
             "vocolinc": [
                 {"name": "vc_flex", "device_name": "vc_flex",
-                 "power_watts": 1500, "role": "flexible", "priority": 20},
+                 "power_watts": 1000},
                 {"name": "vc_fixed", "device_name": "vc_fixed",
-                 "power_watts": 4500, "role": "fixed", "priority": 10},
+                 "power_watts": 4500},
             ]
         }
     }):
@@ -357,4 +339,4 @@ def test_composite_over_target_turns_off_vocolinc():
 
             action_names = [a["device"] for a in result["actions"]]
             assert "vc_flex" in action_names
-            assert "vc_fixed" not in action_names
+            assert "vc_fixed" in action_names

@@ -149,7 +149,6 @@ class PlugConfig:
     name: str
     accessory_id: str
     power_watts: float
-    role: Literal["flexible", "fixed"]
     priority: int = 0
     controller_type: Literal["homekit", "vocolinc"] = "homekit"
     time_range: tuple[time, time] | None = None

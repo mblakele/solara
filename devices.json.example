@@ -10,7 +10,6 @@
         "name": "water_heater",
         "accessory_id": "192.168.1.50",
         "power_watts": 4500,
-        "role": "flexible",
         "priority": 10,
         "time_range": "06:00-22:00"
       }
@@ -20,7 +19,6 @@
         "name": "floor_lamp",
         "device_name": "LivingRoomLamp",
         "power_watts": 60,
-        "role": "flexible",
         "priority": 5
       }
     ]

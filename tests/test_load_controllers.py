@@ -52,7 +52,6 @@ def plug_config():
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="flexible",
             priority=20,
         ),
     }
@@ -293,7 +292,6 @@ class TestCompositePlugController:
                 name="hk_plug",
                 accessory_id="192.168.1.10",
                 power_watts=500.0,
-                role="flexible",
                 priority=10,
             ),
         }
@@ -306,7 +304,6 @@ class TestCompositePlugController:
                 name="vc_plug",
                 accessory_id="vocolinc-device-1",
                 power_watts=300.0,
-                role="flexible",
                 priority=15,
                 controller_type="vocolinc",
             ),
@@ -388,14 +385,14 @@ class TestCompositePlugController:
         hk_plug = {
             "hk1": PlugConfig(
                 name="hk1", accessory_id="192.168.1.10",
-                power_watts=500, role="flexible", priority=10,
+                power_watts=500, priority=10,
             ),
         }
 
         vc_plug = {
             "vc1": PlugConfig(
                 name="vc1", accessory_id="vocolinc-2",
-                power_watts=400, role="flexible", priority=15,
+                power_watts=400, priority=15,
             ),
         }
 
@@ -459,7 +456,7 @@ class TestRealPlugControllerPairingIO:
     def test_load_pairing_no_file(self, tmp_path):
         """Missing pairing file returns None without error."""
         ctrl = RealPlugController(
-            plugs={"plug1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"plug1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
             pairings_path=tmp_path / "pairings.json",
         )
 
@@ -468,7 +465,7 @@ class TestRealPlugControllerPairingIO:
     def test_load_pairing_valid_json(self, tmp_path):
         """Valid JSON file returns parsed data dict."""
         ctrl = RealPlugController(
-            plugs={"plug1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"plug1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
             pairings_path=tmp_path / "pairings.json",
         )
 
@@ -481,7 +478,7 @@ class TestRealPlugControllerPairingIO:
     def test_load_pairing_invalid_json(self, tmp_path):
         """Corrupt JSON returns None and logs an error."""
         ctrl = RealPlugController(
-            plugs={"plug1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"plug1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
             pairings_path=tmp_path / "pairings.json",
         )
 
@@ -493,7 +490,7 @@ class TestRealPlugControllerPairingIO:
     def test_save_pairing_writes_file(self, tmp_path):
         """Saving writes correct JSON to the file."""
         ctrl = RealPlugController(
-            plugs={"plug1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"plug1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
             pairings_path=tmp_path / "pairings.json",
         )
 
@@ -519,7 +516,7 @@ class TestVocolincEnsureInit:
         monkeypatch.setenv("VOCOLINC_PASSWORD", "")
 
         ctrl = VocolincPlugController(
-            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
         )
 
         with pytest.raises(RuntimeError, match="VOCOlinc credentials not configured"):
@@ -536,7 +533,7 @@ class TestVocolincEnsureInit:
 
         try:
             ctrl = VocolincPlugController(
-                plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+                plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
             )
 
             ctrl._ensure_initialized()
@@ -563,7 +560,7 @@ class TestVocolincErrorPaths:
         monkeypatch.setenv("VOCOLINC_PASSWORD", "pass")
 
         ctrl = VocolincPlugController(
-            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
         )
 
         with caplog.at_level("WARNING"):
@@ -578,7 +575,7 @@ class TestVocolincErrorPaths:
         monkeypatch.setenv("VOCOLINC_PASSWORD", "pass")
 
         ctrl = VocolincPlugController(
-            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
         )
 
         with caplog.at_level("WARNING"):
@@ -593,7 +590,7 @@ class TestVocolincErrorPaths:
 
         monkeypatch.setenv("VOCOLINC_USERNAME", "")
         ctrl = VocolincPlugController(
-            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
         )
 
         result = asyncio.run(ctrl.get_state("p1"))
@@ -605,7 +602,7 @@ class TestVocolincErrorPaths:
 
         monkeypatch.setenv("VOCOLINC_USERNAME", "")
         ctrl = VocolincPlugController(
-            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, role="flexible", priority=1)},
+            plugs={"p1": PlugConfig(name="p", accessory_id="x", power_watts=500, priority=1)},
         )
 
         result = asyncio.run(ctrl.set_state("p1", True))

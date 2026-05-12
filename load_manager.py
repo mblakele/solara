@@ -446,7 +446,6 @@ class LoadManager:
             )
             detail: dict[str, Any] = {
                 "name": name,
-                "role": plug.role,
                 "power_watts": plug.power_watts,
                 "capacity_wh": round(capacity_wh, 1),
                 "can_toggle": can_toggle,
@@ -462,7 +461,6 @@ class LoadManager:
         if tesla_configured:
             tesla_detail: dict[str, Any] = {
                 "name": "tesla",
-                "role": "flexible",
                 "state_available": tesla_state is not None,
                 "error": tesla_error,
             }
@@ -516,17 +514,11 @@ class LoadManager:
             if not self._is_device_in_time_range(name, plug.time_range):
                 continue
             dev_state = self.state.devices.get(name)
-            eligible = False
+            # All plugs are eligible: turn-on when off/unknown, turn-off when on
             if gap_positive:
-                if plug.role == "fixed":
-                    eligible = True
-                elif plug.role == "flexible":
-                    if dev_state is None or dev_state.desired_state is False:
-                        eligible = True
+                eligible = dev_state is None or dev_state.desired_state is False
             else:
-                if plug.role == "flexible":
-                    if dev_state and dev_state.desired_state is True:
-                        eligible = True
+                eligible = dev_state is not None and dev_state.desired_state is True
 
             if eligible:
                 has_eligible = True
@@ -606,8 +598,7 @@ class LoadManager:
         for candidate in (cycle_result.get("diagnostics") or {}).get(
             "candidates"
         ) or []:
-            if candidate.get("role") == "flexible":
-                max_load_capacity += candidate.get("power_watts", 0)
+            max_load_capacity += candidate.get("power_watts", 0)
 
         if max_load_capacity > 0 and seconds_remaining > 0:
             # Time to close the gap at full capacity (in seconds)

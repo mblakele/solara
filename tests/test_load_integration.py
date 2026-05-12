@@ -74,14 +74,12 @@ def _make_excess_manager(
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="flexible",
             priority=20,
         ),
         "pool_pump": PlugConfig(
             name="pool_pump",
             accessory_id="xyz789",
             power_watts=1500.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -129,14 +127,12 @@ def _make_overn_target_manager(
             name="pool_pump",
             accessory_id="xyz789",
             power_watts=1500.0,
-            role="flexible",
             priority=10,
         ),
         "water_heater": PlugConfig(
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="fixed",
             priority=20,
         ),
     }
@@ -233,20 +229,20 @@ def test_turns_on_plugs_in_priority_order():
 
 
 def test_turns_off_plugs_in_priority_order():
-    """Load shedding: turns off plugs in priority order."""
-    # have 2000 deficit
-    # water heater p20 4500w
-    # pool pump p10 1500w
-    # desired: shed water before pool pump
-    mgr, plug_ctrl = _make_overn_target_manager(predicted_wh=2000.0)
+    """Load shedding: turns plugs off priority order."""
+    # predicted_wh=-200, target=-500 => gap=300 Wh
+    # in reverse priority order:
+    # p20 water heater 4500w => 1125 Wh/quarter-hour (fills deficit)
+    # no more deficit so pool pump stays on
+    mgr, plug_ctrl = _make_overn_target_manager(predicted_wh=-200.0)
 
     result = mgr.run_cycle()
 
     assert result["status"] == "ok"
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
     pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
-    assert wh_state
-    assert pp_state is False
+    assert wh_state is False
+    assert pp_state
 
 
 def test_plug_states_updated():
@@ -264,25 +260,15 @@ def test_plug_states_updated():
 # --- Over-target tests ---
 
 
-def test_turns_off_flexible_only():
-    """Over-target: turns off flexible plugs only, not fixed."""
+def test_turns_off_all_on_plugs():
+    """Over-target: turns off all plugs that are currently on."""
     mgr, _ = _make_overn_target_manager(predicted_wh=2000.0)
 
     result = mgr.run_cycle()
 
     action_names = [a["device"] for a in result["actions"]]
     assert "pool_pump" in action_names
-    assert "water_heater" not in action_names
-
-
-def test_fixed_plug_remains_on():
-    """Over-target: fixed plug state is unchanged."""
-    mgr, plug_ctrl = _make_overn_target_manager(predicted_wh=2000.0)
-
-    mgr.run_cycle()
-
-    wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
-    assert wh_state
+    assert "water_heater" in action_names
 
 
 # --- Tesla safety tests ---
@@ -647,7 +633,6 @@ def test_full_lifecycle_action_wait_resolve():
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -847,7 +832,6 @@ def test_stale_data_prunes_old_effects():
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -906,7 +890,6 @@ def test_stale_data_includes_candidates():
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -943,7 +926,6 @@ def test_stale_data_includes_candidates():
         (c for c in candidates if c["name"] == "heater"), None
     )
     assert heater_candidate is not None
-    assert heater_candidate["role"] == "flexible"
     assert heater_candidate["power_watts"] == 2000.0
 
 
@@ -991,7 +973,6 @@ def test_waiting_for_fresh_data_includes_candidates():
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -1032,7 +1013,6 @@ def test_waiting_for_fresh_data_includes_candidates():
         (c for c in candidates if c["name"] == "heater"), None
     )
     assert heater_candidate is not None
-    assert heater_candidate["role"] == "flexible"
 
 
 # --- Cache tests ---
@@ -1096,7 +1076,6 @@ def test_dry_run_returns_dry_run_status():
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -1127,7 +1106,6 @@ def test_dry_run_does_not_execute():
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -1159,7 +1137,6 @@ def test_dry_run_state_not_mutated():
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -1202,7 +1179,6 @@ def test_tesla_amp_adjustment(_mock_load_tesla):
             name="small_plug",
             accessory_id="abc",
             power_watts=500.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -1282,7 +1258,6 @@ def test_turn_off_only_device_even_when_savings_exceed_gap():
             name="water_heater",
             accessory_id="abc123",
             power_watts=4700.0,
-            role="flexible",
         )
     }
 
@@ -1459,7 +1434,7 @@ class TestAdaptiveSleep:
         )
         # Add candidates with 1000W flexible capacity
         result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 1000.0, "role": "flexible"}
+            {"name": "heater", "power_watts": 1000.0}
         ]
         hint = lm._calculate_adaptive_sleep(result)
         # time_to_close = (1500 / 1000) * 3600 = 5400s
@@ -1477,7 +1452,7 @@ class TestAdaptiveSleep:
         )
         # Add candidates with 1000W flexible capacity
         result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 1000.0, "role": "flexible"}
+            {"name": "heater", "power_watts": 1000.0}
         ]
         hint = lm._calculate_adaptive_sleep(result)
         # time_to_close = (100 / 1000) * 3600 = 360s
@@ -1494,7 +1469,7 @@ class TestAdaptiveSleep:
             seconds_remaining=899,  # almost full QH remaining
         )
         result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 100.0, "role": "flexible"}
+            {"name": "heater", "power_watts": 100.0}
         ]
         hint = lm._calculate_adaptive_sleep(result)
         # time_to_close = (10 / 100) * 3600 = 360s
@@ -1530,7 +1505,7 @@ class TestAdaptiveSleep:
             seconds_remaining=10,
         )
         result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 50.0, "role": "flexible"}
+            {"name": "heater", "power_watts": 50.0}
         ]
         hint = lm._calculate_adaptive_sleep(result)
         assert hint >= 5.0
@@ -1544,7 +1519,7 @@ class TestAdaptiveSleep:
             seconds_remaining=899,
         )
         result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 10.0, "role": "flexible"}
+            {"name": "heater", "power_watts": 10.0}
         ]
         hint = lm._calculate_adaptive_sleep(result)
         assert hint <= 60.0  # 2 * interval
@@ -1714,7 +1689,7 @@ class TestAdaptiveSleep:
             seconds_remaining=0,
         )
         result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 100.0, "role": "flexible"}
+            {"name": "heater", "power_watts": 100.0}
         ]
         hint = lm._calculate_adaptive_sleep(result)
         assert hint >= 5.0
@@ -1728,7 +1703,7 @@ class TestAdaptiveSleep:
             seconds_remaining=9999,
         )
         result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 10.0, "role": "flexible"}
+            {"name": "heater", "power_watts": 10.0}
         ]
         hint = lm._calculate_adaptive_sleep(result)
         assert hint <= 60.0  # 2 * interval

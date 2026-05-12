@@ -26,14 +26,12 @@ def stub_plugs():
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="flexible",
             priority=20,
         ),
         "pool_pump": PlugConfig(
             name="pool_pump",
             accessory_id="xyz789",
             power_watts=1500.0,
-            role="fixed",
             priority=10,
         ),
     }

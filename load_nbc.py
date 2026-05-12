@@ -682,12 +682,6 @@ class GapMinder:
         candidates: list[tuple[int, str, Any]] = []
 
         for name, plug in plugs.items():
-            if plug.role != "flexible":
-                logger.debug(
-                    "[_decide_turn_on] %s: skipped (not flexible)",
-                    name,
-                )
-                continue
             if not state.can_toggle(name, now, turning_on=True):
                 logger.debug(
                     "[_decide_turn_on] %s: skipped (debounce)",
@@ -857,12 +851,6 @@ class GapMinder:
         candidates: list[tuple[int, str, Any]] = []
 
         for name, plug in plugs.items():
-            if plug.role != "flexible":
-                logger.debug(
-                    "[_decide_turn_off] %s: skipped (not flexible)",
-                    name,
-                )
-                continue
             if not state.can_toggle(name, now, turning_on=False):
                 logger.debug(
                     "[_decide_turn_off] %s: skipped (debounce)",

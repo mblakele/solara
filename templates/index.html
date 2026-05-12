@@ -261,7 +261,6 @@
         <table class="sub-table">
           <tr>
             <th>Name</th>
-            <th>Role</th>
             <th>Watts</th>
             <th>Capacity Wh</th>
             <th>Can Toggle</th>
@@ -271,7 +270,6 @@
           {% for c in diag.candidates %}
           <tr>
             <td>{{ c.name }}</td>
-            <td>{{ c.role }}</td>
             <td class="num">{{ c.power_watts }}</td>
             <td class="num">{{ c.capacity_wh }}</td>
             <td class="num {{ 'status-ok' if c.can_toggle else 'status-warn' }}">

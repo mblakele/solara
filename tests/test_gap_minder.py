@@ -66,7 +66,6 @@ def test_hysteresis_custom_value():
             name="heater",
             accessory_id="abc123",
             power_watts=1000.0,
-            role="flexible",
         )
     }
 
@@ -98,7 +97,6 @@ def test_turn_on_flexible_plug():
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            role="flexible",
         )
     }
 
@@ -129,7 +127,6 @@ def test_turn_on_flexible_plug_off():
             name="pool_pump",
             accessory_id="xyz789",
             power_watts=1500.0,
-            role="flexible",
         )
     }
 
@@ -159,7 +156,6 @@ def test_skip_flexible_plug_already_on():
             name="pool_pump",
             accessory_id="xyz789",
             power_watts=1500.0,
-            role="flexible",
         )
     }
 
@@ -184,14 +180,12 @@ def test_priority_ordering():
             name="high_pri",
             accessory_id="abc",
             power_watts=1000.0,
-            role="flexible",
             priority=20,
         ),
         "low_pri": PlugConfig(
             name="low_pri",
             accessory_id="def",
             power_watts=1000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -218,13 +212,11 @@ def test_bin_pack_multiple_plugs():
             name="small",
             accessory_id="a",
             power_watts=500.0,
-            role="flexible",
         ),
         "med": PlugConfig(
             name="med",
             accessory_id="b",
             power_watts=1000.0,
-            role="flexible",
         ),
     }
 
@@ -258,7 +250,6 @@ def test_skip_plug_before_debounce():
             name="plug",
             accessory_id="abc",
             power_watts=4500.0,
-            role="fixed",
         )
     }
 
@@ -280,8 +271,8 @@ def test_skip_plug_before_debounce():
 # --- Over-target (turn off) tests ---
 
 
-def test_turn_off_flexible_only():
-    """Turns off flexible plugs only, not fixed."""
+def test_turn_off_all_on_plugs():
+    """Turns off all plugs that are currently on."""
     engine = GapMinder()
     state = StateTracker()
     state.devices["pool_pump"] = DeviceState(
@@ -297,13 +288,11 @@ def test_turn_off_flexible_only():
             name="pool_pump",
             accessory_id="xyz",
             power_watts=1500.0,
-            role="flexible",
         ),
         "water_heater": PlugConfig(
             name="water_heater",
             accessory_id="abc",
             power_watts=4500.0,
-            role="fixed",
         ),
     }
 
@@ -316,7 +305,7 @@ def test_turn_off_flexible_only():
         tesla=None,
     )
 
-    assert len(actions) == 1
+    assert len(actions) == 2
     assert actions[0].action == "turn_off"
     assert actions[0].device_name == "pool_pump"
 
@@ -338,14 +327,12 @@ def test_remove_lowest_priority_first():
             name="high_pri",
             accessory_id="a",
             power_watts=1000.0,
-            role="flexible",
             priority=20,
         ),
         "low_pri": PlugConfig(
             name="low_pri",
             accessory_id="b",
             power_watts=1000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -373,7 +360,6 @@ def test_skip_off_plugs():
             name="pool_pump",
             accessory_id="xyz",
             power_watts=1500.0,
-            role="flexible",
         )
     }
 
@@ -570,14 +556,12 @@ def test_decide_with_plugs_and_tesla_priority_ordering():
             name="high_pri",
             accessory_id="a",
             power_watts=1000.0,
-            role="flexible",
             priority=20,
         ),
         "low_pri": PlugConfig(
             name="low_pri",
             accessory_id="b",
             power_watts=500.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -633,7 +617,6 @@ def test_hysteresis_blocks_small_gap_flexible_turn_off():
             name="pool_pump",
             accessory_id="xyz",
             power_watts=1500.0,
-            role="flexible",
         ),
     }
 
@@ -714,14 +697,12 @@ def test_hysteresis_blocks_small_gap_multiple_flexible():
             name="fan",
             accessory_id="a1",
             power_watts=75.0,
-            role="flexible",
             priority=5,
         ),
         "dehumidifier": PlugConfig(
             name="dehumidifier",
             accessory_id="b2",
             power_watts=300.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -766,7 +747,6 @@ def test_turn_on_skipped_when_seconds_remaining_below_min():
             name="jackery",
             accessory_id="j1",
             power_watts=270.0,
-            role="flexible",
         ),
     }
 
@@ -795,7 +775,6 @@ def test_turn_on_allowed_when_seconds_remaining_above_min():
             name="heater",
             accessory_id="h1",
             power_watts=4500.0,
-            role="flexible",
         ),
     }
 
@@ -833,7 +812,6 @@ def test_turn_off_not_affected_by_min_seconds_guard():
             name="pool_pump",
             accessory_id="p1",
             power_watts=1500.0,
-            role="flexible",
         ),
     }
 
@@ -863,7 +841,6 @@ def test_turn_on_at_exact_min_seconds_boundary():
             name="heater",
             accessory_id="h1",
             power_watts=4500.0,
-            role="flexible",
         ),
     }
 

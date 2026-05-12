@@ -200,7 +200,7 @@ project-root
   The optional `force=True` parameter bypasses the stale-data check and always fetches fresh NBC data from API.
 - EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`
 - Controllers: PlugController (stub) / RealPlugController (aiohomekit), TeslaController (stub) / RealTeslaController (tesla-fleet-api)
-- Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>:<role>[:<priority>] env vars
+- Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>[:<priority>] env vars
 
 ### Authentication & Error Handling
 - **Emporia VUE API**: Auth tokens (access, id, refresh) are stored in `.vue-keys.json` at the project root. The `Metrics` class reads this file to authenticate via `pyemvue`. This file contains sensitive credentials and must never be committed.

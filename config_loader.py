@@ -125,15 +125,10 @@ def load_plugs_from_file() -> dict[str, Any]:
     plugs: dict[str, PlugConfig] = {}
     for entry in device_config.get_homekit_plugs():
         name = entry["name"].lower()
-        role = entry.get("role", "flexible")
-        if role not in ("flexible", "fixed"):
-            logger.warning("Invalid role %s for plug %s", role, name)
-            continue
         plugs[name] = PlugConfig(
             name=name,
             accessory_id=entry["accessory_id"],
             power_watts=float(entry["power_watts"]),
-            role=role,  # type: ignore[arg-type]
             priority=int(entry.get("priority", 0)),
             time_range=_parse_device_time_range(entry.get("time_range")),
         )
@@ -164,15 +159,10 @@ def load_vocolinc_plugs_from_file() -> dict[str, Any]:
     plugs: dict[str, PlugConfig] = {}
     for entry in device_config.get_vocolinc_plugs():
         name = entry["name"].lower()
-        role = entry.get("role", "flexible")
-        if role not in ("flexible", "fixed"):
-            logger.warning("Invalid role %s for VOCOlinc plug %s", role, name)
-            continue
         plugs[name] = PlugConfig(
             name=name,
             accessory_id=entry["device_name"],
             power_watts=float(entry["power_watts"]),
-            role=role,  # type: ignore[arg-type]
             priority=int(entry.get("priority", 0)),
             controller_type="vocolinc",
             time_range=_parse_device_time_range(entry.get("time_range")),

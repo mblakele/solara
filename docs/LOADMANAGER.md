@@ -41,13 +41,21 @@ If actions were taken after the last data point, the system enters a
 | Variable | Default | Description |
 |---|---|---|
 | `LOAD_MANAGE_ENABLED` | `False` | Enable/disable or time range `HH:MM-HH:MM` |
-| `LOAD_TARGET_WH` | `-500` | Target Wh per quarter-hour (negative = excess solar buffer) |
-| `LOAD_NBC_DEVICE` | *(required)* | Device name for NBC predictions (e.g., "EM1-XXXX") |
 | `LOAD_MANAGE_INTERVAL_SECS` | `30` | Seconds between load management cycles |
 | `LOAD_MANAGE_DRY_RUN` | `False` | Log actions without executing them |
 | `LOAD_MANAGE_API_KEY` | *(empty, disabled)* | API key for manual trigger endpoint auth |
 | `LOAD_PLUG_CONTROLLER` | `stub` | `real` (aiohomekit) or `stub` (in-memory mock) |
 | `LOAD_TESLA_CONTROLLER` | `stub` | `real` (tesla-fleet-api) or `stub` (in-memory mock) |
+
+### Device Configuration (`devices.json`)
+
+Device-specific settings live in `devices.json` (copy from `devices.json.example`).
+This section overrides the equivalent env vars:
+
+- **smartmeter**: `device` (equivalent to `LOAD_NBC_DEVICE`), `target_wh` (equivalent to `LOAD_TARGET_WH`)
+- **plugs**: `homekit` and `vocolinc` arrays — name, accessory/device id, power, priority
+- **tesla**: `vehicle_id`, OAuth endpoints, charging limits, time range
+- **timezone**: Device timezone (equivalent to `TIMEZONE` env var)
 
 ## LOAD_MANAGE_ENABLED
 
@@ -120,11 +128,14 @@ enabled, review the logs for a few cycles, then disable when satisfied.
 
 ## Smart Plug Configuration
 
+Plug configuration is managed in `devices.json` (copy `devices.json.example`
+to `devices.json` and edit). This file is git-ignored and never committed.
+
 ### HomeKit Smart Plugs
 
 #### Pairing a New Accessory
 
-Before configuring a plug in `.env`, pair it with the app:
+Before configuring a plug, pair it with the app:
 
 ```bash
 uv run python app.py --pair-plug <name> <accessory_id> <pin>
@@ -138,29 +149,49 @@ Pairing data is saved to `.homekit-pairings.json` in the project root.
 
 #### Configuration
 
-Set `LOAD_PLUG_CONTROLLER=real` and configure each plug:
+Set `LOAD_PLUG_CONTROLLER=real` and add entries to `devices.json`:
 
-```env
-# Format: LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>:<role>[:<priority>]
-LOAD_PLUG_WATER_HEATER=192.168.1.50:4500:flexible:10
-LOAD_PLUG_POOL_PUMP=TasmotaPlug:1500:flexible:20
+```json
+"plugs": {
+  "homekit": [
+    {
+      "name": "water_heater",
+      "accessory_id": "192.168.1.50",
+      "power_watts": 4500,
+      "priority": 10
+    }
+  ]
+}
 ```
 
+- **name**: Label for your reference
 - **accessory_id**: Must match the IP/mDNS name used during pairing
 - **power_watts**: Approximate power draw when on (used for bin-packing decisions)
-- **role**: `flexible` (can be toggled on/off) or `fixed` (always-on, tracked only)
 - **priority**: Lower number = higher priority for activation (optional, default 0)
+- **time_range**: Only activate during this window (optional, format `HH:MM-HH:MM`)
 
 ### VOCOlinc Smart Plugs
 
-Configure credentials and devices in `.env`:
+Set `LOAD_PLUG_CONTROLLER=real` and add entries to `devices.json`:
+
+```json
+"plugs": {
+  "vocolinc": [
+    {
+      "name": "floor_lamp",
+      "device_name": "LivingRoomLamp",
+      "power_watts": 60,
+      "priority": 5
+    }
+  ]
+}
+```
+
+VOCOlinc credentials still go in `.env`:
 
 ```env
 VOCOLINC_USERNAME=your@email.com
 VOCOLINC_PASSWORD=your_password
-
-# Format: LOAD_VOCOLINC_PLUG_<NAME>=<device_name>:<power_watts>:<role>[:<priority>]
-LOAD_VOCOLINC_PLUG_FLOOR_LAMP=LivingRoomLamp:60:flexible:5
 ```
 
 The `device_name` is the friendly name shown in the VOCOlinc app.

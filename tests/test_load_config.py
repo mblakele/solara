@@ -35,9 +35,9 @@ def test_load_plugs_valid():
         "plugs": {
             "homekit": [
                 {"name": "water_heater", "accessory_id": "abc123",
-                 "power_watts": 4500, "role": "flexible", "priority": 10},
+                 "power_watts": 4500, "priority": 10},
                 {"name": "pool_pump", "accessory_id": "xyz789",
-                 "power_watts": 1500, "role": "flexible", "priority": 20},
+                 "power_watts": 1500, "priority": 20},
             ]
         }
     }):
@@ -46,7 +46,6 @@ def test_load_plugs_valid():
 
     assert len(plugs) == 2
     assert plugs["water_heater"].power_watts == 4500.0
-    assert plugs["water_heater"].role == "flexible"
     assert plugs["water_heater"].priority == 10
 
 
@@ -56,7 +55,7 @@ def test_load_plugs_default_priority():
         "plugs": {
             "homekit": [
                 {"name": "test", "accessory_id": "abc",
-                 "power_watts": 1000, "role": "flexible"},
+                 "power_watts": 1000},
             ]
         }
     }):
@@ -66,28 +65,12 @@ def test_load_plugs_default_priority():
     assert plugs["test"].priority == 0
 
 
-def test_load_plugs_invalid_role():
-    """Skips plugs with invalid role."""
-    with patch("device_config._load", return_value={
-        "plugs": {
-            "homekit": [
-                {"name": "test", "accessory_id": "abc",
-                 "power_watts": 1000, "role": "invalid"},
-            ]
-        }
-    }):
-        device_config.reload()
-        plugs = load_plugs_from_file()
-
-    assert len(plugs) == 0
-
-
 def test_load_plugs_invalid_format():
     """Skips entries missing required fields."""
     with patch("device_config._load", return_value={
         "plugs": {
             "homekit": [
-                {"name": "test"},  # missing accessory_id, power_watts, role
+                {"name": "test"},  # missing accessory_id, power_watts
             ]
         }
     }):
@@ -367,7 +350,6 @@ def test_sync_reconciles_external_turn_off():
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -401,7 +383,6 @@ def test_sync_populates_new_device():
             name="pump",
             accessory_id="p1",
             power_watts=500.0,
-            role="flexible",
             priority=5,
         ),
     }
@@ -448,7 +429,6 @@ def test_sync_handles_controller_error():
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -474,7 +454,6 @@ def test_sync_no_reconciliation_when_states_match():
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
         ),
     }
@@ -573,7 +552,7 @@ def test_load_plug_time_range_parsed():
         "plugs": {
             "homekit": [
                 {"name": "water_heater", "accessory_id": "abc123",
-                 "power_watts": 4500, "role": "flexible",
+                 "power_watts": 4500,
                  "time_range": "10:00-15:00"},
             ]
         }
@@ -593,7 +572,7 @@ def test_load_plug_no_time_range():
         "plugs": {
             "homekit": [
                 {"name": "heater", "accessory_id": "abc123",
-                 "power_watts": 4500, "role": "flexible"},
+                 "power_watts": 4500},
             ]
         }
     }):
@@ -609,7 +588,7 @@ def test_load_plug_invalid_time_range():
         "plugs": {
             "homekit": [
                 {"name": "heater", "accessory_id": "abc123",
-                 "power_watts": 4500, "role": "flexible",
+                 "power_watts": 4500,
                  "time_range": "6am-3pm"},
             ]
         }
@@ -628,7 +607,7 @@ def test_load_vocolinc_plug_time_range_parsed():
         "plugs": {
             "vocolinc": [
                 {"name": "floor_lamp", "device_name": "LivingRoomLamp",
-                 "power_watts": 60, "role": "flexible",
+                 "power_watts": 60,
                  "time_range": "18:00-23:00"},
             ]
         }
@@ -723,7 +702,6 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
             time_range=(time(6, 0), time(18, 0)),
         ),
@@ -769,7 +747,6 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
             time_range=(time(6, 0), time(18, 0)),
         ),
@@ -815,7 +792,6 @@ def test_cycle_filters_outside_range_plug(mock_config):
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
             time_range=(time(6, 0), time(18, 0)),
         ),
@@ -866,7 +842,6 @@ def test_cycle_includes_plug_inside_range(mock_config):
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
             time_range=(time(6, 0), time(18, 0)),
         ),
@@ -980,7 +955,6 @@ def test_no_action_reason_skips_outside_range_plug(mock_config):
             name="heater",
             accessory_id="h1",
             power_watts=2000.0,
-            role="flexible",
             priority=10,
             time_range=(time(6, 0), time(18, 0)),
         ),
