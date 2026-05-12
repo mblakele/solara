@@ -1067,7 +1067,7 @@ class LoadManager:
                 }
 
             # ── Stage 2: NBC fetch ─────────────────────────────────────────
-            qh_result = self.nbc_reader.get_current_qh(force=force)
+            qh_result = self.nbc_reader.get_current_qh(force=force, now=now)
             if qh_result is None:
                 return {
                     "status": "no_incomplete_qh",

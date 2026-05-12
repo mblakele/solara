@@ -2,6 +2,9 @@
 <html>
 <head>
 <title>solara</title>
+{% if load_management and load_management.last_cycle_result and load_management.last_cycle_result.get('sleep_hint') is defined %}
+<meta id="sleep-hint" data-value="{{ load_management.last_cycle_result.sleep_hint }}">
+{% endif %}
 <style>
   div.metrics {
       font-size: 4em;
@@ -135,7 +138,11 @@
 
 <script>
   var timePrev = Date.now()
-  var millisMax = 2 * 60 * 1000
+  var sleepHintEl = document.getElementById('sleep-hint')
+  var defaultMax = 2 * 60 * 1000  // 2 minutes — fallback
+  var millisMax = sleepHintEl
+    ? Math.max(15 * 1000, (parseFloat(sleepHintEl.dataset.value) || 0) * 1000)
+    : defaultMax
   var timestamp = function() {
     return new Date(Date.now()).toLocaleTimeString()
   }

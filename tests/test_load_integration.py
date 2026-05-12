@@ -467,8 +467,8 @@ def test_stale_data_from_previous_qh():
     # Patch get_current_qh to return our crafted data_point_at.
     original_get = mgr.nbc_reader.get_current_qh
 
-    def patched_get(force=False):
-        result = original_get(force=force)
+    def patched_get(force=False, now=None):
+        result = original_get(force=force, now=now)
         if result is not None:
             qh_name, predicted_wh, seconds_remaining = result[:3]
             return (qh_name, predicted_wh, seconds_remaining, data_point_at)
@@ -931,9 +931,9 @@ def test_waiting_for_fresh_data_includes_count():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    now = datetime.now(timezone.utc)
-    fetched_at = now - timedelta(seconds=10)
-    energy_cache = _make_energy_cache_with_prediction(-2000.0, now=now, data_lag_secs=10)
+    fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
+    fetched_at = fixed_now - timedelta(seconds=10)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, now=fixed_now, data_lag_secs=10)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -948,12 +948,15 @@ def test_waiting_for_fresh_data_includes_count():
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="plug", action="turn_on",
-            timestamp=now,
+            timestamp=fixed_now,
             power_delta_wh=500.0,
         )
     )
 
-    result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = mgr.run_cycle()
 
     assert result["status"] == "waiting_for_fresh_data"
     assert result["diagnostics"]["pending_effects_count"] == 1
@@ -972,9 +975,9 @@ def test_waiting_for_fresh_data_includes_candidates():
     }
     plug_ctrl = PlugController(plugs)
 
-    now = datetime.now(timezone.utc)
-    fetched_at = now - timedelta(seconds=10)
-    energy_cache = _make_energy_cache_with_prediction(-2000.0, now=now, data_lag_secs=10)
+    fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
+    fetched_at = fixed_now - timedelta(seconds=10)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, now=fixed_now, data_lag_secs=10)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -989,12 +992,15 @@ def test_waiting_for_fresh_data_includes_candidates():
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="heater", action="turn_on",
-            timestamp=now,
+            timestamp=fixed_now,
             power_delta_wh=500.0,
         )
     )
 
-    result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = mgr.run_cycle()
 
     assert result["status"] == "waiting_for_fresh_data"
     candidates = result["diagnostics"]["candidates"]
@@ -1549,7 +1555,7 @@ class TestAdaptiveSleep:
         class StaleQHReader:
             """Mock NBC reader that returns data 200 seconds old."""
 
-            def get_current_qh(self, force=False):
+            def get_current_qh(self, force=False, now=None):
                 return ("QH3", -1000.0, 600, data_point_at)
 
         lm = LoadManager(
@@ -1587,13 +1593,13 @@ class TestAdaptiveSleep:
 
     def test_waiting_for_fresh_data_run_cycle_includes_sleep_hint(self):
         """Waiting for fresh data returns sleep_hint = min(seconds_remaining, 2*interval)."""
-        now = datetime.now(timezone.utc)
-        data_point_at = now - timedelta(seconds=10)  # recent data point
+        fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
+        data_point_at = fixed_now - timedelta(seconds=10)  # recent data point
 
         class FreshQHReader:
             """Mock NBC reader that returns a recent data point."""
 
-            def get_current_qh(self, force=False):
+            def get_current_qh(self, force=False, now=None):
                 return ("QH3", -1000.0, 600, data_point_at)
 
         lm = LoadManager(
@@ -1625,7 +1631,11 @@ class TestAdaptiveSleep:
             timestamp=data_point_at + timedelta(seconds=5),  # after data point
         )]
 
-        result = lm.run_cycle()
+        with patch("load_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            result = lm.run_cycle()
+
         assert result["status"] == "waiting_for_fresh_data"
         # sleep_hint should be min(seconds_remaining, 2*interval)
         assert result["sleep_hint"] <= 60
@@ -1653,7 +1663,7 @@ class TestAdaptiveSleep:
 
         # Create an LM with a mock NBC reader that returns None
         class NoQHReader:
-            def get_current_qh(self, force=False):
+            def get_current_qh(self, force=False, now=None):
                 return None
 
         lm = LoadManager(
