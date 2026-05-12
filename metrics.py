@@ -382,6 +382,17 @@ class EnergyCache:
                         )
 
                 psd = result.get("per_second_data")
+                if not psd:
+                    # Fall back to counting per_second_data from devices
+                    # (full metrics dict path, e.g. HourlyProjection.metrics).
+                    devices = result.get("devices", [])
+                    if devices:
+                        psd = [
+                            point
+                            for device in devices
+                            for point in device.get("per_second_data", [])
+                        ]
+
                 if psd:
                     logger.debug(
                         "EnergyCache fetched %d data points (cache now has %d samples)",

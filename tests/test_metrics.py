@@ -1898,6 +1898,41 @@ class TestEnergyCache(unittest.TestCase):
         finally:
             logger.removeHandler(handler)
 
+    def test_get_or_fetch_logs_data_point_count_from_full_metrics_dict(self):
+        """get_or_fetch logs data points from devices when top-level per_second_data is absent."""
+        import logging
+
+        from metrics import EnergyCache
+
+        handler = _LogCapture()
+        logger = logging.getLogger("metrics")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            cache = EnergyCache(ttl_seconds=60)
+
+            # Simulate a full metrics dict like HourlyProjection.metrics returns.
+            # per_second_data is nested inside devices, not at the top level.
+            def fetch_func():
+                return {
+                    "api_response": {},
+                    "devices": [
+                        {
+                            "gid": 123,
+                            "name": "VUE Device",
+                            "per_second_data": [0.001] * 150,
+                        }
+                    ],
+                }
+
+            cache.get_or_fetch(fetch_func)
+
+            assert "fetched" in handler.text
+            assert "150" in handler.text
+            assert "now has 0 samples" in handler.text
+        finally:
+            logger.removeHandler(handler)
+
 
 class TestBuildIncrementalFetch(unittest.TestCase):
     """Tests for _build_incremental_fetch helper function."""
