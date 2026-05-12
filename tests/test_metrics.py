@@ -1929,9 +1929,37 @@ class TestEnergyCache(unittest.TestCase):
 
             assert "fetched" in handler.text
             assert "150" in handler.text
-            assert "now has 0 samples" in handler.text
+            assert "now has 150 samples" in handler.text
         finally:
             logger.removeHandler(handler)
+
+    def test_get_or_fetch_populates_samples_from_nested_device_data(self):
+        """get_or_fetch populates self._samples when per_second_data is nested in devices."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime.now(timezone.utc)
+
+        # Simulate a full metrics dict like HourlyProjection.metrics returns.
+        # per_second_data is nested inside devices, not at the top level.
+        def fetch_func():
+            return {
+                "api_response": {},
+                "devices": [
+                    {
+                        "gid": 123,
+                        "name": "VUE Device",
+                        "per_second_data": [0.01] * 150,
+                    }
+                ],
+            }
+
+        cache.get_or_fetch(fetch_func)
+
+        # Verify self._samples is populated from nested devices data.
+        self.assertIsNotNone(cache._samples)
+        self.assertEqual(len(cache._samples), 150)
+        self.assertEqual(all(v > 0 for v in cache._samples), True)
 
 
 class TestBuildIncrementalFetch(unittest.TestCase):

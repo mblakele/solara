@@ -336,6 +336,16 @@ class EnergyCache:
 
                 new_samples = result.get("per_second_data", [])
 
+                # When data comes from nested devices (full metrics dict path,
+                # e.g. HourlyProjection.metrics), extract per_second_data from
+                # devices so the merge logic below populates self._samples.
+                if not new_samples and "devices" in result:
+                    new_samples = [
+                        point
+                        for device in result["devices"]
+                        for point in device.get("per_second_data", [])
+                    ]
+
                 # Merge with existing samples (incremental fetch path).
                 if self._samples is not None and len(self._samples) > 0:
                     # Append new samples to existing ones.
