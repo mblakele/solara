@@ -568,7 +568,7 @@ class StateTracker:
 
 
 class GapMinder:
-    """Bin-pack flexible loads to fill (or reduce) the NBC surplus/deficit gap."""
+    """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
     MIN_SECONDS_TO_ACT = 60
@@ -661,7 +661,7 @@ class GapMinder:
         dry_run: bool = False,
         dp_at: datetime | None = None,
     ) -> list[PendingEffect]:
-        """Turn on flexible loads to absorb excess solar.
+        """Turn on eligible loads to absorb excess solar.
 
         Args:
             gap: The Wh surplus to absorb.
@@ -678,7 +678,7 @@ class GapMinder:
         remaining_gap = gap
         actions: list[PendingEffect] = []
 
-        # Collect eligible flexible loads that are currently off
+        # Collect eligible loads that are currently off
         candidates: list[tuple[int, str, Any]] = []
 
         for name, plug in plugs.items():
@@ -735,7 +735,7 @@ class GapMinder:
                         name=name, last_toggle=now, desired_state=True
                     )
 
-            elif self._tesla_supports_partial(plug, tesla) and tesla is not None and tesla.is_charging:
+            elif self._tesla_supports_amps(plug, tesla) and tesla is not None and tesla.is_charging:
                 logger.debug(
                     "[_decide_turn_on] %s: partial via Tesla "
                     "(capacity=%.1f Wh > gap %.1f Wh)",
@@ -754,7 +754,7 @@ class GapMinder:
             else:
                 logger.debug(
                     "[_decide_turn_on] %s: too large "
-                    "(capacity=%.1f Wh > gap %.1f Wh, no partial)",
+                    "(capacity=%.1f Wh > gap %.1f Wh)",
                     name,
                     capacity,
                     remaining_gap,
@@ -862,7 +862,7 @@ class GapMinder:
             if dev_state and dev_state.desired_state is True:
                 candidates.append((plug.priority, name, plug))
                 logger.debug(
-                    "[_decide_turn_off] %s: eligible (flexible, on)",
+                    "[_decide_turn_off] %s: eligible (on)",
                     name,
                 )
             else:
@@ -923,7 +923,7 @@ class GapMinder:
 
         return actions
 
-    def _tesla_supports_partial(
+    def _tesla_supports_amps(
         self, _plug: Any, tesla: TeslaState | None
     ) -> bool:
         """Check if Tesla can handle partial amp adjustment."""

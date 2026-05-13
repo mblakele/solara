@@ -284,16 +284,16 @@ def test_composite_turns_on_both_types():
 
 
 def test_composite_over_target_turns_off_vocolinc():
-    """Over-target turns off VOCOlinc flexible plug but not fixed."""
+    """Over-target turns off VOCOlinc plugs."""
     config.set("VOCOLINC_USERNAME", "test")
     config.set("VOCOLINC_PASSWORD", "test")
 
     with patch("device_config._load", return_value={
         "plugs": {
             "vocolinc": [
-                {"name": "vc_flex", "device_name": "vc_flex",
+                {"name": "vc_alpha", "device_name": "vc_alpha",
                  "power_watts": 1000},
-                {"name": "vc_fixed", "device_name": "vc_fixed",
+                {"name": "vc_bravo", "device_name": "vc_bravo",
                  "power_watts": 4500},
             ]
         }
@@ -321,13 +321,13 @@ def test_composite_over_target_turns_off_vocolinc():
             with patch("load_manager.datetime") as mock_dt:
                 mock_dt.now.return_value = fixed_now
                 mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-                mgr.state.devices["vc_flex"] = DeviceState(
-                    name="vc_flex",
+                mgr.state.devices["vc_alpha"] = DeviceState(
+                    name="vc_alpha",
                     last_toggle=fixed_now - timedelta(seconds=120),
                     desired_state=True,
                 )
-                mgr.state.devices["vc_fixed"] = DeviceState(
-                    name="vc_fixed",
+                mgr.state.devices["vc_bravo"] = DeviceState(
+                    name="vc_bravo",
                     last_toggle=fixed_now - timedelta(seconds=120),
                     desired_state=True,
                 )
@@ -338,5 +338,5 @@ def test_composite_over_target_turns_off_vocolinc():
                 result = mgr.run_cycle()
 
             action_names = [a["device"] for a in result["actions"]]
-            assert "vc_flex" in action_names
-            assert "vc_fixed" in action_names
+            assert "vc_alpha" in action_names
+            assert "vc_bravo" in action_names

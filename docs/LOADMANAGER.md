@@ -9,7 +9,7 @@ Load management runs as a background thread that cycles every N seconds
 2. **State Adjustment**: Adjusts raw prediction with pending effect deltas from
    actions already taken this quarter-hour, so decisions account for loads already toggled
 3. **GapMinder:** Compares adjusted prediction against target Wh,
-   calculates the gap, and uses bin-packing to fit flexible loads into the surplus
+   calculates the gap, and uses bin-packing to fit eligible loads into the surplus
 4. **Action Execution**: Turns plugs on/off or adjusts Tesla charging amps
 
 Key components:
@@ -108,7 +108,7 @@ How it works:
 - NBC predicts how many Wh you'll use in the current quarter-hour (negative = excess solar, positive = grid draw)
 - The engine calculates `gap = predicted_wh - target_wh`
   - Negative gap (e.g., predicted=-2000, target=-500 → gap=-1500): too much excess solar → turn loads on to absorb it
-  - Positive gap (e.g., predicted=2000, target=-500 → gap=2500): drawing too much from grid → turn flexible loads off
+  - Positive gap (e.g., predicted=2000, target=-500 → gap=2500): drawing too much from grid → turn eligible loads off
 
 With the default of -500, the system aims to leave a small buffer
 of excess solar unabsorbed rather than driving net usage to exactly zero.

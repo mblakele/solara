@@ -127,13 +127,13 @@ def _make_overn_target_manager(
             name="pool_pump",
             accessory_id="xyz789",
             power_watts=1500.0,
-            priority=10,
+            priority=200,
         ),
         "water_heater": PlugConfig(
             name="water_heater",
             accessory_id="abc123",
             power_watts=4500.0,
-            priority=20,
+            priority=100,
         ),
     }
     plug_ctrl = PlugController(plugs)
@@ -215,25 +215,30 @@ def _make_tesla_manager(
 
 def test_turns_on_plugs_in_priority_order():
     """Excess solar: turns on plugs in priority order."""
-    mgr, _, _ = _make_excess_manager(predicted_wh=-6000.0)
+    # in priority order:
+    # p200 pool pump turns on
+    # p100 water heater would fit gap without pool pump, but stays off
+    mgr, plug_ctrl = _make_overn_target_manager(predicted_wh=-1500.0)
+    asyncio.run(plug_ctrl.set_state("pool_pump", False))
+    asyncio.run(plug_ctrl.set_state("water_heater", False))
 
     result = mgr.run_cycle()
 
     assert result["status"] == "ok"
     action_names = [a["device"] for a in result["actions"]]
-    assert "water_heater" in action_names
-    assert "pool_pump" in action_names
-    wh_idx = action_names.index("water_heater")
-    pp_idx = action_names.index("pool_pump")
-    assert wh_idx < pp_idx
+    wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
+    pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
+    assert wh_state is False
+    assert pp_state
 
 
 def test_turns_off_plugs_in_priority_order():
     """Load shedding: turns plugs off priority order."""
     # predicted_wh=-200, target=-500 => gap=300 Wh
-    # in reverse priority order:
-    # p20 water heater 4500w => 1125 Wh/quarter-hour (fills deficit)
-    # no more deficit so pool pump stays on
+    # in priority order:
+    # p100 water heater 4500w => 1125 Wh/quarter-hour (fills deficit)
+    # no more deficit so continue
+    # p200 pool pump (potential savings 333.3 Wh) stays on
     mgr, plug_ctrl = _make_overn_target_manager(predicted_wh=-200.0)
 
     result = mgr.run_cycle()
@@ -1248,7 +1253,7 @@ def test_turn_off_only_device_even_when_savings_exceed_gap():
     engine = GapMinder(hysteresis_wh=3)
     state = StateTracker()
 
-    # Water heater is on (confirmed), flexible — the only device available.
+    # Water heater is on (confirmed) — the only device available.
     state.devices["water_heater"] = DeviceState(
         name="water_heater",
         desired_state=True,
@@ -1411,7 +1416,7 @@ class TestAdaptiveSleep:
     # --- Scenario 6: Deficit exists but no capacity → minimum sleep (5s) ---
 
     def test_deficit_no_capacity_returns_minimum_sleep(self):
-        """When deficit exists but no flexible capacity, sleep_hint = 5s."""
+        """When deficit exists but no eligible capacity, sleep_hint = 5s."""
         lm = self._make_manager()
         result = self._make_cycle_result(
             status="ok",
@@ -1432,7 +1437,7 @@ class TestAdaptiveSleep:
             nbc_prediction_wh=-2000.0,  # deficit of 1500 Wh
             seconds_remaining=450,
         )
-        # Add candidates with 1000W flexible capacity
+        # Add candidates with 1000W capacity
         result["diagnostics"]["candidates"] = [
             {"name": "heater", "power_watts": 1000.0}
         ]
@@ -1450,7 +1455,7 @@ class TestAdaptiveSleep:
             nbc_prediction_wh=-600.0,  # deficit of 100 Wh
             seconds_remaining=450,
         )
-        # Add candidates with 1000W flexible capacity
+        # Add candidates with 1000W capacity
         result["diagnostics"]["candidates"] = [
             {"name": "heater", "power_watts": 1000.0}
         ]

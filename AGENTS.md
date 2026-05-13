@@ -144,7 +144,7 @@ project-root
   actions already taken this quarter-hour without waiting for fresh API data
 - Actions are determined by comparing adjusted predicted_wh against target_wh (default -500 Wh)
 - Three action types: "turn_on", "turn_off", "set_amps"
-- Algorithm uses bin-packing to fit flexible loads into the surplus gap
+- Algorithm uses bin-packing to fit eligible loads into the surplus gap
 
 ### Dry-Run Mode
 - Controlled by LOAD_MANAGE_DRY_RUN env var (currently True in .env line 10)

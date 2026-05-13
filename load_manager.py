@@ -593,7 +593,7 @@ class LoadManager:
         # --- Deficit with no actions possible: proportional sleep ---
         gap = abs(predicted_wh - self.target_wh)
 
-        # Calculate total flexible capacity from candidates
+        # Calculate total eligible capacity from candidates
         max_load_capacity = 0.0
         for candidate in (cycle_result.get("diagnostics") or {}).get(
             "candidates"

@@ -88,8 +88,8 @@ def test_hysteresis_default_value():
     assert engine.HYSTERESIS_WH == 1000
 
 
-def test_turn_on_flexible_plug():
-    """Turns on flexible plug when gap exists."""
+def test_turn_on_plug():
+    """Turns on plug when gap exists."""
     engine = GapMinder()
     state = StateTracker()
     plugs = {
@@ -114,8 +114,8 @@ def test_turn_on_flexible_plug():
     assert actions[0].device_name == "water_heater"
 
 
-def test_turn_on_flexible_plug_off():
-    """Turns on flexible plug that's currently off."""
+def test_turn_on_plug_2():
+    """Turns on plug that's currently off."""
     engine = GapMinder()
     state = StateTracker()
     state.devices["pool_pump"] = DeviceState(
@@ -143,8 +143,8 @@ def test_turn_on_flexible_plug_off():
     assert actions[0].action == "turn_on"
 
 
-def test_skip_flexible_plug_already_on():
-    """Skips flexible plug already on."""
+def test_skip_plug_already_on():
+    """Skips plug already on."""
     engine = GapMinder()
     state = StateTracker()
     state.devices["pool_pump"] = DeviceState(
@@ -596,8 +596,8 @@ def test_decide_with_plugs_and_tesla_priority_ordering():
 # --- Hysteresis anti-chatter tests ---
 
 
-def test_hysteresis_blocks_small_gap_flexible_turn_off():
-    """A small over-target gap must not turn off a flexible device when the
+def test_hysteresis_blocks_small_gap_turn_off():
+    """A small over-target gap must not turn off a device when the
     resulting undershoot would exceed the current overshoot.
 
     Regression guard: if the top-level hysteresis gate is removed for
@@ -607,7 +607,7 @@ def test_hysteresis_blocks_small_gap_flexible_turn_off():
     engine = GapMinder()
     state = StateTracker()
 
-    # Pool pump on (flexible), savings ≈ 1500 * 600 / 3600 = 250 Wh
+    # Pool pump on, savings ≈ 1500 * 600 / 3600 = 250 Wh
     state.devices["pool_pump"] = DeviceState(
         name="pool_pump",
         desired_state=True,
@@ -647,7 +647,7 @@ def test_hysteresis_blocks_small_gap_tesla_reduce():
     engine = GapMinder()
     state = StateTracker()
 
-    # No flexible plugs on — only Tesla is available
+    # No plugs on — only Tesla is available
     plugs: dict[str, PlugConfig] = {}
     tesla = TeslaState(
         is_charging=True,
@@ -672,8 +672,8 @@ def test_hysteresis_blocks_small_gap_tesla_reduce():
     assert len(actions) == 0
 
 
-def test_hysteresis_blocks_small_gap_multiple_flexible():
-    """A small over-target gap must not turn off any flexible devices when
+def test_hysteresis_blocks_small_gap_multiple():
+    """A small over-target gap must not turn off any devices when
     all of them fit in the gap but total savings is less than abs_gap.
 
     Regression guard: if the top-level hysteresis gate is removed for
@@ -683,7 +683,7 @@ def test_hysteresis_blocks_small_gap_multiple_flexible():
     engine = GapMinder()
     state = StateTracker()
 
-    # Two small flexible devices on
+    # Two small devices on
     state.devices["fan"] = DeviceState(
         name="fan",
         desired_state=True,
