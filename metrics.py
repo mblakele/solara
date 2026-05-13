@@ -204,6 +204,15 @@ class EnergyCache:
         # Full result dict from the most recent fetch (for non-incremental callers).
         self._data: dict[str, Any] | None = None
 
+    @property
+    def last_sample_at(self) -> datetime | None:
+        """Timestamp of the most recent sample in the cache, or None if empty.
+
+        Returns:
+            datetime of the last sample (data_start + len(samples) - 1), or None.
+        """
+        return self._last_sample_at
+
     def is_valid(self, now: datetime | None = None) -> bool:
         """Check if cache has non-expired data.
 
@@ -624,7 +633,11 @@ class HourlyProjection(MetricsBase):
     Maintains backward compatibility with original Metrics class.
     """
 
-    def __init__(self, logger_next: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        logger_next: Optional[logging.Logger] = None,
+        chart_start: datetime | None = None,
+    ) -> None:
         self.metrics: dict[str, Any] = {
             "api_response": {},
             "debug": is_debug(),
@@ -635,9 +648,10 @@ class HourlyProjection(MetricsBase):
 
         self.instant = datetime.now(pytz.timezone(_cfg.timezone))
         self.metrics["instant"] = self.instant
+        self.chart_start: datetime | None = chart_start
 
         # Fetch usage data without mutating device_info
-        population = self.populate()
+        population = self.populate(self.chart_start)
 
         self.metrics["api_response"]["total"] = sum(
             self.metrics["api_response"].values(), timedelta()
@@ -733,20 +747,20 @@ class HourlyProjection(MetricsBase):
             scales[scale] = self.data_for_scale(offset_data, offset_start, scale)
         return usage_data_local[-300:]
 
-    def populate(self) -> dict[int, _PopulationResult]:
+    def populate(self, chart_start: datetime | None = None) -> dict[int, _PopulationResult]:
         """Fetch recent data using second granularity to minimize lag.
 
-        Returns a dict mapping device gid to PopulationResult without mutating
-        the pyemvue API objects in device_info.
+        Args:
+            chart_start: Start of the fetch window (inclusive).
 
         Returns:
             Dict of gid -> _PopulationResult for each successfully populated device.
+
+        Raises:
+            ValueError: If chart_start is None.
         """
-        chart_start = self.instant - timedelta(
-            minutes=self.instant.minute,
-            seconds=self.instant.second,
-            microseconds=self.instant.microsecond,
-        )
+        if chart_start is None:
+            raise ValueError("chart_start is required; it must be provided by the caller")
         results: dict[int, _PopulationResult] = {}
         for vdi in self.device_info.values():
             self.logger.debug("device: %s", vdi)

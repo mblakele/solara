@@ -42,6 +42,36 @@ from metrics import (
 from mockdata import MetricsMock
 from util import CustomJSONProvider, is_debug
 
+# Module-level lock for thread-safe first-call detection on _create_metrics.
+_create_metrics_lock = threading.Lock()
+
+
+def _create_metrics(logger: logging.Logger) -> dict[str, Any] | None:
+    """Fetch metrics with incremental chart_start tracking via EnergyCache.
+
+    On the first call, EnergyCache has no samples, so chart_start is set to
+    3600 seconds ago (full hour of historical data). After that, chart_start
+    advances to the most recent sample timestamp from the cache.
+
+    Args:
+        logger: Logger instance.
+
+    Returns:
+        Metrics dict from HourlyProjection, or None on failure.
+    """
+    now = datetime.now(pytz.timezone(_cfg.timezone))
+
+    # First call: fetch entire previous hour.
+    # Subsequent calls: fetch incremental data from the last sample timestamp.
+    chart_start = (
+        now - timedelta(seconds=3600)
+        if _energy_cache.last_sample_at is None
+        else _energy_cache.last_sample_at
+    )
+
+    hp = HourlyProjection(logger, chart_start)
+    return hp.metrics
+
 
 # global setup
 from tesla_oauth import bp  # noqa: PLC0415
@@ -257,7 +287,7 @@ def index() -> ResponseReturnValue:
     else:
         # Real mode: use cached metrics to avoid hammering the API
         metrics_data, was_fresh = _energy_cache.get_or_fetch(
-            lambda: HourlyProjection(logger).metrics
+            lambda: _create_metrics(logger)
         )
         if was_fresh:
             logger.debug("Fetched fresh metrics for index endpoint")
@@ -404,7 +434,7 @@ def _get_load_manager():
 
                 def metrics_fetch():
                     return _energy_cache.get_or_fetch(
-                        lambda: HourlyProjection(logger).metrics
+                        lambda: _create_metrics(logger)
                     )[0]
 
                 _load_manager = LoadManager(

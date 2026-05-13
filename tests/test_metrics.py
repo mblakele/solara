@@ -442,7 +442,8 @@ class TestHourlyProjectionErrorPaths(unittest.TestCase):
 
     def test_retryable_exception_on_no_data(self):
         """HourlyProjection should raise RetryableMetricsException when API returns no data."""
-        from unittest.mock import patch, MagicMock
+
+        chart_start = datetime.now(timezone.utc)
 
         with patch.object(MetricsBase, "vue_init"), \
              patch.object(MetricsBase, "get_device_info"):
@@ -464,7 +465,34 @@ class TestHourlyProjectionErrorPaths(unittest.TestCase):
                 ):
 
                     with self.assertRaises(RetryableMetricsException):
-                        HourlyProjection()
+                        HourlyProjection(chart_start=chart_start)
+
+
+class TestHourlyProjectionChartStart(unittest.TestCase):
+    """Tests for HourlyProjection chart_start parameter."""
+
+    def test_init_stores_chart_start(self):
+        """HourlyProjection.__init__ should store chart_start on the instance."""
+        chart_start = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        hp = HourlyProjection(chart_start=chart_start)
+        self.assertIs(hp.chart_start, chart_start)
+        self.assertIsInstance(hp.chart_start, datetime)
+
+    def test_populate_without_chart_start_raises(self):
+        """HourlyProjection.populate() should raise ValueError when chart_start is None."""
+        # Use __new__ to bypass __init__, so we get a bare instance.
+        hp = HourlyProjection.__new__(HourlyProjection)
+        hp.chart_start = None
+        with self.assertRaises(ValueError) as ctx:
+            hp.populate()
+        self.assertIn("chart_start is required", str(ctx.exception))
+
+    def test_populate_with_none_chart_start_raises(self):
+        """HourlyProjection.populate(chart_start=None) should raise ValueError."""
+        chart_start = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        hp = HourlyProjection(chart_start=chart_start)
+        with self.assertRaises(ValueError):
+            hp.populate(None)
 
 
 class TestHourlyProjectionEdgeCases(unittest.TestCase):
