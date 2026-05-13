@@ -130,6 +130,8 @@ project-root
 
 - NBC calculation in `metrics.py` (EnergyCache with incremental fetch, sample merging, and pruning;
   clock-boundary quarter-hour computation via `compute_clock_boundary_nbc_quarters`)
+- HourlyPrediction metrics in `metrics.py` (HourlyProjection with required `chart_start` on `populate()`,
+  minute-scale extrapolation and min/max bounds prediction via `predict()`)
 - TOU in `energy_aggregator.py`
 - clock-boundary NBC quarters (`compute_clock_boundary_nbc_quarters`, `_clock_boundary_windows`) in `util.py`
 - oauth in `load_manager.py`

@@ -636,7 +636,6 @@ class HourlyProjection(MetricsBase):
     def __init__(
         self,
         logger_next: Optional[logging.Logger] = None,
-        chart_start: datetime | None = None,
     ) -> None:
         self.metrics: dict[str, Any] = {
             "api_response": {},
@@ -648,10 +647,25 @@ class HourlyProjection(MetricsBase):
 
         self.instant = datetime.now(pytz.timezone(_cfg.timezone))
         self.metrics["instant"] = self.instant
-        self.chart_start: datetime | None = chart_start
 
+    def populate(self, chart_start: datetime) -> dict[int, dict[str, Any]]:
+        """Fetch recent data using second granularity to minimize lag.
+
+        The caller must compute chart_start. On the first call, use
+        now - 3600 seconds for a full hour of historical data. On
+        subsequent calls, use the most recent sample timestamp from
+        EnergyCache to fetch only incremental new data.
+
+        Args:
+            chart_start: Start of the fetch window (inclusive). Must be a
+                timezone-aware datetime — never None.
+
+        Returns:
+            Dict of gid -> prediction results for each device.
+        """
+        self.logger.debug("populate from %s", chart_start)
         # Fetch usage data without mutating device_info
-        population = self.populate(self.chart_start)
+        population = self.populate_internal(chart_start)
 
         self.metrics["api_response"]["total"] = sum(
             self.metrics["api_response"].values(), timedelta()
@@ -683,6 +697,8 @@ class HourlyProjection(MetricsBase):
             pred_result = predictions[first_gid]
             lag_td: timedelta = pred_result.get("lag", timedelta(0))
             self.metrics["_data_lag_secs"] = lag_td.total_seconds()
+
+        return predictions
 
     def _fetch_channel_data(self, chan, chart_start, instant):
         """
@@ -747,20 +763,20 @@ class HourlyProjection(MetricsBase):
             scales[scale] = self.data_for_scale(offset_data, offset_start, scale)
         return usage_data_local[-300:]
 
-    def populate(self, chart_start: datetime | None = None) -> dict[int, _PopulationResult]:
+    def populate_internal(
+        self, chart_start: datetime
+    ) -> dict[int, _PopulationResult]:
         """Fetch recent data using second granularity to minimize lag.
+
+        This is the internal implementation used by populate(). It handles
+        the actual API calls and per-device population.
 
         Args:
             chart_start: Start of the fetch window (inclusive).
 
         Returns:
             Dict of gid -> _PopulationResult for each successfully populated device.
-
-        Raises:
-            ValueError: If chart_start is None.
         """
-        if chart_start is None:
-            raise ValueError("chart_start is required; it must be provided by the caller")
         results: dict[int, _PopulationResult] = {}
         for vdi in self.device_info.values():
             self.logger.debug("device: %s", vdi)

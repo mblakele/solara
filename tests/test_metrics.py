@@ -464,35 +464,42 @@ class TestHourlyProjectionErrorPaths(unittest.TestCase):
                     MetricsBase.vue, "get_chart_usage", side_effect=empty_fetch
                 ):
 
+                    hp = HourlyProjection()
                     with self.assertRaises(RetryableMetricsException):
-                        HourlyProjection(chart_start=chart_start)
+                        hp.populate(chart_start)
 
 
-class TestHourlyProjectionChartStart(unittest.TestCase):
-    """Tests for HourlyProjection chart_start parameter."""
+class TestHourlyProjectionPopulateChartStart(unittest.TestCase):
+    """Tests for HourlyProjection.populate() chart_start parameter.
 
-    def test_init_stores_chart_start(self):
-        """HourlyProjection.__init__ should store chart_start on the instance."""
-        chart_start = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        hp = HourlyProjection(chart_start=chart_start)
-        self.assertIs(hp.chart_start, chart_start)
-        self.assertIsInstance(hp.chart_start, datetime)
+    chart_start is a required parameter of populate(), not __init__.
+    """
+
+    def test_init_works_without_chart_start(self):
+        """HourlyProjection() must work without passing chart_start."""
+        # After the change, __init__ no longer takes chart_start.
+        with self.assertRaises(TypeError):
+            HourlyProjection(chart_start=datetime.now(timezone.utc))
 
     def test_populate_without_chart_start_raises(self):
-        """HourlyProjection.populate() should raise ValueError when chart_start is None."""
-        # Use __new__ to bypass __init__, so we get a bare instance.
-        hp = HourlyProjection.__new__(HourlyProjection)
-        hp.chart_start = None
-        with self.assertRaises(ValueError) as ctx:
-            hp.populate()
-        self.assertIn("chart_start is required", str(ctx.exception))
+        """HourlyProjection.populate() must require chart_start argument."""
+        hp = HourlyProjection()
+        with self.assertRaises(TypeError):
+            hp.populate()  # type: ignore[call-arg]
 
-    def test_populate_with_none_chart_start_raises(self):
-        """HourlyProjection.populate(chart_start=None) should raise ValueError."""
+    def test_populate_accepts_chart_start(self):
+        """HourlyProjection.populate(chart_start=...) must accept a datetime."""
         chart_start = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        hp = HourlyProjection(chart_start=chart_start)
-        with self.assertRaises(ValueError):
-            hp.populate(None)
+        hp = HourlyProjection()
+        # Should not raise TypeError about missing argument.
+        # It may raise other errors (e.g. RetryableMetricsException) due
+        # to mocked infrastructure, but the signature check passes.
+        try:
+            hp.populate(chart_start)
+        except TypeError as exc:
+            if "chart_start" in str(exc):
+                self.fail(f"populate() rejected valid chart_start: {exc}")
+            raise
 
 
 class TestHourlyProjectionEdgeCases(unittest.TestCase):
