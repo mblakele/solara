@@ -63,6 +63,7 @@ def _create_metrics(logger: logging.Logger) -> dict[str, Any] | None:
 
     # First call: fetch entire previous hour.
     # Subsequent calls: fetch incremental data from the last sample timestamp.
+    logger.debug("_create_metrics: last_sample_at %s", _energy_cache.last_sample_at)
     chart_start = (
         now - timedelta(seconds=3600)
         if _energy_cache.last_sample_at is None

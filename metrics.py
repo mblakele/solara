@@ -689,6 +689,15 @@ class HourlyProjection(MetricsBase):
             "reporting metrics for %d devices", len(self.metrics["devices"])
         )
 
+        # Expose the actual API-reported data start so that EnergyCache can
+        # update _data_start and _last_sample_at.  Without this key the
+        # get_or_fetch merge block silently skips the _last_sample_at update,
+        # leaving it permanently None and causing every call to _create_metrics
+        # to request a full-hour fetch instead of an incremental one.
+        if population:
+            first_gid = next(iter(population))
+            self.metrics["data_start"] = population[first_gid].nbc_data_start
+
         # Compute overall API lag from the first device's prediction.
         # This represents how far behind the most recent data point is
         # relative to when metrics were computed (self.instant).
