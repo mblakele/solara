@@ -1442,26 +1442,70 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
+        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = base_time
+
+            def fetch_func():
+                # Simulate incremental data: first call returns 5 samples, second adds more
+                if not cache._samples or len(cache._samples) == 0:
+                    return {
+                        "per_second_data": [0.1] * 5,
+                        "data_start": base_time,
+                    }
+                else:
+                    # Second fetch starts right after the first 5 samples end
+                    return {
+                        "per_second_data": [0.2] * 3,  # New samples appended
+                        "data_start": base_time + timedelta(seconds=5),
+                    }
+
+            cache.get_or_fetch(fetch_func)  # First fetch: [0.1, 0.1, 0.1, 0.1, 0.1]
+            self.assertEqual(len(cache._samples), 5)
+
+            # Use force=True to simulate an incremental fetch that appends new samples.
+            cache.get_or_fetch(fetch_func, force=True)  # Second fetch: append [0.2, 0.2, 0.2]
+            self.assertEqual(len(cache._samples), 8)
+
+    def test_get_or_fetch_skips_overlapping_samples(self):
+        """Overlapping samples from full-hour fetches should be deduplicated."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        now = datetime(2026, 5, 13, 0, 30, 29, tzinfo=timezone.utc)
+
+        # First fetch: 1830 samples (full hour so far)
+        first_samples = [0.1] * 1830
+        first_start = now - timedelta(seconds=1829)
+
+        # Second fetch: 1890 samples (hour grew by 60 samples)
+        second_samples = [0.1] * 1890
+        second_start = now - timedelta(seconds=1889)
 
         def fetch_func():
-            # Simulate incremental data: first call returns 5 samples, second adds more
+            # Simulates HourlyProjection always fetching from top of hour.
+            # On the second call, _samples already exists, so return the
+            # larger full-hour window (overlapping with what's cached).
             if not cache._samples or len(cache._samples) == 0:
                 return {
-                    "per_second_data": [0.1] * 5,
-                    "data_start": datetime.now(timezone.utc),
+                    "per_second_data": first_samples,
+                    "data_start": first_start,
                 }
-            else:
-                return {
-                    "per_second_data": [0.2] * 3,  # New samples appended
-                    "data_start": datetime.now(timezone.utc),
-                }
+            return {
+                "per_second_data": second_samples,
+                "data_start": second_start,
+            }
 
-        cache.get_or_fetch(fetch_func)  # First fetch: [0.1, 0.1, 0.1, 0.1, 0.1]
-        self.assertEqual(len(cache._samples), 5)
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now
 
-        # Use force=True to simulate an incremental fetch that appends new samples.
-        cache.get_or_fetch(fetch_func, force=True)  # Second fetch: append [0.2, 0.2, 0.2]
-        self.assertEqual(len(cache._samples), 8)
+            cache.get_or_fetch(fetch_func)
+            self.assertEqual(len(cache._samples), 1830)
+
+            # Second fetch should deduplicate: 1830 existing + 60 new = 1890 total
+            cache.get_or_fetch(fetch_func, force=True)
+            self.assertEqual(len(cache._samples), 1890)
 
     def test_get_current_qh_computes_from_samples(self):
         """get_current_qh should compute QH prediction from raw samples."""
@@ -2017,10 +2061,10 @@ class TestIncrementalFetchIntegration(unittest.TestCase):
                     "data_start": start,
                 }
 
-            # Incremental fetch: 60 new samples
+            # Incremental fetch: 60 new samples starting right after first fetch
             return {
                 "per_second_data": [0.2] * 60,
-                "data_start": now - timedelta(seconds=60),
+                "data_start": now,  # 12:30:00 — right after first 300 samples end
             }
 
         # Build incremental fetcher (used to verify it doesn't crash)

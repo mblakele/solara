@@ -274,7 +274,34 @@ class EnergyCache:
 
                 # Merge with existing samples (incremental fetch path).
                 if self._samples is not None and len(self._samples) > 0:
-                    # Append new samples to existing ones.
+                    last_cached_time = self._last_sample_at
+                    result_data_start = result.get("data_start")
+                    if (last_cached_time is not None
+                            and result_data_start is not None
+                            and self._data_start is not None):
+                        # Keep only samples that are outside the cached range:
+                        #   - samples strictly before cache_start
+                        #   - samples strictly after cache_end
+                        cache_start = self._data_start
+                        cache_end = self._last_sample_at
+                        new_end_time = (result_data_start
+                                        + timedelta(seconds=len(new_samples) - 1))
+
+                        # Number of new samples strictly before the cache
+                        if result_data_start < cache_start:
+                            before = int((cache_start - result_data_start).total_seconds())
+                        else:
+                            before = 0
+
+                        # Number of new samples strictly after the cache
+                        if new_end_time > cache_end:
+                            after = int((new_end_time - cache_end).total_seconds())
+                        else:
+                            after = 0
+
+                        # Slice to keep only genuinely new samples
+                        new_samples = (list(new_samples[:before])
+                                       + list(new_samples[len(new_samples) - after:]))
                     self._samples = list(self._samples) + list(new_samples)
 
                 elif new_samples:
