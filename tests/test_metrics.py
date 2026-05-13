@@ -674,32 +674,6 @@ class TestDeviceMetricsDataClass(unittest.TestCase):
         self.assertEqual(d["prediction"], round(0.123456789012345, 14))
         self.assertEqual(d["prediction_min"], round(0.0, 14))
 
-    def test_to_dict_truncates_per_second_data_to_300(self):
-        """to_dict() truncates per_second_data to the latest 300 samples for output."""
-        from metrics import DeviceMetrics
-
-        # Build a DeviceMetrics with 1000 per-second samples.
-        dm = DeviceMetrics(gid=1, name="trunc-test", per_second_data=list(range(1000)))
-        result = dm.to_dict()
-
-        # Must be truncated to exactly 300.
-        self.assertEqual(len(result["per_second_data"]), 300)
-        # Must be the *latest* 300 — i.e. indices 700-999.
-        self.assertEqual(result["per_second_data"][0], 700)
-        self.assertEqual(result["per_second_data"][-1], 999)
-
-    def test_to_dict_has_per_second_data_last(self):
-        """to_dict() places per_second_data as the last key in the output dict."""
-        from metrics import DeviceMetrics
-
-        dm = DeviceMetrics(gid=1, name="order-test")
-        keys = list(dm.to_dict().keys())
-
-        self.assertEqual(keys[-1], "per_second_data")
-        # The second-to-last key should be clock_boundary_nbc.
-        self.assertEqual(keys[-2], "clock_boundary_nbc")
-
-
 class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
     """Tests for MetricsBase.vue_init error paths."""
 

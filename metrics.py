@@ -110,7 +110,7 @@ class DeviceMetrics:
             "timezone": self.timezone,
             "nbc": self.nbc,
             "clock_boundary_nbc": self.clock_boundary_nbc,
-            "per_second_data": self.per_second_data[-300:],
+            "per_second_data": self.per_second_data,
         }
 
 

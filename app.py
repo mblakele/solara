@@ -110,7 +110,7 @@ def _trim_output_device(device: dict[str, Any]) -> dict[str, Any]:
     ensuring the output is compact and debug-friendly.
 
     Args:
-        device: A device dict from mock data or production to_dict().
+        device: A device dict from mock data or production.
 
     Returns:
         New dict with per_second_data truncated to last 300 and moved to end.
