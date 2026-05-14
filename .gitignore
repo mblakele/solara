@@ -8,3 +8,5 @@
 .vue-keys.json
 bugs
 devices.json
+solara.log
+solara.log.*
