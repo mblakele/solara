@@ -285,6 +285,12 @@ class EnergyCache:
                 if self._samples is not None and len(self._samples) > 0:
                     last_cached_time = self._last_sample_at
                     result_data_start = result.get("data_start")
+                    # Number of new samples strictly before / after the cache.
+                    # Initialized here so they're always defined for the
+                    # data_start update below.
+                    before_count = 0
+                    after_count = 0
+
                     if (last_cached_time is not None
                             and result_data_start is not None
                             and self._data_start is not None):
@@ -296,32 +302,41 @@ class EnergyCache:
                         new_end_time = (result_data_start
                                         + timedelta(seconds=len(new_samples) - 1))
 
-                        # Number of new samples strictly before the cache
                         if result_data_start < cache_start:
-                            before = int((cache_start - result_data_start).total_seconds())
+                            before_count = int(
+                                (cache_start - result_data_start).total_seconds()
+                            )
                         else:
-                            before = 0
+                            before_count = 0
 
                         # Number of new samples strictly after the cache
                         if new_end_time > cache_end:
-                            after = int((new_end_time - cache_end).total_seconds())
+                            after_count = int(
+                                (new_end_time - cache_end).total_seconds()
+                            )
                         else:
-                            after = 0
+                            after_count = 0
 
-                        # Slice to keep only genuinely new samples
-                        new_samples = (list(new_samples[:before])
-                                       + list(new_samples[len(new_samples) - after:]))
-                    self._samples = list(self._samples) + list(new_samples)
+                        # Build merged samples in time order:
+                        #   before_samples + existing + after_samples
+                        before_samples = list(new_samples[:before_count])
+                        after_samples = list(
+                            new_samples[len(new_samples) - after_count:]
+                        )
+                        self._samples = (before_samples + list(self._samples)
+                                         + after_samples)
 
                 elif new_samples:
                     self._samples = list(new_samples)
 
                 # Update data_start if we have samples.
                 if self._samples and "data_start" in result:
-                    # If we already have samples, compute the true start time.
+                    # If we already have samples, adjust if we prepended any.
                     if self._data_start is not None:
-                        # New samples are appended, so start time doesn't change.
-                        pass
+                        # Prepended samples shift the start time backward.
+                        if before_count > 0:
+                            self._data_start = result_data_start
+                        # Otherwise (append-only), start time doesn't change.
                     else:
                         self._data_start = result["data_start"]
 

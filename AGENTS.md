@@ -241,6 +241,10 @@ Pre-existing plans, designs, or specifications do not exempt you from the test-f
 For changes larger than ~20 lines, summarize what will change (files affected,
 functions modified, any data migrations or schema changes) before writing any code.
 
+When a plan file is still in `.opencode/plans/`, treat it as potentially active work unless told otherwise. A plan file in that directory is a signal that work may still be in progress.
+
+Before any destructive action (deleting files, removing test classes, truncating files), **stop and ask**.
+
 ---
 
 ## 🚀 Build, Lint, & Test Commands
