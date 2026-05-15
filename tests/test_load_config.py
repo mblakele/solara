@@ -647,7 +647,7 @@ def test_load_tesla_time_range_parsed():
 def test_is_device_in_time_range_no_restriction():
     """Device with time_range=None always returns True."""
     mgr = _make_manager_with_enabled(True)
-    assert mgr._is_device_in_time_range("any_device", None) is True
+    assert mgr._is_device_in_time_range(datetime.now(timezone.utc), "any_device", None) is True
 
 
 @patch("config._decouple_config")
@@ -665,6 +665,7 @@ def test_is_device_in_time_range_inside(mock_config):
         mock_dt.timezone = timezone
         mock_dt.timedelta = timedelta
         result = mgr._is_device_in_time_range(
+            mock_dt.now(timezone.utc),
             "heater", (time(6, 0), time(18, 0))
         )
 
@@ -686,6 +687,7 @@ def test_is_device_in_time_range_outside(mock_config):
         mock_dt.timezone = timezone
         mock_dt.timedelta = timedelta
         result = mgr._is_device_in_time_range(
+            mock_dt.now(timezone.utc),
             "heater", (time(6, 0), time(18, 0))
         )
 
@@ -727,6 +729,7 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
         mock_dt.timezone = timezone
         mock_dt.timedelta = timedelta
         details = mgr._build_candidate_details(
+            fake_now,
             seconds_remaining=600,
             tesla_state=None,
             tesla_error=None,
@@ -772,6 +775,7 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
         mock_dt.timezone = timezone
         mock_dt.timedelta = timedelta
         details = mgr._build_candidate_details(
+            fake_now,
             seconds_remaining=600,
             tesla_state=None,
             tesla_error=None,
@@ -822,6 +826,7 @@ def test_cycle_filters_outside_range_plug(mock_config):
                 mgr._cycle_async_phase(
                     gap_wh=1500.0,
                     adjusted_wh=-2000.0,
+                    now=fake_now,
                     seconds_remaining=600,
                     dry_run=True,
                 )
@@ -871,6 +876,7 @@ def test_cycle_includes_plug_inside_range(mock_config):
                 mgr._cycle_async_phase(
                     gap_wh=1500.0,
                     adjusted_wh=-2000.0,
+                    now=fake_now,
                     seconds_remaining=600,
                     dry_run=True,
                 )
@@ -935,6 +941,7 @@ def test_cycle_filters_outside_range_tesla(mock_config):
                     mgr._cycle_async_phase(
                         gap_wh=-1500.0,
                         adjusted_wh=1000.0,
+                        now=fake_now,
                         seconds_remaining=600,
                         dry_run=True,
                     )
@@ -982,6 +989,7 @@ def test_no_action_reason_skips_outside_range_plug(mock_config):
         reason = mgr._determine_no_action_reason(
             results=[],
             gap_wh=1000.0,
+            now=fake_now,
             seconds_remaining=600,
             tesla_state=None,
             tesla_configured=False,

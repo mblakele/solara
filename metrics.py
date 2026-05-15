@@ -17,7 +17,13 @@ import requests
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 
-from util import CustomJSONProvider, compute_nbc_quarters, custom_json_default, is_debug
+from util import (
+    CustomJSONProvider,
+    _QH_QUARTERS,
+    compute_nbc_quarters,
+    custom_json_default,
+    is_debug,
+)
 from energy_aggregator import EnergyDataAggregator
 
 from config import cfg as _cfg
@@ -118,7 +124,7 @@ def _build_incremental_fetch(
     energy_cache: "EnergyCache",
     vue: PyEmVue,
     device_gid: int,
-    now: datetime | None = None,
+    now: datetime,
 ) -> Callable[[], dict[str, Any] | None]:
     """Build a callable for incremental partial-range API fetches.
 
@@ -135,7 +141,7 @@ def _build_incremental_fetch(
         energy_cache: The EnergyCache instance storing per-second samples.
         vue: A PyEmVue client instance for API calls.
         device_gid: The group ID (device identifier) to fetch data for.
-        now: Current time. Defaults to ``datetime.now(timezone.utc)``.
+        now: Current time. Required.
 
     Returns:
         A callable that returns a dict with ``per_second_data`` and
@@ -143,7 +149,7 @@ def _build_incremental_fetch(
     """
 
     def fetcher() -> dict[str, Any] | None:
-        effective_now = now if now is not None else datetime.now(timezone.utc)
+        effective_now = now
 
         if energy_cache._samples is None or len(energy_cache._samples) == 0:
             start_time = effective_now.replace(minute=0, second=0, microsecond=0)
@@ -213,18 +219,16 @@ class EnergyCache:
         """
         return self._last_sample_at
 
-    def is_valid(self, now: datetime | None = None) -> bool:
+    def is_valid(self, now: datetime) -> bool:
         """Check if cache has non-expired data.
 
         Args:
-            now: Current time for TTL check. Defaults to datetime.now(timezone.utc).
+            now: Current time for TTL check. Required.
 
         Returns:
             True if cache has data and it hasn't expired.
         """
         with self._lock:
-            if now is None:
-                now = datetime.now(timezone.utc)
             if self._samples is None or len(self._samples) == 0:
                 return False
             if self._last_fetch_at is None:
@@ -233,7 +237,7 @@ class EnergyCache:
             return elapsed.total_seconds() < self._ttl_seconds
 
     def get_or_fetch(
-        self, fetch_func: Callable[[], dict[str, Any] | None], force: bool = False
+        self, fetch_func: Callable[[], dict[str, Any] | None], now: datetime, force: bool = False
     ) -> tuple[dict[str, Any] | None, bool]:
         """Return (metrics_dict_or_none, was_fresh).
 
@@ -250,14 +254,13 @@ class EnergyCache:
 
         Args:
             fetch_func: Callable that returns fresh data dict.
+            now: current datetime.
             force: When True, bypass cache and always fetch.
 
         Returns:
             Tuple of (metrics_dict_or_none, was_fresh).
         """
         with self._lock:
-            now = datetime.now(timezone.utc)
-
             # Check if cache is valid (non-expired data exists).
             if not force and self._is_valid_unlocked(now):
                 return self._build_result(), False
@@ -393,17 +396,15 @@ class EnergyCache:
 
             return (result, True) if result is not None else (None, True)
 
-    def _is_valid_unlocked(self, now: datetime | None = None) -> bool:
+    def _is_valid_unlocked(self, now: datetime) -> bool:
         """Check if cache has non-expired data (caller must hold lock).
 
         Args:
-            now: Current time for TTL check. Defaults to datetime.now(timezone.utc).
+            now: Current time for TTL check. Required.
 
         Returns:
             True if cache has data and it hasn't expired.
         """
-        if now is None:
-            now = datetime.now(timezone.utc)
         # Cache is valid if we have either raw samples or a full result dict.
         has_data = (
             self._samples is not None and len(self._samples) > 0
@@ -442,11 +443,17 @@ class EnergyCache:
 
         return result
 
-    def get_current_qh(self) -> dict[str, Any] | None:
+    def get_current_qh(self, now: datetime) -> dict[str, Any] | None:
         """Extract current incomplete QH prediction from cached samples.
 
         Computes NBC quarters on demand and returns the same structure that
         NBCCache.get_or_fetch() would return: {qh_name, predicted_wh, seconds_remaining}.
+
+        ``seconds_remaining`` is derived from wall-clock time so it stays
+        monotonic across cache refreshes even when the sample count fluctuates.
+
+        Args:
+            now: Current time for QH boundary computation. Required.
 
         Returns:
             Dict with QH prediction info or None if no cached data.
@@ -457,24 +464,135 @@ class EnergyCache:
         if samples is None or len(samples) == 0:
             return None
 
-        # Determine how many seconds of data we have.
-        n = len(samples)
+        assert(self._data_start is not None)
+        data_start = self._data_start
 
-        # Compute NBC quarters from raw samples.
-        data_start = self._data_start if self._data_start else datetime.now(timezone.utc)
-        nbc = compute_nbc_quarters(samples, min(n, len(samples)))
+        # Time-based metrics for QH detection and seconds_remaining.
+        # seconds_into_hour from data_start reflects sample position.
+        seconds_into_hour = int((now - data_start).total_seconds())
+        # wall_clock_seconds from now reflects the QH position within
+        # the current hour — used as an override when now spans into a
+        # different hour than data_start.
+        wall_clock_seconds = now.second + now.minute * 60
+
+        # Determine which QH to report and its associated seconds.
+        #
+        # seconds_into_hour can exceed 3600 when now is in a different
+        # hour than data_start (e.g. data from 12:00, now at 13:10).
+        # It can also be <3600 but still span an hour boundary
+        # (e.g. data from 6:21, now at 7:08 → 2800 samples).
+        # In either case, wall-clock position within the current hour
+        # tells us the correct QH.  When the two agree (same hour),
+        # seconds_into_hour is authoritative.
+        cross_hour = data_start.hour != now.hour
+        if seconds_into_hour >= 3600 or cross_hour:
+            # Data spans across an hour boundary.  Use wall-clock
+            # position within the current hour.  If we're exactly at
+            # the top of an hour (wall_clock_seconds == 0) and samples
+            # show a full hour of data, treat all quarters as complete.
+            if wall_clock_seconds == 0 and len(samples) >= 3600:
+                # Top of the hour with one full hour of data — all
+                # quarters complete.  Use 3600 so the wall-clock
+                # completion check passes for QH4 (3600 >= 3600).
+                chosen_qh = "QH4"
+                chosen_secs = 3600
+            else:
+                # Use wall-clock seconds to determine the current QH.
+                chosen_secs = wall_clock_seconds
+                for qh_name, b_start, b_end in _QH_QUARTERS:
+                    if b_start <= chosen_secs <= b_end:
+                        chosen_qh = qh_name
+                        break
+                else:
+                    # wall_clock_seconds == 0 but samples aren't
+                    # complete — still use wall-clock (QH1 with 900s).
+                    chosen_qh = "QH1"
+                    chosen_secs = chosen_secs
+        else:
+            # Same hour — seconds_into_hour matches wall-clock position.
+            chosen_secs = seconds_into_hour
+            for qh_name, b_start, b_end in _QH_QUARTERS:
+                if b_start <= chosen_secs <= b_end:
+                    chosen_qh = qh_name
+                    break
+            else:
+                # At the very top of the hour (seconds_into_hour == 0).
+                chosen_qh = "QH1"
+                chosen_secs = 0
+
+        # Compute NBC quarters from samples.  When data spans an hour
+        # boundary, reorganize samples to match wall-clock quarters so
+        # that ``compute_nbc_quarters`` can produce correct predictions.
+        if cross_hour:
+            # Map each sample to its wall-clock QH based on its offset
+            # from data_start, then reorganize into wall-clock order.
+            reorg: list[float] = []
+            for s in samples:
+                sample_wall_sec = (
+                    data_start.second
+                    + data_start.minute * 60
+                    + len(reorg)
+                ) % 3600
+                for qh_name, b_start, b_end in _QH_QUARTERS:
+                    if b_start <= sample_wall_sec <= b_end:
+                        reorg.append(s)
+                        break
+            # Compute n: samples from the start of the current QH.
+            for qh_name, b_start, b_end in _QH_QUARTERS:
+                if b_start <= chosen_secs <= b_end:
+                    n = min(chosen_secs - b_start, len(reorg))
+                    break
+            else:
+                n = 0
+            # Compute NBC quarters from reorganized samples.
+            nbc = compute_nbc_quarters(reorg, n)
+        else:
+            # Find the QH boundary at or after data_start so we can align
+            # sample indices with the quarter-hour grid that
+            # ``compute_nbc_quarters`` expects.  ``n`` must represent the
+            # number of sample-seconds consumed from that QH boundary;
+            # quarters before the boundary that have no data are simply
+            # skipped by ``compute_nbc_quarters`` when ``n`` is offset.
+            boundary_offset = 0
+            for _qh_name, b_start, b_end in _QH_QUARTERS:
+                if data_start.second + data_start.minute * 60 >= b_start:
+                    boundary_offset = b_start
+                    break
+
+            # Adjust n so it is measured from the QH boundary, not from
+            # data_start.  This keeps the quarter indices correct when
+            # ``data_start`` is offset from the nearest QH boundary.
+            n = min(seconds_into_hour - boundary_offset, len(samples))
+
+            # Compute NBC quarters from raw samples.
+            nbc = compute_nbc_quarters(samples, n)
+
+        # Pre-compute QH end indices and ordering for the loop below.
+        qh_order = ["QH1", "QH2", "QH3", "QH4"]
+        qh_ends = {name: end for name, _, end in _QH_QUARTERS}
 
         # Find the first incomplete QH.
-        qh_order = ["QH1", "QH2", "QH3", "QH4"]
         for qh_name in qh_order:
             qh_data = nbc.get(qh_name)
             if qh_data is None:
                 continue
-            if not qh_data.get("complete", True):
+
+            is_complete = qh_data.get("complete", True)
+            # Check whether wall-clock time says this QH has truly ended.
+            # Uses the chosen time source (which resolves cross-hour
+            # ambiguity between sample position and wall-clock).
+            wall_clock_complete = chosen_secs >= qh_ends[qh_name] + 1
+
+            if not is_complete or not wall_clock_complete:
+                # Derive seconds_remaining from wall-clock time so it
+                # decreases monotonically regardless of cache population.
+                seconds_remaining = qh_ends[qh_name] + 1 - chosen_secs
+                # Clamp to zero so a QH that just completed shows 0.
+                seconds_remaining = max(0, seconds_remaining)
                 return {
                     "qh_name": qh_name,
                     "predicted_wh": qh_data.get("predicted_wh", 0),
-                    "seconds_remaining": qh_data.get("remaining_seconds", 900 - n % 900),
+                    "seconds_remaining": seconds_remaining,
                     "data_start": data_start,
                 }
 
@@ -512,7 +630,7 @@ class RetryableMetricsException(Exception):
 
     def __init__(self, message, *args):
         self.message = message
-        self.instant = datetime.now(timezone.utc)
+        self.instant = datetime.now(timezone.utc) # ok
         super().__init__(message, *args)
 
 
@@ -594,14 +712,14 @@ class MetricsBase:
                 "Vue authentication failed: check credentials"
             )
 
-        self.vue_auth["last"] = datetime.now(timezone.utc)
+        self.vue_auth["last"] = datetime.now(timezone.utc) # ok
 
     def get_device_info(self) -> None:
         """
         Wrapper for vue get_devices,
         filtering results for ZIG001 devices.
         """
-        rt_start = datetime.now(timezone.utc)
+        rt_start = datetime.now(timezone.utc) # ok
         age_limit = timedelta(hours=24)
         self.logger.debug(
             {"device_info_len": len(self.device_info), "vue_auth": self.vue_auth}
@@ -650,6 +768,7 @@ class HourlyProjection(MetricsBase):
 
     def __init__(
         self,
+        instant: datetime,
         logger_next: Optional[logging.Logger] = None,
     ) -> None:
         self.metrics: dict[str, Any] = {
@@ -660,7 +779,7 @@ class HourlyProjection(MetricsBase):
 
         super().__init__(logger_next)
 
-        self.instant = datetime.now(pytz.timezone(_cfg.timezone))
+        self.instant = instant
         self.metrics["instant"] = self.instant
 
     def populate(self, chart_start: datetime) -> dict[int, dict[str, Any]]:
@@ -748,7 +867,7 @@ class HourlyProjection(MetricsBase):
             self.logger.debug({"usage_data": usage_data_local})
             raise RetryableMetricsException("No data for hour")
         self.metrics["api_response"]["get_chart_usage/" + str(chan.channel_num)] = (
-            datetime.now(timezone.utc) - chart_start
+            datetime.now(timezone.utc) - chart_start # ok
         )
         return usage_data_local, usage_data_start_local, chan.channel_num
 
@@ -1113,7 +1232,7 @@ class TOUReporter(MetricsBase):
         self.fetch_usage_data()
         if is_debug():
             filename = (
-                datetime.now().isoformat()
+                datetime.now().isoformat() # ok
                 + f"_{start_date}_{end_date if end_date else 'None'}_"
             )
             with open(filename, "w", encoding="utf-8") as f:

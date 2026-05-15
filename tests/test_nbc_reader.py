@@ -88,16 +88,18 @@ def test_nbc_reader_accepts_device_name():
 
 def test_get_current_qh_returns_none_when_cache_empty():
     """get_current_qh returns None when EnergyCache has no samples."""
+    now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
     reader = NBCReader()
-    result = reader.get_current_qh()
+    result = reader.get_current_qh(now)
     assert result is None
 
 
 def test_get_current_qh_returns_none_when_cache_invalid():
     """get_current_qh returns None when EnergyCache is_valid() is False."""
     # Cache with no _last_fetch_at → is_valid() returns False.
+    now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
     reader = NBCReader(energy_cache=EnergyCache(ttl_seconds=30))
-    result = reader.get_current_qh()
+    result = reader.get_current_qh(now)
     assert result is None
 
 
@@ -174,8 +176,8 @@ def test_get_current_qh_with_positive_samples():
 
 def test_get_current_qh_force_true_triggers_refetch():
     """force=True bypasses cache and triggers a fresh fetch via metrics_fetch."""
-    now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
-    cache = _make_energy_cache(sample_count=1200, value=-0.001, now=now)
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    cache = _make_energy_cache(sample_count=1200, value=-0.001, now=fixed_now)
     reader = NBCReader(energy_cache=cache)
 
     fetch_count = 0
@@ -202,23 +204,23 @@ def test_get_current_qh_force_true_triggers_refetch():
     reader._metrics_fetch = mock_fetch
 
     # First call: reads from existing cache.
-    result1 = reader.get_current_qh(now=now)
+    result1 = reader.get_current_qh(now=fixed_now)
     assert result1 is not None
 
     # Second call with force=True: should trigger fetch.
-    result2 = reader.get_current_qh(force=True)
+    result2 = reader.get_current_qh(now=fixed_now, force=True)
     assert fetch_count == 1
     assert result2 is not None
 
 
 def test_get_current_qh_force_true_without_fetch_callable():
     """force=True without metrics_fetch falls back to reading from cache."""
-    now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
-    cache = _make_energy_cache(sample_count=1200, value=-0.001, now=now)
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    cache = _make_energy_cache(sample_count=1200, value=-0.001, now=fixed_now)
     reader = NBCReader(energy_cache=cache)
 
     # No metrics_fetch set. force=True should still read from cache.
-    result = reader.get_current_qh(force=True, now=now)
+    result = reader.get_current_qh(force=True, now=fixed_now)
 
     assert result is not None
     qh_name, _, _, _ = result

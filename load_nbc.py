@@ -105,7 +105,7 @@ class NBCReader:
         self._metrics_fetch: Any | None = None
 
     def get_current_qh(
-        self, force: bool = False, now: datetime | None = None
+        self, now: datetime, force: bool = False
     ) -> tuple[str, float, int, datetime] | None:
         """Return (qh_name, predicted_wh, seconds_remaining, data_point_at).
 
@@ -115,18 +115,15 @@ class NBCReader:
 
         Args:
             force: When True, bypass cache and always fetch fresh data from the API.
-            now: Current time for TTL check. Defaults to ``datetime.now(timezone.utc)``.
+            now: Current time for TTL check. Required.
 
         Returns:
             Tuple of (qh_name, predicted_wh in Wh, seconds remaining in QH,
             data_point_at), or None if no incomplete QH available.
         """
-        if now is None:
-            now = datetime.now(timezone.utc)
-
         # Fast path: cache is valid — read directly from it.
         if not force and self.energy_cache.is_valid(now=now):
-            qh_data = self.energy_cache.get_current_qh()
+            qh_data = self.energy_cache.get_current_qh(now=now)
             if qh_data is None:
                 return None
             fetched_at = self.energy_cache._last_fetch_at  # pylint: disable=W0212
@@ -151,7 +148,7 @@ class NBCReader:
             parsed = self._parse_metrics(self.device_name, metrics_data)
             if parsed is None:
                 return None
-            fetched_at = parsed.get("_fetched_at", now)
+            fetched_at = metrics_data.get("_fetched_at", now)
             data_lag_secs = parsed.get("_data_lag_secs", 0.0)
             data_point_at = fetched_at - timedelta(seconds=data_lag_secs)
             return (  # type: ignore[return-value]
@@ -163,7 +160,7 @@ class NBCReader:
 
         # force=True but no fetch callable: fall back to reading from cache.
         if force:
-            qh_data = self.energy_cache.get_current_qh()
+            qh_data = self.energy_cache.get_current_qh(now=now)
             if qh_data is None:
                 return None
             fetched_at = self.energy_cache._last_fetch_at  # pylint: disable=W0212
@@ -475,7 +472,7 @@ class StateTracker:
         )
 
     def prune_old_effects(
-        self, data_point_at: datetime, now: datetime | None = None
+        self, data_point_at: datetime, now: datetime
     ) -> int:
         """Remove pending effects eligible for pruning based on dual age checks.
 
@@ -491,13 +488,11 @@ class StateTracker:
 
         Args:
             data_point_at: Timestamp of the most recent per-second data point.
-            now: Current wall clock time. Defaults to ``datetime.now(timezone.utc)``.
+            now: Current wall clock time. Required.
 
         Returns:
             Number of effects removed.
         """
-        if now is None:
-            now = datetime.now(timezone.utc)
         wall_cutoff = now - timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
         dp_cutoff = data_point_at - timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
         before = len(self.pending_effects)
@@ -605,6 +600,7 @@ class GapMinder:
 
     def decide(
         self,
+        now: datetime,
         predicted_wh: float,
         target_wh: float,
         seconds_remaining: int,
@@ -617,6 +613,7 @@ class GapMinder:
         """Decide what actions to take based on the predicted Wh and target Wh.
 
         Args:
+            now: current datetime.
             predicted_wh: The predicted Wh for the current quarter-hour.
             target_wh: The target Wh to achieve (negative = surplus).
             seconds_remaining: Seconds left in the current quarter-hour.
@@ -638,7 +635,6 @@ class GapMinder:
         if abs_gap <= self.HYSTERESIS_WH:
             return []
 
-        now = datetime.now(timezone.utc)
         dp_at = data_point_at if data_point_at is not None else now
 
         if gap > 0:

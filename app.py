@@ -46,7 +46,7 @@ from util import CustomJSONProvider, is_debug
 _create_metrics_lock = threading.Lock()
 
 
-def _create_metrics(logger: logging.Logger) -> dict[str, Any] | None:
+def _create_metrics(now: datetime, logger: logging.Logger) -> dict[str, Any] | None:
     """Fetch metrics with incremental chart_start tracking via EnergyCache.
 
     On the first call, EnergyCache has no samples, so chart_start is set to
@@ -54,13 +54,12 @@ def _create_metrics(logger: logging.Logger) -> dict[str, Any] | None:
     advances to the most recent sample timestamp from the cache.
 
     Args:
+        now: current datetime in local timezone.
         logger: Logger instance.
 
     Returns:
         Metrics dict from HourlyProjection, or None on failure.
     """
-    now = datetime.now(pytz.timezone(_cfg.timezone))
-
     # First call: fetch entire previous hour.
     # Subsequent calls: fetch incremental data from the last sample timestamp.
     logger.debug("_create_metrics: last_sample_at %s", _energy_cache.last_sample_at)
@@ -70,7 +69,7 @@ def _create_metrics(logger: logging.Logger) -> dict[str, Any] | None:
         else _energy_cache.last_sample_at
     )
 
-    hp = HourlyProjection(logger)
+    hp = HourlyProjection(now, logger)
     hp.populate(chart_start)
     return hp.metrics
 
@@ -289,7 +288,7 @@ def index() -> ResponseReturnValue:
     else:
         # Real mode: use cached metrics to avoid hammering the API
         metrics_data, was_fresh = _energy_cache.get_or_fetch(
-            lambda: _create_metrics(logger)
+            lambda: _create_metrics(datetime.now(pytz.timezone(_cfg.timezone)), logger)
         )
         if was_fresh:
             logger.debug("Fetched fresh metrics for index endpoint")
@@ -436,7 +435,7 @@ def _get_load_manager():
 
                 def metrics_fetch():
                     return _energy_cache.get_or_fetch(
-                        lambda: _create_metrics(logger)
+                        lambda: _create_metrics(datetime.now(pytz.timezone(_cfg.timezone)), logger)
                     )[0]
 
                 _load_manager = LoadManager(

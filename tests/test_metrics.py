@@ -419,8 +419,8 @@ class TestDataForScaleEdgeCases(unittest.TestCase):
         """data_for_scale with a single data point should work."""
         from datetime import datetime, timezone
 
-        now = datetime.now(timezone.utc)
-        result = HourlyProjection.data_for_scale([0.5], now, "1H")
+        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
+        result = HourlyProjection.data_for_scale([0.5], fixed_now, "1H")
 
         # data_len is only present when DEBUG mode is on
         self.assertGreaterEqual(result["usage"], 0.0)
@@ -429,9 +429,9 @@ class TestDataForScaleEdgeCases(unittest.TestCase):
         """The scale parameter should be stored as the 'scale' key."""
         from datetime import datetime, timezone
 
-        now = datetime.now(timezone.utc)
+        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
         result = HourlyProjection.data_for_scale(
-            [0.5, 0.6], now, "CUSTOM_SCALE"
+            [0.5, 0.6], fixed_now, "CUSTOM_SCALE"
         )
 
         self.assertEqual(result["scale"], "CUSTOM_SCALE")
@@ -464,33 +464,31 @@ class TestHourlyProjectionErrorPaths(unittest.TestCase):
                     MetricsBase.vue, "get_chart_usage", side_effect=empty_fetch
                 ):
 
-                    hp = HourlyProjection()
+                    hp = HourlyProjection(instant=chart_start)
                     with self.assertRaises(RetryableMetricsException):
                         hp.populate(chart_start)
 
 
 class TestHourlyProjectionPopulateChartStart(unittest.TestCase):
-    """Tests for HourlyProjection.populate() chart_start parameter.
+    """Tests for HourlyProjection.populate().
 
-    chart_start is a required parameter of populate(), not __init__.
+    chart_start is a required parameter of populate().
     """
 
-    def test_init_works_without_chart_start(self):
-        """HourlyProjection() must work without passing chart_start."""
-        # After the change, __init__ no longer takes chart_start.
-        with self.assertRaises(TypeError):
-            HourlyProjection(chart_start=datetime.now(timezone.utc))
+    def test_init(self):
+        """HourlyProjection() requires passing instant."""
+        HourlyProjection(instant=datetime.now(timezone.utc))
 
     def test_populate_without_chart_start_raises(self):
-        """HourlyProjection.populate() must require chart_start argument."""
-        hp = HourlyProjection()
+        """HourlyProjection.populate() requires instant argument."""
+        hp = HourlyProjection(instant=datetime.now(timezone.utc))
         with self.assertRaises(TypeError):
             hp.populate()  # type: ignore[call-arg]
 
     def test_populate_accepts_chart_start(self):
         """HourlyProjection.populate(chart_start=...) must accept a datetime."""
         chart_start = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        hp = HourlyProjection()
+        hp = HourlyProjection(instant=chart_start)
         # Should not raise TypeError about missing argument.
         # It may raise other errors (e.g. RetryableMetricsException) due
         # to mocked infrastructure, but the signature check passes.
@@ -500,6 +498,9 @@ class TestHourlyProjectionPopulateChartStart(unittest.TestCase):
             if "chart_start" in str(exc):
                 self.fail(f"populate() rejected valid chart_start: {exc}")
             raise
+        except RetryableMetricsException:
+            # Expected with mocked infrastructure — the signature check passed.
+            pass
 
 
 class TestHourlyProjectionEdgeCases(unittest.TestCase):
@@ -1256,13 +1257,15 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache()
-        self.assertFalse(cache.is_valid())
+        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
+        self.assertFalse(cache.is_valid(fixed_now))
 
     def test_is_valid_true_after_fetch(self):
         """is_valid returns True after a successful fetch within TTL."""
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
+        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
 
         def fetch_func():
             return {
@@ -1270,23 +1273,24 @@ class TestEnergyCache(unittest.TestCase):
                 "data_start": datetime.now(timezone.utc),
             }
 
-        cache.get_or_fetch(fetch_func)
-        self.assertTrue(cache.is_valid())
+        cache.get_or_fetch(fetch_func, fixed_now)
+        self.assertTrue(cache.is_valid(fixed_now))
 
     def test_is_valid_false_after_ttl_expiry(self):
         """is_valid returns False after TTL expires."""
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=0)  # TTL of 0 means always expired
+        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
 
         def fetch_func():
             return {
                 "per_second_data": [0.001] * 10,
-                "data_start": datetime.now(timezone.utc),
+                "data_start": fixed_now
             }
 
-        cache.get_or_fetch(fetch_func)
-        self.assertFalse(cache.is_valid())
+        cache.get_or_fetch(fetch_func, fixed_now)
+        self.assertFalse(cache.is_valid(fixed_now))
 
     def test_get_or_fetch_miss_on_first_call(self):
         """First call to get_or_fetch should invoke fetch_func and return was_fresh=True."""
@@ -1305,7 +1309,7 @@ class TestEnergyCache(unittest.TestCase):
                 "data_start": now,
             }
 
-        result, was_fresh = cache.get_or_fetch(fetch_func)
+        result, was_fresh = cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
 
         self.assertEqual(fetch_count, 1)
         self.assertTrue(was_fresh)
@@ -1327,8 +1331,8 @@ class TestEnergyCache(unittest.TestCase):
                 "data_start": now,
             }
 
-        cache.get_or_fetch(fetch_func)
-        result2, was_fresh = cache.get_or_fetch(fetch_func)
+        cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
+        result2, was_fresh = cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
 
         self.assertEqual(fetch_count, 1)
         self.assertFalse(was_fresh)
@@ -1349,10 +1353,10 @@ class TestEnergyCache(unittest.TestCase):
                 "data_start": datetime.now(timezone.utc),
             }
 
-        cache.get_or_fetch(fetch_func)
+        cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         self.assertEqual(fetch_count, 1)
 
-        result2, was_fresh = cache.get_or_fetch(fetch_func)
+        result2, was_fresh = cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         self.assertEqual(fetch_count, 2)
         self.assertTrue(was_fresh)
 
@@ -1362,19 +1366,20 @@ class TestEnergyCache(unittest.TestCase):
 
         cache = EnergyCache(ttl_seconds=60)
         fetch_count = 0
+        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
 
         def fetch_func():
             nonlocal fetch_count
             fetch_count += 1
             return {
                 "per_second_data": [0.005] * 3,
-                "data_start": datetime.now(timezone.utc),
+                "data_start": fixed_now,
             }
 
-        cache.get_or_fetch(fetch_func)  # First call: fresh
+        cache.get_or_fetch(fetch_func, fixed_now)  # First call: fresh
         self.assertEqual(fetch_count, 1)
 
-        _, was_fresh = cache.get_or_fetch(fetch_func, force=True)
+        _, was_fresh = cache.get_or_fetch(fetch_func, fixed_now, force=True)
         self.assertEqual(fetch_count, 2)
         self.assertTrue(was_fresh)
 
@@ -1393,12 +1398,12 @@ class TestEnergyCache(unittest.TestCase):
                 "data_start": datetime.now(timezone.utc),
             }
 
-        cache.get_or_fetch(fetch_func)
+        cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         first_fetch_at = cache._last_fetch_at
 
         # Second call should be a cache hit — _last_fetch_at unchanged
         time.sleep(0.01)  # Small delay to ensure different timestamp if updated
-        cache.get_or_fetch(fetch_func)
+        cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
 
         self.assertEqual(cache._last_fetch_at, first_fetch_at)
         self.assertEqual(fetch_count, 1)
@@ -1412,7 +1417,7 @@ class TestEnergyCache(unittest.TestCase):
         def fetch_func():
             return None  # Simulate API failure
 
-        result, was_fresh = cache.get_or_fetch(fetch_func)
+        result, was_fresh = cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         self.assertIsNone(result)
 
     def test_invalidate_clears_cache(self):
@@ -1430,12 +1435,12 @@ class TestEnergyCache(unittest.TestCase):
                 "data_start": datetime.now(timezone.utc),
             }
 
-        cache.get_or_fetch(fetch_func)
+        cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         self.assertEqual(fetch_count, 1)
 
         cache.invalidate()
 
-        result2, was_fresh = cache.get_or_fetch(fetch_func)
+        result2, was_fresh = cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         self.assertEqual(fetch_count, 2)
         self.assertTrue(was_fresh)
 
@@ -1444,7 +1449,7 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache()
-        self.assertIsNone(cache.get_current_qh())
+        self.assertIsNone(cache.get_current_qh(datetime.now(timezone.utc)))
 
     def test_get_or_fetch_merges_samples(self):
         """New samples from fetch_func should be appended to existing _samples."""
@@ -1470,11 +1475,11 @@ class TestEnergyCache(unittest.TestCase):
                         "data_start": base_time + timedelta(seconds=5),
                     }
 
-            cache.get_or_fetch(fetch_func)  # First fetch: [0.1, 0.1, 0.1, 0.1, 0.1]
+            cache.get_or_fetch(fetch_func, base_time)  # First fetch: [0.1, 0.1, 0.1, 0.1, 0.1]
             self.assertEqual(len(cache._samples), 5)
 
             # Use force=True to simulate an incremental fetch that appends new samples.
-            cache.get_or_fetch(fetch_func, force=True)  # Second fetch: append [0.2, 0.2, 0.2]
+            cache.get_or_fetch(fetch_func, base_time, force=True)  # Second fetch: append [0.2, 0.2, 0.2]
             self.assertEqual(len(cache._samples), 8)
 
     def test_get_or_fetch_skips_overlapping_samples(self):
@@ -1509,11 +1514,11 @@ class TestEnergyCache(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = now
 
-            cache.get_or_fetch(fetch_func)
+            cache.get_or_fetch(fetch_func, now)
             self.assertEqual(len(cache._samples), 1830)
 
             # Second fetch should deduplicate: 1830 existing + 60 new = 1890 total
-            cache.get_or_fetch(fetch_func, force=True)
+            cache.get_or_fetch(fetch_func, now, force=True)
             self.assertEqual(len(cache._samples), 1890)
 
     def test_get_current_qh_computes_from_samples(self):
@@ -1521,19 +1526,19 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc).replace(second=30, microsecond=0)
+        fixed_now = datetime(2025, 6, 1, 12, 20, 30, tzinfo=timezone.utc)
 
-        # 1200 samples (first 20 minutes = QH1 complete + first 5 min of QH2)
+        # 12:20 = 1200 samples (QH1 complete 900 + first 5 min of QH2 300)
         samples = [0.001] * 1200
 
         def fetch_func():
             return {
                 "per_second_data": samples,
-                "data_start": now - timedelta(seconds=len(samples)),
+                "data_start": fixed_now - timedelta(seconds=len(samples)),
             }
 
-        cache.get_or_fetch(fetch_func)
-        result = cache.get_current_qh()
+        cache.get_or_fetch(fetch_func, fixed_now)
+        result = cache.get_current_qh(fixed_now)
 
         self.assertIsNotNone(result)
         # Should return a dict with QH prediction info
@@ -1543,6 +1548,7 @@ class TestEnergyCache(unittest.TestCase):
         """Concurrent reads and writes should not corrupt the sample list."""
         from metrics import EnergyCache
 
+        fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
         cache = EnergyCache(ttl_seconds=60)
         errors: list[str] = []
 
@@ -1551,15 +1557,15 @@ class TestEnergyCache(unittest.TestCase):
                 for _ in range(10):
                     cache.get_or_fetch(lambda: {
                         "per_second_data": [0.1] * 5,
-                        "data_start": datetime.now(timezone.utc),
-                    })
+                        "data_start": fixed_now,
+                    }, fixed_now)
             except Exception as ex:  # noqa: BLE001
                 errors.append(str(ex))
 
         def reader():
             try:
                 for _ in range(10):
-                    cache.get_current_qh()
+                    cache.get_current_qh(fixed_now)
             except Exception as ex:  # noqa: BLE001
                 errors.append(str(ex))
 
@@ -1582,24 +1588,24 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
 
         # Pre-populate with 5000 samples (over an hour of data)
-        old_start = now - timedelta(seconds=5000)
+        old_start = fixed_now - timedelta(seconds=5000)
         cache._samples = [0.1] * 5000
         cache._data_start = old_start
 
-        # Patch datetime.now so pruning uses our test time
+        # Patch datetime.now so pruning uses fixed_now
         with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = now
+            mock_dt.now.return_value = fixed_now
 
             def fetch_func():
                 return {
                     "per_second_data": [0.2] * 10,
-                    "data_start": now - timedelta(seconds=10),
+                    "data_start": fixed_now - timedelta(seconds=10),
                 }
 
-            cache.get_or_fetch(fetch_func, force=True)
+            cache.get_or_fetch(fetch_func, now=fixed_now, force=True)
 
         # After merge: 5010 samples. After pruning (keep last 3600s): ~3610
         self.assertLess(len(cache._samples), 5000)
@@ -1611,23 +1617,23 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
 
         # Pre-populate with exactly 3600 samples (1 hour of data)
-        old_start = now - timedelta(seconds=3600)
+        old_start = fixed_now - timedelta(seconds=3600)
         cache._samples = [0.1] * 3600
         cache._data_start = old_start
 
         with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = now
+            mock_dt.now.return_value = fixed_now
 
             def fetch_func():
                 return {
                     "per_second_data": [0.2] * 5,
-                    "data_start": now - timedelta(seconds=5),
+                    "data_start": fixed_now - timedelta(seconds=5),
                 }
 
-            cache.get_or_fetch(fetch_func, force=True)
+            cache.get_or_fetch(fetch_func, now=fixed_now, force=True)
 
         self.assertEqual(len(cache._samples), 3600)
 
@@ -1636,7 +1642,7 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
-        now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
+        fixed_now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
 
         # 450 samples = halfway through QH1 (0-899 seconds)
         # Each sample is 0.5 Wh (stored as kWh in per_second_data, so 0.5 * 1000 = 500 Wh per second...
@@ -1647,14 +1653,14 @@ class TestEnergyCache(unittest.TestCase):
         def fetch_func():
             return {
                 "per_second_data": samples,
-                "data_start": now - timedelta(seconds=450),
+                "data_start": fixed_now - timedelta(seconds=450),
             }
 
         with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = now
-            cache.get_or_fetch(fetch_func)
+            mock_dt.now.return_value = fixed_now
+            cache.get_or_fetch(fetch_func, fixed_now)
 
-        result = cache.get_current_qh()
+        result = cache.get_current_qh(fixed_now)
 
         self.assertIsNotNone(result)
         self.assertEqual(result["qh_name"], "QH1")
@@ -1665,7 +1671,8 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
-        now = datetime(2025, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2025, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
+        data_start = fixed_now - timedelta(seconds=3600)
 
         # 3600 samples = exactly one hour (all 4 quarters complete)
         samples = [0.01] * 3600
@@ -1673,14 +1680,13 @@ class TestEnergyCache(unittest.TestCase):
         def fetch_func():
             return {
                 "per_second_data": samples,
-                "data_start": now - timedelta(seconds=3600),
+                "data_start": data_start,
             }
 
         with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = now
-            cache.get_or_fetch(fetch_func)
-
-        result = cache.get_current_qh()
+            mock_dt.now.return_value = fixed_now
+            cache.get_or_fetch(fetch_func, fixed_now)
+            result = cache.get_current_qh(fixed_now)
 
         self.assertIsNotNone(result)
         self.assertEqual(result["qh_name"], "QH4")
@@ -1692,7 +1698,7 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
-        now = datetime(2025, 6, 1, 12, 37, 30, tzinfo=timezone.utc)
+        fixed_now = datetime(2025, 6, 1, 12, 37, 30, tzinfo=timezone.utc)
 
         # 2250 samples = QH1 (900s), QH2 (900s) complete, halfway through QH3
         samples = [0.002] * 2250
@@ -1700,17 +1706,87 @@ class TestEnergyCache(unittest.TestCase):
         def fetch_func():
             return {
                 "per_second_data": samples,
-                "data_start": now - timedelta(seconds=2250),
+                "data_start": fixed_now - timedelta(seconds=2250),
+            }
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            cache.get_or_fetch(fetch_func, fixed_now)
+
+        result = cache.get_current_qh(fixed_now)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["qh_name"], "QH3")
+
+    def test_get_current_qh_seconds_remaining_from_wall_clock(self):
+        """seconds_remaining must derive from wall-clock time, not sample count.
+
+        When the cache has accumulated many samples (e.g. from incremental
+        fetches), n = len(samples) can be much larger than 900.  The
+        seconds_remaining value must come from wall-clock time to stay
+        monotonic and correct across cache refreshes.
+        """
+        from metrics import EnergyCache
+
+        # Start at :07:30 — in QH1 (0-899).  Seconds into hour = 7*60+30 = 450.
+        # Expected: QH1, remaining = 899 - 450 + 1 = 450
+        now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
+        cache = EnergyCache(ttl_seconds=60)
+
+        # Populate with 3600 samples (full hour) — simulates accumulated cache
+        # where n = len(samples) = 3600 >> 900.
+        samples = [0.01] * 3600
+
+        def fetch_func():
+            return {
+                "per_second_data": samples,
+                "data_start": now - timedelta(seconds=3600),
             }
 
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = now
-            cache.get_or_fetch(fetch_func)
+            cache.get_or_fetch(fetch_func, now)
 
-        result = cache.get_current_qh()
+        result = cache.get_current_qh(now=now)
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["qh_name"], "QH3")
+        self.assertEqual(result["qh_name"], "QH1")
+        self.assertEqual(result["seconds_remaining"], 450)
+
+    def test_get_current_qh_seconds_remaining_decreases_monotonically(self):
+        """seconds_remaining must decrease as wall-clock time advances."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+
+        now1 = datetime(2025, 6, 1, 12, 10, 0, tzinfo=timezone.utc)
+        # 600 seconds into the hour → QH1, remaining = 900 - 600 = 300
+        samples = [0.01] * 3600
+
+        def fetch_func():
+            return {
+                "per_second_data": samples,
+                "data_start": now1 - timedelta(seconds=3600),
+            }
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = now1
+            cache.get_or_fetch(fetch_func, now1)
+            result1 = cache.get_current_qh(now=now1)
+
+        self.assertEqual(result1["seconds_remaining"], 300)
+
+        # Advance 15 seconds → remaining should be 285
+        now2 = now1 + timedelta(seconds=15)
+        result2 = cache.get_current_qh(now=now2)
+        self.assertEqual(result2["seconds_remaining"], 285)
+
+        # Advance to cross quarter boundary → should return QH2
+        # now1 + 301s = 12:15:01 → 901s into the hour → QH2, remaining = 1800 - 901 = 899
+        now3 = now1 + timedelta(seconds=301)
+        result3 = cache.get_current_qh(now=now3)
+        self.assertEqual(result3["qh_name"], "QH2")
+        self.assertEqual(result3["seconds_remaining"], 899)
 
     def test_get_or_fetch_logs_data_point_count(self):
         """get_or_fetch logs the number of fresh data points when fetching."""
@@ -1731,7 +1807,7 @@ class TestEnergyCache(unittest.TestCase):
                     "data_start": datetime.now(timezone.utc),
                 }
 
-            cache.get_or_fetch(fetch_func)
+            cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
 
             assert "fetched" in handler.text
             assert "42" in handler.text
@@ -1760,11 +1836,11 @@ class TestEnergyCache(unittest.TestCase):
                 }
 
             # First call — should log the fetch
-            cache.get_or_fetch(fetch_func)
+            cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
             handler.clear()
 
             # Second call — should serve from cache, no new fetch log
-            cache.get_or_fetch(fetch_func)
+            cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
             assert "fetched" not in handler.text
             assert "now has" not in handler.text
         finally:
@@ -1797,7 +1873,7 @@ class TestEnergyCache(unittest.TestCase):
                     ],
                 }
 
-            cache.get_or_fetch(fetch_func)
+            cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
 
             assert "fetched" in handler.text
             assert "150" in handler.text
@@ -1826,7 +1902,7 @@ class TestEnergyCache(unittest.TestCase):
                 ],
             }
 
-        cache.get_or_fetch(fetch_func)
+        cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
 
         # Verify self._samples is populated from nested devices data.
         self.assertIsNotNone(cache._samples)
@@ -1915,6 +1991,7 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         # Pre-populate cache with 300 samples
         cache._samples = [0.1] * 300
         cache._data_start = old_start
+        cache._last_sample_at = old_start + timedelta(seconds=299)
 
         # Mock API to return new samples starting from where cache left off
         vue_mock.get_chart_usage.return_value = (
@@ -1927,7 +2004,7 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # Cache should have merged samples: 300 + 60 = 360
         self.assertEqual(len(cache._samples), 360)
@@ -1965,9 +2042,9 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         vue_mock = MagicMock()
         gid = 1
 
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
         # Old samples from 2 hours ago (7200 seconds)
-        old_start = now - timedelta(hours=2)
+        old_start = fixed_now - timedelta(hours=2)
 
         # Pre-populate cache with 7200 samples (2 hours of per-second data)
         cache._samples = [0.1] * 7200
@@ -1979,11 +2056,11 @@ class TestBuildIncrementalFetch(unittest.TestCase):
             old_start + timedelta(seconds=7200),
         )
 
-        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+        fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
         # Patch datetime.now so pruning uses our test time
         with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = now
-            cache.get_or_fetch(fetcher, force=True)
+            mock_dt.now.return_value = fixed_now
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # After merging: 7200 + 600 = 7800 samples
         # After pruning (keep only last 3600s): should be ~4200 samples
@@ -2015,15 +2092,15 @@ class TestEnergyCacheSampleMetadata(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc)
+        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
 
         def fetch_func():
             return {
                 "per_second_data": [0.1] * 50,
-                "data_start": now,
+                "data_start": fixed_now,
             }
 
-        cache.get_or_fetch(fetch_func)
+        cache.get_or_fetch(fetch_func, fixed_now)
         self.assertEqual(cache._sample_count, 50)
 
     def test_get_or_fetch_sets_last_sample_at(self):
@@ -2039,7 +2116,7 @@ class TestEnergyCacheSampleMetadata(unittest.TestCase):
                 "data_start": now - timedelta(seconds=50),
             }
 
-        cache.get_or_fetch(fetch_func)
+        cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         # Last sample time = data_start + (count - 1) seconds ≈ now
         self.assertIsNotNone(cache._last_sample_at)
 
@@ -2055,7 +2132,7 @@ class TestIncrementalFetchIntegration(unittest.TestCase):
         vue_mock = MagicMock()
         gid = 1
 
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
+        fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
         call_count = 0
 
         def fetch_func():
@@ -2064,7 +2141,7 @@ class TestIncrementalFetchIntegration(unittest.TestCase):
 
             if call_count == 1:
                 # First fetch: full range, 300 samples (5 minutes)
-                start = now - timedelta(minutes=5)
+                start = fixed_now - timedelta(minutes=5)
                 return {
                     "per_second_data": [0.1] * 300,
                     "data_start": start,
@@ -2073,18 +2150,18 @@ class TestIncrementalFetchIntegration(unittest.TestCase):
             # Incremental fetch: 60 new samples starting right after first fetch
             return {
                 "per_second_data": [0.2] * 60,
-                "data_start": now,  # 12:30:00 — right after first 300 samples end
+                "data_start": fixed_now,  # 12:30:00 — right after first 300 samples end
             }
 
         # Build incremental fetcher (used to verify it doesn't crash)
-        _fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+        _fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
 
         # Patch datetime.now so pruning doesn't wipe out 2025 data
         with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = now
+            mock_dt.now.return_value = fixed_now
 
             # First fetch: full range
-            cache.get_or_fetch(fetch_func)
+            cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
             self.assertEqual(len(cache._samples), 300)
 
             # Second call with force=True to simulate incremental fetch
@@ -2380,7 +2457,14 @@ def _make_hourly_mock(
     if instant is None:
         instant = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
     if chart_start is None:
-        chart_start = instant.replace(minute=0, second=0, microsecond=0)
+        # _process_offset_scales computes usage_minutes from usage_data_end.minute.
+        # usage_data_end = chart_start + timedelta(seconds=n_seconds), so
+        # usage_data_end.minute = (chart_start.minute + n_seconds // 60) % 60.
+        # We need that to be >= min(n_minutes, 10) for the test to see all minute scales.
+        needed_minute = min(n_minutes, 10)
+        added_minutes = n_seconds // 60
+        minute_val = (needed_minute - added_minutes) % 60
+        chart_start = instant.replace(minute=minute_val, second=0, microsecond=0)
 
     # Generate per-second samples for the current hour
     per_second_data = [0.001] * n_seconds
@@ -2399,6 +2483,12 @@ def _make_hourly_mock(
     # Build scale mock
     minute_secs = [60 * (i + 1) for i in range(n_minutes)]
     mock_vue = MagicMock()
+
+    # The channel must iterate over itself so _populate_device's for-loop works
+    mock_channel.channels = [mock_channel]
+
+    # Configure the mocked VUE API to return real per-second data
+    mock_vue.get_chart_usage.return_value = (per_second_data, chart_start)
 
     # The channel .data attribute is used by some tests
     mock_channel.data = {
@@ -2424,7 +2514,7 @@ def _make_hourly_mock(
     # Create HourlyProjection with API calls mocked
     with patch.object(MetricsBase, "vue_init"), \
          patch.object(MetricsBase, "get_device_info"):
-        hp = HourlyProjection(logger_next=logging.getLogger("test"))
+        hp = HourlyProjection(instant=chart_start, logger_next=logging.getLogger("test"))
         hp.instant = instant
         MetricsBase.device_info = {1234: mock_vdi}
 
@@ -2470,7 +2560,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(existing._samples), 360)  # 300 + 60
@@ -2494,7 +2584,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         # 300 (new before) + 300 (existing) = 600
@@ -2522,7 +2612,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(existing._samples), 360)  # 300 + 60, gap skipped
@@ -2546,7 +2636,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         # 10 new but 1 overlap = 9 new samples added
@@ -2569,7 +2659,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         # 6 new - 6 overlap = 0 new samples added
@@ -2592,7 +2682,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(existing._samples), 360)
@@ -2618,7 +2708,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         # Before cache: new_start=13:58:00, cache_start=14:00:00 → 120 samples before
@@ -2646,7 +2736,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         # No new samples: entirely within cache
@@ -2667,7 +2757,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(result[0]["per_second_data"]), 0)
@@ -2690,7 +2780,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         # _data_start should NOT change after merge
         self.assertIsNotNone(result)
@@ -2712,7 +2802,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(existing._sample_count, 360)
@@ -2733,7 +2823,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
 
@@ -2757,7 +2847,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(existing._samples), 600)
@@ -2782,7 +2872,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, force=True)
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         # Old values preserved
         self.assertEqual(existing._samples[0], 0.0)
@@ -2808,7 +2898,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         }
 
     def test_prune_removes_samples_at_boundary(self):
-        """Sample whose time equals cutoff is removed (<, not <=)."""
+        """Samples strictly before cutoff are pruned; sample at cutoff is kept."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
@@ -2817,14 +2907,15 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         cache = _make_cache_with_samples(400, cache_start)  # 14:08:20 - 14:14:59
 
         original_count = len(cache._samples)
-        fetcher = lambda: None  # no-op
+        fetcher = lambda: {"per_second_data": [], "data_start": fixed_now}
 
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        # Samples up to and at cutoff time 14:10:00 should be removed
+        # Samples from 14:08:20 to 14:09:59 are < cutoff → removed (100)
+        # Sample at 14:10:00 (cutoff) is NOT removed (uses <, not <=)
         self.assertEqual(len(cache._samples), 300)
 
     def test_prune_keeps_sample_at_cutoff_plus_one(self):
@@ -2843,7 +2934,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         self.assertEqual(len(cache._samples), 1)
 
@@ -2861,7 +2952,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         self.assertEqual(len(cache._samples), 300)
         self.assertEqual(cache._samples, original_samples)
@@ -2882,7 +2973,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # All 300 samples are before cutoff
         self.assertEqual(len(cache._samples), 100)
@@ -2902,7 +2993,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         self.assertEqual(cache._sample_count, len(cache._samples))
 
@@ -2919,7 +3010,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         assert(len(cache._samples) > 0)
 
@@ -2939,7 +3030,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         self.assertEqual(len(cache._samples), 0)
 
@@ -2961,7 +3052,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # Without _data_start, pruning can't compute times → no pruning
         self.assertEqual(len(cache._samples), 500)
@@ -2983,7 +3074,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # All 3600 samples are >= 3600s old (from 14:10:00 to 15:09:59)
         # cutoff = 15:10:00, so all samples < cutoff
@@ -2995,18 +3086,18 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
         cutoff = fixed_now - timedelta(seconds=3600) # 14:10:00
-        # Only 1 sample after cutoff
-        cache_start = cutoff
-        cache = _make_cache_with_samples(3601, cache_start)  # 14:10:00 – 15:10:00
+        # Shift back so 3600 samples are strictly before cutoff, 1 at cutoff
+        cache_start = cutoff - timedelta(seconds=3600)
+        cache = _make_cache_with_samples(3601, cache_start)  # 13:10:00 – 14:10:00
 
         fetcher = self._fetcher_returns(fixed_now, [])
 
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, force=True)
+            cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        # Samples from 14:10:00 to 15:09:59 are < cutoff → removed
+        # Samples from 13:10:00 to 14:09:59 are < cutoff → removed
         self.assertEqual(len(cache._samples), 1)
 
 
@@ -3101,11 +3192,13 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         original_get_chart_usage = mock.vue.get_chart_usage
 
         call_count = 0
+        chan_data = mock.channels[0].data
         def side_effect(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return original_get_chart_usage(*args, **kwargs)
+                # First call is current hour — return real data
+                return (chan_data["per_second_data"], chan_data["data_start"])
             # Second call is prev_hour — raise
             raise requests.exceptions.RequestException("prev_hour error")
 

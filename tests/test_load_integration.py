@@ -27,7 +27,7 @@ from metrics import EnergyCache
 
 def _make_energy_cache_with_prediction(
     predicted_wh: float,
-    now: datetime | None = None,
+    now: datetime,
     data_lag_secs: float = 0.0,
     fetch_offset_secs: int = 0,
 ) -> EnergyCache:
@@ -39,7 +39,7 @@ def _make_energy_cache_with_prediction(
 
     Args:
         predicted_wh: Target Wh prediction for the incomplete quarter.
-        now: Current time for sample timestamps. Defaults to ``datetime.now(timezone.utc)``.
+        now: Current time for sample timestamps.
         data_lag_secs: Simulated API lag in seconds. The NBCReader computes
             ``data_point_at = _last_fetch_at - timedelta(seconds=data_lag_secs)``.
         fetch_offset_secs: How many seconds ago the data was "fetched". Defaults to 0
@@ -48,8 +48,6 @@ def _make_energy_cache_with_prediction(
     Returns:
         EnergyCache with ~2800 samples backfilled from ``now``.
     """
-    if now is None:
-        now = datetime.now(timezone.utc)
     sample_value = predicted_wh / 900_000.0
     sample_count = 2800  # QH3 is about halfway through the hour
     cache = EnergyCache(ttl_seconds=30)
@@ -66,9 +64,20 @@ def _make_energy_cache_with_prediction(
 
 
 def _make_excess_manager(
-    predicted_wh: float = -2000.0, incomplete_qh: str = "QH3"
+    now: datetime,
+    predicted_wh: float = -2000.0,
+    incomplete_qh: str = "QH3",
 ) -> tuple[LoadManager, PlugController, TeslaController]:
-    """Create LoadManager with stub controllers and mock metrics."""
+    """Create LoadManager with stub controllers and mock metrics.
+
+    Args:
+        predicted_wh: Target Wh prediction for the incomplete quarter.
+        incomplete_qh: The incomplete quarter-hour name (e.g. "QH3").
+        now: Fixed time for sample timestamps. Required.
+
+    Returns:
+        Tuple of (LoadManager, PlugController, TeslaController).
+    """
     plugs = {
         "water_heater": PlugConfig(
             name="water_heater",
@@ -101,7 +110,7 @@ def _make_excess_manager(
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(predicted_wh)
+    energy_cache = _make_energy_cache_with_prediction(predicted_wh, now=now)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -119,6 +128,7 @@ def _make_excess_manager(
 
 
 def _make_overn_target_manager(
+    now: datetime,
     predicted_wh: float = 2000.0,
 ) -> tuple[LoadManager, PlugController]:
     """Create LoadManager for over-target scenario with both plugs ON."""
@@ -146,7 +156,7 @@ def _make_overn_target_manager(
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(predicted_wh)
+    energy_cache = _make_energy_cache_with_prediction(predicted_wh, now=now)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -158,7 +168,6 @@ def _make_overn_target_manager(
         dry_run=False,
     )
 
-    now = datetime.now(timezone.utc)
     mgr.state.devices["pool_pump"] = DeviceState(
         name="pool_pump", last_toggle=now - timedelta(seconds=120), desired_state=True
     )
@@ -176,6 +185,7 @@ def _make_tesla_manager(
     tesla_state: TeslaState, predicted_wh: float = -2000.0
 ) -> tuple[LoadManager, TeslaController]:
     """Create LoadManager with a mocked Tesla controller."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
@@ -196,7 +206,7 @@ def _make_tesla_manager(
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(predicted_wh)
+    energy_cache = _make_energy_cache_with_prediction(predicted_wh, fixed_now)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -215,17 +225,27 @@ def _make_tesla_manager(
 
 def test_turns_on_plugs_in_priority_order():
     """Excess solar: turns on plugs in priority order."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+
     # in priority order:
     # p200 pool pump turns on
     # p100 water heater would fit gap without pool pump, but stays off
-    mgr, plug_ctrl = _make_overn_target_manager(predicted_wh=-1500.0)
+    mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-1000.0)
     asyncio.run(plug_ctrl.set_state("pool_pump", False))
     asyncio.run(plug_ctrl.set_state("water_heater", False))
 
-    result = mgr.run_cycle()
+    def dt_constructor(*args, **kwargs):
+        return datetime(*args, **kwargs)
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = dt_constructor
+        result = mgr.run_cycle()
 
     assert result["status"] == "ok"
-    action_names = [a["device"] for a in result["actions"]]
+    assert result["qh"] == "QH1"
+    assert result["diagnostics"]["gap_wh"] == 500.0
+    assert result["diagnostics"]["seconds_remaining"] == 420
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
     pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
     assert wh_state is False
@@ -234,14 +254,19 @@ def test_turns_on_plugs_in_priority_order():
 
 def test_turns_off_plugs_in_priority_order():
     """Load shedding: turns plugs off priority order."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+
     # predicted_wh=-200, target=-500 => gap=300 Wh
     # in priority order:
     # p100 water heater 4500w => 1125 Wh/quarter-hour (fills deficit)
     # no more deficit so continue
     # p200 pool pump (potential savings 333.3 Wh) stays on
-    mgr, plug_ctrl = _make_overn_target_manager(predicted_wh=-200.0)
+    mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-200.0)
 
-    result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
 
     assert result["status"] == "ok"
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
@@ -252,9 +277,13 @@ def test_turns_off_plugs_in_priority_order():
 
 def test_plug_states_updated():
     """Excess solar: plug controller states are updated."""
-    mgr, plug_ctrl, _ = _make_excess_manager(predicted_wh=-6000.0)
+    fixed_now = datetime(2026, 5, 6, 15, 7, 30, tzinfo=timezone.utc)
+    mgr, plug_ctrl, _ = _make_excess_manager(now=fixed_now, predicted_wh=-6000.0)
 
-    mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        mgr.run_cycle()
 
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
     pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
@@ -262,12 +291,54 @@ def test_plug_states_updated():
     assert pp_state
 
 
+def test_excess_solar_qh_boundary_returns_stale_data():
+    """QH-boundary regression: excess solar at QH start should detect stale data.
+
+    When run_cycle executes just after a 15-minute boundary (e.g. 15:00:01)
+    but the cache's data_point_at is just before it (14:59:59), the QH
+    boundary check in _check_pending_state must detect that the data is from
+    the previous QH and return stale_data — NOT proceed with load decisions
+    based on outdated predictions.
+
+    Regression test for the flaky test_plug_states_updated that fails when
+    real clock happens to land at a QH boundary.
+    """
+    # Time just after a QH boundary (15:00:01 → QH2 starts)
+    fixed_now = datetime(2026, 5, 6, 15, 0, 1, tzinfo=timezone.utc)
+    # data_point_at just before boundary (14:59:59 → QH1)
+    data_point_at = fixed_now - timedelta(seconds=2)
+
+    mgr, plug_ctrl, _ = _make_excess_manager(now=fixed_now, predicted_wh=-6000.0)
+
+    # Patch get_current_qh to return data from the previous QH
+    def patched_get(force=False, now=fixed_now):
+        return ("QH2", -6000.0, 899, data_point_at)
+
+    mgr.nbc_reader.get_current_qh = patched_get  # type: ignore[method-assign]
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = mgr.run_cycle()
+
+    # Must detect stale data — NOT turn on plugs based on old QH prediction
+    assert result["status"] == "stale_data"
+    assert result["diagnostics"]["reason"] == "previous_qh"
+    # Plugs must NOT have been touched
+    wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
+    pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
+    assert wh_state is False
+    assert pp_state is False
+
+
 # --- Over-target tests ---
 
 
 def test_turns_off_all_on_plugs():
     """Over-target: turns off all plugs that are currently on."""
-    mgr, _ = _make_overn_target_manager(predicted_wh=2000.0)
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+
+    mgr, _ = _make_overn_target_manager(now=fixed_now, predicted_wh=2000.0)
 
     result = mgr.run_cycle()
 
@@ -326,6 +397,7 @@ def test_skip_tesla_at_charge_limit():
 
 def test_stale_data_skips_cycle():
     """NBC data >120s old with pending effects returns stale_data status."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
@@ -336,7 +408,7 @@ def test_stale_data_skips_cycle():
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(-2000.0, data_lag_secs=130)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=130)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -383,7 +455,7 @@ def test_stale_no_pending_effects_proceeds():
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(-2000.0)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -425,7 +497,7 @@ def test_stale_data_from_previous_qh():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    # Current wall-clock time: start of QH2
+    # Current wall-clock time: start of QH2 15:00:00
     fixed_now = datetime(2026, 5, 7, 15, 00, 00, tzinfo=timezone.utc)
     # data_point_at: end of previous QH
     data_point_at = fixed_now - timedelta(seconds=1)
@@ -437,7 +509,7 @@ def test_stale_data_from_previous_qh():
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(-2000.0)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -458,21 +530,21 @@ def test_stale_data_from_previous_qh():
     )
 
     # Patch get_current_qh to return our crafted data_point_at.
-    original_get = mgr.nbc_reader.get_current_qh
-
-    def patched_get(force=False, now=None):
-        result = original_get(force=force, now=now)
-        if result is not None:
-            qh_name, predicted_wh, seconds_remaining = result[:3]
-            return (qh_name, predicted_wh, seconds_remaining, data_point_at)
-        return None
+    def patched_get(force=False, now=fixed_now):
+        # Return a 4-tuple matching the expected signature:
+        # (qh_name, predicted_wh, seconds_remaining, data_point_at)
+        return ("QH2", -2000.0, 600, data_point_at)
 
     mgr.nbc_reader.get_current_qh = patched_get  # type: ignore[method-assign]
 
     with patch("load_manager.datetime") as mock_dt_cls:
         mock_dt_cls.now.return_value = fixed_now
-
+        mock_dt_cls.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
         result = mgr.run_cycle()
+
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.debug("Load management cycle result: %s", result)
 
     assert result["status"] == "stale_data"
     # Verify the reason indicates QH boundary detection, not age-based stale.
@@ -484,6 +556,7 @@ def test_stale_data_from_previous_qh():
 
 def test_waits_for_fresh_data():
     """Action taken after last NBC fetch -> wait for fresh data."""
+    fixed_now = datetime(2026, 5, 6, 7, 38, 00, tzinfo=timezone.utc)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
@@ -494,7 +567,7 @@ def test_waits_for_fresh_data():
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(-2000.0)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -537,6 +610,7 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
     is actually 140s old. Stale threshold is 120s, so this should trigger
     stale_data status (not proceed as it would with fetch-time-only check).
     """
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
@@ -549,7 +623,7 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(
-        -2000.0, data_lag_secs=130  # data_point_at = now - 130s → stale (>120s)
+        -2000.0, fixed_now, data_lag_secs=130  # data_point_at = now - 130s → stale (>120s)
     )
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
@@ -621,7 +695,7 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
     with patch("load_manager.datetime") as mock_dt:
         mock_dt.now.return_value = fixed_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-    result = mgr.run_cycle(force=True)
+        result = mgr.run_cycle(force=True)
 
     # With force=True, fresh data is always fetched. The pending effect
     # timestamp (now) may be after the API's data_point_at, but with fresh
@@ -643,8 +717,8 @@ def test_full_lifecycle_action_wait_resolve():
     }
     plug_ctrl = PlugController(plugs)
 
-    now = datetime.now(timezone.utc)
-    energy_cache = _make_energy_cache_with_prediction(-6000.0, now=now)
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    energy_cache = _make_energy_cache_with_prediction(-6000.0, now=fixed_now)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -655,12 +729,20 @@ def test_full_lifecycle_action_wait_resolve():
         dry_run=False,
     )
 
-    result_1 = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result_1 = mgr.run_cycle()
+
     assert result_1["status"] == "ok"
     assert len(result_1["actions"]) > 0
     assert len(mgr.state.pending_effects) > 0
 
-    result_2 = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result_2 = mgr.run_cycle()
+
     assert result_2["status"] == "waiting_for_fresh_data"
 
 
@@ -723,7 +805,7 @@ def test_prune_old_effects():
     # old1 (60s old): exactly at boundary — pruned (60s >= MIN_SECS)
     # old2 (30s old): below MIN_SECS — kept
     # recent (future): above data_point_at — kept
-    pruned = tracker.prune_old_effects(base_time)
+    pruned = tracker.prune_old_effects(base_time, base_time)
     assert pruned == 1
     assert len(tracker.pending_effects) == 2
     assert {e.device_name for e in tracker.pending_effects} == {"old2", "recent"}
@@ -759,7 +841,7 @@ def test_prune_old_effects_respects_minimum_age():
         ),
     ])
 
-    pruned = tracker.prune_old_effects(dp)
+    pruned = tracker.prune_old_effects(dp, dp)
     assert pruned == 1  # only the "old" effect is pruned
     assert len(tracker.pending_effects) == 2
     assert {e.device_name for e in tracker.pending_effects} == {"young", "recent"}
@@ -770,10 +852,11 @@ def test_prune_old_effects_respects_minimum_age():
 
 def test_adjusted_wh_in_response():
     """Response includes both raw predicted_wh and adjusted_wh."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    energy_cache = _make_energy_cache_with_prediction(-500.0)
+    energy_cache = _make_energy_cache_with_prediction(-500.0, fixed_now)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -784,7 +867,10 @@ def test_adjusted_wh_in_response():
         dry_run=False,
     )
 
-    result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
 
     assert "predicted_wh" in result
     assert "adjusted_wh" in result
@@ -793,11 +879,11 @@ def test_adjusted_wh_in_response():
 
 def test_stale_data_includes_pending_count():
     """Stale data response includes pending_effects_count."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    now = datetime.now(timezone.utc)
-    energy_cache = _make_energy_cache_with_prediction(-2000.0, data_lag_secs=180)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=180)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -808,23 +894,25 @@ def test_stale_data_includes_pending_count():
         dry_run=False,
     )
 
-    now = datetime.now(timezone.utc)
     mgr.state.pending_effects.extend([
         PendingEffect(
             device_name="plug", action="turn_on",
-            timestamp=now - timedelta(seconds=60),
-            data_point_at=now - timedelta(seconds=80),
+            timestamp=fixed_now - timedelta(seconds=60),
+            data_point_at=fixed_now - timedelta(seconds=80),
             power_delta_wh=500.0,
         ),
         PendingEffect(
             device_name="plug2", action="turn_off",
-            timestamp=now - timedelta(seconds=30),
-            data_point_at=now - timedelta(seconds=50),
+            timestamp=fixed_now - timedelta(seconds=30),
+            data_point_at=fixed_now - timedelta(seconds=50),
             power_delta_wh=-200.0,
         ),
     ])
 
-    result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
 
     assert result["status"] == "stale_data"
     assert result["diagnostics"]["pending_effects_count"] == 2
@@ -842,8 +930,8 @@ def test_stale_data_prunes_old_effects():
     }
     plug_ctrl = PlugController(plugs)
 
-    now = datetime.now(timezone.utc)
-    energy_cache = _make_energy_cache_with_prediction(-2000.0, data_lag_secs=180)
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=180)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -854,22 +942,21 @@ def test_stale_data_prunes_old_effects():
         dry_run=False,
     )
 
-    now = datetime.now(timezone.utc)
     # Cache created with data_lag_secs=180, fetch_offset_secs=0 (default).
     # data_point_at = cache_now - 180s, cutoff = data_point_at - 60s = cache_now - 240s.
     mgr.state.pending_effects.extend([
         PendingEffect(
             device_name="heater", action="turn_on",
             # -280s is before cutoff (now-240s) → pruned.
-            timestamp=now - timedelta(seconds=280),
-            data_point_at=now - timedelta(seconds=300),
+            timestamp=fixed_now - timedelta(seconds=280),
+            data_point_at=fixed_now - timedelta(seconds=300),
             power_delta_wh=500.0,
         ),
         PendingEffect(
             device_name="heater", action="turn_off",
             # -80s is after cutoff → kept.
-            timestamp=now - timedelta(seconds=80),
-            data_point_at=now - timedelta(seconds=100),
+            timestamp=fixed_now - timedelta(seconds=80),
+            data_point_at=fixed_now - timedelta(seconds=100),
             power_delta_wh=-200.0,
         ),
     ])
@@ -900,8 +987,8 @@ def test_stale_data_includes_candidates():
     }
     plug_ctrl = PlugController(plugs)
 
-    now = datetime.now(timezone.utc)
-    energy_cache = _make_energy_cache_with_prediction(-2000.0, data_lag_secs=180)
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=180)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -912,17 +999,19 @@ def test_stale_data_includes_candidates():
         dry_run=False,
     )
 
-    now = datetime.now(timezone.utc)
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="heater", action="turn_on",
-            timestamp=now,
-            data_point_at=now - timedelta(seconds=20),
+            timestamp=fixed_now,
+            data_point_at=fixed_now - timedelta(seconds=20),
             power_delta_wh=500.0,
         )
     )
 
-    result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
 
     assert result["status"] == "stale_data"
     candidates = result["diagnostics"]["candidates"]
@@ -1025,9 +1114,10 @@ def test_waiting_for_fresh_data_includes_candidates():
 
 def test_cache_hits_within_ttl():
     """Second call within TTL + same QH uses cache."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
-    energy_cache = _make_energy_cache_with_prediction(-2000.0)
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
 
     mgr = LoadManager(
         energy_cache=energy_cache,
@@ -1076,6 +1166,7 @@ def test_disabled_returns_early():
 
 def test_dry_run_returns_dry_run_status():
     """Dry run returns dry-run status instead of ok."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs = {
         "water_heater": PlugConfig(
             name="water_heater",
@@ -1086,7 +1177,7 @@ def test_dry_run_returns_dry_run_status():
     }
     plug_ctrl = PlugController(plugs)
 
-    energy_cache = _make_energy_cache_with_prediction(-6000.0)
+    energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -1097,7 +1188,10 @@ def test_dry_run_returns_dry_run_status():
         dry_run=True,
     )
 
-    result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
 
     assert result["status"] == "dry-run"
     action_names = [a["device"] for a in result["actions"]]
@@ -1106,6 +1200,7 @@ def test_dry_run_returns_dry_run_status():
 
 def test_dry_run_does_not_execute():
     """Dry run does not change plug state or add pending effects."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs = {
         "water_heater": PlugConfig(
             name="water_heater",
@@ -1116,7 +1211,7 @@ def test_dry_run_does_not_execute():
     }
     plug_ctrl = PlugController(plugs)
 
-    energy_cache = _make_energy_cache_with_prediction(-6000.0)
+    energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -1127,7 +1222,10 @@ def test_dry_run_does_not_execute():
         dry_run=True,
     )
 
-    mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
 
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
     assert not wh_state
@@ -1137,6 +1235,7 @@ def test_dry_run_does_not_execute():
 def test_dry_run_state_not_mutated():
     """Dry run does not mutate internal state, so repeated cycles produce
     the same actions instead of seeing stale desired_state."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs = {
         "water_heater": PlugConfig(
             name="water_heater",
@@ -1147,7 +1246,7 @@ def test_dry_run_state_not_mutated():
     }
     plug_ctrl = PlugController(plugs)
 
-    energy_cache = _make_energy_cache_with_prediction(-6000.0)
+    energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -1158,7 +1257,11 @@ def test_dry_run_state_not_mutated():
         dry_run=True,
     )
 
-    first_result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        first_result = mgr.run_cycle()
+
     assert first_result["status"] == "dry-run"
     first_actions = [a["device"] for a in first_result["actions"]]
     assert "water_heater" in first_actions
@@ -1167,7 +1270,11 @@ def test_dry_run_state_not_mutated():
     if dev_state is not None:
         assert dev_state.desired_state is not True
 
-    second_result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        second_result = mgr.run_cycle()
+
     assert second_result["status"] == "dry-run"
     second_actions = [a["device"] for a in second_result["actions"]]
     assert "water_heater" in second_actions
@@ -1179,6 +1286,7 @@ def test_dry_run_state_not_mutated():
 @patch("load_manager.load_tesla_config", return_value=None)
 def test_tesla_amp_adjustment(_mock_load_tesla):
     """After plugs, residual gap triggers Tesla set_charge_amps."""
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs = {
         "small_plug": PlugConfig(
             name="small_plug",
@@ -1212,7 +1320,7 @@ def test_tesla_amp_adjustment(_mock_load_tesla):
         )
     )
 
-    energy_cache = _make_energy_cache_with_prediction(-3000.0)
+    energy_cache = _make_energy_cache_with_prediction(-3000.0, fixed_now)
     mgr = LoadManager(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -1223,7 +1331,10 @@ def test_tesla_amp_adjustment(_mock_load_tesla):
         dry_run=False,
     )
 
-    result = mgr.run_cycle()
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
+        result = mgr.run_cycle()
 
     action_devices = [a["device"] for a in result.get("actions", [])]
     assert "small_plug" in action_devices
@@ -1267,6 +1378,7 @@ def test_turn_off_only_device_even_when_savings_exceed_gap():
     }
 
     actions = engine.decide(
+        now=datetime(2025, 6, 15, 12, 0, 0),
         predicted_wh=967.0,
         target_wh=-9.0,
         seconds_remaining=891,

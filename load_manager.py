@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import threading
+import time
 
 # Third-party imports.
 from typing import Any, Callable
@@ -379,11 +380,12 @@ class LoadManager:
         return "disabled"
 
     def _is_device_in_time_range(
-        self, device_name: str, time_range: tuple[time, time] | None
+        self, now: datetime, device_name: str, time_range: tuple[time, time] | None
     ) -> bool:
         """Check if a device is within its configured time range.
 
         Args:
+            now: current datetime.
             device_name: Device name for logging context.
             time_range: (start, end) tuple from config, or None (always in range).
 
@@ -400,7 +402,7 @@ class LoadManager:
         except pytz.exceptions.UnknownTimeZoneError:
             local_tz = pytz.timezone("America/Los_Angeles")
 
-        now_local = datetime.now(timezone.utc).astimezone(local_tz)
+        now_local = now.astimezone(local_tz)
         current_time = now_local.time()
 
         in_range = start_time <= current_time < end_time
@@ -416,6 +418,7 @@ class LoadManager:
 
     def _build_candidate_details(
         self,
+        now: datetime,
         seconds_remaining: int,
         tesla_state: TeslaState | None,
         tesla_error: str | None,
@@ -424,6 +427,7 @@ class LoadManager:
         """Build per-device diagnostics for visibility into decisions.
 
         Args:
+            now: current datetime.
             seconds_remaining: Seconds left in current quarter-hour.
             tesla_state: Tesla state if available.
             tesla_error: Error message if Tesla state fetch failed.
@@ -432,7 +436,6 @@ class LoadManager:
         Returns:
             List of candidate detail dicts for all plugs and optionally Tesla.
         """
-        now = datetime.now(timezone.utc)
         candidate_details: list[dict[str, Any]] = []
         for name, plug in self.plugs.items():
             dev_state = self.state.devices.get(name)
@@ -450,7 +453,7 @@ class LoadManager:
                 "capacity_wh": round(capacity_wh, 1),
                 "can_toggle": can_toggle,
             }
-            if not self._is_device_in_time_range(name, plug.time_range):
+            if not self._is_device_in_time_range(now, name, plug.time_range):
                 detail["reason"] = "outside_time_range"
             if dev_state:
                 detail["desired_state"] = dev_state.desired_state
@@ -472,7 +475,7 @@ class LoadManager:
                 tesla_detail["at_home"] = tesla_state.at_home
                 tesla_detail["at_charge_limit"] = tesla_state.at_charge_limit
             if self.tesla_config and not self._is_device_in_time_range(
-                "tesla", self.tesla_config.time_range
+                now, "tesla", self.tesla_config.time_range
             ):
                 tesla_detail["reason"] = "outside_time_range"
             candidate_details.append(tesla_detail)
@@ -483,6 +486,7 @@ class LoadManager:
         self,
         results: list[dict[str, str]],
         gap_wh: float,
+        now: datetime,
         seconds_remaining: int,
         tesla_state: TeslaState | None,
         tesla_configured: bool,
@@ -493,6 +497,8 @@ class LoadManager:
         Args:
             results: List of executed action results.
             gap_wh: The Wh gap (positive = surplus, negative = deficit).
+            now: current datetime.
+            seconds_remaining: seconds remaining in NBC period.
             tesla_state: Tesla state if available.
             tesla_configured: Whether a Tesla controller is configured.
             tesla_error: Error message if Tesla state fetch failed.
@@ -503,7 +509,6 @@ class LoadManager:
         if results:
             return "ok"
 
-        now = datetime.now(timezone.utc)
         gap_positive = gap_wh > 0
         has_eligible = False
         has_too_large = False
@@ -511,7 +516,7 @@ class LoadManager:
         for name, plug in self.plugs.items():
             if not self.state.can_toggle(name, now):
                 continue
-            if not self._is_device_in_time_range(name, plug.time_range):
+            if not self._is_device_in_time_range(now, name, plug.time_range):
                 continue
             dev_state = self.state.devices.get(name)
             # All plugs are eligible: turn-on when off/unknown, turn-off when on
@@ -532,6 +537,7 @@ class LoadManager:
         # Check Tesla eligibility for turn-off scenarios
         if not gap_positive and tesla_state is not None:
             tesla_in_range = self._is_device_in_time_range(
+                now,
                 "tesla",
                 self.tesla_config.time_range if self.tesla_config else None,
             )
@@ -698,6 +704,7 @@ class LoadManager:
         self,
         gap_wh: float,
         adjusted_wh: float,
+        now: datetime,
         seconds_remaining: int,
         dry_run: bool,
         qh_name: str | None = None,
@@ -727,6 +734,7 @@ class LoadManager:
                 than recomputed so decide() and the hysteresis guard use the
                 identical value.
             adjusted_wh: NBC prediction adjusted for still-pending effects.
+            now: current datetime.
             seconds_remaining: Seconds left in the current quarter-hour.
             dry_run: When True, log actions without executing them.
             qh_name: Current quarter-hour name (e.g. "QH1").  Used to
@@ -784,7 +792,7 @@ class LoadManager:
         # deficits (e.g. new QH, clouds) still fire immediately; the QH-name
         # check inside is_settling_after_amp_increase() also auto-expires the
         # window on a QH transition.
-        settle_now = datetime.now(timezone.utc)
+        settle_now = now
         if (
             corrected_gap_wh < 0
             and abs(corrected_gap_wh) < self.engine.TESLA_SETTLE_SUPPRESS_WH
@@ -813,7 +821,7 @@ class LoadManager:
         # Filter plugs by per-device time range: only eligible plugs reach the engine.
         eligible_plugs: dict[str, PlugConfig] = {}
         for name, plug in self.plugs.items():
-            if self._is_device_in_time_range(name, plug.time_range):
+            if self._is_device_in_time_range(now, name, plug.time_range):
                 eligible_plugs[name] = plug
 
         # Tesla is only a candidate if within its time range.
@@ -822,12 +830,13 @@ class LoadManager:
             tesla_state is not None
             and self.tesla_config is not None
             and not self._is_device_in_time_range(
-                "tesla", self.tesla_config.time_range
+                now, "tesla", self.tesla_config.time_range
             )
         ):
             eligible_tesla = None
 
         actions = self.engine.decide(
+            now=now,
             predicted_wh=corrected_adjusted_wh,
             target_wh=self.target_wh,
             seconds_remaining=seconds_remaining,
@@ -933,12 +942,12 @@ class LoadManager:
         ):
             # Prune old effects even during stale cycles so the list doesn't
             # grow unbounded while we wait for fresh data.
-            pruned = self.state.prune_old_effects(data_point_at)
+            pruned = self.state.prune_old_effects(data_point_at, now_postfetch)
             if pruned > 0:
                 logger.debug("Pruned %d old pending effects (stale)", pruned)
             pending_count = len(self.state.pending_effects)
             candidate_details = self._build_candidate_details(
-                seconds_remaining, None, None, tesla_configured
+                now_postfetch, seconds_remaining, None, None, tesla_configured
             )
             logger.warning(
                 "NBC data stale (%d pending effects, %s), skipping cycle",
@@ -962,11 +971,11 @@ class LoadManager:
         # catches cases where data is <120s old but from a different QH.
         current_qh_start, _ = NBCPeriod.current_qh_window(now_postfetch)
         if data_point_at < current_qh_start:
-            pruned = self.state.prune_old_effects(data_point_at)
+            pruned = self.state.prune_old_effects(data_point_at, now_postfetch)
             if pruned > 0:
                 logger.debug("Pruned %d old pending effects (previous QH)", pruned)
             candidate_details = self._build_candidate_details(
-                seconds_remaining, None, None, tesla_configured
+                now_postfetch, seconds_remaining, None, None, tesla_configured
             )
             logger.warning(
                 "NBC data from previous QH (%s, %d pending effects), skipping cycle",
@@ -990,7 +999,7 @@ class LoadManager:
         ):
             pending_count = self.state.pending_since_count(nbc_timestamp)
             candidate_details = self._build_candidate_details(
-                seconds_remaining, None, None, tesla_configured
+                now_postfetch, seconds_remaining, None, None, tesla_configured
             )
             logger.info(
                 "Pending effects (%d) not yet reflected, %s; "
@@ -1042,7 +1051,8 @@ class LoadManager:
 
         with self._lock:
             # ── Stage 1: enabled check ─────────────────────────────────────
-            now = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc) # ok because lock may take time
+
             if not self.is_enabled_at(now):
                 return {
                     "status": "disabled",
@@ -1061,6 +1071,7 @@ class LoadManager:
                 }
 
             # ── Stage 2: NBC fetch ─────────────────────────────────────────
+            fetch_start = time.perf_counter()
             qh_result = self.nbc_reader.get_current_qh(force=force, now=now)
             if qh_result is None:
                 return {
@@ -1084,7 +1095,9 @@ class LoadManager:
                 seconds_remaining,
                 data_point_at,
             ) = qh_result
-            now_postfetch = datetime.now(timezone.utc)
+            fetch_end = time.perf_counter()
+            # reduce calls to datetime.now, to reduce scope for test errors
+            now_postfetch = now + timedelta(fetch_end - fetch_start)
 
             # ── Stage 3: pending-state check ───────────────────────────────
             if not force:
@@ -1118,7 +1131,7 @@ class LoadManager:
                 adjusted_wh,
             ) = asyncio.run(
                 self._cycle_async_phase(
-                    gap_wh, adjusted_wh, seconds_remaining, self.dry_run, qh_name,
+                    gap_wh, adjusted_wh, now_postfetch, seconds_remaining, self.dry_run, qh_name,
                     data_point_at=data_point_at,
                 )
             )
@@ -1184,11 +1197,12 @@ class LoadManager:
                 }
 
             candidate_details = self._build_candidate_details(
-                seconds_remaining, tesla_state, tesla_error, tesla_configured
+                now, seconds_remaining, tesla_state, tesla_error, tesla_configured
             )
             reason = self._determine_no_action_reason(
                 results,
                 gap_wh,
+                now,
                 seconds_remaining,
                 tesla_state,
                 tesla_configured,

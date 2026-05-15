@@ -57,7 +57,8 @@ class MetricsMock:
     nbc_result: float
 
     def __init__(self, instant_minute: int = 42) -> None:
-        now = datetime.now(timezone.utc)
+        # Watch out for datetime-related problems from this!        
+        now = datetime.now(timezone.utc) # TODO consider fixed_now pattern in all tests.
 
         is_full_hour = instant_minute >= 60
         minute_of_hour = min(instant_minute, 59)
