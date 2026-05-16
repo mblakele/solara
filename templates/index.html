@@ -2,7 +2,9 @@
 <html>
 <head>
 <title>solara</title>
-{% if load_management and load_management.last_cycle_result and load_management.last_cycle_result.get('sleep_hint') is defined %}
+{% if load_management and load_management.sleep_hint is defined %}
+<meta id="sleep-hint" data-value="{{ load_management.sleep_hint }}">
+{% elif load_management.last_cycle_result and load_management.last_cycle_result.sleep_hint is defined %}
 <meta id="sleep-hint" data-value="{{ load_management.last_cycle_result.sleep_hint }}">
 {% endif %}
 <style>

@@ -419,6 +419,7 @@ def _build_load_management_payload() -> dict:
         "nbc_device": lm.nbc_device,
         "state": lm.state.to_dict(),
         "last_cycle_result": last_result,
+        "sleep_hint": last_result.get("sleep_hint", lm.config_interval_secs),
     }
 
     return payload

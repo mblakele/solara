@@ -382,6 +382,74 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         self.assertIn('id="sleep-hint"', html)
         self.assertIn('data-value="30.0"', html)
 
+    def test_index_json_includes_top_level_sleep_hint(self):
+        """Index JSON loadManagement includes top-level sleepHint."""
+        from decouple import config as dc_config
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.dry_run = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_lm.state.to_dict.return_value = {}
+        mock_lm.config_interval_secs = 30
+        mock_lm.run_cycle.return_value = {
+            "status": "ok",
+            "predicted_wh": -800,
+            "target_wh": -500,
+            "actions": [],
+            "sleep_hint": 30.0,
+        }
+
+        with mock_config():
+            dc_config.set("LOAD_MANAGE_ENABLED", "True")
+            import app as app_mod
+
+            app_mod._load_manager = mock_lm
+            app_mod._load_manager_init_failed = False
+            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            response = self.app.get("/", headers={"Accept": "application/json"})
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn("loadManagement", data)
+        self.assertIn("sleepHint", data["loadManagement"])
+        self.assertEqual(data["loadManagement"]["sleepHint"], 30.0)
+
+    def test_index_json_fallback_sleep_hint_to_config_interval(self):
+        """Index JSON falls back to config_interval_secs when lastCycleResult is empty."""
+        from decouple import config as dc_config
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.dry_run = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_lm.state.to_dict.return_value = {}
+        mock_lm.config_interval_secs = 30
+        # lastCycleResult is empty — sleep_hint should fall back to config_interval_secs
+        mock_lm.run_cycle.return_value = {
+            "status": "ok",
+            "predicted_wh": -800,
+            "target_wh": -500,
+            "actions": [],
+        }
+
+        with mock_config():
+            dc_config.set("LOAD_MANAGE_ENABLED", "True")
+            import app as app_mod
+
+            app_mod._load_manager = mock_lm
+            app_mod._load_manager_init_failed = False
+            app_mod._last_cycle_result = {}
+            response = self.app.get("/", headers={"Accept": "application/json"})
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn("loadManagement", data)
+        self.assertIn("sleepHint", data["loadManagement"])
+        self.assertEqual(data["loadManagement"]["sleepHint"], 30)
+
     def test_index_html_missing_sleep_hint_no_crash(self):
         """Index HTML handles a cycle result without sleep_hint without crashing."""
         from decouple import config as dc_config
