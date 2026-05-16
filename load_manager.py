@@ -566,27 +566,29 @@ class LoadManager:
         """
         status = cycle_result.get("status", "")
         config_interval = self.config_interval_secs
-
-        # --- Stale data: minimum sleep, refresh ASAP ---
-        if status == "stale_data":
-            return 5.0
-
-        # --- Waiting for fresh data: wait until next NBC point ---
-        if status == "waiting_for_fresh_data":
-            seconds_remaining = self._seconds_remaining(cycle_result, config_interval)
-            return min(seconds_remaining, config_interval * 2)
-
-        # --- No incomplete QH: minimum sleep ---
-        if status == "no_incomplete_qh":
-            return 5.0
+        min_interval = 5.0
 
         # --- Disabled: normal interval ---
         if status == "disabled":
             return config_interval
 
+        # --- Stale data: minimum sleep, refresh ASAP ---
+        if status == "stale_data":
+            return min_interval
+
+        # --- No incomplete QH: minimum sleep ---
+        if status == "no_incomplete_qh":
+            return min_interval
+
+        # --- Shared lookups ---
+        seconds_remaining = self._seconds_remaining(cycle_result, config_interval)
+
+        # --- Waiting for fresh data: wait until next NBC point ---
+        if status == "waiting_for_fresh_data":
+            return min(seconds_remaining, config_interval * 2)
+
         # --- Shared lookups ---
         predicted_wh = cycle_result.get("nbc_prediction_wh", 0)
-        seconds_remaining = self._seconds_remaining(cycle_result, config_interval)
 
         # --- No deficit (predicted >= target): check how much QH remains ---
         if predicted_wh >= self.target_wh:
@@ -615,9 +617,9 @@ class LoadManager:
             sleep = config_interval * min(proportion, 2.0)
         else:
             # No capacity or unknown -> minimum sleep
-            sleep = 5.0
+            sleep = min_interval
 
-        return max(5.0, min(sleep, config_interval * 2))
+        return max(min_interval, min(sleep, config_interval * 2))
 
     @staticmethod
     def _seconds_remaining(cycle_result: dict, default: float) -> float:
@@ -1097,7 +1099,9 @@ class LoadManager:
             ) = qh_result
             fetch_end = time.perf_counter()
             # reduce calls to datetime.now, to reduce scope for test errors
-            now_postfetch = now + timedelta(fetch_end - fetch_start)
+            now_postfetch = now + timedelta(seconds=(fetch_end - fetch_start))
+            # TODO assert now_postfetch is same QH as local now? retryable exception?
+            logger.debug("now %s postfetch %s", now, now_postfetch)
 
             # ── Stage 3: pending-state check ───────────────────────────────
             if not force:

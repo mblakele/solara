@@ -20,10 +20,12 @@ from pyemvue.enums import Scale, Unit
 from util import (
     CustomJSONProvider,
     _QH_QUARTERS,
+    QH_PERIOD_SECONDS,
     ceil_to_qh,
     compute_nbc_quarters,
     custom_json_default,
     is_debug,
+    qh_seconds_remaining,
 )
 from energy_aggregator import EnergyDataAggregator
 
@@ -282,7 +284,6 @@ class EnergyCache:
 
                 # Merge with existing samples (incremental fetch path).
                 if self._samples is not None and len(self._samples) > 0:
-                    last_cached_time = self._last_sample_at
                     result_data_start = result.get("data_start")
                     # Number of new samples strictly before / after the cache.
                     # Initialized here so they're always defined for the
@@ -290,31 +291,46 @@ class EnergyCache:
                     before_count = 0
                     after_count = 0
 
-                    if (last_cached_time is not None
-                            and result_data_start is not None
-                            and self._data_start is not None):
-                        # Keep only samples that are outside the cached range:
-                        #   - samples strictly before cache_start
-                        #   - samples strictly after cache_end
-                        cache_start = self._data_start
-                        cache_end = self._last_sample_at
+                    if (self._last_sample_at is not None
+                            and self._data_start is not None
+                            and result_data_start is not None):
+                        # Compute the cache's effective time range from its
+                        # own _data_start so overlap detection is anchored
+                        # to real sample positions.
+                        cache_start_time = self._data_start
+                        cache_end_time = (self._data_start
+                                          + timedelta(
+                                              seconds=len(self._samples) - 1
+                                          ))
+
+                        # Where the new samples end (from API's data_start).
                         new_end_time = (result_data_start
                                         + timedelta(seconds=len(new_samples) - 1))
 
-                        if result_data_start < cache_start:
+                        # Standard overlap detection:
+                        # New samples before the cache start.
+                        before_count = 0
+                        if result_data_start < cache_start_time:
                             before_count = int(
-                                (cache_start - result_data_start).total_seconds()
+                                (cache_start_time
+                                 - result_data_start
+                                 ).total_seconds()
                             )
-                        else:
-                            before_count = 0
+                            before_count = min(before_count,
+                                               len(new_samples))
 
-                        # Number of new samples strictly after the cache
-                        if new_end_time > cache_end:
+                        # New samples after the cache end.
+                        after_count = 0
+                        if new_end_time > cache_end_time:
                             after_count = int(
-                                (new_end_time - cache_end).total_seconds()
+                                (new_end_time - cache_end_time
+                                 ).total_seconds()
                             )
-                        else:
-                            after_count = 0
+                            # Don't double-count: after_count can't exceed
+                            # remaining samples.
+                            after_count = min(after_count,
+                                              len(new_samples)
+                                              - before_count)
 
                         # Build merged samples in time order:
                         #   before_samples + existing + after_samples
@@ -380,10 +396,11 @@ class EnergyCache:
 
                 if psd:
                     logger.debug(
-                        "EnergyCache fetched %d data points (%s: %d samples)",
+                        "EnergyCache fetched %d data points (%s: %d samples) at %s",
                         len(psd),
                         self._data_start,
                         len(self._samples or []),
+                        now,
                     )
 
                 self._last_fetch_at = now
@@ -483,7 +500,7 @@ class EnergyCache:
 
         # Seconds elapsed since data_start within the current QH window.
         seconds_elapsed = int((now - self._data_start).total_seconds())
-        seconds_in_current_qh = seconds_elapsed % 900
+        seconds_in_current_qh = seconds_elapsed % QH_PERIOD_SECONDS
 
         nbc = compute_nbc_quarters(samples, samples_len)
 
@@ -500,7 +517,7 @@ class EnergyCache:
 
         # Return the incomplete (current) QH with wall-clock-based seconds_remaining.
         qh_data = nbc.get(nbc_qh) or {}
-        seconds_remaining = 900 - seconds_in_current_qh
+        seconds_remaining = qh_seconds_remaining(now)
         return {
             "qh_name": current_qh,
             "predicted_wh": qh_data.get("predicted_wh", qh_data.get("wh", 0)),
@@ -1008,10 +1025,10 @@ class HourlyProjection(MetricsBase):
             )
         )
         hour = scales[Scale.HOUR.value]
-        seconds_remaining = (hour_next - hour["instant"]).total_seconds()
+        seconds_remaining_hour = (hour_next - hour["instant"]).total_seconds() # hour, not NBC QH period
 
         minute_predicted = (
-            seconds_remaining * scales[Scale.MINUTE.value]["usage"] / 60.0
+            seconds_remaining_hour * scales[Scale.MINUTE.value]["usage"] / 60.0
         )
         prediction = hour["usage"] + minute_predicted
 
@@ -1022,7 +1039,7 @@ class HourlyProjection(MetricsBase):
             if not scale.endswith("MIN"):
                 continue
             sval = hour["usage"] + (
-                seconds_remaining * scales[scale]["usage"] / 60.0
+                seconds_remaining_hour * scales[scale]["usage"] / 60.0
             )
             prediction_min = min(sval, prediction_min)
             prediction_max = max(sval, prediction_max)
@@ -1040,7 +1057,7 @@ class HourlyProjection(MetricsBase):
             "prediction": prediction,
             "prediction_min": prediction_min,
             "prediction_max": prediction_max,
-            "seconds_remaining": seconds_remaining,
+            "seconds_remaining": seconds_remaining_hour,
             "smoothing": smoothing,
         }
 

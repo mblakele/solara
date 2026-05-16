@@ -145,6 +145,10 @@ class NBCReader:
             metrics_data = self._metrics_fetch()
             if metrics_data is None:
                 return None
+            # Tag with wall-clock time so _parse_metrics can compute
+            # seconds_remaining from the clock rather than sample counts.
+            if metrics_data is not None:
+                metrics_data["_now"] = now
             parsed = self._parse_metrics(self.device_name, metrics_data)
             if parsed is None:
                 return None
@@ -200,7 +204,7 @@ class NBCReader:
         return result["qh_name"], result["predicted_wh"], result["seconds_remaining"]
 
     def _parse_metrics(
-        self, device_name: str, metrics_data: dict[str, Any] | None
+        self, device_name: str, metrics_data: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         """Parse metrics data and extract incomplete QH info.
 
@@ -235,28 +239,48 @@ class NBCReader:
         qh_order = ["QH1", "QH2", "QH3", "QH4"]
         last_complete: dict[str, Any] | None = None
 
-        for qh_name in qh_order:
+        for i, qh_name in enumerate(qh_order):
             qh_data = nbc.get(qh_name)
             if qh_data is None:
                 continue
             if not qh_data.get("complete", True):
                 predicted_wh = qh_data.get("predicted_wh", 0)
-                seconds_remaining = qh_data.get("remaining_seconds", NBCPeriod.PERIOD_SECS)
+                # Derive seconds_remaining from wall-clock time so it stays
+                # monotonic across cache refreshes even when sample counts
+                # fluctuate due to API delivery latency.
+                now = metrics_data.get("_now")
+                if now is not None:
+                    offset_in_hour = now.second + (now.minute % 15) * 60
+                    current_qh_index = now.minute // 15
+                    if current_qh_index == i:
+                        remaining_seconds = 900 - offset_in_hour
+                    else:
+                        remaining_seconds = qh_data.get(
+                            "remaining_seconds", NBCPeriod.PERIOD_SECS
+                        )
+                else:
+                    remaining_seconds = qh_data.get(
+                        "remaining_seconds", NBCPeriod.PERIOD_SECS
+                    )
                 return {
                     "qh_name": qh_name,
                     "predicted_wh": predicted_wh,
-                    "seconds_remaining": seconds_remaining,
+                    "seconds_remaining": remaining_seconds,
                     "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
                 }
             # Track the last complete QH as a fallback.
             predicted_wh = qh_data.get("predicted_wh", qh_data.get("wh", 0))
-            seconds_remaining = qh_data.get(
-                "remaining_seconds", NBCPeriod.PERIOD_SECS - 1
-            )
+            now = metrics_data.get("_now")
+            if now is not None:
+                remaining_seconds = 900 - (now.second + (now.minute % 15) * 60)
+            else:
+                remaining_seconds = qh_data.get(
+                    "remaining_seconds", NBCPeriod.PERIOD_SECS - 1
+                )
             last_complete = {
                 "qh_name": qh_name,
                 "predicted_wh": predicted_wh,
-                "seconds_remaining": seconds_remaining,
+                "seconds_remaining": remaining_seconds,
                 "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
             }
 

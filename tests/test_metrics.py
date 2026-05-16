@@ -2582,8 +2582,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         cache_start = fixed_now - timedelta(minutes=5)  # 14:05:00
         existing = _make_cache_with_samples(300, cache_start)
 
-        # New samples are entirely before the cache (13:55–14:00)
-        new_start = cache_start - timedelta(minutes=5)
+        # New samples are entirely before the cache (13:59:59–14:04:58)
+        new_start = cache_start - timedelta(seconds=301)
         new_samples = [0.003] * 300
 
         fetcher = self._fetcher_returns(new_start, new_samples)
@@ -3255,6 +3255,67 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         self.assertEqual(len(result.per_second_data), 3600)
         # prev_hour_data should be empty list (error caught, default to [])
         self.assertEqual(result.prev_hour_data, [])
+
+    def test_incremental_merge_appends_data_after_cache_end(self):
+        """Merge correctly appends new samples after cache end."""
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+
+        # Simulate a cache populated with samples starting at a QH boundary.
+        qh_boundary = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        num_existing = 3278  # ~55 minutes of samples
+        existing_samples = [0.01] * num_existing
+
+        def initial_fetch():
+            return {
+                "per_second_data": existing_samples,
+                "data_start": qh_boundary,
+            }
+
+        last_sample_time = qh_boundary + timedelta(seconds=num_existing - 1)
+        now1 = last_sample_time + timedelta(seconds=37)  # 37s after last sample
+
+        cache.get_or_fetch(initial_fetch, now1)
+
+        self.assertEqual(len(cache._samples), num_existing)
+        self.assertEqual(cache._data_start, qh_boundary)
+        self.assertEqual(cache._last_sample_at, last_sample_time)
+
+        # Simulate an incremental fetch where the new data genuinely starts
+        # after the cache end. The data_start is right after the cache end.
+        cache_end_time = qh_boundary + timedelta(seconds=num_existing - 1)
+        new_data_start = cache_end_time + timedelta(seconds=1)
+        num_new = 31
+        new_samples = [0.02] * num_new
+
+        def incremental_fetch():
+            return {
+                "per_second_data": new_samples,
+                "data_start": new_data_start,
+            }
+
+        now2 = now1 + timedelta(seconds=30)
+
+        # Use force=True because now2 is within the 60s TTL — without it the
+        # second call would return cached data and never exercise the merge
+        # logic.
+        cache.get_or_fetch(incremental_fetch, now2, force=True)
+
+        # All genuinely new samples must be appended — none dropped.
+        expected_total = num_existing + num_new
+        self.assertEqual(len(cache._samples), expected_total,
+                         "All new samples must be appended; none should be dropped")
+
+        # The cache's _data_start must remain at its original QH boundary
+        # and must NOT be changed to the API's QH-aligned data_start.
+        self.assertEqual(cache._data_start, qh_boundary,
+                         "_data_start must not be overwritten by the API's "
+                         "QH-aligned data_start during merge")
+
+        # Verify _last_sample_at was updated to include the new samples.
+        expected_last = qh_boundary + timedelta(seconds=expected_total - 1)
+        self.assertEqual(cache._last_sample_at, expected_last)
 
 
 

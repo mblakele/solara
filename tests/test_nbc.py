@@ -779,9 +779,11 @@ class TestComputeClockBoundaryNBCQuarters(unittest.TestCase):
         for qh in ("QH1", "QH2", "QH3", "QH4"):
             self.assertIsNotNone(result[qh])
 
-        # QH1 (09:35–09:50) is incomplete, predicted ~1800 Wh
+        # QH1 (09:35–09:50) is incomplete: only 300 of 900 samples available
+        # raw = 300 * 0.002 * 1000 = 600 Wh, remaining = 29.5s, rate = 0.002
+        # predicted = 600 + 0.002 * 29.5 * 1000 = 1740 Wh
         self.assertFalse(result["QH1"]["complete"])
-        self.assertAlmostEqual(result["QH1"]["wh"], 1800.0, places=1)
+        self.assertAlmostEqual(result["QH1"]["wh"], 1740.0, places=1)
 
         # QH2–QH4 (09:20–09:35, 09:05–09:20, 08:50–09:05) are complete
         for qh in ("QH2", "QH3", "QH4"):
@@ -840,9 +842,11 @@ class TestComputeClockBoundaryNBCQuarters(unittest.TestCase):
         non_none = [v for v in qh_values if isinstance(v, dict)]
         self.assertEqual(len(non_none), 4)
 
-        # QH1 (09:15–09:30) incomplete, predicted ~2700 Wh (0.003 * 900)
+        # QH1 (09:15–09:30) incomplete: only 300 of 900 samples available
+        # raw = 300 * 0.003 * 1000 = 900 Wh, remaining = 570s, rate = 0.003
+        # predicted = 900 + 0.003 * 570 * 1000 = 2610 Wh
         self.assertFalse(result["QH1"]["complete"])
-        self.assertAlmostEqual(result["QH1"]["wh"], 2700.0, places=1)
+        self.assertAlmostEqual(result["QH1"]["wh"], 2610.0, places=1)
 
         # QH2 (09:00–09:15) complete, 0.003 * 900 = 2700 Wh
         self.assertTrue(result["QH2"]["complete"])
@@ -968,7 +972,9 @@ class TestComputeWindowWhPredictedWh(unittest.TestCase):
         from util import _compute_window_wh
 
         data = [0.001] * 900
-        result = _compute_window_wh(data, 0, 899)
+        now = datetime.now().replace(tzinfo=None)
+        win_end = now + timedelta(seconds=900)
+        result = _compute_window_wh(data, 0, 899, win_end, now)
 
         self.assertTrue(result["complete"])
         self.assertIn("predicted_wh", result)
@@ -979,7 +985,9 @@ class TestComputeWindowWhPredictedWh(unittest.TestCase):
         from util import _compute_window_wh
 
         data = [0.002] * 900
-        result = _compute_window_wh(data, 0, 499)
+        now = datetime.now().replace(tzinfo=None)
+        win_end = now + timedelta(seconds=400)
+        result = _compute_window_wh(data, 0, 499, win_end, now)
 
         self.assertFalse(result["complete"])
         self.assertIn("predicted_wh", result)
@@ -989,7 +997,9 @@ class TestComputeWindowWhPredictedWh(unittest.TestCase):
         """Empty data / out-of-order indices must include predicted_wh key."""
         from util import _compute_window_wh
 
-        result = _compute_window_wh([], 500, 400)
+        now = datetime.now().replace(tzinfo=None)
+        win_end = now + timedelta(seconds=0)
+        result = _compute_window_wh([], 500, 400, win_end, now)
 
         self.assertFalse(result["complete"])
         self.assertIn("predicted_wh", result)
@@ -999,7 +1009,9 @@ class TestComputeWindowWhPredictedWh(unittest.TestCase):
         """Zero-length slice must include predicted_wh key."""
         from util import _compute_window_wh
 
-        result = _compute_window_wh([0.001], 100, 99)
+        now = datetime.now().replace(tzinfo=None)
+        win_end = now + timedelta(seconds=0)
+        result = _compute_window_wh([0.001], 100, 99, win_end, now)
 
         self.assertFalse(result["complete"])
         self.assertIn("predicted_wh", result)

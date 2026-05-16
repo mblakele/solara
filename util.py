@@ -45,6 +45,8 @@ class CustomJSONProvider(DefaultJSONProvider):
         return custom_json_default(o)
 
 
+QH_PERIOD_SECONDS = 900
+
 _QH_QUARTERS: list[tuple[str, int, int]] = [
     ("QH1", 0, 899),       # seconds 0-899   (minutes 0-14)
     ("QH2", 900, 1799),    # seconds 900-1799 (minutes 15-29)
@@ -61,6 +63,18 @@ def ceil_to_qh(dt: datetime) -> datetime:
         return truncated
     minutes_to_next = (15 - remainder) % 15 or 15
     return truncated + timedelta(minutes=minutes_to_next)
+
+def qh_seconds_remaining(dt: datetime) -> int:
+    """Calculate seconds remaining in the QH period,
+    using input datetime.
+
+    Args:
+        dt: datetime representing current wall-clock time.
+
+    Returns:
+        Remaining seconds in QH period.
+    """
+    return QH_PERIOD_SECONDS - (dt.second + (dt.minute % 15) * 60)
 
 def compute_nbc_quarters(
     per_second_data: list[float], n: int
@@ -97,7 +111,8 @@ def compute_nbc_quarters(
                 "raw_wh": raw_wh,
             }
         else:
-            remaining_seconds = end_idx + 1 - n
+            remaining_seconds = max(0, end_idx + 1 - n)
+
             obs_start = start_idx
             obs_end = min(n, end_idx + 1)
             raw_values = per_second_data[obs_start:obs_end]
@@ -275,14 +290,14 @@ def compute_clock_boundary_nbc_quarters(
         )
 
         # Compute Wh for this window.
-        result[qh_key] = _compute_window_wh(data, start_idx, end_idx)
+        result[qh_key] = _compute_window_wh(data, start_idx, end_idx, win_end, now)
 
     result["window_labels"] = window_labels
     return result
 
 
 def _compute_window_wh(
-    data: list[float], start_idx: int, end_idx: int
+    data: list[float], start_idx: int, end_idx: int, win_end: datetime, now: datetime
 ) -> dict[str, Any]:
     """Compute Wh for a single 15-minute window from per-second samples.
 
@@ -296,7 +311,7 @@ def _compute_window_wh(
         also include ``predicted_wh``, ``samples_used``, and ``remaining_seconds``.
     """
     expected_length = end_idx - start_idx + 1
-    is_complete = expected_length == 900
+    is_complete = expected_length == QH_PERIOD_SECONDS
 
     if not data or start_idx > end_idx:
         return {
@@ -317,12 +332,13 @@ def _compute_window_wh(
             "predicted_wh": raw_wh,
         }
 
-    # Incomplete window — extrapolate from lookback rate.
-    observed_count = len(slice_data)
-    remaining_seconds = 900 - observed_count
+    # Incomplete window — compute remaining_seconds from wall-clock time
+    # instead of sample count, so it stays monotonic and independent of
+    # API delivery latency.
+    remaining_seconds = max(0, int((win_end - now).total_seconds()))
 
     # Lookback: last 60 seconds of observed data within this window.
-    lookback_size = min(60, observed_count)
+    lookback_size = min(60, len(slice_data))
     lookback_values = slice_data[-lookback_size:] if lookback_size > 0 else []
     rate = (
         sum(lookback_values) / len(lookback_values)

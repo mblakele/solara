@@ -162,8 +162,8 @@ class MetricsMock:
             )
 
         one_min_usage = scales.get("1MIN", {}).get("usage", 0) if "1MIN" in scales else 0
-        seconds_remaining = 3600 - minute_of_hour * 60
-        minute_predicted = seconds_remaining * one_min_usage / 60.0
+        seconds_remaining_hour = 3600 - minute_of_hour * 60
+        minute_predicted = seconds_remaining_hour * one_min_usage / 60.0
         prediction = hour_usage + minute_predicted
 
         return {
@@ -171,7 +171,7 @@ class MetricsMock:
             "lag": timedelta(seconds=2, microseconds=hash(device_name) % 999999),
             "name": device_name,
             "minute_predicted": round(minute_predicted, 14),
-            "minutes_remaining": round(seconds_remaining / 60.0, 14),
+            "minutes_remaining": round(seconds_remaining_hour / 60.0, 14),
             "per_second_data": per_second_data,
             "prediction": round(prediction, 14),
             "prediction_min": round(prediction, 14),
