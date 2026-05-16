@@ -20,6 +20,7 @@ from pyemvue.enums import Scale, Unit
 from util import (
     CustomJSONProvider,
     _QH_QUARTERS,
+    ceil_to_qh,
     compute_nbc_quarters,
     custom_json_default,
     is_debug,
@@ -149,22 +150,17 @@ def _build_incremental_fetch(
     """
 
     def fetcher() -> dict[str, Any] | None:
-        effective_now = now
-
-        if energy_cache._samples is None or len(energy_cache._samples) == 0:
-            start_time = effective_now.replace(minute=0, second=0, microsecond=0)
+        if energy_cache._data_start is None or energy_cache._samples is None or len(energy_cache._samples) == 0:
+            start_time = ceil_to_qh(now)
         else:
-            if energy_cache._data_start is None:
-                start_time = effective_now.replace(minute=0, second=0, microsecond=0)
-            else:
-                last_sample_idx = len(energy_cache._samples)
-                start_time = energy_cache._data_start + timedelta(seconds=last_sample_idx)
+            last_sample_idx = len(energy_cache._samples)
+            start_time = energy_cache._data_start + timedelta(seconds=last_sample_idx)
 
         try:
             usage_data, data_start = vue.get_chart_usage(
                 device_gid,
                 start_time,
-                effective_now,
+                now,
                 scale=Scale.SECOND.value,
                 unit=Unit.KWH.value,
             )
@@ -343,9 +339,8 @@ class EnergyCache:
                     else:
                         self._data_start = result["data_start"]
 
-                # Prune old samples older than 3600s from now.
                 if self._samples:
-                    cutoff = now - timedelta(seconds=3600)
+                    cutoff = ceil_to_qh(now - timedelta(seconds=3600))
                     # Determine the time of each sample to know which are old.
                     if self._data_start is not None:
                         # Compute how many samples are before the cutoff.
@@ -385,8 +380,9 @@ class EnergyCache:
 
                 if psd:
                     logger.debug(
-                        "EnergyCache fetched %d data points (cache now has %d samples)",
+                        "EnergyCache fetched %d data points (%s: %d samples)",
                         len(psd),
+                        self._data_start,
                         len(self._samples or []),
                     )
 
@@ -461,153 +457,57 @@ class EnergyCache:
         with self._lock:
             samples = self._samples
 
-        if samples is None or len(samples) == 0:
+        if samples is None:
             return None
 
+        samples_len = len(samples)
+        if samples_len == 0:
+            return None
+
+        # Required: data_start present and aligned to a QH boundary
         assert(self._data_start is not None)
-        data_start = self._data_start
+        assert(self._data_start == ceil_to_qh(self._data_start))
 
-        # Time-based metrics for QH detection and seconds_remaining.
-        # seconds_into_hour from data_start reflects sample position.
-        seconds_into_hour = int((now - data_start).total_seconds())
-        # wall_clock_seconds from now reflects the QH position within
-        # the current hour — used as an override when now spans into a
-        # different hour than data_start.
-        wall_clock_seconds = now.second + now.minute * 60
-
-        # Determine which QH to report and its associated seconds.
-        #
-        # seconds_into_hour can exceed 3600 when now is in a different
-        # hour than data_start (e.g. data from 12:00, now at 13:10).
-        # It can also be <3600 but still span an hour boundary
-        # (e.g. data from 6:21, now at 7:08 → 2800 samples).
-        # In either case, wall-clock position within the current hour
-        # tells us the correct QH.  When the two agree (same hour),
-        # seconds_into_hour is authoritative.
-        cross_hour = data_start.hour != now.hour
-        if seconds_into_hour >= 3600 or cross_hour:
-            # Data spans across an hour boundary.  Use wall-clock
-            # position within the current hour.  If we're exactly at
-            # the top of an hour (wall_clock_seconds == 0) and samples
-            # show a full hour of data, treat all quarters as complete.
-            if wall_clock_seconds == 0 and len(samples) >= 3600:
-                # Top of the hour with one full hour of data — all
-                # quarters complete.  Use 3600 so the wall-clock
-                # completion check passes for QH4 (3600 >= 3600).
-                chosen_qh = "QH4"
-                chosen_secs = 3600
-            else:
-                # Use wall-clock seconds to determine the current QH.
-                chosen_secs = wall_clock_seconds
-                for qh_name, b_start, b_end in _QH_QUARTERS:
-                    if b_start <= chosen_secs <= b_end:
-                        chosen_qh = qh_name
-                        break
-                else:
-                    # wall_clock_seconds == 0 but samples aren't
-                    # complete — still use wall-clock (QH1 with 900s).
-                    chosen_qh = "QH1"
-                    chosen_secs = chosen_secs
-        else:
-            # Same hour — seconds_into_hour matches wall-clock position.
-            chosen_secs = seconds_into_hour
-            for qh_name, b_start, b_end in _QH_QUARTERS:
-                if b_start <= chosen_secs <= b_end:
-                    chosen_qh = qh_name
-                    break
-            else:
-                # At the very top of the hour (seconds_into_hour == 0).
-                chosen_qh = "QH1"
-                chosen_secs = 0
-
-        # Compute NBC quarters from samples.  When data spans an hour
-        # boundary, reorganize samples to match wall-clock quarters so
-        # that ``compute_nbc_quarters`` can produce correct predictions.
-        if cross_hour:
-            # Map each sample to its wall-clock QH based on its offset
-            # from data_start, then reorganize into wall-clock order.
-            reorg: list[float] = []
-            for s in samples:
-                sample_wall_sec = (
-                    data_start.second
-                    + data_start.minute * 60
-                    + len(reorg)
-                ) % 3600
-                for qh_name, b_start, b_end in _QH_QUARTERS:
-                    if b_start <= sample_wall_sec <= b_end:
-                        reorg.append(s)
-                        break
-            # Compute n: samples from the start of the current QH.
-            for qh_name, b_start, b_end in _QH_QUARTERS:
-                if b_start <= chosen_secs <= b_end:
-                    n = min(chosen_secs - b_start, len(reorg))
-                    break
-            else:
-                n = 0
-            # Compute NBC quarters from reorganized samples.
-            nbc = compute_nbc_quarters(reorg, n)
-        else:
-            # Find the QH boundary at or after data_start so we can align
-            # sample indices with the quarter-hour grid that
-            # ``compute_nbc_quarters`` expects.  ``n`` must represent the
-            # number of sample-seconds consumed from that QH boundary;
-            # quarters before the boundary that have no data are simply
-            # skipped by ``compute_nbc_quarters`` when ``n`` is offset.
-            boundary_offset = 0
-            for _qh_name, b_start, b_end in _QH_QUARTERS:
-                if data_start.second + data_start.minute * 60 >= b_start:
-                    boundary_offset = b_start
-                    break
-
-            # Adjust n so it is measured from the QH boundary, not from
-            # data_start.  This keeps the quarter indices correct when
-            # ``data_start`` is offset from the nearest QH boundary.
-            n = min(seconds_into_hour - boundary_offset, len(samples))
-
-            # Compute NBC quarters from raw samples.
-            nbc = compute_nbc_quarters(samples, n)
-
-        # Pre-compute QH end indices and ordering for the loop below.
+        # Determine the current QH from wall-clock time.
+        minutes_in_hour = now.minute
+        wall_clock_qh_index = minutes_in_hour // 15  # 0-3
         qh_order = ["QH1", "QH2", "QH3", "QH4"]
-        qh_ends = {name: end for name, _, end in _QH_QUARTERS}
+        current_qh = qh_order[wall_clock_qh_index]
 
-        # Find the first incomplete QH.
-        for qh_name in qh_order:
-            qh_data = nbc.get(qh_name)
-            if qh_data is None:
-                continue
+        # Offset: which QH index does data_start correspond to in wall-clock terms.
+        data_start_qh_index = int(self._data_start.minute) // 15
 
-            is_complete = qh_data.get("complete", True)
-            # Check whether wall-clock time says this QH has truly ended.
-            # Uses the chosen time source (which resolves cross-hour
-            # ambiguity between sample position and wall-clock).
-            wall_clock_complete = chosen_secs >= qh_ends[qh_name] + 1
+        # Map current wall-clock QH to nbc dict index (relative to data_start).
+        nbc_qh_index = (wall_clock_qh_index - data_start_qh_index) % 4
+        nbc_qh = qh_order[nbc_qh_index]
 
-            if not is_complete or not wall_clock_complete:
-                # Derive seconds_remaining from wall-clock time so it
-                # decreases monotonically regardless of cache population.
-                seconds_remaining = qh_ends[qh_name] + 1 - chosen_secs
-                # Clamp to zero so a QH that just completed shows 0.
-                seconds_remaining = max(0, seconds_remaining)
-                return {
-                    "qh_name": qh_name,
-                    "predicted_wh": qh_data.get("predicted_wh", 0),
-                    "seconds_remaining": seconds_remaining,
-                    "data_start": data_start,
-                }
+        # Seconds elapsed since data_start within the current QH window.
+        seconds_elapsed = int((now - self._data_start).total_seconds())
+        seconds_in_current_qh = seconds_elapsed % 900
 
-        # All quarters complete — return the last one.
-        for qh_name in reversed(qh_order):
-            qh_data = nbc.get(qh_name)
-            if qh_data is not None and qh_data.get("complete", False):
-                return {
-                    "qh_name": qh_name,
-                    "predicted_wh": qh_data.get("wh", 0),
-                    "seconds_remaining": 0,
-                    "data_start": data_start,
-                }
+        nbc = compute_nbc_quarters(samples, samples_len)
 
-        return None
+        # If all four quarters have complete data, return QH4.
+        has_all_qh = all(nbc.get(qh) for qh in qh_order)
+        if has_all_qh:
+            qh4_data = nbc["QH4"]
+            return {
+                "qh_name": "QH4",
+                "predicted_wh": qh4_data.get("predicted_wh", qh4_data.get("wh", 0)),
+                "seconds_remaining": 0,
+                "data_start": self._data_start,
+            }
+
+        # Return the incomplete (current) QH with wall-clock-based seconds_remaining.
+        qh_data = nbc.get(nbc_qh) or {}
+        seconds_remaining = 900 - seconds_in_current_qh
+        return {
+            "qh_name": current_qh,
+            "predicted_wh": qh_data.get("predicted_wh", qh_data.get("wh", 0)),
+            "seconds_remaining": seconds_remaining,
+            "data_start": self._data_start,
+        }
+
 
     def invalidate(self) -> None:
         """Clear the cache."""
@@ -786,9 +686,11 @@ class HourlyProjection(MetricsBase):
         """Fetch recent data using second granularity to minimize lag.
 
         The caller must compute chart_start. On the first call, use
-        now - 3600 seconds for a full hour of historical data. On
-        subsequent calls, use the most recent sample timestamp from
-        EnergyCache to fetch only incremental new data.
+        now - 3600 seconds, aligned to QH boundary, for up to a full hour
+        of historical data. On subsequent calls, use the most recent sample
+        timestamp from EnergyCache to fetch only incremental new data.
+
+        Evict older data so that the cache contains at most 3600 samples.
 
         Args:
             chart_start: Start of the fetch window (inclusive). Must be a

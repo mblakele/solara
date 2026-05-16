@@ -53,6 +53,15 @@ _QH_QUARTERS: list[tuple[str, int, int]] = [
 ]
 
 
+def ceil_to_qh(dt: datetime) -> datetime:
+    """Return dt advanced to the next quarter-hour boundary, or unchanged if already on one."""
+    truncated = dt.replace(second=0, microsecond=0)
+    remainder = truncated.minute % 15
+    if remainder == 0 and dt == truncated:
+        return truncated
+    minutes_to_next = (15 - remainder) % 15 or 15
+    return truncated + timedelta(minutes=minutes_to_next)
+
 def compute_nbc_quarters(
     per_second_data: list[float], n: int
 ) -> dict[str, Any]:

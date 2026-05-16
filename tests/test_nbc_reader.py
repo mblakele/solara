@@ -106,8 +106,17 @@ def test_get_current_qh_returns_none_when_cache_invalid():
 def test_get_current_qh_returns_tuple_from_cached_samples():
     """get_current_qh extracts QH prediction from cached per-second samples."""
     now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
-    # 1200 samples = ~20 minutes of data, covering QH2 (seconds 900-1799).
-    cache = _make_energy_cache(sample_count=1200, value=-0.001, now=now)
+    # QH2 (15:15-15:30). data_start aligned to QH1 boundary 15:00:00.
+    # 1200 samples covers 15:00:00 to 15:20:00.
+    # wall_clock QH=1 (QH2), data_start QH=0 (QH1), nbc_qh_index=(1-0)%4=1 → QH2 (incomplete).
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
+        cache._last_sample_at = now - timedelta(seconds=1)
+        cache._sample_count = 1200
+        cache._last_fetch_at = now
     reader = NBCReader(energy_cache=cache)
 
     result = reader.get_current_qh(now=now)
@@ -152,7 +161,15 @@ def test_get_current_qh_returns_correct_qh_for_minute_40():
 def test_get_current_qh_returns_data_point_at_from_cache():
     """get_current_qh returns the data_point_at timestamp from EnergyCache."""
     now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
-    cache = _make_energy_cache(sample_count=1200, value=-0.001, now=now)
+    # data_start aligned to QH boundary 15:15:00 (QH3 start)
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache._last_sample_at = now - timedelta(seconds=1)
+        cache._sample_count = 1200
+        cache._last_fetch_at = now
     reader = NBCReader(energy_cache=cache)
 
     _, _, _, data_point_at = reader.get_current_qh(now=now)
@@ -163,7 +180,15 @@ def test_get_current_qh_returns_data_point_at_from_cache():
 def test_get_current_qh_with_positive_samples():
     """get_current_qh handles positive (consumption) samples correctly."""
     now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
-    cache = _make_energy_cache(sample_count=1200, value=0.001, now=now)
+    # data_start aligned to QH boundary 15:15:00 (QH2 start)
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [0.001] * 1200
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache._last_sample_at = now - timedelta(seconds=1)
+        cache._sample_count = 1200
+        cache._last_fetch_at = now
     reader = NBCReader(energy_cache=cache)
 
     result = reader.get_current_qh(now=now)
@@ -177,7 +202,15 @@ def test_get_current_qh_with_positive_samples():
 def test_get_current_qh_force_true_triggers_refetch():
     """force=True bypasses cache and triggers a fresh fetch via metrics_fetch."""
     fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
-    cache = _make_energy_cache(sample_count=1200, value=-0.001, now=fixed_now)
+    # data_start aligned to QH boundary 15:15:00 (QH3 start)
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache._last_sample_at = fixed_now - timedelta(seconds=1)
+        cache._sample_count = 1200
+        cache._last_fetch_at = fixed_now
     reader = NBCReader(energy_cache=cache)
 
     fetch_count = 0
@@ -216,7 +249,15 @@ def test_get_current_qh_force_true_triggers_refetch():
 def test_get_current_qh_force_true_without_fetch_callable():
     """force=True without metrics_fetch falls back to reading from cache."""
     fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
-    cache = _make_energy_cache(sample_count=1200, value=-0.001, now=fixed_now)
+    # data_start aligned to QH boundary 15:15:00 (QH3 start)
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache._last_sample_at = fixed_now - timedelta(seconds=1)
+        cache._sample_count = 1200
+        cache._last_fetch_at = fixed_now
     reader = NBCReader(energy_cache=cache)
 
     # No metrics_fetch set. force=True should still read from cache.

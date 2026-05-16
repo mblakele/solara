@@ -40,7 +40,7 @@ from metrics import (
     RetryableMetricsException,
 )
 from mockdata import MetricsMock
-from util import CustomJSONProvider, is_debug
+from util import CustomJSONProvider, ceil_to_qh, is_debug
 
 # Module-level lock for thread-safe first-call detection on _create_metrics.
 _create_metrics_lock = threading.Lock()
@@ -60,11 +60,11 @@ def _create_metrics(now: datetime, logger: logging.Logger) -> dict[str, Any] | N
     Returns:
         Metrics dict from HourlyProjection, or None on failure.
     """
-    # First call: fetch entire previous hour.
+    # First call: fetch up to four QH periods.
     # Subsequent calls: fetch incremental data from the last sample timestamp.
     logger.debug("_create_metrics: last_sample_at %s", _energy_cache.last_sample_at)
     chart_start = (
-        now - timedelta(seconds=3600)
+        ceil_to_qh(now - timedelta(seconds=3600))
         if _energy_cache.last_sample_at is None
         else _energy_cache.last_sample_at
     )
@@ -274,6 +274,8 @@ def index() -> ResponseReturnValue:
     # Determine whether to use mock or real data
     is_mock = _cfg.is_mock_mode
 
+    now = datetime.now(timezone.utc)
+
     if is_mock:
         # Mock mode: use MetricsMock for deterministic test data
         instant_minute_str = request.args.get("instant_minute")
@@ -288,7 +290,8 @@ def index() -> ResponseReturnValue:
     else:
         # Real mode: use cached metrics to avoid hammering the API
         metrics_data, was_fresh = _energy_cache.get_or_fetch(
-            lambda: _create_metrics(datetime.now(pytz.timezone(_cfg.timezone)), logger)
+            lambda: _create_metrics(datetime.now(pytz.timezone(_cfg.timezone)), logger),
+            now
         )
         if was_fresh:
             logger.debug("Fetched fresh metrics for index endpoint")
@@ -300,7 +303,7 @@ def index() -> ResponseReturnValue:
     # continued aging, so we add elapsed seconds to keep the display fresh.
     fetched_at = metrics_data.get("_fetched_at")
     if fetched_at is not None:
-        elapsed = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+        elapsed = (now - fetched_at).total_seconds()
         for d in metrics_data.get("devices", []):
             cached_lag = d.get("lag", timedelta(0))
             d["lag"] = timedelta(seconds=cached_lag.total_seconds() + elapsed)
@@ -434,8 +437,10 @@ def _get_load_manager():
                 from load_manager import LoadManager
 
                 def metrics_fetch():
+                    now = datetime.now(timezone.utc)
                     return _energy_cache.get_or_fetch(
-                        lambda: _create_metrics(datetime.now(pytz.timezone(_cfg.timezone)), logger)
+                        lambda: _create_metrics(datetime.now(pytz.timezone(_cfg.timezone)), logger),
+                        now
                     )[0]
 
                 _load_manager = LoadManager(

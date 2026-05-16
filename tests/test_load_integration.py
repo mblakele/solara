@@ -49,12 +49,19 @@ def _make_energy_cache_with_prediction(
         EnergyCache with ~2800 samples backfilled from ``now``.
     """
     sample_value = predicted_wh / 900_000.0
-    sample_count = 2800  # QH3 is about halfway through the hour
+
+    # Align data_start to the previous QH boundary so ceil_to_qh(data_start) == data_start.
+    # qh_minute floors to 0, 15, 30, or 45 — the start of the current QH window.
+    # Subtract 15 minutes to land on the previous boundary (also QH-aligned).
+    qh_minute = (now.minute // 15) * 15
+    data_start = now.replace(minute=qh_minute, second=0, microsecond=0) - timedelta(minutes=15)
+    sample_count = int((now - data_start).total_seconds())
+
     cache = EnergyCache(ttl_seconds=30)
     samples = [sample_value] * sample_count
     with cache._lock:
         cache._samples = samples
-        cache._data_start = now - timedelta(seconds=sample_count)
+        cache._data_start = data_start
         cache._last_sample_at = now - timedelta(seconds=1)
         cache._sample_count = sample_count
         cache._last_fetch_at = now - timedelta(seconds=fetch_offset_secs)
@@ -225,7 +232,7 @@ def _make_tesla_manager(
 
 def test_turns_on_plugs_in_priority_order():
     """Excess solar: turns on plugs in priority order."""
-    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc) # 07:08:00
 
     # in priority order:
     # p200 pool pump turns on
