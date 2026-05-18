@@ -7,6 +7,11 @@
 {% elif load_management.last_cycle_result and load_management.last_cycle_result.sleep_hint is defined %}
 <meta id="sleep-hint" data-value="{{ load_management.last_cycle_result.sleep_hint }}">
 {% endif %}
+{% if load_management and load_management.sleep_hint_at is defined %}
+<meta id="sleep-hint-at" data-value="{{ load_management.sleep_hint_at }}">
+{% elif load_management.last_cycle_result and load_management.last_cycle_result.sleep_hint_at is defined %}
+<meta id="sleep-hint-at" data-value="{{ load_management.last_cycle_result.sleep_hint_at }}">
+{% endif %}
 <style>
   div.metrics {
       font-size: 4em;
@@ -139,10 +144,24 @@
 <script>
   var timePrev = Date.now()
   var sleepHintEl = document.getElementById('sleep-hint')
+  var sleepHintAtEl = document.getElementById('sleep-hint-at')
   var defaultMax = 2 * 60 * 1000  // 2 minutes — fallback
   var millisMax = sleepHintEl
     ? Math.max(15 * 1000, (parseFloat(sleepHintEl.dataset.value) || 0) * 1000)
     : defaultMax
+
+  // Validate freshness: if the hint was computed long ago, it may be stale.
+  if (sleepHintAtEl) {
+    var hintAt = new Date(sleepHintAtEl.dataset.value).getTime()
+    var hintAge = Date.now() - hintAt
+    // Stale threshold: 2x the hint value. If the hint is older than this,
+    // the sleep hint is unreliable — fall back to a short timeout.
+    if (hintAge > millisMax) {
+      console.log('sleep hint stale (age=%dms), using 15s fallback', hintAge)
+      millisMax = 15 * 1000  // 15 seconds
+    }
+  }
+
   var timestamp = function() {
     return new Date(Date.now()).toLocaleTimeString()
   }

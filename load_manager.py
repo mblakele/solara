@@ -406,14 +406,6 @@ class LoadManager:
         current_time = now_local.time()
 
         in_range = start_time <= current_time < end_time
-        if not in_range:
-            logger.debug(
-                "%s outside time range (%s-%s), current %s",
-                device_name,
-                start_time.strftime("%H:%M"),
-                end_time.strftime("%H:%M"),
-                current_time.strftime("%H:%M"),
-            )
         return in_range
 
     def _build_candidate_details(
@@ -822,9 +814,16 @@ class LoadManager:
 
         # Filter plugs by per-device time range: only eligible plugs reach the engine.
         eligible_plugs: dict[str, PlugConfig] = {}
+        outside_range: list[str] = []
         for name, plug in self.plugs.items():
             if self._is_device_in_time_range(now, name, plug.time_range):
                 eligible_plugs[name] = plug
+            else:
+                outside_range.append(name)
+
+        # Log which devices were filtered out by time range (once per cycle).
+        if outside_range:
+            logger.debug("Outside time range: %s", ", ".join(outside_range))
 
         # Tesla is only a candidate if within its time range.
         eligible_tesla: TeslaState | None = tesla_state
@@ -1070,6 +1069,7 @@ class LoadManager:
                         "plugs_configured": plugs_configured,
                     },
                     "sleep_hint": self.config_interval_secs,
+                    "sleep_hint_at": now.isoformat(),
                 }
 
             # ── Stage 2: NBC fetch ─────────────────────────────────────────
@@ -1090,6 +1090,7 @@ class LoadManager:
                         "plugs_configured": plugs_configured,
                     },
                     "sleep_hint": 5.0,
+                    "sleep_hint_at": now.isoformat(),
                 }
             (
                 qh_name,
@@ -1109,6 +1110,7 @@ class LoadManager:
                     now_postfetch, data_point_at, seconds_remaining
                 )
                 if early is not None:
+                    early["sleep_hint_at"] = now_postfetch.isoformat()
                     return early
 
             # ── Stage 4: accept fresh data, compute gap ────────────────────
@@ -1198,6 +1200,7 @@ class LoadManager:
                         "plugs_configured": plugs_configured,
                     },
                     "sleep_hint": self.config_interval_secs,
+                    "sleep_hint_at": now_postfetch.isoformat(),
                 }
 
             candidate_details = self._build_candidate_details(
@@ -1234,6 +1237,7 @@ class LoadManager:
                     "plugs_configured": plugs_configured,
                 },
                 "sleep_hint": self.config_interval_secs,
+                "sleep_hint_at": now_postfetch.isoformat(),
             }
 
     async def _execute_action(self, action: PendingEffect) -> bool:

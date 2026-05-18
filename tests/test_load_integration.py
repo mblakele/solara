@@ -1917,3 +1917,140 @@ class TestAdaptiveSleep:
         # No status → falls through to predicted_wh check.
         # predicted_wh=0 >= target=-500 → no deficit path, early QH (450s > 300)
         assert hint == 45.0  # config_interval * 1.5 (early in QH)
+
+    # --- sleep_hint_at tests ---
+
+    def test_run_cycle_includes_sleep_hint_at(self):
+        """run_cycle() returns sleep_hint_at in the result dict."""
+        lm = self._make_manager(interval=30)
+        result = lm.run_cycle(force=True)
+        assert "sleep_hint_at" in result
+
+    def test_disabled_run_cycle_includes_sleep_hint_at(self):
+        """Disabled run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
+        mock_cfg = MagicMock()
+        mock_cfg.load_manage_enabled = False
+
+        with patch("load_manager._cfg", mock_cfg):
+            lm = self._make_manager(interval=30)
+
+        result = lm.run_cycle()
+        assert result["status"] == "disabled"
+        assert "sleep_hint_at" in result
+        # Should be a valid ISO 8601 string that parses to a UTC datetime
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(result["sleep_hint_at"])
+        assert parsed.tzinfo is not None
+
+    def test_stale_data_run_cycle_includes_sleep_hint_at(self):
+        """Stale data run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
+        now = datetime.now(timezone.utc)
+        data_point_at = now - timedelta(seconds=200)  # >120s old → stale
+
+        class StaleQHReader:
+            """Mock NBC reader that returns data 200 seconds old."""
+
+            def get_current_qh(self, force=False, now=None):
+                return ("QH3", -1000.0, 600, data_point_at)
+
+        lm = LoadManager(
+            metrics_fetch=lambda: None,
+            plug_ctrl=PlugController({}),
+            tesla_ctrl=TeslaController(
+                TeslaConfig(
+                    client_id="test-id",
+                    client_secret="test-secret",
+                    redirect_uri="http://localhost/callback",
+                    vehicle_id="vehicle-123",
+                    home_lat=37.0,
+                    home_lon=-122.0,
+                    home_radius_m=500,
+                )
+            ),
+            target_wh=-500,
+            config_interval_secs=30,
+        )
+        lm.nbc_reader = StaleQHReader()
+        lm.enabled = True
+
+        lm.state.pending_effects = [PendingEffect(
+            device_name="test",
+            action="turn_on",
+            target_amps=None,
+            power_delta_wh=100.0,
+            timestamp=data_point_at - timedelta(seconds=30),
+            data_point_at=data_point_at - timedelta(seconds=50),
+        )]
+
+        result = lm.run_cycle()
+        assert result["status"] == "stale_data"
+        assert "sleep_hint_at" in result
+        parsed = datetime.fromisoformat(result["sleep_hint_at"])
+        assert parsed.tzinfo is not None
+
+    def test_no_incomplete_qh_run_cycle_includes_sleep_hint_at(self):
+        """No incomplete QH run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
+        lm = self._make_manager(interval=30)
+        result = lm.run_cycle(force=True)
+        assert "sleep_hint_at" in result
+        parsed = datetime.fromisoformat(result["sleep_hint_at"])
+        assert parsed.tzinfo is not None
+
+    def test_waiting_for_fresh_data_run_cycle_includes_sleep_hint_at(self):
+        """Waiting for fresh data run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
+        now = datetime.now(timezone.utc)
+        data_point_at = now - timedelta(seconds=30)
+
+        class PendingQHReader:
+            """Mock NBC reader where pending effects exist since the data point."""
+
+            def get_current_qh(self, force=False, now=None):
+                return ("QH2", -800.0, 450, data_point_at)
+
+        lm = LoadManager(
+            metrics_fetch=lambda: None,
+            plug_ctrl=PlugController({}),
+            tesla_ctrl=TeslaController(
+                TeslaConfig(
+                    client_id="test-id",
+                    client_secret="test-secret",
+                    redirect_uri="http://localhost/callback",
+                    vehicle_id="vehicle-123",
+                    home_lat=37.0,
+                    home_lon=-122.0,
+                    home_radius_m=500,
+                )
+            ),
+            target_wh=-500,
+            config_interval_secs=30,
+        )
+        lm.nbc_reader = PendingQHReader()
+        lm.enabled = True
+
+        # Add a pending effect *after* the data point so we hit waiting_for_fresh_data
+        lm.state.pending_effects = [PendingEffect(
+            device_name="test",
+            action="turn_on",
+            target_amps=None,
+            power_delta_wh=50.0,
+            timestamp=data_point_at + timedelta(seconds=5),
+            data_point_at=data_point_at + timedelta(seconds=5),
+        )]
+
+        result = lm.run_cycle()
+        assert result["status"] == "waiting_for_fresh_data"
+        assert "sleep_hint_at" in result
+        parsed = datetime.fromisoformat(result["sleep_hint_at"])
+        assert parsed.tzinfo is not None
+
+    def test_sleep_hint_at_is_recent(self):
+        """sleep_hint_at should be within a few seconds of datetime.now(timezone.utc)."""
+        lm = self._make_manager(interval=30)
+        before = datetime.now(timezone.utc)
+        result = lm.run_cycle(force=True)
+        after = datetime.now(timezone.utc)
+
+        hint_at = datetime.fromisoformat(result["sleep_hint_at"])
+        assert hint_at >= before - timedelta(seconds=2)
+        assert hint_at <= after + timedelta(seconds=2)

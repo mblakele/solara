@@ -372,6 +372,7 @@ class TestLoadManagementEndpoints(unittest.TestCase):
                 "plugs_configured": 0,
             },
             "sleep_hint": 30.0,
+            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
         }
         with patch("app._get_load_manager", return_value=mock_lm):
             response = self.app.post("/api/v1/load/manage")
@@ -411,6 +412,7 @@ class TestLoadManagementEndpoints(unittest.TestCase):
                 "plugs_configured": 0,
             },
             "sleep_hint": 30.0,
+            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
         }
 
         with mock_config():
@@ -444,6 +446,7 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             "target_wh": -500,
             "actions": [],
             "sleep_hint": 30.0,
+            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
         }
 
         with mock_config():
@@ -526,6 +529,162 @@ class TestLoadManagementEndpoints(unittest.TestCase):
                 "plugs_configured": 0,
             },
             # No sleep_hint — should not cause a template error
+        }
+        mock_lm.run_cycle.return_value = mock_result
+
+        with mock_config():
+            dc_config.set("LOAD_MANAGE_ENABLED", "True")
+            import app as app_mod
+
+            app_mod._load_manager = mock_lm
+            app_mod._load_manager_init_failed = False
+            app_mod._last_cycle_result = mock_result
+            response = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_index_json_includes_sleep_hint_at(self):
+        """Index JSON loadManagement includes sleepHintAt timestamp."""
+        from datetime import datetime
+
+        from decouple import config as dc_config
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.dry_run = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_lm.state.to_dict.return_value = {}
+        mock_lm.config_interval_secs = 30
+        mock_lm.run_cycle.return_value = {
+            "status": "ok",
+            "predicted_wh": -800,
+            "target_wh": -500,
+            "actions": [],
+            "sleep_hint": 30.0,
+            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+        }
+
+        with mock_config():
+            dc_config.set("LOAD_MANAGE_ENABLED", "True")
+            import app as app_mod
+
+            app_mod._load_manager = mock_lm
+            app_mod._load_manager_init_failed = False
+            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            response = self.app.get("/", headers={"Accept": "application/json"})
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn("loadManagement", data)
+        self.assertIn("sleepHintAt", data["loadManagement"])
+        self.assertEqual(data["loadManagement"]["sleepHintAt"], "2025-01-15T12:00:00+00:00")
+        # Verify it parses as a valid datetime
+        parsed = datetime.fromisoformat(data["loadManagement"]["sleepHintAt"])
+        self.assertIsNotNone(parsed.tzinfo)
+
+    def test_index_html_includes_sleep_hint_at_meta(self):
+        """Index HTML includes a meta tag with the sleep_hint_at value for JS."""
+        from decouple import config as dc_config
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.dry_run = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_lm.state.to_dict.return_value = {}
+        mock_lm.config_interval_secs = 30
+        mock_lm.run_cycle.return_value = {
+            "status": "ok",
+            "predicted_wh": -800,
+            "target_wh": -500,
+            "actions": [],
+            "sleep_hint": 30.0,
+            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+        }
+
+        with mock_config():
+            dc_config.set("LOAD_MANAGE_ENABLED", "True")
+            import app as app_mod
+
+            app_mod._load_manager = mock_lm
+            app_mod._load_manager_init_failed = False
+            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            response = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('id="sleep-hint-at"', html)
+        self.assertIn('data-value="2025-01-15T12:00:00+00:00"', html)
+
+    def test_index_json_missing_sleep_hint_at_no_crash(self):
+        """Index JSON handles missing sleepHintAt gracefully."""
+        from decouple import config as dc_config
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.dry_run = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_lm.state.to_dict.return_value = {}
+        mock_lm.config_interval_secs = 30
+        # No sleep_hint_at in the result
+        mock_lm.run_cycle.return_value = {
+            "status": "ok",
+            "predicted_wh": -800,
+            "target_wh": -500,
+            "actions": [],
+            "sleep_hint": 30.0,
+        }
+
+        with mock_config():
+            dc_config.set("LOAD_MANAGE_ENABLED", "True")
+            import app as app_mod
+
+            app_mod._load_manager = mock_lm
+            app_mod._load_manager_init_failed = False
+            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            response = self.app.get("/", headers={"Accept": "application/json"})
+
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        self.assertIn("loadManagement", data)
+        self.assertIn("sleepHintAt", data["loadManagement"])
+        self.assertIsNone(data["loadManagement"]["sleepHintAt"])
+
+    def test_index_html_missing_sleep_hint_at_no_crash(self):
+        """Index HTML handles missing sleep_hint_at without crashing."""
+        from decouple import config as dc_config
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.dry_run = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_lm.state.to_dict.return_value = {}
+        mock_lm.config_interval_secs = 30
+        mock_result = {
+            "status": "ok",
+            "qh": "QH1",
+            "predicted_wh": -800,
+            "adjusted_wh": -750,
+            "target_wh": -500,
+            "actions": [],
+            "diagnostics": {
+                "gap_wh": -300,
+                "hysteresis_wh": 50,
+                "seconds_remaining": 45,
+                "reason": "ok",
+                "pending_effects_count": 0,
+                "candidates": [],
+                "tesla_configured": False,
+                "tesla_state": None,
+                "tesla_error": None,
+                "tesla_login_url": None,
+                "plugs_configured": 0,
+            },
+            "sleep_hint": 30.0,
+            # No sleep_hint_at — should not cause a template error
         }
         mock_lm.run_cycle.return_value = mock_result
 
