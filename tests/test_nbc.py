@@ -15,7 +15,8 @@ Covers:
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytz
 
@@ -44,6 +45,7 @@ class _NBCFixture(HourlyProjection):
             device_tz = get_timezone()
         self.instant = instant_utc
         self.device_info: dict = {"time_zone": device_tz}
+        self.logger: Any = MagicMock()
 
 
 def _make_data(seconds_count: int, value: float) -> list:

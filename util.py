@@ -73,20 +73,20 @@ def qh_seconds_remaining(dt: datetime) -> int:
 
 def compute_nbc_quarter(
     values: list[float]
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Compute NBC metrics for a single quarter-hour period from per-second kWh data.
 
     Args:
         values: Up to 900 per-second kWh values for a single QH period.
     """
-    if values == None:
+    if values is None:
         return None
 
     values_len = len(values)
     if values_len < 1:
         return None
 
-    assert(values_len <= QH_PERIOD_SECONDS)
+    assert values_len <= QH_PERIOD_SECONDS
 
     is_complete = values_len == QH_PERIOD_SECONDS
     raw_wh = sum(values) * 1000
@@ -123,12 +123,11 @@ def compute_nbc_quarters(values: list[float]) -> dict[str, Any]:
         quarter has not yet started.
     """
     result: dict[str, Any] = {}
-    results = []
     values_len = len(values)
-    assert(values_len <= 3600)
+    assert values_len <= 3600
 
     incomplete_len = values_len % QH_PERIOD_SECONDS
-    names_remaining = QH_NAMES        
+    names_remaining = QH_NAMES
 
     # By definition, incomplete data is always in the most recent QH period.
     if incomplete_len > 0:

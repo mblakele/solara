@@ -71,7 +71,7 @@ def _create_metrics(now: datetime, logger: logging.Logger) -> dict[str, Any] | N
         else _energy_cache.last_sample_at
     )
 
-    hp = HourlyProjection(now, logger)
+    hp = HourlyProjection(now, logger, _energy_cache)
     hp.populate(chart_start)
     return hp.metrics
 

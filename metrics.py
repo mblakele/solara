@@ -690,6 +690,7 @@ class HourlyProjection(MetricsBase):
         self,
         instant: datetime,
         logger_next: Optional[logging.Logger] = None,
+        energy_cache: Optional["EnergyCache"] = None,
     ) -> None:
         self.metrics: dict[str, Any] = {
             "api_response": {},
@@ -701,6 +702,7 @@ class HourlyProjection(MetricsBase):
 
         self.instant = instant
         self.metrics["instant"] = self.instant
+        self.energy_cache = energy_cache  # Merged samples for NBC computation
 
     def populate(self, chart_start: datetime) -> dict[int, dict[str, Any]]:
         """Fetch recent data using second granularity to minimize lag.
@@ -721,7 +723,7 @@ class HourlyProjection(MetricsBase):
         """
         self.logger.debug("populate from %s", chart_start)
         # Fetch usage data without mutating device_info
-        population = self.populate_internal(chart_start)
+        population = self.populate_internal(chart_start, self.energy_cache)
 
         self.metrics["api_response"]["total"] = sum(
             self.metrics["api_response"].values(), timedelta()
@@ -829,7 +831,7 @@ class HourlyProjection(MetricsBase):
         return usage_data_local[-300:]
 
     def populate_internal(
-        self, chart_start: datetime
+        self, chart_start: datetime, energy_cache: Optional["EnergyCache"] = None
     ) -> dict[int, _PopulationResult]:
         """Fetch recent data using second granularity to minimize lag.
 
@@ -838,6 +840,7 @@ class HourlyProjection(MetricsBase):
 
         Args:
             chart_start: Start of the fetch window (inclusive).
+            energy_cache: Optional merged sample cache for NBC computation.
 
         Returns:
             Dict of gid -> _PopulationResult for each successfully populated device.
@@ -845,7 +848,7 @@ class HourlyProjection(MetricsBase):
         results: dict[int, _PopulationResult] = {}
         for vdi in self.device_info.values():
             self.logger.debug("device: %s", vdi)
-            result = self._populate_device(vdi, chart_start)
+            result = self._populate_device(vdi, chart_start, energy_cache)
             if result is not None:
                 results[vdi.device_gid] = result
         return results
@@ -943,17 +946,24 @@ class HourlyProjection(MetricsBase):
         return result
 
     def _populate_device(
-        self, vdi: Any, chart_start: datetime
+        self,
+        vdi: Any,
+        chart_start: datetime,
+        energy_cache: Optional["EnergyCache"] = None,
     ) -> Optional[_PopulationResult]:
         """Fetch and compute usage data for one device without mutating API objects.
 
         Args:
             vdi: The VDeviceUsageInfo object from pyemvue (read-only).
             chart_start: Start of the chart window.
+            energy_cache: Optional merged sample cache for NBC computation.
 
         Returns:
             PopulationResult with computed scales, or None on error.
         """
+        # Store cache reference for _compute_device_metrics to use for NBC.
+        if energy_cache is not None:
+            self.energy_cache = energy_cache
         for chan in vdi.channels:
             usage_data_start_local = chart_start  # safe default if fetch fails
             try:
@@ -1058,7 +1068,16 @@ class HourlyProjection(MetricsBase):
         Returns:
             DeviceMetrics instance with all derived fields.
         """
-        nbc_result = self._compute_nbc(pop_result.nbc_seconds)
+        nbc_seconds = pop_result.nbc_seconds
+        # Use merged cache samples for NBC computation when available.
+        # This ensures _compute_nbc sees the full hour of data rather than
+        # only the incremental delta from the API call.
+        if self.energy_cache is not None:
+            cache_samples = self.energy_cache.samples
+            if cache_samples:
+                nbc_seconds = cache_samples
+
+        nbc_result = self._compute_nbc(nbc_seconds)
 
         return DeviceMetrics(
             gid=vdi.device_gid,

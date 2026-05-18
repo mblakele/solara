@@ -975,6 +975,7 @@ class TestComputeNBCEdgeCases(unittest.TestCase):
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
         hp.instant = now
+        hp.logger = MagicMock()
         # Only 10 seconds of data but instant is far ahead → elapsed >> len(data)
         short_data = [0.1] * 10
 
@@ -3048,6 +3049,181 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         expected_last = qh_boundary + timedelta(seconds=expected_total - 1)
         self.assertEqual(cache._last_sample_at, expected_last)
 
+
+# ===========================================================================
+# TestNBCUsesFullCache
+# ===========================================================================
+
+
+class TestNBCUsesFullCache(unittest.TestCase):
+    """Tests verifying _compute_nbc uses energy_cache.samples over incremental delta."""
+
+    def test_nbc_uses_full_cache_on_incremental_fetch(self):
+        """_compute_nbc should use energy_cache.samples, not incremental delta.
+
+        After an incremental fetch where the API returns only ~60 new samples,
+        NBC computation should still produce complete QH2/QH3 from the
+        merged cache data instead of treating all 60 samples as belonging to
+        the incomplete QH1.
+        """
+        import metrics
+
+        now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+
+        # Pre-populate EnergyCache with a full hour of data (3600 samples).
+        # data_start aligned to QH boundary (14:00).
+        full_hour_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        full_samples = [0.001] * 3600
+        cache = metrics.EnergyCache()
+        cache._samples = list(full_samples)
+        cache._data_start = full_hour_start
+        cache._sample_count = 3600
+        cache._last_sample_at = full_hour_start + timedelta(seconds=3599)
+
+        # Create an HourlyProjection with the cache.
+        hp = HourlyProjection(
+            instant=now,
+            logger_next=logging.getLogger("test"),
+            energy_cache=cache,
+        )
+
+        # Simulate a _PopulationResult from an incremental fetch (only 60 samples).
+        incremental_samples = [0.001] * 60
+        pop_result = _PopulationResult(
+            per_second_data=incremental_samples,
+            scales={},
+            chart_data=incremental_samples[-300:],
+            nbc_seconds=incremental_samples,
+            nbc_data_start=full_hour_start + timedelta(seconds=3540),
+            nbc_sample_count=60,
+        )
+
+        pred_result = {
+            "lag": timedelta(seconds=5),
+            "minute_predicted": 1.0,
+            "prediction": 60.0,
+            "prediction_min": 55.0,
+            "prediction_max": 65.0,
+            "seconds_remaining": 900.0,
+            "smoothing": {"1MIN": 1.0},
+        }
+
+        # Build a minimal mock VDeviceUsageInfo
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+
+        # With 60 samples, compute_nbc_quarters would give only QH1 (60 % 900 = 60).
+        # QH2, QH3, QH4 would be None. But with the full cache (3600 samples),
+        # all four quarters should be present.
+        nbc = device_metrics.nbc
+
+        # QH1 — always present (has data points)
+        self.assertIsNotNone(nbc.get("QH1"), "QH1 should have data")
+
+        # QH2, QH3 — should be computed from full cache (3600 samples)
+        self.assertIsNotNone(nbc.get("QH2"),
+                             "QH2 should be computed from full cache, not incremental delta")
+        self.assertIsNotNone(nbc.get("QH3"),
+                             "QH3 should be computed from full cache, not incremental delta")
+
+        # QH4 — may be partial (samples 2700-3599), but still present
+        self.assertIsNotNone(nbc.get("QH4"),
+                             "QH4 should be present (partial) from full cache")
+
+    def test_nbc_falls_back_to_pop_result_when_no_cache(self):
+        """When energy_cache is None, _compute_nbc uses pop_result.nbc_seconds.
+
+        This verifies the fallback path still works for existing callers that
+        don't pass an energy_cache.
+        """
+        hp = HourlyProjection(
+            instant=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            logger_next=logging.getLogger("test"),
+            energy_cache=None,
+        )
+
+        # 3600 samples = exactly one hour → all quarters complete
+        full_samples = [0.001] * 3600
+        pop_result = _PopulationResult(
+            per_second_data=full_samples,
+            scales={},
+            chart_data=full_samples[-300:],
+            nbc_seconds=full_samples,
+            nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+            nbc_sample_count=3600,
+        )
+
+        pred_result = {
+            "lag": timedelta(seconds=5),
+            "minute_predicted": 1.0,
+            "prediction": 60.0,
+            "prediction_min": 55.0,
+            "prediction_max": 65.0,
+            "seconds_remaining": 900.0,
+            "smoothing": {"1MIN": 1.0},
+        }
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+
+        # With the fallback path (energy_cache=None), NBC should be computed
+        # from pop_result.nbc_seconds (3600 samples), giving complete quarters.
+        nbc = device_metrics.nbc
+        self.assertIsNotNone(nbc.get("QH1"))
+        self.assertIsNotNone(nbc.get("QH2"))
+        self.assertIsNotNone(nbc.get("QH3"))
+        self.assertIsNotNone(nbc.get("QH4"))
+
+    def test_nbc_ignores_empty_cache_samples(self):
+        """When energy_cache.samples is None/empty, fall back to pop_result."""
+        import metrics
+
+        hp = HourlyProjection(
+            instant=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            logger_next=logging.getLogger("test"),
+            energy_cache=metrics.EnergyCache(),  # fresh cache, no samples
+        )
+
+        # Only 60 samples in pop_result — would normally give only QH1
+        pop_result = _PopulationResult(
+            per_second_data=[0.001] * 60,
+            scales={},
+            chart_data=[],
+            nbc_seconds=[0.001] * 60,
+            nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+            nbc_sample_count=60,
+        )
+
+        pred_result = {
+            "lag": timedelta(seconds=5),
+            "minute_predicted": 1.0,
+            "prediction": 60.0,
+            "prediction_min": 55.0,
+            "prediction_max": 65.0,
+            "seconds_remaining": 900.0,
+            "smoothing": {"1MIN": 1.0},
+        }
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+
+        # Empty cache → fallback: only QH1 present (60 samples)
+        nbc = device_metrics.nbc
+        self.assertIsNotNone(nbc.get("QH1"))
+        self.assertIsNone(nbc.get("QH2"))
+        self.assertIsNone(nbc.get("QH3"))
 
 
 
