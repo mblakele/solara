@@ -66,21 +66,19 @@ def _make_metrics_data(
 
 
 def _make_metrics_with_wh(
-    device_name: str, incomplete_qh: str, predicted_wh: float
+    device_name: str, predicted_wh: float
 ) -> dict:
     """Create mock metrics data with a specific predicted Wh value.
 
     Args:
         device_name: Name of the device in the metrics response.
-        incomplete_qh: Which quarter-hour is currently incomplete (e.g., "QH3").
         predicted_wh: The predicted Wh value for the incomplete quarter.
     """
     qh_order = ["QH1", "QH2", "QH3", "QH4"]
-    qh_index = qh_order.index(incomplete_qh)
 
     qh_data = {}
     for i, qh in enumerate(qh_order):
-        if qh == incomplete_qh:
+        if i == 0:
             samples_used = 5 * 60
             remaining_seconds = 900 - samples_used
             qh_data[qh] = {
@@ -91,7 +89,7 @@ def _make_metrics_with_wh(
                 "samples_used": samples_used,
                 "remaining_seconds": remaining_seconds,
             }
-        elif i < qh_index:
+        else:
             qh_data[qh] = {
                 "wh": 100.0,
                 "complete": True,
@@ -99,8 +97,6 @@ def _make_metrics_with_wh(
                 "predicted_wh": 100.0,
                 "samples_used": 900,
             }
-        else:
-            qh_data[qh] = None
 
     return {"devices": [{"name": device_name, "nbc": qh_data}]}
 

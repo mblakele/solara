@@ -263,9 +263,7 @@ def test_composite_turns_on_both_types():
             mock_instance.devices = {}
 
             mgr = LoadManager(
-                metrics_fetch=lambda: _make_metrics_with_wh(
-                    "main_panel", "QH3", -8000.0
-                ),
+                metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -8000.0),
                 energy_cache=EnergyCache(),
                 target_wh=-500,
                 nbc_device="main_panel",
@@ -307,9 +305,7 @@ def test_composite_over_target_turns_off_vocolinc():
             mock_instance.devices = {}
 
             mgr = LoadManager(
-                metrics_fetch=lambda: _make_metrics_with_wh(
-                    "main_panel", "QH2", 2000.0
-                ),
+                metrics_fetch=lambda: _make_metrics_with_wh("main_panel", 2000.0),
                 energy_cache=EnergyCache(),
                 target_wh=-500,
                 nbc_device="main_panel",

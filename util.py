@@ -47,12 +47,7 @@ class CustomJSONProvider(DefaultJSONProvider):
 
 QH_PERIOD_SECONDS = 900
 
-_QH_QUARTERS: list[tuple[str, int, int]] = [
-    ("QH1", 0, 899),       # seconds 0-899   (minutes 0-14)
-    ("QH2", 900, 1799),    # seconds 900-1799 (minutes 15-29)
-    ("QH3", 1800, 2699),   # seconds 1800-2699 (minutes 30-44)
-    ("QH4", 2700, 3599),   # seconds 2700-3599 (minutes 45-59)
-]
+QH_NAMES: list[str] = ["QH1", "QH2", "QH3", "QH4"]
 
 
 def ceil_to_qh(dt: datetime) -> datetime:
@@ -76,9 +71,42 @@ def qh_seconds_remaining(dt: datetime) -> int:
     """
     return QH_PERIOD_SECONDS - (dt.second + (dt.minute % 15) * 60)
 
-def compute_nbc_quarters(
-    per_second_data: list[float], n: int
+def compute_nbc_quarter(
+    values: list[float]
 ) -> dict[str, Any]:
+    """Compute NBC metrics for a single quarter-hour period from per-second kWh data.
+
+    Args:
+        values: Up to 900 per-second kWh values for a single QH period.
+    """
+    if values == None:
+        return None
+
+    values_len = len(values)
+    if values_len < 1:
+        return None
+
+    assert(values_len <= QH_PERIOD_SECONDS)
+
+    is_complete = values_len == QH_PERIOD_SECONDS
+    raw_wh = sum(values) * 1000
+    result = {
+        "complete": is_complete,
+        "raw_wh": raw_wh,
+        "wh": max(0, raw_wh)
+    }
+
+    if not is_complete:
+        remaining_seconds = QH_PERIOD_SECONDS - values_len
+        predicted_wh = QH_PERIOD_SECONDS * raw_wh / values_len
+        result["predicted_wh"] = predicted_wh
+        result["remaining_seconds"] = remaining_seconds
+        result["samples_used"] = values_len
+
+    return result
+
+
+def compute_nbc_quarters(values: list[float]) -> dict[str, Any]:
     """Compute NBC metrics for each quarter-hour from per-second kWh data.
 
     PG&E bills Non-Bypassable Charges based on net consumption over each
@@ -88,116 +116,32 @@ def compute_nbc_quarters(
     crossing the quarter boundary) and extrapolates.
 
     Args:
-        per_second_data: Per-second kWh values for the current hour.
-        n: Number of seconds observed so far (may be less than
-            ``len(per_second_data)`` due to API lag).
+        values: Per-second kWh values for up to 3600 seconds, aligned to QH boundary.
 
     Returns:
         Dict with keys QH1-QH4, each containing NBC metrics or None if the
         quarter has not yet started.
     """
     result: dict[str, Any] = {}
-    for qh_name, start_idx, end_idx in _QH_QUARTERS:
-        if n <= start_idx:
-            result[qh_name] = None
-            continue
+    results = []
+    values_len = len(values)
+    assert(values_len <= 3600)
 
-        if n > end_idx:
-            values = per_second_data[start_idx:end_idx + 1]
-            raw_wh = sum(values) * 1000
-            result[qh_name] = {
-                "wh": max(0, raw_wh),
-                "complete": True,
-                "raw_wh": raw_wh,
-            }
-        else:
-            remaining_seconds = max(0, end_idx + 1 - n)
+    incomplete_len = values_len % QH_PERIOD_SECONDS
+    names_remaining = QH_NAMES        
 
-            obs_start = start_idx
-            obs_end = min(n, end_idx + 1)
-            raw_values = per_second_data[obs_start:obs_end]
-            lookback_start = max(n - 60, start_idx)
-            lookback_values = per_second_data[lookback_start:n]
-            rate = (
-                sum(lookback_values) / len(lookback_values)
-                if lookback_values
-                else 0.0
-            )
+    # By definition, incomplete data is always in the most recent QH period.
+    if incomplete_len > 0:
+        values_incomplete = values[-incomplete_len:]
+        result[QH_NAMES[0]] = compute_nbc_quarter(values_incomplete)
+        names_remaining = names_remaining[1:]
 
-            if not raw_values:
-                result[qh_name] = {
-                    "wh": 0,
-                    "complete": False,
-                    "raw_wh": 0,
-                    "predicted_wh": 0,
-                    "samples_used": 0,
-                    "remaining_seconds": remaining_seconds,
-                }
-                continue
-
-            raw_wh = sum(raw_values) * 1000
-            predicted_wh = raw_wh + rate * remaining_seconds * 1000
-            result[qh_name] = {
-                "wh": max(0, predicted_wh),
-                "complete": False,
-                "raw_wh": raw_wh,
-                "predicted_wh": predicted_wh,
-                "samples_used": len(lookback_values),
-                "remaining_seconds": remaining_seconds,
-            }
-
-    return result
-
-
-def compute_nbc_quarters_for_window(
-    prev_hour_data: list[float],
-    current_hour_data: list[float],
-    n_prev: int,
-    n_current: int,
-) -> dict[str, Any]:
-    """Compute NBC metrics for the most recent 4 quarter-hour periods across two hours.
-
-    Takes per-second data and observation counts for both the previous and current
-    hours, computes NBC quarters for each hour independently, then selects the 4 most
-    recent non-None quarters and relabels them QH1–QH4 in chronological order.
-
-    Args:
-        prev_hour_data: Per-second kWh values for the previous hour (up to 3600).
-        current_hour_data: Per-second kWh values for the current hour (up to 3600).
-        n_prev: Number of seconds observed in the previous hour (typically 3600).
-        n_current: Number of seconds observed so far in the current hour.
-
-    Returns:
-        Dict with keys QH1-QH4 (most recent 4 non-None quarters, oldest first).
-    """
-    prev_result: dict[str, Any] = {}
-    if prev_hour_data and n_prev > 0:
-        prev_result = compute_nbc_quarters(prev_hour_data, n_prev)
-
-    curr_result: dict[str, Any] = {}
-    if current_hour_data and n_current > 0:
-        curr_result = compute_nbc_quarters(current_hour_data, n_current)
-
-    # Collect all non-None quarters in chronological order:
-    # prev QH1, prev QH2, prev QH3, prev QH4, curr QH1, curr QH2, curr QH3, curr QH4
-    all_quarters: list[Any] = []
-    for qh in ("QH1", "QH2", "QH3", "QH4"):
-        if prev_result.get(qh) is not None:
-            all_quarters.append(prev_result[qh])
-    for qh in ("QH1", "QH2", "QH3", "QH4"):
-        if curr_result.get(qh) is not None:
-            all_quarters.append(curr_result[qh])
-
-    # Take the 4 most recent (from end of list)
-    selected = all_quarters[-4:] if len(all_quarters) > 4 else list(all_quarters)
-
-    # Build result dict with QH1–QH4 labels
-    result: dict[str, Any] = {}
-    for i, qh_name in enumerate(("QH1", "QH2", "QH3", "QH4")):
-        if i < len(selected):
-            result[qh_name] = selected[i]
-        else:
-            result[qh_name] = None
+    remaining_len = values_len - incomplete_len
+    values_remaining = values[:remaining_len]
+    for qh_name in names_remaining:
+        values_qh = values_remaining[-QH_PERIOD_SECONDS:]
+        values_remaining = values_remaining[:-QH_PERIOD_SECONDS]
+        result[qh_name] = compute_nbc_quarter(values_qh)
 
     return result
 
@@ -229,129 +173,3 @@ def _clock_boundary_windows(now: datetime) -> list[tuple[datetime, datetime]]:
         windows.append((window_start, window_end))
 
     return windows
-
-
-def compute_clock_boundary_nbc_quarters(
-    prev_hour_data: list[float],
-    curr_hour_data: list[float],
-    now: datetime,
-) -> dict[str, Any]:
-    """Compute NBC metrics for the 4 most recent clock-boundary quarter-hour periods.
-
-    Takes per-second data from both the previous and current hours, determines
-    which 15-minute windows are relevant based on wall-clock time, and computes
-    Wh values for each window. Complete windows sum all samples; incomplete
-    windows extrapolate from a 60-second lookback rate.
-
-    Args:
-        prev_hour_data: Per-second kWh values for the previous hour (up to 3600).
-        curr_hour_data: Per-second kWh values for the current hour (up to 3600).
-        now: Current datetime, used to determine which windows are relevant.
-
-    Returns:
-        Dict with keys QH1–QH4 (most recent first) and a ``window_labels`` key
-        mapping each QH key to its ``(start, end)`` time strings.
-    """
-    windows = _clock_boundary_windows(now)
-    result: dict[str, Any] = {}
-    window_labels: dict[str, str] = {}
-
-    for i, (win_start, win_end) in enumerate(windows):
-        qh_key = f"QH{i + 1}"
-
-        # Determine which hour this window belongs to.
-        curr_hour_start = now.replace(minute=0, second=0, microsecond=0)
-        prev_hour_start = curr_hour_start - timedelta(hours=1)
-
-        # Map window to data source and index range.
-        if win_start >= curr_hour_start:
-            # Entirely in current hour.
-            data = curr_hour_data
-            start_idx = int((win_start - curr_hour_start).total_seconds())
-            end_idx = int((win_end - curr_hour_start).total_seconds()) - 1
-        elif win_start >= prev_hour_start:
-            # Entirely in previous hour.
-            data = prev_hour_data
-            start_idx = int((win_start - prev_hour_start).total_seconds())
-            end_idx = int((win_end - prev_hour_start).total_seconds()) - 1
-        else:
-            # Window is before the previous hour — skip.
-            result[qh_key] = None
-            window_labels[qh_key] = win_start.strftime("%H:%M") + "\u2013" + win_end.strftime("%H:%M")
-            continue
-
-        # Clamp indices to data bounds.
-        start_idx = max(0, min(start_idx, len(data)))
-        end_idx = max(start_idx, min(end_idx + 1, len(data))) - 1
-
-        # Build human-readable label.
-        window_labels[qh_key] = (
-            win_start.strftime("%H:%M") + "\u2013" + win_end.strftime("%H:%M")
-        )
-
-        # Compute Wh for this window.
-        result[qh_key] = _compute_window_wh(data, start_idx, end_idx, win_end, now)
-
-    result["window_labels"] = window_labels
-    return result
-
-
-def _compute_window_wh(
-    data: list[float], start_idx: int, end_idx: int, win_end: datetime, now: datetime
-) -> dict[str, Any]:
-    """Compute Wh for a single 15-minute window from per-second samples.
-
-    Args:
-        data: Per-second kWh values for the relevant hour segment.
-        start_idx: Start index (inclusive) in the data array.
-        end_idx: End index (inclusive) in the data array.
-
-    Returns:
-        Dict with ``wh``, ``complete``, and ``raw_wh`` keys. Incomplete windows
-        also include ``predicted_wh``, ``samples_used``, and ``remaining_seconds``.
-    """
-    expected_length = end_idx - start_idx + 1
-    is_complete = expected_length == QH_PERIOD_SECONDS
-
-    if not data or start_idx > end_idx:
-        return {
-            "wh": 0,
-            "complete": is_complete,
-            "raw_wh": 0,
-            "predicted_wh": 0,
-        }
-
-    slice_data = data[start_idx:end_idx + 1]
-    raw_wh = sum(slice_data) * 1000
-
-    if is_complete:
-        return {
-            "wh": max(0, raw_wh),
-            "complete": True,
-            "raw_wh": raw_wh,
-            "predicted_wh": raw_wh,
-        }
-
-    # Incomplete window — compute remaining_seconds from wall-clock time
-    # instead of sample count, so it stays monotonic and independent of
-    # API delivery latency.
-    remaining_seconds = max(0, int((win_end - now).total_seconds()))
-
-    # Lookback: last 60 seconds of observed data within this window.
-    lookback_size = min(60, len(slice_data))
-    lookback_values = slice_data[-lookback_size:] if lookback_size > 0 else []
-    rate = (
-        sum(lookback_values) / len(lookback_values)
-        if lookback_values
-        else 0.0
-    )
-
-    predicted_wh = raw_wh + rate * remaining_seconds * 1000
-    return {
-        "wh": max(0, predicted_wh),
-        "complete": False,
-        "raw_wh": raw_wh,
-        "predicted_wh": predicted_wh,
-        "samples_used": len(lookback_values),
-        "remaining_seconds": remaining_seconds,
-    }

@@ -129,11 +129,9 @@ project-root
 ### Key entry points
 
 - NBC calculation in `metrics.py` (EnergyCache with incremental fetch, sample merging, and pruning;
-  clock-boundary quarter-hour computation via `compute_clock_boundary_nbc_quarters`)
 - HourlyPrediction metrics in `metrics.py` (HourlyProjection with required `chart_start` on `populate()`,
   minute-scale extrapolation and min/max bounds prediction via `predict()`)
 - TOU in `energy_aggregator.py`
-- clock-boundary NBC quarters (`compute_clock_boundary_nbc_quarters`, `_clock_boundary_windows`) in `util.py`
 - oauth in `load_manager.py`
 - routes in `app.py`
 - test data generation in `mockdata.py`
@@ -159,7 +157,6 @@ project-root
 - app.py / route (lines 171-195) serves HTML or JSON based on Accept header
 - Returns model.metrics which includes:
   - devices: list with gid, lag, name, prediction, nbc (clock-boundary quarter-hour data),
-    clock_boundary_nbc (4 most recent 15-min windows regardless of hour boundaries),
     prev_hour_data, scales, smoothing
   - api_response: timing info
   - instant: timestamp

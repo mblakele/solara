@@ -208,6 +208,9 @@ class NBCReader:
     ) -> dict[str, Any] | None:
         """Parse metrics data and extract incomplete QH info.
 
+        Maps hour-relative NBC quarters to clock-boundary semantics:
+        QH1 = most recent 15-min window (per _clock_boundary_windows).
+
         Args:
             device_name: Name of the VUE device to query (reserved for future use).
             metrics_data: The raw metrics dict from HourlyProjection, or None.
@@ -238,8 +241,9 @@ class NBCReader:
 
         qh_order = ["QH1", "QH2", "QH3", "QH4"]
         last_complete: dict[str, Any] | None = None
+        incomplete_result: dict[str, Any] | None = None
 
-        for i, qh_name in enumerate(qh_order):
+        for qh_name in qh_order:
             qh_data = nbc.get(qh_name)
             if qh_data is None:
                 continue
@@ -251,39 +255,40 @@ class NBCReader:
                 now = metrics_data.get("_now")
                 if now is not None:
                     offset_in_hour = now.second + (now.minute % 15) * 60
-                    current_qh_index = now.minute // 15
-                    if current_qh_index == i:
-                        remaining_seconds = 900 - offset_in_hour
-                    else:
-                        remaining_seconds = qh_data.get(
-                            "remaining_seconds", NBCPeriod.PERIOD_SECS
-                        )
+                    remaining_seconds = 900 - offset_in_hour
+                    remaining_seconds = max(0, remaining_seconds)
                 else:
                     remaining_seconds = qh_data.get(
                         "remaining_seconds", NBCPeriod.PERIOD_SECS
                     )
-                return {
-                    "qh_name": qh_name,
+                # Clock-boundary: the incomplete QH is always QH1 (most recent).
+                incomplete_result = {
+                    "qh_name": "QH1",
                     "predicted_wh": predicted_wh,
                     "seconds_remaining": remaining_seconds,
                     "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
                 }
-            # Track the last complete QH as a fallback.
-            predicted_wh = qh_data.get("predicted_wh", qh_data.get("wh", 0))
-            now = metrics_data.get("_now")
-            if now is not None:
-                remaining_seconds = 900 - (now.second + (now.minute % 15) * 60)
+                # Don't break — keep scanning for the last complete QH fallback.
             else:
-                remaining_seconds = qh_data.get(
-                    "remaining_seconds", NBCPeriod.PERIOD_SECS - 1
-                )
-            last_complete = {
-                "qh_name": qh_name,
-                "predicted_wh": predicted_wh,
-                "seconds_remaining": remaining_seconds,
-                "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
-            }
+                # Track the last complete QH as a fallback.
+                predicted_wh = qh_data.get("predicted_wh", qh_data.get("wh", 0))
+                now = metrics_data.get("_now")
+                if now is not None:
+                    remaining_seconds = 900 - (now.second + (now.minute % 15) * 60)
+                else:
+                    remaining_seconds = qh_data.get(
+                        "remaining_seconds", NBCPeriod.PERIOD_SECS - 1
+                    )
+                last_complete = {
+                    "qh_name": "QH1",
+                    "predicted_wh": predicted_wh,
+                    "seconds_remaining": remaining_seconds,
+                    "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
+                }
 
+        # Return incomplete QH if found, otherwise fallback to last complete.
+        if incomplete_result is not None:
+            return incomplete_result
         return last_complete
 
 

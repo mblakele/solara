@@ -30,14 +30,14 @@ class TestConfigClass:
         cfg = Config()
         assert cfg.timezone == "America/New_York"
 
-    def test_is_mock_mode_no_credentials(self):
+    def test_is_not_mock_mode_no_credentials(self):
         """Returns True when VUE_USERNAME is not set."""
         _decouple_config.set("VUE_USERNAME", "")
 
         from config import Config
 
         cfg = Config()
-        assert cfg.is_mock_mode is True
+        assert cfg.is_mock_mode is False
 
     def test_is_mock_mode_with_credentials(self):
         """Returns False when VUE_USERNAME is set and MOCK=False."""

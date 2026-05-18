@@ -42,6 +42,8 @@ from metrics import (
 from mockdata import MetricsMock
 from util import CustomJSONProvider, ceil_to_qh, is_debug
 
+from tesla_oauth import bp
+
 # Module-level lock for thread-safe first-call detection on _create_metrics.
 _create_metrics_lock = threading.Lock()
 
@@ -73,9 +75,6 @@ def _create_metrics(now: datetime, logger: logging.Logger) -> dict[str, Any] | N
     hp.populate(chart_start)
     return hp.metrics
 
-
-# global setup
-from tesla_oauth import bp  # noqa: PLC0415
 
 app = Flask(__name__)
 app.logger.handlers.clear()
@@ -176,6 +175,7 @@ app.json = CustomJSONProvider(app)
 
 def _get_model(
     logger: logging.Logger,
+    instant: datetime,
     is_mock_error: bool = False,
     force_mock: bool = False,
     instant_minute: int | None = None,
@@ -187,6 +187,7 @@ def _get_model(
 
     Args:
         logger: Logger instance.
+        instant: Current datetime for the Metrics model.
         is_mock_error: If True, raise RetryableMetricsException.
         force_mock: If True, use MetricsMock even if real credentials exist.
         instant_minute: For testing — sets the minute component of MetricsMock's
@@ -199,7 +200,7 @@ def _get_model(
         if instant_minute is not None:
             return MetricsMock(instant_minute=instant_minute)
         return MetricsMock()
-    return Metrics(logger)
+    return Metrics(instant, logger)
 
 
 def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = False):
@@ -271,6 +272,9 @@ def index() -> ResponseReturnValue:
     logger.debug("index")
     is_mock_error = _cfg.is_mock_error
 
+    if is_mock_error:
+        raise RetryableMetricsException("mock error")
+
     # Determine whether to use mock or real data
     is_mock = _cfg.is_mock_mode
 
@@ -285,7 +289,7 @@ def index() -> ResponseReturnValue:
                 instant_minute = int(instant_minute_str)
             except (ValueError, TypeError):
                 instant_minute = None
-        model = _get_model(logger, is_mock_error, instant_minute=instant_minute)
+        model = _get_model(logger, now, is_mock_error, instant_minute=instant_minute)
         metrics_data = model.metrics
     else:
         # Real mode: use cached metrics to avoid hammering the API
@@ -395,7 +399,7 @@ _energy_cache = EnergyCache(ttl_seconds=30)
 _load_manager = None
 _load_manager_lock = threading.Lock()
 _load_manager_init_failed = False
-_last_cycle_result: dict = {}
+_last_cycle_result: dict | None = None
 
 
 def _build_load_management_payload() -> dict:
@@ -410,7 +414,7 @@ def _build_load_management_payload() -> dict:
         return {}
 
     with _load_manager_lock:
-        last_result = dict(_last_cycle_result)
+        last_result = dict(_last_cycle_result) if _last_cycle_result else {}
 
     payload: dict = {
         "enabled": lm.enabled,
@@ -457,9 +461,11 @@ def _get_load_manager():
 
 def _load_management_loop() -> None:
     """Background thread that runs load management cycle with adaptive sleep."""
+    global _last_cycle_result
     interval_secs_config = _cfg.load_manage_interval_secs
     logger.info(
-        "Load management background loop started (interval=%ds)", interval_secs_config
+        "Load management background loop started: dry-run=%s, mock=%s, interval=%d",
+        _cfg.dry_run, _cfg.is_mock_mode, interval_secs_config
     )
     while True:
         try:
@@ -490,6 +496,7 @@ def load_manage() -> Response:
     Returns JSON with status, current NBC prediction, pending effects, device states.
     Requires ``X-API-Key`` header matching ``LOAD_MANAGE_API_KEY`` env var when set.
     """
+    global _last_cycle_result
     required_key = _cfg.load_manage_api_key  # type: ignore[arg-type]
     if required_key:
         provided_key = request.headers.get("X-API-Key", "")
@@ -525,7 +532,7 @@ def load_status() -> Response:
         return abort(503, "LoadManager not initialized")
 
     with _load_manager_lock:
-        last_result = dict(_last_cycle_result)
+        last_result = dict(_last_cycle_result) if _last_cycle_result else {}
 
     payload = {
         "enabled": lm.enabled,

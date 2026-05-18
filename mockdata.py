@@ -57,7 +57,7 @@ class MetricsMock:
     nbc_result: float
 
     def __init__(self, instant_minute: int = 42) -> None:
-        # Watch out for datetime-related problems from this!        
+        # Watch out for datetime-related problems from this!
         now = datetime.now(timezone.utc) # TODO consider fixed_now pattern in all tests.
 
         is_full_hour = instant_minute >= 60
@@ -179,10 +179,7 @@ class MetricsMock:
             "scales": scales,
             "smoothing": {k: round(v, 14) for k, v in smoothing.items()},
             "timezone": timezone_str,
-            "nbc": self._compute_nbc(
-                per_second_data,
-                start=self.instant - timedelta(seconds=n),
-            ),
+            "nbc": compute_nbc_quarters(per_second_data,),
         }
 
     @staticmethod
@@ -208,26 +205,3 @@ class MetricsMock:
             "seconds": data_len,
             "usage": usage,
         }
-
-    def _compute_nbc(
-        self, per_second_data: List[float], start: datetime | None = None
-    ) -> Dict[str, Any]:
-        """Compute NBC values for each quarter hour.
-
-        Delegates to ``compute_nbc_quarters`` in util.
-
-        Args:
-            per_second_data: Variable-length list of observed kWh/second values.
-            start: When data collection started. When None, all data is assumed
-                observed (n = len(per_second_data)).
-
-        Returns:
-            Dict with keys QH1-QH4, each containing NBC metrics or None.
-        """
-        if start is not None:
-            elapsed = self.instant - start
-            n = max(0, int(elapsed.total_seconds()))
-        else:
-            n = len(per_second_data)
-        n = min(n, len(per_second_data))
-        return compute_nbc_quarters(per_second_data, n)

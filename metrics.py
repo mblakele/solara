@@ -12,15 +12,12 @@ import locale
 import logging
 from typing import Any, Callable, ClassVar, Optional
 
-import pytz
 import requests
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 
 from util import (
     CustomJSONProvider,
-    _QH_QUARTERS,
-    QH_PERIOD_SECONDS,
     ceil_to_qh,
     compute_nbc_quarters,
     custom_json_default,
@@ -46,7 +43,7 @@ class _PopulationResult:
     chart_data: list[float]
     nbc_seconds: list[float]
     nbc_data_start: datetime
-    prev_hour_data: list[float] = dataclasses.field(default_factory=list)
+    nbc_sample_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,9 +92,6 @@ class DeviceMetrics:
     nbc: dict[str, Any] = dataclasses.field(  # type: ignore[assignment]
         default_factory=dict, repr=False
     )
-    clock_boundary_nbc: dict[str, Any] = dataclasses.field(  # type: ignore[assignment]
-        default_factory=dict, repr=False
-    )
     timezone: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -118,7 +112,6 @@ class DeviceMetrics:
             "smoothing": {k: round(v, 14) for k, v in self.smoothing.items()},
             "timezone": self.timezone,
             "nbc": self.nbc,
-            "clock_boundary_nbc": self.clock_boundary_nbc,
             "per_second_data": self.per_second_data,
         }
 
@@ -152,11 +145,13 @@ def _build_incremental_fetch(
     """
 
     def fetcher() -> dict[str, Any] | None:
-        if energy_cache._data_start is None or energy_cache._samples is None or len(energy_cache._samples) == 0:
+        if energy_cache.data_start is None or energy_cache.samples is None or len(
+            energy_cache.samples
+        ) == 0:
             start_time = ceil_to_qh(now)
         else:
-            last_sample_idx = len(energy_cache._samples)
-            start_time = energy_cache._data_start + timedelta(seconds=last_sample_idx)
+            last_sample_idx = len(energy_cache.samples)
+            start_time = energy_cache.data_start + timedelta(seconds=last_sample_idx)
 
         try:
             usage_data, data_start = vue.get_chart_usage(
@@ -216,6 +211,24 @@ class EnergyCache:
             datetime of the last sample (data_start + len(samples) - 1), or None.
         """
         return self._last_sample_at
+
+    @property
+    def samples(self) -> list[float] | None:
+        """The list of per-second Wh samples, or None if empty.
+
+        Returns:
+            List of float Wh values, or None.
+        """
+        return self._samples
+
+    @property
+    def data_start(self) -> datetime | None:
+        """Timestamp of the first sample in the cache, or None if empty.
+
+        Returns:
+            datetime of the first sample, or None.
+        """
+        return self._data_start
 
     def is_valid(self, now: datetime) -> bool:
         """Check if cache has non-expired data.
@@ -459,8 +472,10 @@ class EnergyCache:
     def get_current_qh(self, now: datetime) -> dict[str, Any] | None:
         """Extract current incomplete QH prediction from cached samples.
 
-        Computes NBC quarters on demand and returns the same structure that
-        NBCCache.get_or_fetch() would return: {qh_name, predicted_wh, seconds_remaining}.
+        Computes NBC quarters using clock-boundary alignment (QH1 = most recent
+        15-min window) and returns the same structure that
+        NBCCache.get_or_fetch() would return: {qh_name, predicted_wh,
+        seconds_remaining}.
 
         ``seconds_remaining`` is derived from wall-clock time so it stays
         monotonic across cache refreshes even when the sample count fluctuates.
@@ -482,45 +497,33 @@ class EnergyCache:
             return None
 
         # Required: data_start present and aligned to a QH boundary
-        assert(self._data_start is not None)
-        assert(self._data_start == ceil_to_qh(self._data_start))
+        assert self._data_start is not None
+        assert self._data_start == ceil_to_qh(self._data_start)
 
-        # Determine the current QH from wall-clock time.
-        minutes_in_hour = now.minute
-        wall_clock_qh_index = minutes_in_hour // 15  # 0-3
-        qh_order = ["QH1", "QH2", "QH3", "QH4"]
-        current_qh = qh_order[wall_clock_qh_index]
+        #self.logger.debug("get_current_qh len %d", len(samples))
+        nbc = compute_nbc_quarters(samples)
 
-        # Offset: which QH index does data_start correspond to in wall-clock terms.
-        data_start_qh_index = int(self._data_start.minute) // 15
+        # Find QH1 (most recent window).
+        qh1_data = nbc.get("QH1")
 
-        # Map current wall-clock QH to nbc dict index (relative to data_start).
-        nbc_qh_index = (wall_clock_qh_index - data_start_qh_index) % 4
-        nbc_qh = qh_order[nbc_qh_index]
+        if qh1_data is None:
+            # No data at all — return the first non-None QH as fallback.
+            for qh in ("QH2", "QH3", "QH4"):
+                if nbc.get(qh) is not None:
+                    qh_data = nbc[qh]
+                    return {
+                        "qh_name": qh,
+                        "predicted_wh": qh_data.get("predicted_wh", 0),
+                        "seconds_remaining": qh_data.get("remaining_seconds", 0),
+                        "data_start": self._data_start,
+                    }
+            return None
 
-        # Seconds elapsed since data_start within the current QH window.
-        seconds_elapsed = int((now - self._data_start).total_seconds())
-        seconds_in_current_qh = seconds_elapsed % QH_PERIOD_SECONDS
-
-        nbc = compute_nbc_quarters(samples, samples_len)
-
-        # If all four quarters have complete data, return QH4.
-        has_all_qh = all(nbc.get(qh) for qh in qh_order)
-        if has_all_qh:
-            qh4_data = nbc["QH4"]
-            return {
-                "qh_name": "QH4",
-                "predicted_wh": qh4_data.get("predicted_wh", qh4_data.get("wh", 0)),
-                "seconds_remaining": 0,
-                "data_start": self._data_start,
-            }
-
-        # Return the incomplete (current) QH with wall-clock-based seconds_remaining.
-        qh_data = nbc.get(nbc_qh) or {}
         seconds_remaining = qh_seconds_remaining(now)
+        predicted_wh = qh1_data.get("predicted_wh", qh1_data.get("wh", 0))
         return {
-            "qh_name": current_qh,
-            "predicted_wh": qh_data.get("predicted_wh", qh_data.get("wh", 0)),
+            "qh_name": "QH1",
+            "predicted_wh": predicted_wh,
             "seconds_remaining": seconds_remaining,
             "data_start": self._data_start,
         }
@@ -919,9 +922,7 @@ class HourlyProjection(MetricsBase):
 
     def _compute_nbc(
         self,
-        usage_data_local: list[float],
-        usage_data_start_local: datetime,
-        device_time_zone: str | None = None,  # pylint: disable=unused-argument
+        usage_data_local: list[float]
     ) -> dict[str, Any]:
         """Compute NBC values for each quarter hour in the current hour.
 
@@ -932,17 +933,14 @@ class HourlyProjection(MetricsBase):
 
         Args:
             usage_data_local: Per-second kWh data for the current hour.
-            usage_data_start_local: Start time of the first data point.
-            device_time_zone: Unused; kept for call-site compatibility.
 
         Returns:
             Dict with keys QH1-QH4, each containing NBC metrics or None if
             the quarter has not yet started.
         """
-        elapsed = self.instant - usage_data_start_local
-        n = max(0, int(elapsed.total_seconds()))
-        n = min(n, len(usage_data_local))
-        return compute_nbc_quarters(usage_data_local, n)
+        result = compute_nbc_quarters(usage_data_local)
+        self.logger.debug("_compute_nbc len %d (%s)", len(usage_data_local), result)
+        return result
 
     def _populate_device(
         self, vdi: Any, chart_start: datetime
@@ -973,28 +971,8 @@ class HourlyProjection(MetricsBase):
                 usage_data_local, usage_data_start_local, Scale.HOUR.value
             )
 
-            usage_data_end = usage_data_start_local + timedelta(
-                seconds=len(usage_data_local)
-            )
+            usage_data_end = usage_data_start_local + timedelta(seconds=len(usage_data_local))
             chart_data = self._process_offset_scales(scales, usage_data_local, usage_data_end)
-
-            # Fetch previous hour data for clock-boundary NBC quarters
-            prev_hour_start = chart_start - timedelta(hours=1)
-            prev_hour_data: list[float] = []
-            try:
-                prev_usage, _ = self.vue.get_chart_usage(
-                    chan,
-                    prev_hour_start,
-                    chart_start,
-                    scale=Scale.SECOND.value,
-                    unit=Unit.KWH.value,
-                )
-                if prev_usage and len(prev_usage) > 0 and prev_usage[0] is not None:
-                    prev_hour_data = prev_usage
-            except (requests.exceptions.RequestException, IOError):
-                self.logger.debug(
-                    "could not fetch previous hour data for %s", vdi.device_name
-                )
 
             return _PopulationResult(
                 per_second_data=usage_data_local,
@@ -1002,7 +980,7 @@ class HourlyProjection(MetricsBase):
                 chart_data=chart_data,
                 nbc_seconds=usage_data_local,
                 nbc_data_start=usage_data_start_local,
-                prev_hour_data=prev_hour_data,
+                nbc_sample_count=len(usage_data_local),
             )
         return None
 
@@ -1080,27 +1058,7 @@ class HourlyProjection(MetricsBase):
         Returns:
             DeviceMetrics instance with all derived fields.
         """
-        nbc_result = self._compute_nbc(
-            pop_result.nbc_seconds,
-            pop_result.nbc_data_start,
-            getattr(vdi, "time_zone", None),
-        )
-
-        # Compute clock-boundary NBC quarters for the 4 most recent 15-min windows
-        from util import compute_clock_boundary_nbc_quarters
-
-        clock_boundary_nbc = {}
-        if pop_result.prev_hour_data:
-            try:
-                clock_boundary_nbc = compute_clock_boundary_nbc_quarters(
-                    pop_result.prev_hour_data,
-                    pop_result.nbc_seconds,
-                    self.instant,
-                )
-            except Exception:  # pylint: disable=broad-exception-caught
-                self.logger.debug(
-                    "clock-boundary NBC computation failed for %s", vdi.device_name
-                )
+        nbc_result = self._compute_nbc(pop_result.nbc_seconds)
 
         return DeviceMetrics(
             gid=vdi.device_gid,
@@ -1119,7 +1077,6 @@ class HourlyProjection(MetricsBase):
             scales=pop_result.scales,
             smoothing=pred_result["smoothing"],
             nbc=nbc_result,
-            clock_boundary_nbc=clock_boundary_nbc,
             timezone=getattr(vdi, "time_zone", None) or "",
         )
 

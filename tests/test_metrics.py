@@ -158,18 +158,18 @@ class TestMetrics(unittest.TestCase):
         self.assertIn("QH4", nbc)
 
     def test_mock_nbc_complete_quarters(self):
-        """At minute=42, QH1 and QH2 should be complete."""
+        """At minute=42, QH2 and QH3 should be complete."""
         device = self.metrics_data["devices"][0]
-        self.assertTrue(device["nbc"]["QH1"]["complete"])
         self.assertTrue(device["nbc"]["QH2"]["complete"])
+        self.assertTrue(device["nbc"]["QH3"]["complete"])
 
     def test_mock_nbc_incomplete_quarter(self):
-        """At minute=42, QH3 should be incomplete with predicted_wh."""
+        """At minute=42, QH1 should be incomplete with predicted_wh."""
         device = self.metrics_data["devices"][0]
-        qh3 = device["nbc"]["QH3"]
-        self.assertFalse(qh3["complete"])
-        self.assertIn("predicted_wh", qh3)
-        self.assertIn("samples_used", qh3)
+        qh1 = device["nbc"]["QH1"]
+        self.assertFalse(qh1["complete"])
+        self.assertIn("predicted_wh", qh1)
+        self.assertIn("samples_used", qh1)
 
     def test_mock_nbc_not_started(self):
         """At minute=42, QH4 should be None."""
@@ -184,12 +184,12 @@ class TestMetrics(unittest.TestCase):
         self.assertFalse(nbc_10["QH1"]["complete"])
         self.assertIsNone(nbc_10["QH2"])
 
-        # minute=37: QH1–QH2 complete, QH3 incomplete, QH4 not started
+        # minute=37: QH1 incomplete, QH2 complete, QH3 incomplete, QH4 not started
         mock_37 = MetricsMock(instant_minute=37)
         nbc_37 = mock_37.metrics["devices"][0]["nbc"]
-        self.assertTrue(nbc_37["QH1"]["complete"])
+        self.assertFalse(nbc_37["QH1"]["complete"])
         self.assertTrue(nbc_37["QH2"]["complete"])
-        self.assertFalse(nbc_37["QH3"]["complete"])
+        self.assertTrue(nbc_37["QH3"]["complete"])
         self.assertIsNone(nbc_37["QH4"])
 
     def test_mock_nbc_wh_clamped_at_zero(self):
@@ -225,15 +225,14 @@ class TestMetrics(unittest.TestCase):
         nbc = device["nbc"]
 
         # QH1 and QH2 should be complete with positive wh
-        self.assertTrue(nbc["QH1"]["complete"])
+        self.assertFalse(nbc["QH1"]["complete"])
         self.assertGreater(nbc["QH1"]["wh"], 0)
         self.assertTrue(nbc["QH2"]["complete"])
         self.assertGreater(nbc["QH2"]["wh"], 0)
 
         # QH3 should be incomplete with positive predicted_wh
-        self.assertFalse(nbc["QH3"]["complete"])
-        self.assertIn("predicted_wh", nbc["QH3"])
-        self.assertGreater(nbc["QH3"]["predicted_wh"], 0)
+        self.assertTrue(nbc["QH3"]["complete"])
+        self.assertNotIn("predicted_wh", nbc["QH3"])
 
     def test_mock_device_b_nbc_parameterized_minute(self):
         """Test Device B NBC at different instant_minute values."""
@@ -243,20 +242,20 @@ class TestMetrics(unittest.TestCase):
         self.assertFalse(nbc_10["QH1"]["complete"])
         self.assertIsNone(nbc_10["QH2"])
 
-        # minute=37: QH1–QH2 complete, QH3 incomplete, QH4 not started
+        # minute=37: QH1 incomplete, QH2-QH3 incomplete, QH4 not started
         mock_37 = MetricsMock(instant_minute=37)
         nbc_37 = mock_37.metrics["devices"][1]["nbc"]
-        self.assertTrue(nbc_37["QH1"]["complete"])
+        self.assertFalse(nbc_37["QH1"]["complete"])
         self.assertTrue(nbc_37["QH2"]["complete"])
-        self.assertFalse(nbc_37["QH3"]["complete"])
+        self.assertTrue(nbc_37["QH3"]["complete"])
         self.assertIsNone(nbc_37["QH4"])
 
     def test_mock_nbc_all_scenarios_covered(self):
         """Verify NBC covers all required scenarios across both devices.
 
         Device A (solar export, negative raw_wh) tests:
-          - QH1 complete with clamped wh=0 (raw_wh < 0 → wh = 0)
-          - QH2 incomplete with predicted_wh from recent samples
+          - QH1 incomplete with predicted_wh from recent samples
+          - QH2 complete with clamped wh=0 (raw_wh < 0 → wh = 0)
 
         Device B (load only, positive raw_wh) tests:
           - Complete quarters with positive wh (no clamping needed)
@@ -268,17 +267,17 @@ class TestMetrics(unittest.TestCase):
 
         # Device A: solar export scenario (negative raw_wh → clamped to 0)
         nbc_a = device_a["nbc"]
-        self.assertTrue(nbc_a["QH1"]["complete"])
-        self.assertGreaterEqual(nbc_a["QH1"]["wh"], 0)
-        self.assertFalse(nbc_a["QH3"]["complete"])
-        self.assertIn("predicted_wh", nbc_a["QH3"])
+        self.assertTrue(nbc_a["QH2"]["complete"])
+        self.assertGreaterEqual(nbc_a["QH2"]["wh"], 0)
+        self.assertFalse(nbc_a["QH1"]["complete"])
+        self.assertIn("predicted_wh", nbc_a["QH1"])
 
         # Device B: load-only scenario (positive raw_wh, no clamping)
         nbc_b = device_b["nbc"]
-        self.assertTrue(nbc_b["QH1"]["complete"])
-        self.assertGreater(nbc_b["QH1"]["wh"], 0)
-        self.assertFalse(nbc_b["QH3"]["complete"])
-        self.assertIn("predicted_wh", nbc_b["QH3"])
+        self.assertTrue(nbc_b["QH2"]["complete"])
+        self.assertGreater(nbc_b["QH2"]["wh"], 0)
+        self.assertFalse(nbc_b["QH1"]["complete"])
+        self.assertIn("predicted_wh", nbc_b["QH1"])
 
 
 class TestComputeNBCQuartersEdgeCases(unittest.TestCase):
@@ -286,99 +285,91 @@ class TestComputeNBCQuartersEdgeCases(unittest.TestCase):
 
     def test_empty_data_returns_all_none(self):
         """With empty per_second_data, all quarters should be None."""
-        result = compute_nbc_quarters([], 0)
+        result = compute_nbc_quarters([])
 
         for qh in ["QH1", "QH2", "QH3", "QH4"]:
             self.assertIsNone(result[qh])
 
     def test_n_zero_returns_all_none(self):
         """With n=0 (no seconds observed), all quarters should be None."""
-        data = [0.001] * 3600
-        result = compute_nbc_quarters(data, 0)
+        data = []
+        result = compute_nbc_quarters(data)
 
         for qh in ["QH1", "QH2", "QH3", "QH4"]:
             self.assertIsNone(result[qh])
 
     def test_n_900_completes_qh1(self):
-        """n=900 (first second of QH2) should complete QH1, leave others None."""
-        data = [0.002] * 3600
-        result = compute_nbc_quarters(data, 900)
+        """n=900 should complete QH1, leave others None."""
+        data = [0.002] * 900
+        result = compute_nbc_quarters(data)
 
         self.assertTrue(result["QH1"]["complete"])
-        # raw_wh = 900 * 0.002 * 1000
         self.assertAlmostEqual(result["QH1"]["raw_wh"], 900 * 0.002 * 1000)
         self.assertIsNone(result["QH2"])
+        self.assertIsNone(result["QH3"])
+        self.assertIsNone(result["QH4"])
 
-    def test_n_901_partial_qh2(self):
-        """n=901 should complete QH1, partial QH2 with 2 samples."""
-        data = [0.005] * 3600
-        result = compute_nbc_quarters(data, 901)
+    def test_n_901_partial_qh1(self):
+        """n=901 should complete QH2, partial QH1 with 1 sample."""
+        data = [0.005] * 901
+        result = compute_nbc_quarters(data)
 
-        self.assertTrue(result["QH1"]["complete"])
-        self.assertFalse(result["QH2"]["complete"])
+        self.assertTrue(result["QH2"]["complete"])
+        self.assertFalse(result["QH1"]["complete"])
+        self.assertEqual(result["QH1"]["samples_used"], 1)
 
     def test_n_3600_completes_all_quarters(self):
         """n=3600 (past end of QH4) should complete all quarters."""
         data = [0.002] * 3600
-        result = compute_nbc_quarters(data, 3600)
+        result = compute_nbc_quarters(data)
 
         for qh in ["QH1", "QH2", "QH3", "QH4"]:
             self.assertTrue(result[qh]["complete"])
 
-    def test_n_past_end_clamped_to_data_length(self):
-        """n exceeding data length should still produce partial results."""
-        # Only 10 seconds of data, but n=50 — function uses raw values
-        # QH1 is partial (n < 900), not None, because n > start_idx(0)
-        data = [0.002] * 10
-        result = compute_nbc_quarters(data, 50)
-
-        self.assertFalse(result["QH1"]["complete"])
-        # lookback = data[0:50] → 10 elements (Python clamps slice)
-        self.assertEqual(result["QH1"]["samples_used"], 10)
-
     def test_negative_raw_wh_clamped_to_zero_in_complete(self):
         """Complete quarters with negative raw_wh should have wh=0."""
-        data = [-0.002] * 3600
-        result = compute_nbc_quarters(data, 900)
+        data = [-0.002] * 900
+        result = compute_nbc_quarters(data)
 
         self.assertTrue(result["QH1"]["complete"])
         self.assertEqual(result["QH1"]["wh"], 0)
 
     def test_negative_raw_wh_clamped_to_zero_in_partial(self):
         """Partial quarters with negative predicted_wh should have wh=0."""
-        data = [-0.002] * 3600
-        result = compute_nbc_quarters(data, 1500)
+        data = [-0.002] * 1500
+        result = compute_nbc_quarters(data)
 
-        self.assertFalse(result["QH2"]["complete"])
+        self.assertFalse(result["QH1"]["complete"])
         # predicted_wh will be negative, clamped to 0
-        self.assertEqual(result["QH2"]["wh"], 0)
+        self.assertLess(result["QH1"]["raw_wh"], 0)
+        self.assertEqual(result["QH1"]["wh"], 0)
 
     def test_partial_qh_has_predicted_wh(self):
         """Incomplete quarters should include predicted_wh field."""
-        data = [0.002] * 3600
-        result = compute_nbc_quarters(data, 1500)
+        data = [0.002] * 1500
+        result = compute_nbc_quarters(data)
 
-        self.assertFalse(result["QH2"]["complete"])
-        self.assertIn("predicted_wh", result["QH2"])
+        self.assertFalse(result["QH1"]["complete"])
+        self.assertIn("predicted_wh", result["QH1"])
 
     def test_partial_qh_has_remaining_seconds(self):
         """Incomplete quarters should include remaining_seconds field."""
-        data = [0.002] * 3600
-        result = compute_nbc_quarters(data, 1500)
+        data = [0.002] * 1500
+        result = compute_nbc_quarters(data)
 
-        self.assertIn("remaining_seconds", result["QH2"])
-        # QH2 ends at index 1799, n=1500 → remaining = 1800 - 1500
-        self.assertEqual(result["QH2"]["remaining_seconds"], 300)
+        self.assertIn("remaining_seconds", result["QH1"])
+        # QH1 ends at index 1799, n=1500 → remaining = 1800 - 1500
+        self.assertEqual(result["QH1"]["remaining_seconds"], 300)
 
     def test_partial_qh_has_samples_used(self):
         """Incomplete quarters should include samples_used field."""
-        data = [0.002] * 3600
-        result = compute_nbc_quarters(data, 1500)
+        data = [0.002] * 1500
+        result = compute_nbc_quarters(data)
 
-        self.assertIn("samples_used", result["QH2"])
+        self.assertIn("samples_used", result["QH1"])
         # lookback = max(1500-60, 900) to 1500 = max(1440, 900)=1440 to 1500
         # samples = 60 (or less if lookback_start < start_idx)
-        self.assertGreater(result["QH2"]["samples_used"], 0)
+        self.assertGreater(result["QH1"]["samples_used"], 0)
 
     def test_partial_qh_lookback_cannot_cross_boundary(self):
         """Lookback window should not cross quarter boundary."""
@@ -386,21 +377,21 @@ class TestComputeNBCQuartersEdgeCases(unittest.TestCase):
         # lookback_start = max(901-60, 900) = max(841, 900) = 900
         # So lookback only includes seconds from QH2, not QH1: data[900:901]
         # Python slice [start:end] is exclusive of end → 2 elements (indices 900, 901)
-        data = [0.005] * 3600  # uniform positive values
-        result = compute_nbc_quarters(data, 901)
+        data = [0.005] * 901  # uniform positive values
+        result = compute_nbc_quarters(data)
 
-        self.assertFalse(result["QH2"]["complete"])
+        self.assertFalse(result["QH1"]["complete"])
         # lookback is data[900:901] → 2 elements (indices 900 and 901)
-        self.assertEqual(result["QH2"]["samples_used"], 1)
+        self.assertEqual(result["QH1"]["samples_used"], 1)
 
     def test_partial_qh_lookback_clamped_to_start_idx(self):
         """Lookback start should be clamped to quarter start index."""
         # n=910, lookback_start = max(850, 900) = 900
         # So lookback is from index 900 to 910 = 10 samples
-        data = [0.005] * 3600
-        result = compute_nbc_quarters(data, 910)
+        data = [0.005] * 910
+        result = compute_nbc_quarters(data)
 
-        self.assertEqual(result["QH2"]["samples_used"], 10)
+        self.assertEqual(result["QH1"]["samples_used"], 10)
 
 
 class TestDataForScaleEdgeCases(unittest.TestCase):
@@ -656,8 +647,7 @@ class TestDeviceMetricsDataClass(unittest.TestCase):
             "gid", "lag", "name", "per_second_data",
             "prediction", "prediction_min", "prediction_max",
             "minute_predicted", "minutes_remaining",
-            "scales", "smoothing", "timezone", "nbc",
-            "clock_boundary_nbc",
+            "scales", "smoothing", "timezone", "nbc"
         }
         self.assertEqual(set(d.keys()), expected_keys)
 
@@ -977,22 +967,6 @@ class TestProcessOffsetScalesEdgeCases(unittest.TestCase):
 class TestComputeNBCEdgeCases(unittest.TestCase):
     """Tests for _compute_nbc edge cases."""
 
-    def test_elapsed_zero(self):
-        """When instant == usage_data_start, n=0 and all quarters are not started."""
-        from unittest.mock import MagicMock
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-        hp.instant = now
-        data_start = now  # Same time → elapsed=0
-
-        result = hp._compute_nbc([0.1] * 3600, data_start)
-
-        # n=0 → all quarters should be None
-        for qh in ["QH1", "QH2", "QH3", "QH4"]:
-            self.assertIsNone(result[qh])
-
     def test_elapsed_exceeds_data_len(self):
         """When elapsed exceeds data length, n is clamped to len(data)."""
         from unittest.mock import MagicMock
@@ -1004,27 +978,10 @@ class TestComputeNBCEdgeCases(unittest.TestCase):
         # Only 10 seconds of data but instant is far ahead → elapsed >> len(data)
         short_data = [0.1] * 10
 
-        result = hp._compute_nbc(short_data, now - timedelta(seconds=5))
+        result = hp._compute_nbc(short_data)
 
         # n should be clamped to len(data)=10
         self.assertFalse(result["QH1"]["complete"])
-
-    def test_negative_elapsed(self):
-        """When instant is before data start, elapsed is negative → n=0."""
-        from unittest.mock import MagicMock
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-        hp.instant = now
-        # Data start is in the future relative to instant → negative elapsed
-        data_start = now + timedelta(hours=1)
-
-        result = hp._compute_nbc([0.1] * 3600, data_start)
-
-        # n = max(0, negative_int) → 0
-        for qh in ["QH1", "QH2", "QH3", "QH4"]:
-            self.assertIsNone(result[qh])
 
 
 class TestPopulateDeviceErrors(unittest.TestCase):
@@ -1669,7 +1626,7 @@ class TestEnergyCache(unittest.TestCase):
         self.assertFalse(result.get("seconds_remaining", 0) == 0)
 
     def test_get_current_qh_returns_complete_last_qh_when_all_done(self):
-        """When all 4 quarters are complete, get_current_qh returns QH4."""
+        """When all 4 quarters are complete, get_current_qh returns QH1 (most recent)."""
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
@@ -1692,18 +1649,19 @@ class TestEnergyCache(unittest.TestCase):
             result = cache.get_current_qh(fixed_now)
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["qh_name"], "QH4")
-        # QH4 is complete, so seconds_remaining should be 0
-        self.assertEqual(result["seconds_remaining"], 0)
+        self.assertEqual(result["qh_name"], "QH1")
+        # QH1 now represents the most recent complete window (12:45-13:00)
+        # seconds_remaining is derived from wall-clock, not 0
+        self.assertEqual(result["seconds_remaining"], 900)
 
-    def test_get_current_qh_skips_complete_quarters(self):
-        """get_current_qh skips complete quarters and returns the first incomplete one."""
+    def test_get_current_qh_returns_most_recent_qh(self):
+        """get_current_qh returns QH1 (most recent window), not the last incomplete one."""
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 12, 37, 30, tzinfo=timezone.utc)
 
-        # 2250 samples = QH1 (900s), QH2 (900s) complete, halfway through QH3
+        # 2250 samples = 12:00:00 to 12:37:29
         samples = [0.002] * 2250
 
         def fetch_func():
@@ -1719,7 +1677,7 @@ class TestEnergyCache(unittest.TestCase):
         result = cache.get_current_qh(fixed_now)
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["qh_name"], "QH3")
+        self.assertEqual(result["qh_name"], "QH1")
 
     def test_get_current_qh_seconds_remaining_from_wall_clock(self):
         """seconds_remaining must derive from wall-clock time, not sample count.
@@ -1788,11 +1746,11 @@ class TestEnergyCache(unittest.TestCase):
         result2 = cache.get_current_qh(now=now2)
         self.assertEqual(result2["seconds_remaining"], 285)
 
-        # Advance to cross quarter boundary → should return QH2
-        # now1 + 301s = 12:15:01 → QH2, remaining = 899
+        # Advance to cross quarter boundary → clock-boundary QH1 = 12:15-12:30
+        # now1 + 301s = 12:15:01 → QH1 (most recent), remaining = 899
         now3 = now1 + timedelta(seconds=301)
         result3 = cache.get_current_qh(now=now3)
-        self.assertEqual(result3["qh_name"], "QH2")
+        self.assertEqual(result3["qh_name"], "QH1")
         self.assertEqual(result3["seconds_remaining"], 899)
 
     def test_get_or_fetch_logs_data_point_count(self):
@@ -2176,197 +2134,6 @@ class TestIncrementalFetchIntegration(unittest.TestCase):
             self.assertEqual(len(cache._samples), 2684)
 
 
-class TestClockBoundaryNBC(unittest.TestCase):
-    """Tests for clock-boundary NBC quarter computation in metrics."""
-
-    def test_populate_device_fetches_prev_hour_data(self):
-        """_populate_device calls get_chart_usage for previous hour data."""
-        from unittest.mock import MagicMock
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-
-        hp.instant = now
-        hp.metrics = {"api_response": {}, "debug": False, "devices": [], "instant": now}
-        hp.vue = MagicMock()
-        hp.logger = MagicMock()
-
-        # Mock current hour data (30 minutes = 1800 seconds)
-        curr_data = [0.001] * 1800
-        # Mock previous hour data (full hour = 3600 seconds)
-        prev_data = [0.002] * 3600
-
-        def get_chart_usage_side_effect(chan, start, end, scale=None, unit=None):
-            if start.hour == 12:
-                return curr_data, now.replace(minute=0)
-            # prev hour (11:00-12:00)
-            return prev_data, now.replace(hour=11, minute=0)
-
-        hp.vue.get_chart_usage.side_effect = get_chart_usage_side_effect
-
-        vdi_mock = MagicMock()
-        chan_mock = MagicMock(channel_num=1)
-        vdi_mock.channels = [chan_mock]
-
-        result = hp._populate_device(vdi_mock, now.replace(minute=0))
-        self.assertIsNotNone(result)
-
-        # Verify prev_hour_data was fetched (3600 samples from previous hour)
-        self.assertEqual(len(result.prev_hour_data), 3600)
-
-    def test_populate_device_handles_prev_hour_api_error(self):
-        """_populate_device returns prev_hour_data=[] when previous hour API call fails."""
-        from unittest.mock import MagicMock
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-
-        hp.instant = now
-        hp.metrics = {"api_response": {}, "debug": False, "devices": [], "instant": now}
-        hp.vue = MagicMock()
-        hp.logger = MagicMock()
-
-        # Mock current hour data succeeds, previous hour fails
-        curr_data = [0.001] * 1800
-
-        def get_chart_usage_side_effect(chan, start, end, scale=None, unit=None):
-            if start.hour == 12:
-                return curr_data, now.replace(minute=0)
-            raise requests.exceptions.RequestException("API error")
-
-        hp.vue.get_chart_usage.side_effect = get_chart_usage_side_effect
-
-        vdi_mock = MagicMock()
-        chan_mock = MagicMock(channel_num=1)
-        vdi_mock.channels = [chan_mock]
-
-        result = hp._populate_device(vdi_mock, now.replace(minute=0))
-        self.assertIsNotNone(result)
-
-        # prev_hour_data should be empty list when API fails
-        self.assertEqual(result.prev_hour_data, [])
-
-    def test_compute_device_metrics_includes_clock_boundary_nbc(self):
-        """_compute_device_metrics computes clock_boundary_nbc when prev_hour_data is available."""
-        from unittest.mock import MagicMock
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-
-        hp.instant = now
-        hp.logger = MagicMock()
-
-        # Create population result with prev_hour_data
-        pop_result = _PopulationResult(
-            per_second_data=[0.001] * 1800,
-            scales={"1H": {"usage": 1.8}},
-            chart_data=[0.001] * 1800,
-            nbc_seconds=[0.001] * 1800,
-            nbc_data_start=now.replace(minute=0),
-            prev_hour_data=[0.002] * 3600,
-        )
-
-        vdi_mock = MagicMock()
-        vdi_mock.device_gid = 123
-        vdi_mock.device_name = "TestDevice"
-        vdi_mock.time_zone = "America/Los_Angeles"
-
-        pred_result = {
-            "lag": 5,
-            "prediction": -900.0,
-            "prediction_min": -1000.0,
-            "prediction_max": -800.0,
-            "minute_predicted": 15.0,
-            "seconds_remaining": 900,
-            "smoothing": {"1MIN": 14.5},
-        }
-
-        device_metrics = hp._compute_device_metrics(vdi_mock, pop_result, pred_result)
-        self.assertIsNotNone(device_metrics.clock_boundary_nbc)
-
-        # Should have QH1-QH4 keys and window_labels
-        self.assertIn("QH1", device_metrics.clock_boundary_nbc)
-        self.assertIn("window_labels", device_metrics.clock_boundary_nbc)
-
-    def test_compute_device_metrics_empty_clock_boundary_nbc_without_prev_hour(self):
-        """_compute_device_metrics returns empty clock_boundary_nbc when no prev_hour_data."""
-        from unittest.mock import MagicMock
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-
-        hp.instant = now
-        hp.logger = MagicMock()
-
-        # Create population result WITHOUT prev_hour_data (empty list)
-        pop_result = _PopulationResult(
-            per_second_data=[0.001] * 1800,
-            scales={"1H": {"usage": 1.8}},
-            chart_data=[0.001] * 1800,
-            nbc_seconds=[0.001] * 1800,
-            nbc_data_start=now.replace(minute=0),
-        )
-
-        vdi_mock = MagicMock()
-        vdi_mock.device_gid = 123
-        vdi_mock.device_name = "TestDevice"
-        vdi_mock.time_zone = "America/Los_Angeles"
-
-        pred_result = {
-            "lag": 5,
-            "prediction": -900.0,
-            "prediction_min": -1000.0,
-            "prediction_max": -800.0,
-            "minute_predicted": 15.0,
-            "seconds_remaining": 900,
-            "smoothing": {"1MIN": 14.5},
-        }
-
-        device_metrics = hp._compute_device_metrics(vdi_mock, pop_result, pred_result)
-        # Should be empty dict when no prev_hour_data
-        self.assertEqual(device_metrics.clock_boundary_nbc, {})
-
-    def test_device_metrics_to_dict_includes_clock_boundary_nbc(self):
-        """DeviceMetrics.to_dict() includes clock_boundary_nbc."""
-        from unittest.mock import MagicMock
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-
-        hp.instant = now
-        hp.logger = MagicMock()
-
-        pop_result = _PopulationResult(
-            per_second_data=[0.001] * 1800,
-            scales={"1H": {"usage": 1.8}},
-            chart_data=[0.001] * 1800,
-            nbc_seconds=[0.001] * 1800,
-            nbc_data_start=now.replace(minute=0),
-            prev_hour_data=[0.002] * 3600,
-        )
-
-        vdi_mock = MagicMock()
-        vdi_mock.device_gid = 123
-        vdi_mock.device_name = "TestDevice"
-        vdi_mock.time_zone = "America/Los_Angeles"
-
-        pred_result = {
-            "lag": 5,
-            "prediction": -900.0,
-            "prediction_min": -1000.0,
-            "prediction_max": -800.0,
-            "minute_predicted": 15.0,
-            "seconds_remaining": 900,
-            "smoothing": {"1MIN": 14.5},
-        }
-
-        device_metrics = hp._compute_device_metrics(vdi_mock, pop_result, pred_result)
-        d = device_metrics.to_dict()
-
-        self.assertIn("clock_boundary_nbc", d)
-        self.assertIn("QH1", d["clock_boundary_nbc"])
-
-
 if __name__ == "__main__":
     unittest.main()
 
@@ -2444,7 +2211,7 @@ def _make_hourly_mock(
     hour_usage: float = 1.0,
     n_minutes: int = 5,
     n_seconds: int = 100,
-    prev_hour_data: list[float] | None = None,
+    samples: list[float] | None = None,
     instant: datetime | None = None,
     chart_start: datetime | None = None,
 ) -> tuple[HourlyProjection, MagicMock]:
@@ -2454,7 +2221,7 @@ def _make_hourly_mock(
         hour_usage: Simulated hour-scale usage (kWh).
         n_minutes: Number of minute-scale entries to generate.
         n_seconds: Number of per-second samples to return from API.
-        prev_hour_data: Optional list of per-second samples for previous hour.
+        samples: Optional list of per-second samples for previous hour.
         instant: Override the "now" instant.
         chart_start: Override the chart start time.
 
@@ -2502,7 +2269,7 @@ def _make_hourly_mock(
         "per_second_data": per_second_data,
         "data_start": chart_start,
     }
-    mock_channel.prev_hour_data = prev_hour_data or []
+    mock_channel.samples = samples or []
     mock_channel.scales = {
         "1H": {"instant": chart_start, "usage": hour_usage},
     }
@@ -3157,7 +2924,7 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
 
     def test_populate_device_returns_all_fields(self):
         """Returned _PopulationResult has all fields populated."""
-        hp, mock = _make_hourly_mock(n_seconds=3600, prev_hour_data=[0.001] * 3600)
+        hp, mock = _make_hourly_mock(n_seconds=3600, samples=[0.001] * 3600)
 
         result = hp._populate_device(mock.channels[0], datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
 
@@ -3168,15 +2935,6 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         self.assertIsNotNone(result.chart_data)
         self.assertIsNotNone(result.nbc_seconds)
         self.assertIsNotNone(result.nbc_data_start)
-        self.assertIsNotNone(result.prev_hour_data)
-
-    def test_populate_device_prev_hour_data_correct_range(self):
-        """prev_hour_data has correct length (3600 samples for 1 hour)."""
-        hp, mock = _make_hourly_mock(n_seconds=3600, prev_hour_data=[0.001] * 3600)
-
-        result = hp._populate_device(mock.channels[0], datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
-
-        self.assertEqual(len(result.prev_hour_data), 3600)
 
     def test_populate_device_per_second_data_length_matches_fetch(self):
         """per_second_data length matches what API returned."""
@@ -3228,33 +2986,6 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
 
         # Should use first channel (channel_num=1)
         self.assertEqual(len(result.per_second_data), 100)
-
-    def test_populate_device_prev_hour_error_does_not_affect_current(self):
-        """If prev_hour fetch fails, current-hour data is still returned correctly."""
-        hp, mock = _make_hourly_mock(n_seconds=3600)
-
-        # Make prev_hour fetch fail by having an API error for the previous hour call
-        original_get_chart_usage = mock.vue.get_chart_usage
-
-        call_count = 0
-        chan_data = mock.channels[0].data
-        def side_effect(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # First call is current hour — return real data
-                return (chan_data["per_second_data"], chan_data["data_start"])
-            # Second call is prev_hour — raise
-            raise requests.exceptions.RequestException("prev_hour error")
-
-        mock.vue.get_chart_usage.side_effect = side_effect
-
-        result = hp._populate_device(mock.channels[0], datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
-
-        self.assertIsNotNone(result)
-        self.assertEqual(len(result.per_second_data), 3600)
-        # prev_hour_data should be empty list (error caught, default to [])
-        self.assertEqual(result.prev_hour_data, [])
 
     def test_incremental_merge_appends_data_after_cache_end(self):
         """Merge correctly appends new samples after cache end."""
@@ -3316,6 +3047,8 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         # Verify _last_sample_at was updated to include the new samples.
         expected_last = qh_boundary + timedelta(seconds=expected_total - 1)
         self.assertEqual(cache._last_sample_at, expected_last)
+
+
 
 
 

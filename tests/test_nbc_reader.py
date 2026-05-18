@@ -105,29 +105,28 @@ def test_get_current_qh_returns_none_when_cache_invalid():
 
 def test_get_current_qh_returns_tuple_from_cached_samples():
     """get_current_qh extracts QH prediction from cached per-second samples."""
-    now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
-    # QH2 (15:15-15:30). data_start aligned to QH1 boundary 15:00:00.
-    # 1200 samples covers 15:00:00 to 15:20:00.
-    # wall_clock QH=1 (QH2), data_start QH=0 (QH1), nbc_qh_index=(1-0)%4=1 → QH2 (incomplete).
+    data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc) # xx:15:00
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc) # xx:20:30
     cache = EnergyCache(ttl_seconds=30)
-    samples = [-0.001] * 1200
+    sample_len = 1200
+    samples = [-0.001] * sample_len
+
     with cache._lock:
         cache._samples = samples
-        cache._data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = 1200
-        cache._last_fetch_at = now
-    reader = NBCReader(energy_cache=cache)
+        cache._data_start = data_start
+        cache._last_sample_at = fixed_now - timedelta(seconds=1)
+        cache._sample_count = sample_len
+        cache._last_fetch_at = fixed_now
 
-    result = reader.get_current_qh(now=now)
+    reader = NBCReader(energy_cache=cache)
+    result = reader.get_current_qh(now=fixed_now)
 
     assert result is not None
     qh_name, predicted_wh, seconds_remaining, data_point_at = result
-    assert qh_name == "QH2"
-    # -0.001 kWh/s * 900 samples * 1000 = -900 Wh raw, extrapolated for incomplete QH
+    assert qh_name == "QH1"
     assert predicted_wh < 0  # negative = generation
     assert seconds_remaining > 0
-    assert data_point_at == now
+    assert data_point_at == fixed_now
 
 
 def test_get_current_qh_returns_correct_qh_for_minute_5():
@@ -145,9 +144,9 @@ def test_get_current_qh_returns_correct_qh_for_minute_5():
 
 
 def test_get_current_qh_returns_correct_qh_for_minute_40():
-    """get_current_qh identifies QH3 when minute_in_hour is 40."""
+    """get_current_qh identifies QH1 (most recent window) when minute_in_hour is 40."""
     now = datetime(2026, 5, 7, 15, 40, 30, tzinfo=timezone.utc)
-    # 2430 samples covers QH1-QH2 complete, QH3 incomplete.
+    # 2430 samples covers 15:00–15:40:29
     cache = _make_energy_cache(sample_count=2430, value=-0.0015, now=now)
     reader = NBCReader(energy_cache=cache)
 
@@ -155,7 +154,8 @@ def test_get_current_qh_returns_correct_qh_for_minute_40():
 
     assert result is not None
     qh_name, _, _, _ = result
-    assert qh_name == "QH3"
+    # With clock-boundary: QH1 = 15:30–15:44 (current, incomplete)
+    assert qh_name == "QH1"
 
 
 def test_get_current_qh_returns_data_point_at_from_cache():
@@ -195,7 +195,7 @@ def test_get_current_qh_with_positive_samples():
 
     assert result is not None
     qh_name, predicted_wh, _, _ = result
-    assert qh_name == "QH2"
+    assert qh_name == "QH1"
     assert predicted_wh > 0  # positive = consumption
 
 
@@ -265,7 +265,7 @@ def test_get_current_qh_force_true_without_fetch_callable():
 
     assert result is not None
     qh_name, _, _, _ = result
-    assert qh_name == "QH2"
+    assert qh_name == "QH1"
 
 
 # --- NBCReader.get_current_qh_direct() tests (unchanged) ---
@@ -298,7 +298,7 @@ def test_get_current_qh_direct_with_valid_data():
 
     assert result is not None
     qh_name, predicted_wh, seconds_remaining = result
-    assert qh_name == "QH2"
+    assert qh_name == "QH1"
     assert predicted_wh == -300.0
     assert seconds_remaining == 600
 
@@ -332,6 +332,6 @@ def test_get_current_qh_direct_with_no_incomplete_qh():
 
     assert result is not None
     qh_name, predicted_wh, _ = result
-    # All quarters complete or not started → return last complete QH.
-    assert qh_name == "QH2"
+    # All quarters complete or not started → return last complete QH, labeled QH1.
+    assert qh_name == "QH1"
     assert predicted_wh == 300.0

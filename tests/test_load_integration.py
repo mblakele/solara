@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import unittest
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -73,13 +74,11 @@ def _make_energy_cache_with_prediction(
 def _make_excess_manager(
     now: datetime,
     predicted_wh: float = -2000.0,
-    incomplete_qh: str = "QH3",
 ) -> tuple[LoadManager, PlugController, TeslaController]:
     """Create LoadManager with stub controllers and mock metrics.
 
     Args:
         predicted_wh: Target Wh prediction for the incomplete quarter.
-        incomplete_qh: The incomplete quarter-hour name (e.g. "QH3").
         now: Fixed time for sample timestamps. Required.
 
     Returns:
@@ -112,7 +111,7 @@ def _make_excess_manager(
     )
     tesla_ctrl = TeslaController(tesla_config)
 
-    metrics_data = _make_metrics_with_wh("main_panel", incomplete_qh, predicted_wh)
+    metrics_data = _make_metrics_with_wh("main_panel", predicted_wh)
 
     def metrics_fetch():
         return metrics_data
@@ -158,7 +157,7 @@ def _make_overn_target_manager(
     asyncio.run(plug_ctrl.set_state("pool_pump", True))
     asyncio.run(plug_ctrl.set_state("water_heater", True))
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH2", predicted_wh)
+    metrics_data = _make_metrics_with_wh("main_panel", predicted_wh)
 
     def metrics_fetch():
         return metrics_data
@@ -208,7 +207,7 @@ def _make_tesla_manager(
     tesla_ctrl = TeslaController(tesla_config)
     tesla_ctrl.set_mock_state(tesla_state)
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", predicted_wh)
+    metrics_data = _make_metrics_with_wh("main_panel", predicted_wh)
 
     def metrics_fetch():
         return metrics_data
@@ -230,38 +229,42 @@ def _make_tesla_manager(
 # --- Excess solar tests ---
 
 
-def test_turns_on_plugs_in_priority_order():
-    """Excess solar: turns on plugs in priority order."""
-    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc) # 07:08:00
+class TestLoadIntegration(unittest.TestCase):
 
-    # in priority order:
-    # p200 pool pump turns on
-    # p100 water heater would fit gap without pool pump, but stays off
-    mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-1000.0)
-    asyncio.run(plug_ctrl.set_state("pool_pump", False))
-    asyncio.run(plug_ctrl.set_state("water_heater", False))
+ def test_turns_on_plugs_in_priority_order(self):
+     """Excess solar: turns on plugs in priority order."""
+     fixed_now = datetime(2026, 5, 6, 7, 8, 0, tzinfo=timezone.utc) # 07:08:00
 
-    def dt_constructor(*args, **kwargs):
-        return datetime(*args, **kwargs)
+     # in priority order:
+     # p200 pool pump turns on
+     # p100 water heater would fit gap without pool pump, but stays off
+     mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-1000.0)
+     samples = mgr.nbc_reader.energy_cache._samples
+     assert len(samples) == 900 + 8 * 60
+     asyncio.run(plug_ctrl.set_state("pool_pump", False))
+     asyncio.run(plug_ctrl.set_state("water_heater", False))
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = dt_constructor
-        result = mgr.run_cycle()
+     def dt_constructor(*args, **kwargs):
+         return datetime(*args, **kwargs)
 
-    assert result["status"] == "ok"
-    assert result["qh"] == "QH1"
-    assert result["diagnostics"]["gap_wh"] == 500.0
-    assert result["diagnostics"]["seconds_remaining"] == 420
-    wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
-    pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
-    assert wh_state is False
-    assert pp_state
+     with patch("load_manager.datetime") as mock_dt:
+         mock_dt.now.return_value = fixed_now
+         mock_dt.side_effect = dt_constructor
+         result = mgr.run_cycle()
+
+     assert result["status"] == "ok"
+     assert result["qh"] == "QH1"
+     self.assertAlmostEqual(result["diagnostics"]["gap_wh"], 500.0)
+     assert result["diagnostics"]["seconds_remaining"] == 420
+     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
+     pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
+     assert wh_state is False
+     assert pp_state
 
 
 def test_turns_off_plugs_in_priority_order():
     """Load shedding: turns plugs off priority order."""
-    fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 5, 6, 7, 8, 0, tzinfo=timezone.utc) # 07:08:00
 
     # predicted_wh=-200, target=-500 => gap=300 Wh
     # in priority order:
@@ -409,7 +412,7 @@ def test_stale_data_skips_cycle():
     plug_ctrl = PlugController(plugs)
 
     fetched_at = datetime.now(timezone.utc) - timedelta(seconds=130)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
+    metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
 
     def metrics_fetch():
@@ -456,7 +459,7 @@ def test_stale_no_pending_effects_proceeds():
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     data_point_at = fixed_now - timedelta(seconds=StateTracker.STALE_THRESHOLD_SECS)
     fetched_at = data_point_at + timedelta(seconds=10)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
+    metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
 
     def metrics_fetch():
@@ -510,7 +513,7 @@ def test_stale_data_from_previous_qh():
     data_point_at = fixed_now - timedelta(seconds=1)
     fetched_at = data_point_at + timedelta(seconds=10)
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH2", -2000.0)
+    metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
 
     def metrics_fetch():
@@ -568,7 +571,7 @@ def test_waits_for_fresh_data():
     plug_ctrl = PlugController(plugs)
 
     fetched_at = datetime.now(timezone.utc) - timedelta(seconds=10)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
+    metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
 
     def metrics_fetch():
@@ -622,7 +625,7 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
     plug_ctrl = PlugController(plugs)
 
     fetched_at = datetime.now(timezone.utc) - timedelta(seconds=60)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
+    metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
     metrics_data["_data_lag_secs"] = 80.0
 
@@ -1149,7 +1152,7 @@ def test_disabled_returns_early():
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", -2000.0)
+    metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
 
     energy_cache = EnergyCache()
     mgr = LoadManager(

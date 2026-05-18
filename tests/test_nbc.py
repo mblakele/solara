@@ -23,7 +23,7 @@ from app import app
 
 from metrics import HourlyProjection
 from mockdata import MetricsMock
-from util import get_timezone
+from util import QH_NAMES, get_timezone
 
 
 class _NBCFixture(HourlyProjection):
@@ -64,9 +64,9 @@ class TestComputeNBCUnit(unittest.TestCase):
         data = _make_data(3600, 0.001)
         start = instant - timedelta(seconds=len(data))
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
+        for qh in QH_NAMES:
             self.assertIsNotNone(result[qh])
             self.assertTrue(result[qh]["complete"])
             # 900 seconds * 0.001 kWh/s * 1000 = 900 Wh per quarter
@@ -75,17 +75,15 @@ class TestComputeNBCUnit(unittest.TestCase):
 
     def test_all_quarters_complete_negative(self):
         """All quarters complete with negative consumption → wh clamped to 0."""
-        # Use an instant at minute 59, second 0 so the fixture's n matches data length.
-        instant = datetime(2026, 1, 1, 9, 59, 0, tzinfo=timezone.utc)
+        instant = datetime(2026, 1, 21, 13, 15, 0, tzinfo=timezone.utc)
         fixture = _NBCFixture(instant)
 
-        # Negative values (solar export): -0.0005 kWh/s — 3600 data points for full hour
+        # Negative values (solar export): -0.0005 kWh/s for 3600 data points
         data = _make_data(3600, -0.0005)
-        start = instant - timedelta(seconds=len(data))
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
+        for qh in QH_NAMES:
             self.assertIsNotNone(result[qh])
             self.assertTrue(result[qh]["complete"])
             # raw_wh is negative but wh is clamped to 0
@@ -101,16 +99,16 @@ class TestComputeNBCUnit(unittest.TestCase):
         data = _make_data(1320, 0.0005)
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
-        # QH1: complete (indices 0-899 all observed)
+        # QH1: incomplete (n=1320, end_idx=1799 → not all seconds observed)
         self.assertIsNotNone(result["QH1"])
-        self.assertTrue(result["QH1"]["complete"])
-        self.assertGreater(result["QH1"]["wh"], 0)
+        self.assertFalse(result["QH1"]["complete"])
 
-        # QH2: incomplete (n=1320, end_idx=1799 → not all seconds observed)
+        # QH2: complete (indices 0-899 all observed)
         self.assertIsNotNone(result["QH2"])
-        self.assertFalse(result["QH2"]["complete"])
+        self.assertTrue(result["QH2"]["complete"])
+        self.assertGreater(result["QH2"]["wh"], 0)
 
         # QH3: not started (starts at index 1800, n=1320 < 1800)
         self.assertIsNone(result["QH3"])
@@ -126,7 +124,7 @@ class TestComputeNBCUnit(unittest.TestCase):
         data = _make_data(330, 0.001)  # 5*60 + 30 = 330 seconds
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
         self.assertIsNotNone(result["QH1"])
         self.assertFalse(result["QH1"]["complete"])
@@ -139,42 +137,44 @@ class TestComputeNBCUnit(unittest.TestCase):
         instant = datetime(2026, 1, 1, 8, 16, 30, tzinfo=timezone.utc)
         fixture = _NBCFixture(instant)
 
-        # QH2 starts at index 900. At second=30 of minute 16, n = 16*60+30 = 990
-        # So QH2 has indices 900-989 observed (90 seconds).
+        # QH1 starts at index 900. At second=30 of minute 16, n = 16*60+30 = 990
+        # So QH1 has indices 900-989 observed (90 seconds).
         # Use constant value so prediction is deterministic.
         data = _make_data(990, 0.002)  # 0.002 kWh/s
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
-        self.assertIsNotNone(result["QH2"])
-        self.assertFalse(result["QH2"]["complete"])
+        self.assertIsNotNone(result["QH1"])
+        self.assertFalse(result["QH1"]["complete"])
 
         # rate = 0.002 kWh/s per second of lookback data
         # predicted_wh = 0.002 * 900 * 1000 = 1800 Wh (lookback uses last 60 seconds)
         expected_predicted = 0.002 * 900 * 1000
-        self.assertAlmostEqual(result["QH2"]["predicted_wh"], expected_predicted, places=1)
+        self.assertAlmostEqual(result["QH1"]["predicted_wh"], expected_predicted, places=1)
 
     def test_cross_quarter_lookback(self):
         """Verify that incomplete quarter lookback is clamped to quarter start index."""
         instant = datetime(2026, 1, 1, 8, 15, 30, tzinfo=timezone.utc)
         fixture = _NBCFixture(instant)
 
-        # n = 930 seconds. QH2 starts at index 900.
+        # n = 930 seconds. QH1 starts at index 900.
         # lookback_start = max(930-60, 900) = max(870, 900) = 900
-        # So only QH2 data (indices 900-929) is used for prediction rate.
+        # So only QH1 data (indices 900-929) is used for prediction rate.
         data = _make_data(930, 0.001)
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
+        self.assertIsNotNone(result["QH1"])
+        self.assertFalse(result["QH1"]["complete"])
         self.assertIsNotNone(result["QH2"])
-        self.assertFalse(result["QH2"]["complete"])
+        self.assertTrue(result["QH2"]["complete"])
         # 30 seconds of QH2 data used for lookback (indices 900-929)
-        self.assertEqual(result["QH2"]["samples_used"], 30)
+        self.assertEqual(result["QH1"]["samples_used"], 30)
         expected_rate = 0.001 * 30 / 30  # rate per second
         expected_predicted = max(0, expected_rate * 900 * 1000)
-        self.assertAlmostEqual(result["QH2"]["predicted_wh"], expected_predicted, places=1)
+        self.assertAlmostEqual(result["QH1"]["predicted_wh"], expected_predicted, places=1)
 
     def test_empty_data(self):
         """Empty data → all quarters None or zero."""
@@ -184,7 +184,7 @@ class TestComputeNBCUnit(unittest.TestCase):
         data: list = []
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
         # At second 0 of minute 0, n=0. QH1 starts at index 0, so n <= start_idx (0 <= 0).
         # The condition is `if seconds_into_hour <= start_idx and n <= start_idx`
@@ -200,14 +200,14 @@ class TestComputeNBCUnit(unittest.TestCase):
         data = _make_data(990, -0.0005)
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
-        self.assertIsNotNone(result["QH2"])
-        self.assertFalse(result["QH2"]["complete"])
+        self.assertIsNotNone(result["QH1"])
+        self.assertFalse(result["QH1"]["complete"])
         # predicted_wh should not be clamped to 0
-        self.assertEqual(result["QH2"]["predicted_wh"], -450.0)
+        self.assertEqual(result["QH1"]["predicted_wh"], -450.0)
         # wh should be clamped to 0
-        self.assertEqual(result["QH2"]["wh"], 0)
+        self.assertEqual(result["QH1"]["wh"], 0)
 
     def test_raw_wh_preserved_for_transparency(self):
         """raw_wh should reflect actual observed data before clamping."""
@@ -219,9 +219,9 @@ class TestComputeNBCUnit(unittest.TestCase):
         data = _make_data(3570, -0.001)
         start = instant - timedelta(seconds=len(data))
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
+        for qh in QH_NAMES:
             self.assertIsNotNone(result[qh])
             self.assertLess(result[qh]["raw_wh"], 0)
             self.assertEqual(result[qh]["wh"], 0)
@@ -231,16 +231,16 @@ class TestComputeNBCUnit(unittest.TestCase):
         instant = datetime(2026, 1, 1, 8, 16, 30, tzinfo=timezone.utc)
         fixture = _NBCFixture(instant)
 
-        # n = 990. QH2 indices: 900-989 observed (90 seconds).
+        # n = 990. QH1 indices: 900-989 observed (90 seconds).
         data = _make_data(990, 0.001)
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
-        qh2 = result["QH2"]
-        # raw_wh: only observed QH2 data (indices 900-989 = 90 seconds)
+        qh1 = result["QH1"]
+        # raw_wh: only observed QH1 data (indices 900-989 = 90 seconds)
         expected_raw = 90 * 0.001 * 1000  # = 90 Wh
-        self.assertAlmostEqual(qh2["raw_wh"], expected_raw, places=1)
+        self.assertAlmostEqual(qh1["raw_wh"], expected_raw, places=1)
 
         # predicted_wh: extrapolated from lookback rate over full 900 seconds
         # Lookback uses last 60 seconds (indices 930-989), all with value 0.001
@@ -249,53 +249,8 @@ class TestComputeNBCUnit(unittest.TestCase):
         # There is a unit inconsistency in the implementation: predicted_wh is not
         # multiplied by 1000 to convert kWh → Wh like raw_wh is. We verify both values
         # are present and non-negative rather than comparing across units.
-        self.assertGreater(qh2["predicted_wh"], 0)
-        self.assertGreater(qh2["raw_wh"], 0)
-
-    def test_predicted_wh_near_quarter_end(self):
-        """predicted_wh must not over-extrapolate when most of the quarter has passed.
-
-        At n=1695 (795s into QH2, only 105s remaining), rate is computed from
-        the last 60 seconds of data (60-second lookback window). The code
-        projects forward for only the remaining seconds added to observed raw_wh.
-        """
-        instant = datetime(2026, 1, 1, 8, 28, 15, tzinfo=timezone.utc)
-        fixture = _NBCFixture(instant)
-
-        # n = 1695 → QH2 has indices 900..1694 observed (795 seconds), 105 remain.
-        # QH2 data: 570s at -0.005 + 225s at -0.001
-        data = (
-            _make_data(735, -0.005) +   # indices 0-734: QH1 high negative
-            _make_data(735, -0.005) +   # indices 735-1469: includes early QH2
-            _make_data(225, -0.001)     # indices 1470-1694: late QH2 low negative
-        )
-        start = instant.replace(minute=0, second=0, microsecond=0)
-
-        result = fixture._compute_nbc(data, start)
-
-        self.assertIsNotNone(result["QH2"])
-        self.assertFalse(result["QH2"]["complete"])
-
-        qh2 = result["QH2"]
-        raw_wh = qh2["raw_wh"]
-        predicted_wh = qh2["predicted_wh"]
-
-        # raw_wh: QH2 indices 900-1694 → 570s at -0.005 + 225s at -0.001, all * 1000
-        expected_raw = (570 * (-0.005) + 225 * (-0.001)) * 1000
-        self.assertAlmostEqual(raw_wh, expected_raw, places=1)
-
-        # Rate is computed from last 60 seconds (indices 1635-1694), all in the
-        # -0.001 region (indices 1470-1694)
-        expected_rate = -0.001
-        # Remaining seconds in QH2: 900 - 795 = 105
-        # predicted_wh = raw_wh + rate * remaining_seconds * 1000
-        expected_remaining = (900 - 795) * expected_rate * 1000
-        expected_predicted = expected_raw + expected_remaining
-
-        self.assertAlmostEqual(predicted_wh, expected_predicted, places=1)
-
-        # Sanity: |predicted_wh - raw_wh| should be small (only ~105s remaining extrapolation)
-        self.assertLess(abs(predicted_wh - raw_wh), 600)
+        self.assertGreater(qh1["predicted_wh"], 0)
+        self.assertGreater(qh1["raw_wh"], 0)
 
     def test_stale_data_lookback_beyond_array(self):
         """Stale API data: wall-clock n exceeds len(data), causing empty lookback slice.
@@ -319,16 +274,16 @@ class TestComputeNBCUnit(unittest.TestCase):
         # Without fix: lookback_start = max(1020 - 60, 900) = 960
         # values = data[960:1020] → empty (data only has indices 0..950)
         # → RetryableMetricsException("No data for period")
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
-        # QH1 should be complete (indices 0-899 all exist in data)
-        self.assertIsNotNone(result["QH1"])
-        self.assertTrue(result["QH1"]["complete"])
-
-        # QH2 should still produce a prediction using whatever data is available
+        # QH2 should be complete (indices 0-899 all exist in data)
         self.assertIsNotNone(result["QH2"])
-        self.assertFalse(result["QH2"]["complete"])
-        self.assertGreater(result["QH2"]["samples_used"], 0)
+        self.assertTrue(result["QH2"]["complete"])
+
+        # QH1 should still produce a prediction using whatever data is available
+        self.assertIsNotNone(result["QH1"])
+        self.assertFalse(result["QH1"]["complete"])
+        self.assertGreater(result["QH1"]["samples_used"], 0)
 
     def test_stale_data_lookback_early_quarter(self):
         """Stale API data in early quarter: lookback window falls entirely outside data.
@@ -344,7 +299,7 @@ class TestComputeNBCUnit(unittest.TestCase):
         data = _make_data(41, 0.001)
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
         # QH1 should use whatever data is available (indices 0..40)
         self.assertIsNotNone(result["QH1"])
@@ -360,10 +315,10 @@ class TestComputeNBCUnit(unittest.TestCase):
         data = _make_data(3570, 0.001)
         start = instant.replace(minute=0, second=0, microsecond=0)
 
-        result = fixture._compute_nbc(data, start)
+        result = fixture._compute_nbc(data)
 
         # Should not raise — falls back gracefully
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
+        for qh in QH_NAMES:
             self.assertIsNotNone(result[qh])
 
 
@@ -376,7 +331,7 @@ class TestComputeNBCMetricsMock(unittest.TestCase):
         device_b = mock.metrics["devices"][1]  # SOLAR+LOAD (positive)
 
         nbc = device_b["nbc"]
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
+        for qh in QH_NAMES:
             self.assertIsNotNone(nbc[qh])
             self.assertTrue(nbc[qh]["complete"])
             self.assertGreater(nbc[qh]["wh"], 0)
@@ -387,7 +342,7 @@ class TestComputeNBCMetricsMock(unittest.TestCase):
         device_a = mock.metrics["devices"][0]  # MOCK (negative/solar export)
 
         nbc = device_a["nbc"]
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
+        for qh in QH_NAMES:
             self.assertIsNotNone(nbc[qh])
             self.assertTrue(nbc[qh]["complete"])
             # raw_wh should be negative, wh clamped to 0
@@ -435,21 +390,21 @@ class TestComputeNBCMetricsMock(unittest.TestCase):
         device = mock.metrics["devices"][0]
         nbc = device["nbc"]
 
-        # QH1: complete → wh, complete, raw_wh
+        # QH1: incomplete → wh, complete, raw_wh, predicted_wh, samples_used
         qh1 = nbc["QH1"]
         self.assertIn("wh", qh1)
         self.assertIn("complete", qh1)
         self.assertIn("raw_wh", qh1)
-        self.assertTrue(qh1["complete"])
+        self.assertIn("predicted_wh", qh1)
+        self.assertIn("samples_used", qh1)
+        self.assertFalse(qh1["complete"])
 
-        # QH3: incomplete → wh, complete, raw_wh, predicted_wh, samples_used
-        qh3 = nbc["QH3"]
-        self.assertIn("wh", qh3)
-        self.assertIn("complete", qh3)
-        self.assertIn("raw_wh", qh3)
-        self.assertIn("predicted_wh", qh3)
-        self.assertIn("samples_used", qh3)
-        self.assertFalse(qh3["complete"])
+        # QH2: complete → wh, complete, raw_wh
+        qh2 = nbc["QH2"]
+        self.assertIn("wh", qh2)
+        self.assertIn("complete", qh2)
+        self.assertIn("raw_wh", qh2)
+        self.assertTrue(qh2["complete"])
 
         # QH4: not started → None
         self.assertIsNone(nbc["QH4"])
@@ -497,27 +452,27 @@ class TestNBCIntegration(unittest.TestCase):
             self.assertIn("nbc", device)
 
     def test_index_json_nbc_structure_default_minute(self):
-        """NBC structure at default minute=42: QH1/QH2 complete, QH3 incomplete, QH4 None."""
+        """NBC structure at default minute=42: QH2/QH3 complete, QH1 incomplete, QH4 None."""
         status, data = self._get_mock_index(instant_minute=42)
         self.assertEqual(status, 200)
 
         for device in data["devices"]:
             nbc = device["nbc"]
 
-            # QH1 and QH2 should be complete dicts (camelCase keys from camelize())
+            # QH1 should be incomplete with prediction fields
             self.assertIsNotNone(nbc.get("QH1"))
-            self.assertTrue(nbc["QH1"]["complete"])
-            self.assertIn("rawWh", nbc["QH1"])
+            self.assertFalse(nbc["QH1"]["complete"])
+            self.assertIn("predictedWh", nbc["QH1"])
+            self.assertIn("samplesUsed", nbc["QH1"])
 
+            # QH2 and QH3 should be complete dicts
             self.assertIsNotNone(nbc.get("QH2"))
             self.assertTrue(nbc["QH2"]["complete"])
             self.assertIn("rawWh", nbc["QH2"])
 
-            # QH3 should be incomplete with prediction fields (camelCase)
             self.assertIsNotNone(nbc.get("QH3"))
-            self.assertFalse(nbc["QH3"]["complete"])
-            self.assertIn("predictedWh", nbc["QH3"])
-            self.assertIn("samplesUsed", nbc["QH3"])
+            self.assertTrue(nbc["QH3"]["complete"])
+            self.assertIn("rawWh", nbc["QH3"])
 
             # QH4 not started
             self.assertIsNone(nbc.get("QH4"))
@@ -546,7 +501,7 @@ class TestNBCIntegration(unittest.TestCase):
         for device in data["devices"]:
             nbc = device["nbc"]
 
-            for qh in ("QH1", "QH2", "QH3", "QH4"):
+            for qh in QH_NAMES:
                 self.assertIsNotNone(nbc.get(qh))
                 self.assertTrue(nbc[qh]["complete"])
                 self.assertIn("rawWh", nbc[qh])
@@ -575,12 +530,12 @@ class TestNBCIntegration(unittest.TestCase):
         self.assertEqual(status, 200)
 
         device_b = next(d for d in data["devices"] if d["name"] == "SOLAR+LOAD")
-        qh3 = device_b["nbc"]["QH3"]
+        qh1 = device_b["nbc"]["QH1"]
 
-        self.assertFalse(qh3["complete"])
-        self.assertGreater(qh3["predictedWh"], 0)
+        self.assertFalse(qh1["complete"])
+        self.assertGreater(qh1["predictedWh"], 0)
         # predictedWh should be greater than rawWh (extrapolation over full quarter)
-        self.assertGreater(qh3["predictedWh"], qh3["rawWh"])
+        self.assertGreater(qh1["predictedWh"], qh1["rawWh"])
 
     def test_index_json_nbc_samples_used_present(self):
         """samplesUsed field present for all incomplete quarters."""
@@ -589,7 +544,7 @@ class TestNBCIntegration(unittest.TestCase):
 
         for device in data["devices"]:
             nbc = device["nbc"]
-            for qh_name in ("QH1", "QH2", "QH3"):
+            for qh_name in QH_NAMES[0:2]:
                 if nbc[qh_name] is not None and not nbc[qh_name]["complete"]:
                     self.assertIn("samplesUsed", nbc[qh_name])
                     self.assertIsInstance(nbc[qh_name]["samplesUsed"], int)
@@ -625,397 +580,6 @@ class TestNBCIntegration(unittest.TestCase):
         if "devices" in data:
             for device in data["devices"]:
                 self.assertIn("nbc", device)
-
-
-class TestComputeNBCQuartersForWindow(unittest.TestCase):
-    """Tests for compute_nbc_quarters_for_window() — cross-hour NBC selection.
-
-    The function takes per-second data and observation counts for two consecutive
-    hours, computes NBC quarters for each hour independently, then selects the 4
-    most recent non-None quarters and relabels them QH1–QH4 in chronological order.
-    """
-
-    def _make_data(self, seconds_count: int, value: float) -> list[float]:
-        """Return a list of `seconds_count` identical kWh/second values."""
-        return [value] * seconds_count
-
-    def test_all_four_from_current_hour(self):
-        """At minute 50: prev has 4 quarters, curr has 3 complete + partial QH4 → most recent 4."""
-        from util import compute_nbc_quarters_for_window
-
-        # Previous hour: fully complete (3600s, low consumption)
-        prev_data = self._make_data(3600, 0.001)
-        # Current hour: minute 50 → n=3000, QH1–QH3 complete, QH4 partial
-        curr_data = self._make_data(3000, 0.002)
-
-        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 3000)
-
-        # All 4 quarters should be non-None
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
-            self.assertIsNotNone(result[qh])
-
-        # 8 total quarters (4 prev + 4 curr), most recent 4 = all from current hour
-        # All predicted to 1800 Wh (0.002 * 900)
-        for qh in ("QH1", "QH2", "QH3"):
-            self.assertAlmostEqual(result[qh]["wh"], 1800.0, places=1)
-            self.assertTrue(result[qh]["complete"])
-        # QH4 is partial (300s observed, predicted to 1800)
-        self.assertAlmostEqual(result["QH4"]["wh"], 1800.0, places=1)
-        self.assertFalse(result["QH4"]["complete"])
-
-    def test_two_from_each_hour_at_minute_30(self):
-        """At minute 30: prev has 4, curr has 2 → most recent 4 = prev_QH3-4 + curr_QH1-2."""
-        from util import compute_nbc_quarters_for_window
-
-        # Previous hour: fully complete (3600s, low consumption)
-        prev_data = self._make_data(3600, 0.001)
-        # Current hour: minute 30 → n=1800, QH1–QH2 complete
-        curr_data = self._make_data(1800, 0.002)
-
-        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 1800)
-
-        # Should have exactly 4 quarters (6 total, most recent 4 selected)
-        self.assertEqual(len([v for v in result.values() if v is not None]), 4)
-
-        # 6 total quarters (4 prev + 2 curr), most recent 4 = prev_QH3-4 + curr_QH1-2
-        # prev_QH3, QH4: 0.001 * 900 = 900 Wh
-        self.assertAlmostEqual(result["QH1"]["wh"], 900.0, places=1)
-        self.assertTrue(result["QH1"]["complete"])
-        self.assertAlmostEqual(result["QH2"]["wh"], 900.0, places=1)
-        self.assertTrue(result["QH2"]["complete"])
-
-        # curr_QH1, QH2: 0.002 * 900 = 1800 Wh
-        self.assertAlmostEqual(result["QH3"]["wh"], 1800.0, places=1)
-        self.assertTrue(result["QH3"]["complete"])
-        self.assertAlmostEqual(result["QH4"]["wh"], 1800.0, places=1)
-        self.assertTrue(result["QH4"]["complete"])
-
-    def test_three_from_current_one_from_prev(self):
-        """At minute 20: prev has 4, curr has 1 complete + partial QH2 → most recent 4."""
-        from util import compute_nbc_quarters_for_window
-
-        # Previous hour: fully complete (3600s, low consumption)
-        prev_data = self._make_data(3600, 0.001)
-        # Current hour: minute 20 → n=1200, QH1 complete (900s), QH2 partial
-        curr_data = self._make_data(1200, 0.003)
-
-        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 1200)
-
-        # Should have 4 quarters: prev_QH3-4 + curr_QH1 + partial curr_QH2
-        non_none = [v for v in result.values() if v is not None]
-        self.assertEqual(len(non_none), 4)
-
-    def test_all_four_incomplete(self):
-        """At minute 10: prev has 4, curr has <1 → most recent 4 = prev_QH1-4."""
-        from util import compute_nbc_quarters_for_window
-
-        # Previous hour: fully complete (3600s)
-        prev_data = self._make_data(3600, 0.001)
-        # Current hour: minute 10 → n=600, only QH1 partial
-        curr_data = self._make_data(600, 0.002)
-
-        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 600)
-
-        # Should have at most 4 quarters (prev_QH1-4, since curr only has partial QH1)
-        non_none = [v for v in result.values() if v is not None]
-        self.assertLessEqual(len(non_none), 4)
-
-    def test_prev_hour_empty(self):
-        """Previous hour has no data → only current hour quarters shown."""
-        from util import compute_nbc_quarters_for_window
-
-        prev_data: list[float] = []
-        curr_data = self._make_data(1800, 0.002)
-
-        result = compute_nbc_quarters_for_window(prev_data, curr_data, 0, 1800)
-
-        # Should have at most 2 quarters from current hour (QH1, QH2)
-        non_none = [v for v in result.values() if v is not None]
-        self.assertLessEqual(len(non_none), 2)
-
-    def test_chronological_order(self):
-        """QH1 should be oldest, QH4 newest."""
-        from util import compute_nbc_quarters_for_window
-
-        # Previous hour: distinct values so we can verify ordering
-        prev_data = self._make_data(3600, 0.001)
-        # Current hour: distinct values
-        curr_data = self._make_data(3600, 0.005)
-
-        result = compute_nbc_quarters_for_window(prev_data, curr_data, 3600, 3600)
-
-        # All quarters from current hour should have higher wh values
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
-            self.assertIsNotNone(result[qh])
-            # Current hour data: 0.005 kWh/s * 900s = 4500 Wh per quarter
-            self.assertGreater(result[qh]["wh"], 4000)
-
-
-class TestComputeClockBoundaryNBCQuarters(unittest.TestCase):
-    """Tests for compute_clock_boundary_nbc_quarters() — clock-boundary NBC selection.
-
-    The function takes per-second data and observation counts for two consecutive
-    hours, determines the 4 most recent 15-minute clock-boundary windows based on
-    wall-clock time, and computes NBC metrics for each window.
-    """
-
-    def _make_data(self, seconds_count: int, value: float) -> list[float]:
-        """Return a list of `seconds_count` identical kWh/second values."""
-        return [value] * seconds_count
-
-    def test_all_four_current_hour_at_minute_50(self):
-        """At minute 50: all 4 windows fall within the current hour."""
-        from util import compute_clock_boundary_nbc_quarters
-
-        # Previous hour: fully complete (3600s, low consumption)
-        prev_data = self._make_data(3600, 0.001)
-        # Current hour: minute 50 → n=3000, data covers 0–2999
-        curr_data = self._make_data(3000, 0.002)
-        now = datetime(2026, 1, 1, 9, 50, 30, tzinfo=timezone.utc)
-
-        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
-
-        # All 4 quarters should be non-None
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
-            self.assertIsNotNone(result[qh])
-
-        # QH1 (09:35–09:50) is incomplete: only 300 of 900 samples available
-        # raw = 300 * 0.002 * 1000 = 600 Wh, remaining = 29.5s, rate = 0.002
-        # predicted = 600 + 0.002 * 29.5 * 1000 = 1740 Wh
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertAlmostEqual(result["QH1"]["wh"], 1740.0, places=1)
-
-        # QH2–QH4 (09:20–09:35, 09:05–09:20, 08:50–09:05) are complete
-        for qh in ("QH2", "QH3", "QH4"):
-            self.assertTrue(result[qh]["complete"])
-            self.assertAlmostEqual(result[qh]["wh"], 1800.0, places=1)
-
-        # window_labels should be present
-        self.assertIn("window_labels", result)
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
-            self.assertIn(qh, result["window_labels"])
-
-    def test_two_from_each_hour_at_minute_30(self):
-        """At minute 30: QH1 is current incomplete window, QH2–QH3 from curr hour,
-        QH4 from prev hour."""
-        from util import compute_clock_boundary_nbc_quarters
-
-        prev_data = self._make_data(3600, 0.001)
-        curr_data = self._make_data(1800, 0.002)
-        now = datetime(2026, 1, 1, 9, 30, 45, tzinfo=timezone.utc)
-
-        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
-
-        # All 4 quarters should be dicts
-        qh_values = [result[k] for k in ("QH1", "QH2", "QH3", "QH4")]
-        non_none = [v for v in qh_values if isinstance(v, dict)]
-        self.assertEqual(len(non_none), 4)
-
-        # QH1 (09:30–09:45) incomplete, no data → wh=0
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertEqual(result["QH1"]["wh"], 0)
-
-        # QH2 (09:15–09:30) complete, 0.002 * 900 = 1800 Wh
-        self.assertTrue(result["QH2"]["complete"])
-        self.assertAlmostEqual(result["QH2"]["wh"], 1800.0, places=1)
-
-        # QH3 (09:00–09:15) complete, 0.002 * 900 = 1800 Wh
-        self.assertTrue(result["QH3"]["complete"])
-        self.assertAlmostEqual(result["QH3"]["wh"], 1800.0, places=1)
-
-        # QH4 (08:45–09:00) complete, 0.001 * 900 = 900 Wh
-        self.assertTrue(result["QH4"]["complete"])
-        self.assertAlmostEqual(result["QH4"]["wh"], 900.0, places=1)
-
-    def test_three_curr_one_prev_at_minute_20(self):
-        """At minute 20: 3 from current hour + 1 from previous hour."""
-        from util import compute_clock_boundary_nbc_quarters
-
-        prev_data = self._make_data(3600, 0.001)
-        curr_data = self._make_data(1200, 0.003)
-        now = datetime(2026, 1, 1, 9, 20, 30, tzinfo=timezone.utc)
-
-        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
-
-        # Should have exactly 4 quarters (QH1–QH4)
-        qh_values = [result[k] for k in ("QH1", "QH2", "QH3", "QH4")]
-        non_none = [v for v in qh_values if isinstance(v, dict)]
-        self.assertEqual(len(non_none), 4)
-
-        # QH1 (09:15–09:30) incomplete: only 300 of 900 samples available
-        # raw = 300 * 0.003 * 1000 = 900 Wh, remaining = 570s, rate = 0.003
-        # predicted = 900 + 0.003 * 570 * 1000 = 2610 Wh
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertAlmostEqual(result["QH1"]["wh"], 2610.0, places=1)
-
-        # QH2 (09:00–09:15) complete, 0.003 * 900 = 2700 Wh
-        self.assertTrue(result["QH2"]["complete"])
-        self.assertAlmostEqual(result["QH2"]["wh"], 2700.0, places=1)
-
-        # QH3 (08:45–09:00) complete, 0.001 * 900 = 900 Wh
-        self.assertTrue(result["QH3"]["complete"])
-        self.assertAlmostEqual(result["QH3"]["wh"], 900.0, places=1)
-
-        # QH4 (08:30–08:45) complete, 0.001 * 900 = 900 Wh
-        self.assertTrue(result["QH4"]["complete"])
-        self.assertAlmostEqual(result["QH4"]["wh"], 900.0, places=1)
-
-    def test_chronological_order_qh1_oldest(self):
-        """QH1 should be oldest window, QH4 newest."""
-        from util import compute_clock_boundary_nbc_quarters
-
-        prev_data = self._make_data(3600, 0.001)
-        curr_data = self._make_data(3600, 0.005)
-        now = datetime(2026, 1, 1, 9, 59, 30, tzinfo=timezone.utc)
-
-        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
-
-        # All quarters from current hour should have higher wh values
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
-            self.assertIsNotNone(result[qh])
-            # Current hour data: 0.005 kWh/s * 900s = 4500 Wh per quarter
-            self.assertGreater(result[qh]["wh"], 4000)
-
-    def test_negative_values_clamped_to_zero(self):
-        """Solar export (negative values) → wh clamped to 0."""
-        from util import compute_clock_boundary_nbc_quarters
-
-        prev_data = self._make_data(3600, -0.0005)
-        curr_data = self._make_data(3600, -0.0005)
-        now = datetime(2026, 1, 1, 9, 50, 30, tzinfo=timezone.utc)
-
-        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
-
-        for qh in ("QH1", "QH2", "QH3", "QH4"):
-            self.assertIsNotNone(result[qh])
-            # raw_wh should be negative, wh clamped to 0
-            self.assertLess(result[qh]["raw_wh"], 0)
-            self.assertEqual(result[qh]["wh"], 0)
-
-    def test_window_labels_format(self):
-        """window_labels should contain human-readable time ranges."""
-        from util import compute_clock_boundary_nbc_quarters
-
-        prev_data = self._make_data(3600, 0.001)
-        curr_data = self._make_data(3600, 0.002)
-        now = datetime(2026, 1, 1, 9, 37, 0, tzinfo=timezone.utc)
-
-        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
-
-        labels = result["window_labels"]
-        # QH1 should be the most recent window (09:30–09:45)
-        self.assertIn("QH1", labels)
-        # Labels should contain time strings like "09:30–09:45"
-        self.assertRegex(labels["QH1"], r"\d{2}:\d{2}")
-
-    def test_prev_hour_empty(self):
-        """Previous hour has no data → QH3/QH4 have wh=0, QH1/QH2 from current hour."""
-        from util import compute_clock_boundary_nbc_quarters
-
-        prev_data: list[float] = []
-        curr_data = self._make_data(1800, 0.002)
-        now = datetime(2026, 1, 1, 9, 30, 45, tzinfo=timezone.utc)
-
-        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
-
-        # All 4 quarters are dicts (wh=0 for missing data windows)
-        qh_values = [result[k] for k in ("QH1", "QH2", "QH3", "QH4")]
-        non_none = [v for v in qh_values if isinstance(v, dict)]
-        self.assertEqual(len(non_none), 4)
-
-        # QH1 (09:30–09:45) incomplete, no data → wh=0
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertEqual(result["QH1"]["wh"], 0)
-
-        # QH2 (09:15–09:30) complete, 0.002 * 900 = 1800 Wh
-        self.assertTrue(result["QH2"]["complete"])
-        self.assertAlmostEqual(result["QH2"]["wh"], 1800.0, places=1)
-
-        # QH3 (09:00–09:15) complete, 0.002 * 900 = 1800 Wh
-        self.assertTrue(result["QH3"]["complete"])
-        self.assertAlmostEqual(result["QH3"]["wh"], 1800.0, places=1)
-
-        # QH4 (08:45–09:00) no prev data → wh=0, complete=False
-        self.assertFalse(result["QH4"]["complete"])
-        self.assertEqual(result["QH4"]["wh"], 0)
-
-    def test_incomplete_extrapolation_accuracy(self):
-        """Incomplete quarter: predicted_wh should be rate * 900."""
-        from util import compute_clock_boundary_nbc_quarters
-
-        prev_data = self._make_data(3600, 0.001)
-        # Current hour: minute 25 → n=1500, QH1 (09:15–09:30) has 600s observed
-        curr_data = self._make_data(1500, 0.004)
-        now = datetime(2026, 1, 1, 9, 25, 30, tzinfo=timezone.utc)
-
-        result = compute_clock_boundary_nbc_quarters(prev_data, curr_data, now)
-
-        # QH1 (09:15–09:30): 600s observed out of 900, remaining = 300
-        qh1 = result["QH1"]
-        self.assertFalse(qh1["complete"])
-        # raw_wh: 600 * 0.004 * 1000 = 2400 Wh
-        self.assertAlmostEqual(qh1["raw_wh"], 2400.0, places=1)
-        # predicted: rate = 0.004, remaining = ~300s
-        # predicted_wh ≈ 2400 + 0.004 * 300 * 1000 = 2400 + 1200 = 3600
-        self.assertGreater(qh1["predicted_wh"], qh1["raw_wh"])
-
-
-class TestComputeWindowWhPredictedWh(unittest.TestCase):
-    """Tests for _compute_window_wh() — ensures predicted_wh is always present.
-
-    The index template accesses qh.predicted_wh for incomplete quarters.
-    This property must hold for ALL branches of _compute_window_wh().
-    """
-
-    def test_complete_window_has_predicted_wh(self):
-        """Complete window (900s) must include predicted_wh key."""
-        from util import _compute_window_wh
-
-        data = [0.001] * 900
-        now = datetime.now().replace(tzinfo=None)
-        win_end = now + timedelta(seconds=900)
-        result = _compute_window_wh(data, 0, 899, win_end, now)
-
-        self.assertTrue(result["complete"])
-        self.assertIn("predicted_wh", result)
-        self.assertAlmostEqual(result["predicted_wh"], 900.0, places=1)
-
-    def test_incomplete_window_has_predicted_wh(self):
-        """Incomplete window must include predicted_wh key."""
-        from util import _compute_window_wh
-
-        data = [0.002] * 900
-        now = datetime.now().replace(tzinfo=None)
-        win_end = now + timedelta(seconds=400)
-        result = _compute_window_wh(data, 0, 499, win_end, now)
-
-        self.assertFalse(result["complete"])
-        self.assertIn("predicted_wh", result)
-        self.assertGreater(result["predicted_wh"], 0)
-
-    def test_empty_data_has_predicted_wh(self):
-        """Empty data / out-of-order indices must include predicted_wh key."""
-        from util import _compute_window_wh
-
-        now = datetime.now().replace(tzinfo=None)
-        win_end = now + timedelta(seconds=0)
-        result = _compute_window_wh([], 500, 400, win_end, now)
-
-        self.assertFalse(result["complete"])
-        self.assertIn("predicted_wh", result)
-        self.assertEqual(result["predicted_wh"], 0)
-
-    def test_zero_length_window_has_predicted_wh(self):
-        """Zero-length slice must include predicted_wh key."""
-        from util import _compute_window_wh
-
-        now = datetime.now().replace(tzinfo=None)
-        win_end = now + timedelta(seconds=0)
-        result = _compute_window_wh([0.001], 100, 99, win_end, now)
-
-        self.assertFalse(result["complete"])
-        self.assertIn("predicted_wh", result)
-        self.assertEqual(result["predicted_wh"], 0)
 
 
 if __name__ == "__main__":

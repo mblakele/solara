@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, time, timezone
 import logging
 import threading
-import time
+import time as _time_mod
 
 # Third-party imports.
 from typing import Any, Callable
@@ -1073,7 +1073,7 @@ class LoadManager:
                 }
 
             # ── Stage 2: NBC fetch ─────────────────────────────────────────
-            fetch_start = time.perf_counter()
+            fetch_start = _time_mod.perf_counter()
             qh_result = self.nbc_reader.get_current_qh(force=force, now=now)
             if qh_result is None:
                 return {
@@ -1097,9 +1097,9 @@ class LoadManager:
                 seconds_remaining,
                 data_point_at,
             ) = qh_result
-            fetch_end = time.perf_counter()
+            fetch_end = _time_mod.perf_counter()
             # reduce calls to datetime.now, to reduce scope for test errors
-            now_postfetch = now + timedelta(seconds=(fetch_end - fetch_start))
+            now_postfetch = now + timedelta(seconds=fetch_end - fetch_start)
             # TODO assert now_postfetch is same QH as local now? retryable exception?
             logger.debug("now %s postfetch %s", now, now_postfetch)
 

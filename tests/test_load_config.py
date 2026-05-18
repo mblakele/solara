@@ -226,7 +226,7 @@ def _make_manager_with_enabled(
     """Create a LoadManager with the given enabled value and predicted Wh."""
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
-    metrics_data = _make_metrics_with_wh("main_panel", "QH3", predicted_wh)
+    metrics_data = _make_metrics_with_wh("main_panel", predicted_wh)
 
     energy_cache = EnergyCache()
     return LoadManager(
@@ -357,7 +357,7 @@ def test_sync_reconciles_external_turn_off():
     plug_ctrl._state["heater"] = False
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -390,7 +390,7 @@ def test_sync_populates_new_device():
     plug_ctrl._state["pump"] = True
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -435,7 +435,7 @@ def test_sync_handles_controller_error():
     plug_ctrl = FailingController(plugs)
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -461,7 +461,7 @@ def test_sync_no_reconciliation_when_states_match():
     plug_ctrl._state["heater"] = True
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -711,7 +711,7 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
     plug_ctrl = PlugController(plugs)
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -757,7 +757,7 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
     plug_ctrl = PlugController(plugs)
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -803,7 +803,7 @@ def test_cycle_filters_outside_range_plug(mock_config):
     plug_ctrl = PlugController(plugs)
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -854,7 +854,7 @@ def test_cycle_includes_plug_inside_range(mock_config):
     plug_ctrl = PlugController(plugs)
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -906,7 +906,7 @@ def test_cycle_filters_outside_range_tesla(mock_config):
     )
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,
@@ -969,7 +969,7 @@ def test_no_action_reason_skips_outside_range_plug(mock_config):
     plug_ctrl = PlugController(plugs)
 
     mgr = LoadManager(
-        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", "QH3", -2000.0),
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
         target_wh=-500,

@@ -43,10 +43,7 @@ class Config:
     @property
     def is_mock_mode(self) -> bool:
         """Return True when running in mock/test mode."""
-        username = _decouple_config("VUE_USERNAME", default=None)  # type: ignore[assignment]
-        return username is None or username == "" or _decouple_config(
-            "MOCK", default="False", cast=bool
-        )
+        return _decouple_config("MOCK", default="False", cast=bool)
 
     @property
     def is_mock_error(self) -> bool:
