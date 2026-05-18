@@ -89,17 +89,20 @@ def compute_nbc_quarter(
     assert values_len <= QH_PERIOD_SECONDS
 
     is_complete = values_len == QH_PERIOD_SECONDS
-    raw_wh = sum(values) * 1000
+    raw_wh = 1000 * sum(values)
     result = {
         "complete": is_complete,
         "raw_wh": raw_wh,
+        # TODO change name to nbc_wh?
         "wh": max(0, raw_wh)
     }
 
     if not is_complete:
+        prediction_values = values[-60:]
+        prediction_w = 1000 * sum(prediction_values) / len(prediction_values)
         remaining_seconds = QH_PERIOD_SECONDS - values_len
-        predicted_wh = QH_PERIOD_SECONDS * raw_wh / values_len
-        result["predicted_wh"] = predicted_wh
+        result["prediction_w"] = prediction_w
+        result["predicted_wh"] = raw_wh + remaining_seconds * prediction_w
         result["remaining_seconds"] = remaining_seconds
         result["samples_used"] = values_len
 
