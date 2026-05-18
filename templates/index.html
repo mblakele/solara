@@ -92,9 +92,9 @@
         {{ vd.lag }}
       </td>
     </tr>
-    {% if vd.clock_boundary_nbc and vd.clock_boundary_nbc.get("window_labels") %}
+    {% if vd.nbc and vd.nbc.get("window_labels") %}
     {% for qh_key in ["QH1", "QH2", "QH3", "QH4"] %}
-    {% set qh = vd.clock_boundary_nbc.get(qh_key) %}
+    {% set qh = vd.nbc.get(qh_key) %}
     {% if qh is not none and qh is not false %}
     <tr>
       <td class="op">{{ qh_key }}</td>
@@ -106,7 +106,7 @@
         {% endif %}
       </td>
       <td class="note">
-        {{ vd.clock_boundary_nbc["window_labels"].get(qh_key, "") }}
+        {{ vd.nbc["window_labels"].get(qh_key, "") }}
       </td>
     </tr>
     {% endif %}
