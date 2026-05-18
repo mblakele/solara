@@ -92,12 +92,12 @@
         {{ vd.lag }}
       </td>
     </tr>
-    {% if vd.nbc and vd.nbc.get("window_labels") %}
+    {% if vd.nbc %}
     {% for qh_key in ["QH1", "QH2", "QH3", "QH4"] %}
     {% set qh = vd.nbc.get(qh_key) %}
     {% if qh is not none and qh is not false %}
     <tr>
-      <td class="op">{{ qh_key }}</td>
+      <td class="op"></td>
       <td class="num">
         {% if not qh.complete %}
           {{ "%.0f" % (qh.raw_wh) }}&nbsp;/&nbsp;{{ "%.0f" % (qh.predicted_wh) }}
@@ -105,9 +105,7 @@
           {{ "%.0f" % (qh.raw_wh) }}
         {% endif %}
       </td>
-      <td class="note">
-        {{ vd.nbc["window_labels"].get(qh_key, "") }}
-      </td>
+      <td class="note">{{ qh_key }}</td>
     </tr>
     {% endif %}
     {% endfor %}
