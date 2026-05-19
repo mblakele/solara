@@ -361,20 +361,21 @@ class StateTracker:
         self.last_tesla_increase_at: datetime | None = None
         self.last_tesla_increase_qh: str | None = None
 
-    def estimated_current_wh(self, nbc_predicted_wh: float) -> float:
+    def estimated_current_wh(self, nbc_predicted_wh: float, seconds_remaining:
+  int) -> float:
         """Estimate actual current Wh by adding pending effects to NBC prediction.
 
-        Used in run_cycle() to adjust predictions before calling decide(),
-        so the engine accounts for actions already taken this quarter-hour
-        without waiting for fresh API data.
+        Tesla set_amps effects are excluded — their contribution is recomputed live
+        each cycle in _cycle_async_phase using the vehicle API's reported
+        current_amps via tesla_inflight_wh().
 
-        Tesla set_amps effects are excluded here — their contribution is
-        recomputed live each cycle in _cycle_async_phase using the vehicle
-        API's reported current_amps, so it never goes stale as seconds_remaining
-        shrinks. See tesla_inflight_wh().
+        Other effects (plug turn_on/turn_off) use power_watts if set, computing
+        Wh dynamically from seconds_remaining. Falls back to stored power_delta_wh
+        for backwards compatibility.
 
         Args:
             nbc_predicted_wh: Raw predicted Wh from NBC cache/API.
+            seconds_remaining: Seconds left in the current quarter-hour.
 
         Returns:
             Adjusted Wh estimate including all pending effect deltas.
@@ -383,7 +384,10 @@ class StateTracker:
         for effect in self.pending_effects:
             if effect.device_name == "tesla" and effect.action == "set_amps":
                 continue
-            adjusted += effect.power_delta_wh
+            if effect.power_watts is not None:
+                adjusted += effect.power_watts * seconds_remaining / NBCPeriod.PERIOD_SECS
+            else:
+                adjusted += effect.power_delta_wh
         return adjusted
 
     def tesla_inflight_wh(
@@ -752,6 +756,7 @@ class GapMinder:
                         timestamp=now,
                         data_point_at=dp_at or now,
                         power_delta_wh=capacity,
+                        power_watts=plug.power_watts,
                     )
                 )
                 remaining_gap -= capacity
@@ -919,6 +924,7 @@ class GapMinder:
                     timestamp=now,
                     data_point_at=dp,
                     power_delta_wh=-savings,
+                    power_watts=plug.power_watts,
                 )
             )
             remaining_reduction -= savings

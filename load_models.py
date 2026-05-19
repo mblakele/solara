@@ -194,6 +194,7 @@ class PendingEffect:
             Used alongside timestamp for dual-pruning checks.
         power_delta_wh: Expected watt-hour impact of the action.
         target_amps: Target amps for "set_amps" actions; None otherwise.
+        power_watts: Expected impact of the action, in Watts.
     """
 
     device_name: str
@@ -202,6 +203,7 @@ class PendingEffect:
     data_point_at: datetime
     power_delta_wh: float
     target_amps: int | None = None  # Target amps for set_amps actions
+    power_watts: float | None = None
 
 
 @dataclass

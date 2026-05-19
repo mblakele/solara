@@ -116,14 +116,14 @@ def test_estimated_current_wh_adds_pending():
             power_delta_wh=200.0,
         )
     )
-    estimated = tracker.estimated_current_wh(1000.0)
+    estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=900)
     assert pytest.approx(estimated) == 1200.0
 
 
 def test_estimated_current_wh_no_pending():
     """Returns raw prediction when no pending effects."""
     tracker = StateTracker()
-    estimated = tracker.estimated_current_wh(1000.0)
+    estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=900)
     assert pytest.approx(estimated) == 1000.0
 
 
@@ -145,8 +145,34 @@ def test_estimated_current_wh_multiple_effects():
             power_delta_wh=-100.0,
         ),
     ])
-    estimated = tracker.estimated_current_wh(1000.0)
+    estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=900)
     assert pytest.approx(estimated) == 1100.0
+
+
+def test_estimated_current_wh_dynamic_power_watts():
+    """Plug effects with power_watts compute Wh dynamically from
+    seconds_remaining."""
+    tracker = StateTracker()
+    now = datetime.now(timezone.utc)
+    # A turn_on effect for a 2000W plug
+    tracker.pending_effects.append(
+        PendingEffect(
+            device_name="heater",
+            action="turn_on",
+            timestamp=now,
+            data_point_at=now - timedelta(seconds=20),
+            power_delta_wh=0.0,
+            power_watts=2000.0,
+        )
+    )
+    # At 600s remaining: 2000W * 600/900 = 1333.33... Wh
+    estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=600)
+    assert pytest.approx(estimated) == 1000.0 + 2000.0 * 600 / 900
+    # At 300s remaining: 2000W * 300/900 = 666.67... Wh
+    estimated_late = tracker.estimated_current_wh(
+        1000.0, seconds_remaining=300
+    )
+    assert pytest.approx(estimated_late) == 1000.0 + 2000.0 * 300 / 900
 
 
 def test_pending_since_count_empty():

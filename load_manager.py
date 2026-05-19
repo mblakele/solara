@@ -999,6 +999,9 @@ class LoadManager:
             nbc_timestamp
         ):
             pending_count = self.state.pending_since_count(nbc_timestamp)
+            pruned = self.state.prune_old_effects(data_point_at, now_postfetch)
+            if pruned > 0:
+                logger.debug("Pruned %d old pending effects (waiting path)", pruned)
             candidate_details = self._build_candidate_details(
                 now_postfetch, seconds_remaining, None, None, tesla_configured
             )
@@ -1120,7 +1123,7 @@ class LoadManager:
             self.state.last_data_point_at = data_point_at
             # Adjust prediction with still-pending effects so decide() accounts
             # for actions already taken this quarter-hour.
-            adjusted_wh = self.state.estimated_current_wh(predicted_wh)
+            adjusted_wh = self.state.estimated_current_wh(predicted_wh, seconds_remaining)
             gap_wh = self.target_wh - adjusted_wh
 
             # ── Stage 5: async phase (one event loop for the whole cycle) ──

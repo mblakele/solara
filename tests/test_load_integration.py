@@ -985,6 +985,53 @@ def test_stale_data_prunes_old_effects():
     )
 
 
+def test_check_pending_state_prunes_in_waiting_path():
+    """_check_pending_state prunes old effects in the waiting-for-fresh-data path."""
+    plugs: dict[str, PlugConfig] = {}
+    plug_ctrl = PlugController(plugs)
+
+    fixed_now = datetime(2026, 5, 6, 7, 8, 0, tzinfo=timezone.utc)
+    # Lag of 10s: data_point_at = now - 10s = well within 120s stale threshold.
+    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=10)
+    mgr = LoadManager(
+        energy_cache=energy_cache,
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=False,
+    )
+
+    # data_point_at = fixed_now - 10s.
+    # A recent effect (8s ago) is AFTER data_point_at → triggers waiting path.
+    # An old effect (90s ago) is BEFORE cutoff (data_point_at - 60s) → should be pruned.
+    mgr.state.pending_effects.extend([
+        PendingEffect(
+            device_name="heater", action="turn_on",
+            timestamp=fixed_now - timedelta(seconds=8),
+            data_point_at=fixed_now - timedelta(seconds=8),
+            power_delta_wh=500.0,
+        ),
+        PendingEffect(
+            device_name="old_plug", action="turn_off",
+            timestamp=fixed_now - timedelta(seconds=90),
+            data_point_at=fixed_now - timedelta(seconds=90),
+            power_delta_wh=-200.0,
+        ),
+    ])
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = mgr.run_cycle()
+
+    assert result["status"] == "waiting_for_fresh_data"
+    # The old effect should have been pruned; the recent one should remain.
+    assert len(mgr.state.pending_effects) == 1
+    assert mgr.state.pending_effects[0].device_name == "heater"
+
+
 def test_stale_data_includes_candidates():
     """Stale data response includes candidates in diagnostics."""
     plugs = {
