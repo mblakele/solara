@@ -128,14 +128,17 @@ project-root
 
 ### Key entry points
 
-- NBC calculation in `metrics.py` (EnergyCache with incremental fetch, sample merging, and pruning;
-- HourlyPrediction metrics in `metrics.py` (HourlyProjection with required `chart_start` on `populate()`,
-  minute-scale extrapolation and min/max bounds prediction via `predict()`)
+- **Guard functions** `metrics.py`: `cap_chart_start()`, `cap_fetch_window()` —
+  prevent over-fetching when cache is stale; pure functions, independently tested
+- NBC calculation in `metrics.py` (`EnergyCache` with incremental fetch, sample
+  merging, and pruning; `NBCReader` with `get_current_qh(force=False)`)
+- `HourlyProjection` in `metrics.py` with `populate()` (uses `cap_chart_start`
+  guard), `predict()`, and per-device prediction via `_predict_device()`
 - TOU in `energy_aggregator.py`
-- oauth in `load_manager.py`
-- routes in `app.py`
-- test data generation in `mockdata.py`
-- timezones in `util.py`
+- OAuth in `load_manager.py`
+- Routes in `app.py`
+- Test data generation in `mockdata.py`
+- Timezones in `util.py`
 
 ### Actions Generation Flow
 - GapMinder.decide() generates actions as a list of PendingEffect objects

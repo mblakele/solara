@@ -31,6 +31,54 @@ from config import cfg as _cfg
 
 logger = logging.getLogger(__name__)
 
+MAX_FETCH_WINDOW = timedelta(hours=1)
+
+
+def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
+    """Cap chart_start to prevent over-fetching after stale cache.
+
+    If chart_start is more than 1 hour before *now*, return the current
+    quarter-hour boundary.  Otherwise return chart_start unchanged.
+
+    This guard prevents the Emporia API from rejecting large 1-second
+    resolution requests when the load manager has been idle for a long
+    period (e.g. disabled overnight).
+
+    Args:
+        chart_start: The proposed fetch window start time.
+        now: The current time.
+
+    Returns:
+        A datetime no more than 1 hour before *now*, or *chart_start*
+        unchanged if it is already within the 1-hour window.
+    """
+    if now - chart_start > MAX_FETCH_WINDOW:
+        return ceil_to_qh(now)
+    return chart_start
+
+
+def cap_fetch_window(start_time: datetime, now: datetime) -> datetime:
+    """Cap a fetch start_time to prevent over-fetching after stale cache.
+
+    If *start_time* is more than 1 hour before *now*, return the current
+    quarter-hour boundary.  Otherwise return start_time unchanged.
+
+    Used by the incremental fetch builder to guard against stale
+    EnergyCache state that would otherwise request hours of 1-second
+    data.
+
+    Args:
+        start_time: The proposed fetch window start time.
+        now: The current time.
+
+    Returns:
+        A datetime no more than 1 hour before *now*, or *start_time*
+        unchanged if it is already within the 1-hour window.
+    """
+    if now - start_time > MAX_FETCH_WINDOW:
+        return ceil_to_qh(now)
+    return start_time
+
 
 
 
@@ -152,6 +200,18 @@ def _build_incremental_fetch(
         else:
             last_sample_idx = len(energy_cache.samples)
             start_time = energy_cache.data_start + timedelta(seconds=last_sample_idx)
+
+        # Guard against stale cache: if the incremental window would be >1h,
+        # fall back to a full-hour fetch to avoid API rejection.
+        capped = cap_fetch_window(start_time, now)
+        if capped != start_time:
+            logger.debug(
+                "[_build_incremental_fetch] incremental window %s-%s >1h, "
+                "falling back to full-hour fetch",
+                start_time,
+                now,
+            )
+            start_time = capped
 
         try:
             usage_data, data_start = vue.get_chart_usage(
@@ -721,6 +781,20 @@ class HourlyProjection(MetricsBase):
         Returns:
             Dict of gid -> prediction results for each device.
         """
+        # Cap chart_start to prevent over-fetching after stale cache.
+        # If the cache has been stale for >1 hour (e.g. load manager was
+        # disabled overnight), chart_start may point far in the past.
+        # The Emporia API rejects large 1-s resolution requests.
+        capped = cap_chart_start(chart_start, self.instant)
+        if capped != chart_start:
+            self.logger.debug(
+                "[HourlyProjection.populate] chart_start %s capped to %s "
+                "(was >1h before now)",
+                chart_start,
+                capped,
+            )
+            chart_start = capped
+
         self.logger.debug("populate from %s", chart_start)
         # Fetch usage data without mutating device_info
         population = self.populate_internal(chart_start, self.energy_cache)
