@@ -65,7 +65,7 @@ Solara is a Python/Flask web application that connects to the Emporia VUE Utilit
 Connect API to predict hourly solar energy usage. It helps homeowners with rooftop
 solar and net energy metering (NEM) maximize self-consumption by predicting total
 energy produced or consumed in the coming hour, based on per-second energy data from
-smart meters over the past ten minutes.
+smart meters.
 
 Key capabilities:
 - Fetches real-time energy metrics from the Emporia VUE API via `pyemvue`

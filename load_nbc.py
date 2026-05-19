@@ -299,7 +299,7 @@ class StateTracker:
     # is fast (enables rapid recovery from an over-commit without waiting out the
     # full on-guard period, which would leave a large deficit in place).
     MIN_TOGGLE_ON_SECS = 60
-    MIN_TOGGLE_OFF_SECS = 10
+    MIN_TOGGLE_OFF_SECS = 20
     STALE_THRESHOLD_SECS = 61
     PENDING_EFFECT_MIN_SECS = 60
     VOLTAGE = 240
@@ -595,7 +595,7 @@ class GapMinder:
     """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
-    MIN_SECONDS_TO_ACT = 60
+    MIN_SECONDS_TO_ACT = 45
     # Capacity discount applied to turn-on decisions.  A load is only turned on
     # if its discounted capacity fits in the gap, reserving headroom for solar
     # variability and NBC prediction error.  Acts as damping to reduce overshoot.
