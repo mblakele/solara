@@ -216,6 +216,7 @@ including the description — before finishing the task.
 
 **During planning, operate in strict read-only mode.** This means:
 
+- Always write your plan to a new file in `.opencode/plans/`.
 - No file writes anywhere in the repo except `.opencode/plans/`
 - No shell commands that mutate state: no `pip install`, no `git commit`,
   no `git add`, no file edits, no database migrations
@@ -224,7 +225,7 @@ including the description — before finishing the task.
 When asked to plan changes, break tasks into subtasks that each fit within a
 **32k–48k token budget per subtask**. If a task requires touching more than 3
 files or ~200 lines of code, split it into sequential subtasks and plan them
-separately. Document each subtask as its own file in `.opencode/plans/`.
+separately. Document each subtask in the overall plan file in `.opencode/plans/`.
 
 ### Plan Implementation
 
