@@ -2,8 +2,11 @@
 Energy data aggregation for Time-of-Use (TOU) reporting.
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
+
 import pytz
 
 from config import get_timezone
@@ -26,6 +29,13 @@ class EnergyDataAggregator:
     Units: All results in Watt-hours (Wh). Negative totals indicate net export.
     """
 
+    _BUCKET_DEFAULTS: dict[str, float] = {
+        "total": 0.0,
+        "peak": 0.0,
+        "part_peak": 0.0,
+        "off_peak": 0.0,
+    }
+
     @staticmethod
     def classify_hour(hour: int) -> str:
         """
@@ -34,8 +44,8 @@ class EnergyDataAggregator:
         Args:
             hour: Hour of day (0-23).
 
-         Returns:
-             Bucket name: 'peak', 'part_peak', or 'off_peak'.
+        Returns:
+            Bucket name: 'peak', 'part_peak', or 'off_peak'.
         """
         if 16 <= hour <= 20:
             return "peak"
@@ -52,6 +62,46 @@ class EnergyDataAggregator:
         return timestamp.astimezone(local_tz).hour
 
     @staticmethod
+    def _aggregate(
+        start_time: datetime,
+        data: list[float],
+        step: timedelta,
+    ) -> dict[str, float]:
+        """Aggregate index-based data into TOU buckets.
+
+        Each element in *data* represents one time step starting from
+        *start_time* advancing by *step* (e.g. 1 second, 1 minute,
+        15 minutes, or 1 hour).
+
+        Args:
+            start_time: Start time of the first data point.
+            data: List of kWh values, one per time step.
+            step: Time delta between consecutive data points.
+
+        Returns:
+            Dictionary with bucket totals in Wh:
+            {'total', 'peak', 'part_peak', 'off_peak'}
+        """
+        buckets: dict[str, float] = dict(EnergyDataAggregator._BUCKET_DEFAULTS)
+
+        local_tz = pytz.timezone(get_timezone())
+        if start_time.tzinfo is None:
+            start_local = local_tz.localize(start_time)
+        else:
+            start_local = start_time.astimezone(local_tz)
+
+        for idx, usage_kwh in enumerate(data):
+            if usage_kwh is None:
+                continue
+            timestamp = start_local + step * idx
+            usage_wh = usage_kwh * 1000.0
+            bucket = EnergyDataAggregator.classify_hour(timestamp.hour)
+            buckets[bucket] += usage_wh
+            buckets["total"] += usage_wh
+
+        return buckets
+
+    @staticmethod
     def aggregate_from_hourly(
         hourly_data: List[Tuple[datetime, float]],
     ) -> Dict[str, float]:
@@ -66,7 +116,7 @@ class EnergyDataAggregator:
             Dictionary with bucket totals in Wh:
             {'total': float, 'peak': float, 'part_peak': float, 'off_peak': float}
         """
-        buckets = {"total": 0.0, "peak": 0.0, "part_peak": 0.0, "off_peak": 0.0}
+        buckets: Dict[str, float] = dict(EnergyDataAggregator._BUCKET_DEFAULTS)
 
         for timestamp, usage_kwh in hourly_data:
             if usage_kwh is None:
@@ -94,23 +144,9 @@ class EnergyDataAggregator:
             Dictionary with bucket totals in Wh:
             {'total': float, 'peak': float, 'part_peak': float, 'off_peak': float}
         """
-        buckets = {"total": 0.0, "peak": 0.0, "part_peak": 0.0, "off_peak": 0.0}
-
-        start_local = (
-            start_time.astimezone(pytz.timezone(get_timezone()))
-            if start_time.tzinfo
-            else pytz.timezone(get_timezone()).localize(start_time)
+        return EnergyDataAggregator._aggregate(
+            start_time, usage_data, timedelta(seconds=1)
         )
-        for idx, usage_kwh in enumerate(usage_data):
-            if usage_kwh is None:
-                continue
-            timestamp = start_local + timedelta(seconds=idx)
-            usage_wh = usage_kwh * 1000.0
-            bucket = EnergyDataAggregator.classify_hour(timestamp.hour)
-            buckets[bucket] += usage_wh
-            buckets["total"] += usage_wh
-
-        return buckets
 
     @staticmethod
     def aggregate_from_minutes(
@@ -127,23 +163,9 @@ class EnergyDataAggregator:
             Dictionary with bucket totals in Wh:
             {'total': float, 'peak': float, 'part_peak': float, 'off_peak': float}
         """
-        buckets = {"total": 0.0, "peak": 0.0, "part_peak": 0.0, "off_peak": 0.0}
-
-        start_local = (
-            start_time.astimezone(pytz.timezone(get_timezone()))
-            if start_time.tzinfo
-            else pytz.timezone(get_timezone()).localize(start_time)
+        return EnergyDataAggregator._aggregate(
+            start_time, usage_data, timedelta(minutes=1)
         )
-        for idx, usage_kwh in enumerate(usage_data):
-            if usage_kwh is None:
-                continue
-            timestamp = start_local + timedelta(minutes=idx)
-            usage_wh = usage_kwh * 1000.0
-            bucket = EnergyDataAggregator.classify_hour(timestamp.hour)
-            buckets[bucket] += usage_wh
-            buckets["total"] += usage_wh
-
-        return buckets
 
     @staticmethod
     def aggregate_from_15min(
@@ -159,20 +181,6 @@ class EnergyDataAggregator:
             Dictionary with bucket totals in Wh:
             {'total': float, 'peak': float, 'part_peak': float, 'off_peak': float}
         """
-        buckets = {"total": 0.0, "peak": 0.0, "part_peak": 0.0, "off_peak": 0.0}
-
-        start_local = (
-            start_time.astimezone(pytz.timezone(get_timezone()))
-            if start_time.tzinfo
-            else pytz.timezone(get_timezone()).localize(start_time)
+        return EnergyDataAggregator._aggregate(
+            start_time, usage_data, timedelta(minutes=15)
         )
-        for idx, usage_kwh in enumerate(usage_data):
-            if usage_kwh is None:
-                continue
-            timestamp = start_local + timedelta(minutes=15 * idx)
-            usage_wh = usage_kwh * 1000.0
-            bucket = EnergyDataAggregator.classify_hour(timestamp.hour)
-            buckets[bucket] += usage_wh
-            buckets["total"] += usage_wh
-
-        return buckets
