@@ -1160,13 +1160,18 @@ class HourlyProjection(MetricsBase):
             DeviceMetrics instance with all derived fields.
         """
         nbc_seconds = pop_result.nbc_seconds
+        pop_data_start = pop_result.nbc_data_start
         # Use merged cache samples for NBC computation when available.
         # This ensures _compute_nbc sees the full hour of data rather than
         # only the incremental delta from the API call.
-        if self.energy_cache is not None:
+        if nbc_seconds is not None and pop_data_start is not None and self.energy_cache is not None:
             cache_samples = self.energy_cache.samples
             if cache_samples:
-                nbc_seconds = cache_samples
+                nbc_seconds = self.energy_cache.merge_incremental(
+                    self.energy_cache._data_start,
+                    pop_data_start,
+                    cache_samples,
+                    nbc_seconds)
 
         nbc_result = self._compute_nbc(nbc_seconds)
 
