@@ -10,7 +10,7 @@ code consistency, maintainability, and adherence to project standards.
 
 Take time to think things through.
 
-Don't ask whether a bug or error might be pre-existing or might pre-date your changes. Just fix it.
+No blame games. Don't ask whether a bug or error might be pre-existing or might pre-date your changes. Don't try to dig into git. Just fix it.
 
 When something is ambiguous or two consecutive attempts have not resolved a
 failing test, **stop and ask** rather than continuing to iterate blindly.
@@ -20,6 +20,8 @@ Write tests first, then diagnose and fix bugs.
 ### Tool Use
 
 Always invoke tools using the structured function-calling API. Never emit tool calls as inline XML or markdown text.
+
+Never try to work around permission errors.
 
 ### Communication Style
 
@@ -226,7 +228,7 @@ including the description — before finishing the task.
 - No file writes anywhere in the repo except `.opencode/plans/`
 - No shell commands that mutate state: no `pip install`, no `git commit`,
   no `git add`, no file edits, no database migrations
-- Allowed read operations: `cat`, `ls`, `grep`, `git log`, `git diff`, `git status`
+- Allowed read operations: `cat`, `ls`, `grep`
 
 When asked to plan changes, break tasks into subtasks that each fit within a
 **32k–48k token budget per subtask**. If a task requires touching more than 3
@@ -240,6 +242,7 @@ When implementing a pre-existing plan (written by you or another agent), follow 
 2. **Write failing tests first** — even if the plan is detailed, a plan is not a substitute for tests.
 3. **Make them pass** — implement production code to satisfy the tests.
 4. **Refactor** — clean up while keeping all tests green.
+
 Pre-existing plans, designs, or specifications do not exempt you from the test-first requirement. The Red phase must always come first — before any production code changes, even if the plan was written by a human or another agent.
 
 For changes larger than ~20 lines, summarize what will change (files affected,
