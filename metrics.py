@@ -88,7 +88,7 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
     advances to the most recent sample timestamp from the cache.
 
     Args:
-        evergy_cache: instance of EnergyCache.
+        energy_cache: instance of EnergyCache.
         now: current datetime in local timezone.
         logger: Logger instance.
 
@@ -339,11 +339,28 @@ class EnergyCache:
     @staticmethod
     def merge_incremental(data_start: datetime,
                           result_data_start: datetime,
-                          old_samples: [],
-                          new_samples: []
-                          ) -> [] | None:
-        """
-        TODO docstring
+                          old_samples: list[float],
+                          new_samples: list[float]
+                          ) -> list[float] | None:
+        """Merge new samples into existing cache samples based on time overlap.
+
+        Computes the cache's effective time range from `data_start`, detects
+        overlap with `result_data_start`, and returns the union of both
+        sample lists in chronological order.
+
+        New samples arriving before the cache start will raise AssertionError.
+
+        Args:
+            data_start: Start time of the existing cache samples.
+            result_data_start: Start time of the new samples from the API.
+            old_samples: Existing samples stored in the cache.
+            new_samples: New samples returned from the API.
+
+        Returns:
+            Merged sample list in chronological order, or None if merge fails.
+
+        Raises:
+            AssertionError: If result_data_start is before data_start.
         """
         # Compute the cache's effective time range from its
         # own _data_start so overlap detection is anchored
@@ -1164,7 +1181,8 @@ class HourlyProjection(MetricsBase):
         # Use merged cache samples for NBC computation when available.
         # This ensures _compute_nbc sees the full hour of data rather than
         # only the incremental delta from the API call.
-        if nbc_seconds is not None and pop_data_start is not None and self.energy_cache is not None:
+        energy_cache = self.energy_cache
+        if nbc_seconds is not None and pop_data_start is not None and energy_cache is not None and energy_cache._data_start is not None:
             cache_samples = self.energy_cache.samples
             if cache_samples:
                 nbc_seconds = self.energy_cache.merge_incremental(
