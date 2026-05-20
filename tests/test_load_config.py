@@ -834,7 +834,8 @@ def test_cycle_filters_outside_range_plug(mock_config):
 
     # engine.decide should receive an empty plugs dict since heater is out of range
     call_kwargs = mock_decide.call_args.kwargs if hasattr(mock_decide.call_args, 'kwargs') else mock_decide.call_args[1]
-    assert call_kwargs["plugs"] == {}
+    ctx = call_kwargs.get("ctx")
+    assert ctx.plugs == {}
 
 
 @patch("config._decouple_config")
@@ -883,7 +884,8 @@ def test_cycle_includes_plug_inside_range(mock_config):
             )
 
     call_kwargs = mock_decide.call_args.kwargs if hasattr(mock_decide.call_args, 'kwargs') else mock_decide.call_args[1]
-    assert "heater" in call_kwargs["plugs"]
+    ctx = call_kwargs.get("ctx")
+    assert "heater" in ctx.plugs
 
 
 @patch("config._decouple_config")
@@ -948,8 +950,9 @@ def test_cycle_filters_outside_range_tesla(mock_config):
                 )
 
     call_kwargs = mock_decide.call_args.kwargs if hasattr(mock_decide.call_args, 'kwargs') else mock_decide.call_args[1]
+    ctx = call_kwargs.get("ctx")
     # Tesla should be None since it's outside its time range
-    assert call_kwargs["tesla"] is None
+    assert ctx.tesla is None
 
 
 @patch("config._decouple_config")

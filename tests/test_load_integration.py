@@ -19,6 +19,7 @@ from load_manager import (
     TeslaState,
     GapMinder,
 )
+from load_nbc import DecideContext
 from tests.helpers import _make_metrics_with_wh
 from metrics import EnergyCache
 
@@ -1437,13 +1438,15 @@ def test_turn_off_only_device_even_when_savings_exceed_gap():
     }
 
     actions = engine.decide(
-        now=datetime(2025, 6, 15, 12, 0, 0),
+        ctx=DecideContext(
+            now=datetime(2025, 6, 15, 12, 0, 0),
+            seconds_remaining=891,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=967.0,
         target_wh=-9.0,
-        seconds_remaining=891,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     # Engine must still turn the heater off — accepting a mild undershoot is

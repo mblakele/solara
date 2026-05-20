@@ -12,6 +12,7 @@ from load_manager import (
     TeslaState,
     GapMinder,
 )
+from load_nbc import DecideContext
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 
@@ -26,13 +27,15 @@ def test_hysteresis_no_action():
     plugs: dict[str, PlugConfig] = {}
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-500.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 0
@@ -45,13 +48,15 @@ def test_hysteresis_no_action_at_boundary():
     plugs: dict[str, PlugConfig] = {}
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-1500.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 0
@@ -72,13 +77,15 @@ def test_hysteresis_custom_value():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-1000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 1
@@ -104,13 +111,15 @@ def test_turn_on_plug():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-2000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 1
@@ -135,13 +144,15 @@ def test_turn_on_plug_2():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-2500.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 1
@@ -165,13 +176,15 @@ def test_skip_plug_already_on():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-2500.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 0
@@ -197,13 +210,15 @@ def test_priority_ordering():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-2000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert actions[0].device_name == "high_pri"
@@ -228,13 +243,15 @@ def test_bin_pack_multiple_plugs():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=1000,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-2500.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=1000,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 2
@@ -265,13 +282,15 @@ def test_skip_plug_before_debounce():
         mock_dt.now.return_value = fixed_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         actions = engine.decide(
+            ctx=DecideContext(
+                now=fixed_now,
+                seconds_remaining=300,
+                state=state,
+                plugs=plugs,
+                tesla=None,
+            ),
             predicted_wh=-2000.0,
             target_wh=-500.0,
-            now=fixed_now,
-            seconds_remaining=300,
-            state=state,
-            plugs=plugs,
-            tesla=None,
         )
 
     assert len(actions) == 0
@@ -306,13 +325,15 @@ def test_turn_off_all_on_plugs():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=2000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 2
@@ -348,13 +369,15 @@ def test_remove_lowest_priority_first():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=1000,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=2000.0,
         target_wh=500.0,
-        now=fixed_now,
-        seconds_remaining=1000,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     # Each plug saves 278 Wh (1000W * 1000s / 3600), both fit in 1500 Wh gap
@@ -375,13 +398,15 @@ def test_skip_off_plugs():
     }
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=2000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     assert len(actions) == 0
@@ -405,13 +430,15 @@ def test_tesla_skip_when_not_at_home():
     )
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
         predicted_wh=-2000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=tesla,
     )
 
     assert len(actions) == 0
@@ -432,13 +459,15 @@ def test_tesla_skip_when_not_plugged_in():
     )
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
         predicted_wh=-2000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=tesla,
     )
 
     assert len(actions) == 0
@@ -459,13 +488,15 @@ def test_tesla_skip_at_charge_limit():
     )
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
         predicted_wh=-2000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=300,
-        state=state,
-        plugs=plugs,
-        tesla=tesla,
     )
 
     assert len(actions) == 0
@@ -487,13 +518,15 @@ def test_decide_tesla_increase_amps_5_8():
     )
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=711,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
         predicted_wh=-561.258618125,
         target_wh=-9.0,
-        now=fixed_now,
-        seconds_remaining=711,
-        state=state,
-        plugs=plugs,
-        tesla=tesla,
     )
 
     assert len(actions) == 1
@@ -518,13 +551,15 @@ def test_decide_tesla_increase_amps_7_9():
     )
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=231,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
         predicted_wh=-43.87908600000001,
         target_wh=-9.0,
-        now=fixed_now,
-        seconds_remaining=231,
-        state=state,
-        plugs=plugs,
-        tesla=tesla,
     )
 
     assert len(actions) == 1
@@ -550,13 +585,15 @@ def test_decide_tesla_reduce_below_min_stops_charging():
     )
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
         predicted_wh=2000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=tesla,
     )
 
     assert len(actions) == 1
@@ -593,13 +630,15 @@ def test_decide_with_plugs_and_tesla_priority_ordering():
     )
 
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
         predicted_wh=-3000.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=tesla,
     )
 
     # high_pri plug (1000W * 600/3600 = 166.7 Wh) turns on first by priority
@@ -642,13 +681,15 @@ def test_hysteresis_blocks_small_gap_turn_off():
     # Tiny over-target gap: predicted -450 Wh vs target -500 Wh
     # → gap = -500 - (-450) = -50 Wh (abs_gap = 50, within hysteresis)
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-450.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     # savings (250) > 2 * abs_gap (100), so undershoot would be worse than
@@ -680,13 +721,15 @@ def test_hysteresis_blocks_small_gap_tesla_reduce():
 
     # Small over-target gap: predicted 350 Wh vs target -500 Wh → abs_gap = 150 Wh
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
         predicted_wh=350.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=tesla,
     )
 
     # Within hysteresis (150 < 1000) and no oversized device to bypass — no action
@@ -731,13 +774,15 @@ def test_hysteresis_blocks_small_gap_multiple():
     # Small over-target gap: predicted -350 Wh vs target -500 Wh
     # → gap = -500 - (-350) = -150 Wh (abs_gap = 150, within hysteresis)
     actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
         predicted_wh=-350.0,
         target_wh=-500.0,
-        now=fixed_now,
-        seconds_remaining=600,
-        state=state,
-        plugs=plugs,
-        tesla=None,
     )
 
     # fan savings ≈ 12.5 Wh (fits), dehumidifier savings ≈ 50 Wh (fits)
@@ -777,13 +822,15 @@ def test_turn_on_skipped_when_seconds_remaining_below_min():
         mock_dt.now.return_value = fixed_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         actions = engine.decide(
-            predicted_wh=-2000.0,  # big surplus: gap = -1500 Wh
+            ctx=DecideContext(
+                now=fixed_now,
+                seconds_remaining=21,
+                state=state,
+                plugs=plugs,
+                tesla=None,
+            ),
+            predicted_wh=-2000.0,
             target_wh=-500.0,
-            now=fixed_now,
-            seconds_remaining=21,  # only 21 s left in QH3
-            state=state,
-            plugs=plugs,
-            tesla=None,
         )
 
     assert len(actions) == 0
@@ -806,13 +853,15 @@ def test_turn_on_allowed_when_seconds_remaining_above_min():
         mock_dt.now.return_value = fixed_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         actions = engine.decide(
-            now=fixed_now,
-            predicted_wh=-2000.0,  # big surplus: gap = -1500 Wh
+            ctx=DecideContext(
+                now=fixed_now,
+                seconds_remaining=600,
+                state=state,
+                plugs=plugs,
+                tesla=None,
+            ),
+            predicted_wh=-2000.0,
             target_wh=-500.0,
-            seconds_remaining=600,  # plenty of time left (10 min)
-            state=state,
-            plugs=plugs,
-            tesla=None,
         )
 
     assert len(actions) == 1
@@ -844,13 +893,15 @@ def test_turn_off_not_affected_by_min_seconds_guard():
         mock_dt.now.return_value = fixed_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         actions = engine.decide(
-            now=fixed_now,
-            predicted_wh=2000.0,  # deficit: gap = -2500 Wh (exceeds hysteresis)
+            ctx=DecideContext(
+                now=fixed_now,
+                seconds_remaining=21,
+                state=state,
+                plugs=plugs,
+                tesla=None,
+            ),
+            predicted_wh=2000.0,
             target_wh=-500.0,
-            seconds_remaining=21,  # only 21 s left — turn-off should still fire
-            state=state,
-            plugs=plugs,
-            tesla=None,
         )
 
     assert len(actions) == 1
@@ -874,13 +925,15 @@ def test_turn_on_at_exact_min_seconds_boundary():
         mock_dt.now.return_value = fixed_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         actions = engine.decide(
-            now=fixed_now,
-            predicted_wh=-2000.0,  # big surplus: gap = -1500 Wh
+            ctx=DecideContext(
+                now=fixed_now,
+                seconds_remaining=60,
+                state=state,
+                plugs=plugs,
+                tesla=None,
+            ),
+            predicted_wh=-2000.0,
             target_wh=-500.0,
-            seconds_remaining=60,  # exactly MIN_SECONDS_TO_ACT (1 min)
-            state=state,
-            plugs=plugs,
-            tesla=None,
         )
 
     assert len(actions) == 1

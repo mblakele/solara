@@ -9,6 +9,7 @@ computed on demand from raw per-second samples via util.compute_nbc_quarters().
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -601,6 +602,35 @@ class StateTracker:
         }
 
 
+@dataclass(frozen=True)
+class DecideContext:
+    """Shared context for GapMinder decision methods.
+
+    Replaces the previous 8+ individual arguments on
+    ``GapMinder.decide()`` and its private helpers, reducing
+    positional-argument count and making call-sites self-documenting.
+
+    Attributes:
+        now: Current wall-clock time.
+        seconds_remaining: Seconds left in the current quarter-hour.
+        state: Current state tracker with device states and pending effects.
+        plugs: Dictionary of plug configurations.
+        tesla: Current Tesla state, if available.
+        dry_run: When True, skip mutating ``state.devices`` so subsequent
+            dry-run cycles re-evaluate instead of seeing stale state.
+        data_point_at: The NBC data-point-at timestamp. Used by created
+            ``PendingEffect`` objects for dual-pruning checks.
+    """
+
+    now: datetime
+    seconds_remaining: int
+    state: StateTracker
+    plugs: dict[str, Any]
+    tesla: TeslaState | None
+    dry_run: bool = False
+    data_point_at: datetime | None = None
+
+
 class GapMinder:
     """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
@@ -639,31 +669,16 @@ class GapMinder:
 
     def decide(
         self,
-        now: datetime,
+        ctx: DecideContext,
         predicted_wh: float,
         target_wh: float,
-        seconds_remaining: int,
-        state: StateTracker,
-        plugs: dict[str, Any],
-        tesla: TeslaState | None,
-        dry_run: bool = False,
-        data_point_at: datetime | None = None,
     ) -> list[PendingEffect]:
         """Decide what actions to take based on the predicted Wh and target Wh.
 
         Args:
-            now: current datetime.
+            ctx: Decision context containing time, state, devices, and Tesla info.
             predicted_wh: The predicted Wh for the current quarter-hour.
             target_wh: The target Wh to achieve (negative = surplus).
-            seconds_remaining: Seconds left in the current quarter-hour.
-            state: The current state tracker.
-            plugs: Dictionary of plug configurations.
-            tesla: Current Tesla state, if available.
-            dry_run: When True, skip mutating state.devices so subsequent
-                dry-run cycles re-evaluate instead of seeing stale desired_state.
-            data_point_at: The NBC data-point-at timestamp. Used by
-                created ``PendingEffect`` objects for dual-pruning checks.
-                Defaults to the current wall clock time.
 
         Returns:
             List of PendingEffect objects representing actions to take.
@@ -674,38 +689,25 @@ class GapMinder:
         if abs_gap <= self.HYSTERESIS_WH:
             return []
 
-        dp_at = data_point_at if data_point_at is not None else now
-
         if gap > 0:
             return self._decide_turn_on(
-                gap, seconds_remaining, state, plugs, tesla, now, dry_run, dp_at
+                ctx, gap,
             )
 
         return self._decide_turn_off(
-            abs(gap), seconds_remaining, state, plugs, tesla, now, dry_run, dp_at
+            ctx, abs(gap),
         )
 
     def _decide_turn_on(
         self,
+        ctx: DecideContext,
         gap: float,
-        seconds_remaining: int,
-        state: StateTracker,
-        plugs: dict[str, Any],
-        tesla: TeslaState | None,
-        now: datetime,
-        dry_run: bool = False,
-        dp_at: datetime | None = None,
     ) -> list[PendingEffect]:
         """Turn on eligible loads to absorb excess solar.
 
         Args:
+            ctx: Decision context.
             gap: The Wh surplus to absorb.
-            seconds_remaining: Seconds left in the current quarter-hour.
-            state: The current state tracker.
-            plugs: Dictionary of plug configurations.
-            tesla: Current Tesla state, if available.
-            now: Current wall clock time.
-            dp_at: NBC data-point-at timestamp for pending effects.
 
         Returns:
             List of PendingEffect objects.
@@ -716,21 +718,21 @@ class GapMinder:
         # Collect eligible loads that are currently off
         candidates: list[tuple[int, str, Any]] = []
 
-        for name, plug in plugs.items():
-            if not state.can_toggle(name, now, turning_on=True):
+        for name, plug in ctx.plugs.items():
+            if not ctx.state.can_toggle(name, ctx.now, turning_on=True):
                 logger.debug(
                     "[_decide_turn_on] %s: skipped (debounce)",
                     name,
                 )
                 continue
-            if seconds_remaining < self.MIN_SECONDS_TO_ACT:
+            if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
                 logger.debug(
                     "[_decide_turn_on] %s: skipped (too little time: %d s)",
                     name,
-                    seconds_remaining,
+                    ctx.seconds_remaining,
                 )
                 continue
-            dev_state = state.devices.get(name)
+            dev_state = ctx.state.devices.get(name)
             if dev_state and dev_state.desired_state is True:
                 continue  # already on
             candidates.append((plug.priority, name, plug))
@@ -740,7 +742,7 @@ class GapMinder:
         candidates.sort(key=lambda x: x[0], reverse=True)
 
         for _, name, plug in candidates:
-            capacity = StateTracker.watts_to_wh(plug.power_watts, seconds_remaining)
+            capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
             # Apply turn-on margin: only commit if the discounted capacity fits in
             # the gap.  This reserves headroom for solar variability and NBC
             # prediction error, acting as damping to reduce overshoot.
@@ -759,18 +761,18 @@ class GapMinder:
                     PendingEffect(
                         device_name=name,
                         action="turn_on",
-                        timestamp=now,
-                        data_point_at=dp_at or now,
+                        timestamp=ctx.now,
+                        data_point_at=ctx.data_point_at or ctx.now,
                         power_watts=plug.power_watts,
                     )
                 )
                 remaining_gap -= capacity
-                if not dry_run:
-                    state.devices[name] = DeviceState(
-                        name=name, last_toggle=now, desired_state=True
+                if not ctx.dry_run:
+                    ctx.state.devices[name] = DeviceState(
+                        name=name, last_toggle=ctx.now, desired_state=True
                     )
 
-            elif self._tesla_supports_amps(plug, tesla) and tesla is not None and tesla.is_charging:
+            elif self._tesla_supports_amps(plug, ctx.tesla) and ctx.tesla is not None and ctx.tesla.is_charging:
                 logger.debug(
                     "[_decide_turn_on] %s: partial via Tesla "
                     "(capacity=%.1f Wh > gap %.1f Wh)",
@@ -779,7 +781,7 @@ class GapMinder:
                     remaining_gap,
                 )
                 tesla_action = self._decide_tesla_amps(
-                    remaining_gap, seconds_remaining, tesla, now, dp_at
+                    ctx, remaining_gap,
                 )
                 if tesla_action:
                     actions.append(tesla_action)
@@ -795,14 +797,14 @@ class GapMinder:
                     remaining_gap,
                 )
 
-        if tesla and tesla.is_charging and remaining_gap > 0:
+        if ctx.tesla and ctx.tesla.is_charging and remaining_gap > 0:
             logger.debug(
                 "[_decide_turn_on] trying Tesla amps increase "
                 "for remaining %.1f Wh",
                 remaining_gap,
             )
             tesla_action = self._decide_tesla_amps(
-                remaining_gap, seconds_remaining, tesla, now, dp_at
+                ctx, remaining_gap,
             )
             if tesla_action:
                 actions.append(tesla_action)
@@ -811,14 +813,8 @@ class GapMinder:
 
     def _decide_turn_off(
         self,
+        ctx: DecideContext,
         gap_wh: float,
-        seconds_remaining: int,
-        state: StateTracker,
-        plugs: dict[str, Any],
-        tesla: TeslaState | None,
-        now: datetime,
-        dry_run: bool = False,
-        dp_at: datetime | None = None,
     ) -> list[PendingEffect]:
         """Turn off loads to reduce consumption.
 
@@ -828,48 +824,40 @@ class GapMinder:
           3. Stop Tesla charging if a deficit still remains.
 
         Args:
+            ctx: Decision context.
             gap_wh: Wh reduction needed.
-            seconds_remaining: Seconds left in the current quarter-hour.
-            state: The current state tracker.
-            plugs: Dictionary of plug configurations.
-            tesla: Current Tesla state, if available.
-            now: Current wall clock time.
-            dp_at: NBC data-point-at timestamp for pending effects.
 
         Returns:
             List of PendingEffect objects.
         """
         actions: list[PendingEffect] = []
         remaining_reduction = gap_wh
-        dp = dp_at or now
+        dp = ctx.data_point_at or ctx.now
 
         logger.debug(
             "[_decide_turn_off] gap=%.1f Wh, seconds_remaining=%d",
             gap_wh,
-            seconds_remaining,
+            ctx.seconds_remaining,
         )
 
         # ── Step 1: reduce Tesla charge amps first (no stop) ──────────────────
-        if tesla and tesla.is_charging:
+        if ctx.tesla and ctx.tesla.is_charging:
             logger.debug(
                 "[_decide_turn_off] trying Tesla amps-only reduce "
                 "for %.1f Wh remaining",
                 remaining_reduction,
             )
             tesla_action = self._decide_tesla_reduce(
+                ctx,
                 remaining_reduction,
-                seconds_remaining,
-                tesla,
-                now,
                 stop_allowed=False,
-                dp_at=dp,
             )
             if tesla_action:
                 actions.append(tesla_action)
-                current_amps = tesla.current_amps or 0
+                current_amps = ctx.tesla.current_amps or 0
                 target_amps = tesla_action.target_amps or 0
                 savings = StateTracker.delta_amps_to_wh(
-                    current_amps - target_amps, seconds_remaining
+                    current_amps - target_amps, ctx.seconds_remaining
                 )
                 logger.debug(
                     "[_decide_turn_off] Tesla amps %d → %d, "
@@ -885,15 +873,15 @@ class GapMinder:
         # ── Step 2: disable plugs in priority order ────────────────────────────
         candidates: list[tuple[int, str, Any]] = []
 
-        for name, plug in plugs.items():
-            if not state.can_toggle(name, now, turning_on=False):
+        for name, plug in ctx.plugs.items():
+            if not ctx.state.can_toggle(name, ctx.now, turning_on=False):
                 logger.debug(
                     "[_decide_turn_off] %s: skipped (debounce)",
                     name,
                 )
                 continue
 
-            dev_state = state.devices.get(name)
+            dev_state = ctx.state.devices.get(name)
             if dev_state and dev_state.desired_state is True:
                 candidates.append((plug.priority, name, plug))
                 logger.debug(
@@ -911,7 +899,7 @@ class GapMinder:
         candidates.sort(key=lambda x: x[0])
 
         for _, name, plug in candidates:
-            savings = StateTracker.watts_to_wh(plug.power_watts, seconds_remaining)
+            savings = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
 
             # omit any "too large to turn off" logic:
             # not relevant when shedding load.
@@ -926,21 +914,21 @@ class GapMinder:
                 PendingEffect(
                     device_name=name,
                     action="turn_off",
-                    timestamp=now,
+                    timestamp=ctx.now,
                     data_point_at=dp,
                     power_watts=plug.power_watts,
                 )
             )
             remaining_reduction -= savings
-            if not dry_run:
-                state.devices[name] = DeviceState(
-                    name=name, last_toggle=now, desired_state=False
+            if not ctx.dry_run:
+                ctx.state.devices[name] = DeviceState(
+                    name=name, last_toggle=ctx.now, desired_state=False
                 )
             if remaining_reduction <= 0:
                 break
 
         # ── Step 3: if deficit remains, stop Tesla charging ────────────
-        if tesla and tesla.is_charging and remaining_reduction > 0:
+        if ctx.tesla and ctx.tesla.is_charging and remaining_reduction > 0:
             logger.debug(
                 "[_decide_turn_off] stopping Tesla to cover "
                 "%.1f Wh remaining deficit",
@@ -950,9 +938,9 @@ class GapMinder:
                 PendingEffect(
                     device_name="tesla",
                     action="turn_off",
-                    timestamp=now,
+                    timestamp=ctx.now,
                     data_point_at=dp,
-                    power_watts=-StateTracker.amps_to_watts(tesla.current_amps),
+                    power_watts=-StateTracker.amps_to_watts(ctx.tesla.current_amps),
                 )
             )
 
@@ -972,24 +960,21 @@ class GapMinder:
 
     def _decide_tesla_amps(
         self,
+        ctx: DecideContext,
         gap_wh: float,
-        seconds_remaining: int,
-        tesla: TeslaState,
-        now: datetime,
-        dp_at: datetime | None = None,
     ) -> PendingEffect | None:
         """Adjust Tesla charge amps to fill residual gap.
 
         Args:
+            ctx: Decision context.
             gap_wh: Wh surplus to absorb.
-            seconds_remaining: Seconds left in the current quarter-hour.
-            tesla: Current Tesla state.
-            now: Current wall clock time.
-            dp_at: NBC data-point-at timestamp for pending effects.
 
         Returns:
             PendingEffect for set_amps, or None if no action needed.
         """
+        tesla = ctx.tesla
+        if tesla is None:
+            return None
         if not tesla.plugged_in or not tesla.at_home:
             logger.debug(
                 "[_decide_tesla_amps] skipped: plugged_in=%s at_home=%s",
@@ -1000,16 +985,16 @@ class GapMinder:
         if tesla.at_charge_limit:
             logger.debug("[_decide_tesla_amps] skipped: at_charge_limit")
             return None
-        if seconds_remaining < self.MIN_SECONDS_TO_ACT:
+        if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
             logger.debug(
                 "[_decide_tesla_amps] skipped: too little time (%d s < %d s)",
-                seconds_remaining, self.MIN_SECONDS_TO_ACT,
+                ctx.seconds_remaining, self.MIN_SECONDS_TO_ACT,
             )
             return None
 
         current_amps = tesla.current_amps or 0
-        needed_watts = StateTracker.wh_to_watts(gap_wh, seconds_remaining)
-        additional_amps = StateTracker.watts_to_amps(needed_watts, seconds_remaining)
+        needed_watts = StateTracker.wh_to_watts(gap_wh, ctx.seconds_remaining)
+        additional_amps = StateTracker.watts_to_amps(needed_watts, ctx.seconds_remaining)
         target_amps = current_amps + additional_amps
         # Clamp to the configured range; callers enforce controller-specific limits.
         target_amps = max(self.charge_amps_min, min(self.charge_amps_max, target_amps))
@@ -1018,7 +1003,7 @@ class GapMinder:
             "[_decide_tesla_amps] gap=%.1f Wh, seconds=%d, needed_watts=%.1f, "
             "current_amps=%d, additional_amps=%d, target_amps=%d",
             gap_wh,
-            seconds_remaining,
+            ctx.seconds_remaining,
             needed_watts,
             current_amps,
             additional_amps,
@@ -1035,33 +1020,30 @@ class GapMinder:
         return PendingEffect(
             device_name="tesla",
             action="set_amps",
-            timestamp=now,
-            data_point_at=dp_at or now,
+            timestamp=ctx.now,
+            data_point_at=ctx.data_point_at or ctx.now,
             power_watts=StateTracker.amps_to_watts(additional_amps),
             target_amps=target_amps,
         )
 
     def _decide_tesla_reduce(
         self,
+        ctx: DecideContext,
         reduce_wh: float,
-        seconds_remaining: int,
-        tesla: TeslaState,
-        now: datetime,
         stop_allowed: bool = True,
-        dp_at: datetime | None = None,
     ) -> PendingEffect | None:
         """Reduce Tesla charge amps, or stop charging if amps can't be reduced further.
 
         Args:
+            ctx: Decision context.
             reduce_wh: Wh reduction needed.
-            seconds_remaining: Seconds left in the current quarter-hour.
-            tesla: Current Tesla state.
-            now: Current timestamp.
             stop_allowed: When False, return None instead of issuing a turn_off
                 command. Used when the caller wants amps-only reduction and will
                 handle stopping as a separate last-resort step.
-            dp_at: NBC data-point-at timestamp for pending effects.
         """
+        tesla = ctx.tesla
+        if tesla is None:
+            return None
         current_amps = tesla.current_amps
         if current_amps is None or current_amps <= 5:
             if not stop_allowed:
@@ -1074,15 +1056,15 @@ class GapMinder:
             return PendingEffect(
                 device_name="tesla",
                 action="turn_off",
-                timestamp=now,
-                data_point_at=dp_at or now,
+                timestamp=ctx.now,
+                data_point_at=ctx.data_point_at or ctx.now,
                 power_watts=-StateTracker.amps_to_watts(current_amps),
             )
 
         current_watts = StateTracker.amps_to_watts(current_amps)
-        reduce_watts = StateTracker.wh_to_watts(reduce_wh, seconds_remaining)
+        reduce_watts = StateTracker.wh_to_watts(reduce_wh, ctx.seconds_remaining)
         new_watts = max(0, current_watts - reduce_watts)
-        new_amps = StateTracker.watts_to_amps(new_watts, seconds_remaining)
+        new_amps = StateTracker.watts_to_amps(new_watts, ctx.seconds_remaining)
 
         if new_amps < self.charge_amps_min:
             # guard against premature turn-off
@@ -1106,15 +1088,15 @@ class GapMinder:
             return PendingEffect(
                 device_name="tesla",
                 action="turn_off",
-                timestamp=now,
-                data_point_at=dp_at or now,
+                timestamp=ctx.now,
+                data_point_at=ctx.data_point_at or ctx.now,
                 power_watts=-StateTracker.amps_to_watts(current_amps),
             )
 
-        if seconds_remaining < self.MIN_SECONDS_TO_ACT:
+        if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
             logger.debug(
                 "[_decide_tesla_reduce] skipped: too little time (%d s < %d s)",
-                seconds_remaining, self.MIN_SECONDS_TO_ACT,
+                ctx.seconds_remaining, self.MIN_SECONDS_TO_ACT,
             )
             return None
 
@@ -1129,8 +1111,8 @@ class GapMinder:
         return PendingEffect(
             device_name="tesla",
             action="set_amps",
-            timestamp=now,
-            data_point_at=dp_at or now,
+            timestamp=ctx.now,
+            data_point_at=ctx.data_point_at or ctx.now,
             power_watts=StateTracker.amps_to_watts(new_amps - current_amps),
             target_amps=new_amps,
         )

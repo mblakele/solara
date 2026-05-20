@@ -65,7 +65,7 @@ from load_models import (  # noqa: F401
     _tesla_state_to_dict,
 )
 
-from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder  # noqa: F401
+from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder, DecideContext  # noqa: F401
 
 from metrics import EnergyCache
 
@@ -837,15 +837,17 @@ class LoadManager:
             eligible_tesla = None
 
         actions = self.engine.decide(
-            now=now,
+            ctx=DecideContext(
+                now=now,
+                seconds_remaining=seconds_remaining,
+                state=self.state,
+                plugs=eligible_plugs,
+                tesla=eligible_tesla,
+                dry_run=dry_run,
+                data_point_at=data_point_at,
+            ),
             predicted_wh=corrected_adjusted_wh,
             target_wh=self.target_wh,
-            seconds_remaining=seconds_remaining,
-            state=self.state,
-            plugs=eligible_plugs,
-            tesla=eligible_tesla,
-            dry_run=dry_run,
-            data_point_at=data_point_at,
         )
 
         succeeded_effects: list[PendingEffect] = []
