@@ -111,6 +111,8 @@ project-root
 ├── conftest.py         # Pytest shared fixtures & configuration
 ├── energy_aggregator.py # TOU (time-of-use) energy aggregation logic
 ├── load_manager.py     # OAuth handling & load-shedding management
+├── load_models.py      # Shared data models (PendingEffect, TeslaState, etc.)
+├── load_nbc.py         # NBC state tracking, GapMinder bin-packing, Tesla decisions
 ├── metrics.py          # NBC (net-billing-cycle) calculation metrics, EnergyCache with
                        # per-second sample storage, incremental fetch merging, and pruning
 ├── mockdata.py         # Test data generation utilities
@@ -136,6 +138,7 @@ project-root
   guard), `predict()`, and per-device prediction via `_predict_device()`
 - TOU in `energy_aggregator.py`
 - OAuth in `load_manager.py`
+- Data models in `load_models.py` (`PendingEffect`, `TeslaState`)
 - Routes in `app.py`
 - Test data generation in `mockdata.py`
 - Timezones in `util.py`

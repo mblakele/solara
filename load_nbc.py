@@ -324,8 +324,17 @@ class StateTracker:
         return energy_wh * NBCPeriod.PERIOD_SECS / seconds
 
     @staticmethod
-    def amps_to_watts(current_amps: float) -> float:
-        """Convert current in amps to watts at nominal voltage."""
+    def amps_to_watts(current_amps: float | None) -> float:
+        """Convert current in amps to watts at nominal voltage.
+
+        Args:
+            current_amps: Current in amps, or None to indicate unknown.
+
+        Returns:
+            Wattage, or 0.0 if current_amps is None.
+        """
+        if current_amps is None:
+            return 0.0
         return current_amps * StateTracker.VOLTAGE
 
     @staticmethod
@@ -369,9 +378,9 @@ class StateTracker:
         each cycle in _cycle_async_phase using the vehicle API's reported
         current_amps via tesla_inflight_wh().
 
-        Other effects (plug turn_on/turn_off) use power_watts if set, computing
-        Wh dynamically from seconds_remaining. Falls back to stored power_delta_wh
-        for backwards compatibility.
+        Other effects (plug turn_on/turn_off) use power_watts to compute Wh
+        dynamically from seconds_remaining, so the estimate adjusts as the
+        quarter-hour progresses.
 
         Args:
             nbc_predicted_wh: Raw predicted Wh from NBC cache/API.
@@ -384,10 +393,7 @@ class StateTracker:
         for effect in self.pending_effects:
             if effect.device_name == "tesla" and effect.action == "set_amps":
                 continue
-            if effect.power_watts is not None:
-                adjusted += effect.power_watts * seconds_remaining / NBCPeriod.PERIOD_SECS
-            else:
-                adjusted += effect.power_delta_wh
+            adjusted += effect.power_watts * seconds_remaining / NBCPeriod.PERIOD_SECS
         return adjusted
 
     def tesla_inflight_wh(
@@ -582,7 +588,7 @@ class StateTracker:
                 "action": eff.action,
                 "timestamp": eff.timestamp.isoformat(),
                 "data_point_at": eff.data_point_at.isoformat(),
-                "power_delta_wh": eff.power_delta_wh,
+                "power_watts": eff.power_watts,
             } for eff in self.pending_effects],
             "last_data_point_at": (self.last_data_point_at.isoformat()
                                    if self.last_data_point_at else None),
@@ -755,7 +761,6 @@ class GapMinder:
                         action="turn_on",
                         timestamp=now,
                         data_point_at=dp_at or now,
-                        power_delta_wh=capacity,
                         power_watts=plug.power_watts,
                     )
                 )
@@ -923,7 +928,6 @@ class GapMinder:
                     action="turn_off",
                     timestamp=now,
                     data_point_at=dp,
-                    power_delta_wh=-savings,
                     power_watts=plug.power_watts,
                 )
             )
@@ -948,7 +952,7 @@ class GapMinder:
                     action="turn_off",
                     timestamp=now,
                     data_point_at=dp,
-                    power_delta_wh=-remaining_reduction,
+                    power_watts=-StateTracker.amps_to_watts(tesla.current_amps),
                 )
             )
 
@@ -1033,7 +1037,7 @@ class GapMinder:
             action="set_amps",
             timestamp=now,
             data_point_at=dp_at or now,
-            power_delta_wh=0.0,  # recomputed live via tesla_inflight_wh each cycle
+            power_watts=StateTracker.amps_to_watts(additional_amps),
             target_amps=target_amps,
         )
 
@@ -1072,7 +1076,7 @@ class GapMinder:
                 action="turn_off",
                 timestamp=now,
                 data_point_at=dp_at or now,
-                power_delta_wh=-reduce_wh,
+                power_watts=-StateTracker.amps_to_watts(current_amps),
             )
 
         current_watts = StateTracker.amps_to_watts(current_amps)
@@ -1104,7 +1108,7 @@ class GapMinder:
                 action="turn_off",
                 timestamp=now,
                 data_point_at=dp_at or now,
-                power_delta_wh=-reduce_wh,
+                power_watts=-StateTracker.amps_to_watts(current_amps),
             )
 
         if seconds_remaining < self.MIN_SECONDS_TO_ACT:
@@ -1122,15 +1126,11 @@ class GapMinder:
             )
             return None
 
-        power_delta = StateTracker.delta_amps_to_wh(
-            new_amps - current_amps, seconds_remaining
-        )
-
         return PendingEffect(
             device_name="tesla",
             action="set_amps",
             timestamp=now,
             data_point_at=dp_at or now,
-            power_delta_wh=power_delta,
+            power_watts=StateTracker.amps_to_watts(new_amps - current_amps),
             target_amps=new_amps,
         )

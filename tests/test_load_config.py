@@ -647,7 +647,7 @@ def test_load_tesla_time_range_parsed():
 def test_is_device_in_time_range_no_restriction():
     """Device with time_range=None always returns True."""
     mgr = _make_manager_with_enabled(True)
-    assert mgr._is_device_in_time_range(datetime.now(timezone.utc), "any_device", None) is True
+    assert mgr._is_device_in_time_range(datetime.now(timezone.utc), None) is True
 
 
 @patch("config._decouple_config")
@@ -666,7 +666,7 @@ def test_is_device_in_time_range_inside(mock_config):
         mock_dt.timedelta = timedelta
         result = mgr._is_device_in_time_range(
             mock_dt.now(timezone.utc),
-            "heater", (time(6, 0), time(18, 0))
+            (time(6, 0), time(18, 0))
         )
 
     assert result is True
@@ -688,7 +688,7 @@ def test_is_device_in_time_range_outside(mock_config):
         mock_dt.timedelta = timedelta
         result = mgr._is_device_in_time_range(
             mock_dt.now(timezone.utc),
-            "heater", (time(6, 0), time(18, 0))
+            (time(6, 0), time(18, 0))
         )
 
     assert result is False

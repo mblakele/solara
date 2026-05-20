@@ -562,7 +562,6 @@ def load_status() -> Response:
                 "device_name": effect.device_name,
                 "action": effect.action,
                 "timestamp": effect.timestamp.isoformat(),
-                "power_delta_wh": effect.power_delta_wh,
             }
         )
 

@@ -97,7 +97,7 @@ def test_has_pending_effect_since():
             action="turn_on",
             timestamp=datetime(2025, 1, 1, 0, 0, 30, tzinfo=timezone.utc),
             data_point_at=datetime(2025, 1, 1, 0, 0, 10, tzinfo=timezone.utc),
-            power_delta_wh=100.0,
+            power_watts=1000.0,
         )
     )
     assert tracker.has_pending_effect_since(datetime(2025, 1, 1, tzinfo=timezone.utc)) is True
@@ -113,7 +113,7 @@ def test_estimated_current_wh_adds_pending():
             action="turn_on",
             timestamp=now,
             data_point_at=now - timedelta(seconds=20),
-            power_delta_wh=200.0,
+            power_watts=200.0,
         )
     )
     estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=900)
@@ -136,13 +136,13 @@ def test_estimated_current_wh_multiple_effects():
             device_name="a", action="turn_on",
             timestamp=now,
             data_point_at=now - timedelta(seconds=20),
-            power_delta_wh=200.0,
+            power_watts=200.0,
         ),
         PendingEffect(
             device_name="b", action="turn_off",
             timestamp=now,
             data_point_at=now - timedelta(seconds=20),
-            power_delta_wh=-100.0,
+            power_watts=-100.0,
         ),
     ])
     estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=900)
@@ -161,7 +161,6 @@ def test_estimated_current_wh_dynamic_power_watts():
             action="turn_on",
             timestamp=now,
             data_point_at=now - timedelta(seconds=20),
-            power_delta_wh=0.0,
             power_watts=2000.0,
         )
     )

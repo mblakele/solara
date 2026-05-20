@@ -380,13 +380,12 @@ class LoadManager:
         return "disabled"
 
     def _is_device_in_time_range(
-        self, now: datetime, device_name: str, time_range: tuple[time, time] | None
+        self, now: datetime, time_range: tuple[time, time] | None
     ) -> bool:
-        """Check if a device is within its configured time range.
+        """Check if the current time is within a configured time range.
 
         Args:
             now: current datetime.
-            device_name: Device name for logging context.
             time_range: (start, end) tuple from config, or None (always in range).
 
         Returns:
@@ -445,7 +444,7 @@ class LoadManager:
                 "capacity_wh": round(capacity_wh, 1),
                 "can_toggle": can_toggle,
             }
-            if not self._is_device_in_time_range(now, name, plug.time_range):
+            if not self._is_device_in_time_range(now, plug.time_range):
                 detail["reason"] = "outside_time_range"
             if dev_state:
                 detail["desired_state"] = dev_state.desired_state
@@ -467,7 +466,7 @@ class LoadManager:
                 tesla_detail["at_home"] = tesla_state.at_home
                 tesla_detail["at_charge_limit"] = tesla_state.at_charge_limit
             if self.tesla_config and not self._is_device_in_time_range(
-                now, "tesla", self.tesla_config.time_range
+                now, self.tesla_config.time_range
             ):
                 tesla_detail["reason"] = "outside_time_range"
             candidate_details.append(tesla_detail)
@@ -508,7 +507,7 @@ class LoadManager:
         for name, plug in self.plugs.items():
             if not self.state.can_toggle(name, now):
                 continue
-            if not self._is_device_in_time_range(now, name, plug.time_range):
+            if not self._is_device_in_time_range(now, plug.time_range):
                 continue
             dev_state = self.state.devices.get(name)
             # All plugs are eligible: turn-on when off/unknown, turn-off when on
@@ -530,7 +529,6 @@ class LoadManager:
         if not gap_positive and tesla_state is not None:
             tesla_in_range = self._is_device_in_time_range(
                 now,
-                "tesla",
                 self.tesla_config.time_range if self.tesla_config else None,
             )
             if tesla_in_range and tesla_state.is_charging:
@@ -718,10 +716,11 @@ class LoadManager:
         with that state, then executes all resulting actions. Consolidating into
         one coroutine means one event loop per cycle instead of one per action.
 
-        Tesla amp-change effects carry power_delta_wh=0. After fetching the
-        vehicle state we recompute the in-flight contribution via
-        tesla_inflight_wh() and fold it into corrected_adjusted_wh before
-        calling decide(), so the gap never drifts as seconds_remaining shrinks.
+        Tesla amp-change effects have no power_watts so they're excluded from
+        estimated_current_wh(). After fetching the vehicle state we recompute
+        the in-flight contribution via tesla_inflight_wh() and fold it into
+        corrected_adjusted_wh before calling decide(), so the gap never
+        drifts as seconds_remaining shrinks.
 
         Args:
             gap_wh: Pre-computed Wh gap (target - adjusted). Passed in rather
@@ -750,9 +749,10 @@ class LoadManager:
             await self._fetch_tesla_state_async()
         )
 
-        # Fold live Tesla in-flight contribution into the gap.  This replaces
-        # the frozen power_delta_wh=0 in any set_amps pending effect with a
-        # value that decays correctly as seconds_remaining shrinks.
+        # Fold live Tesla in-flight contribution into the gap.  Tesla set_amps
+        # effects are excluded from estimated_current_wh() so this live
+        # recalculation prevents the adjustment from drifting as
+        # seconds_remaining shrinks.
         tesla_reported = tesla_state.current_amps if tesla_state is not None else None
         inflight_wh = self.state.tesla_inflight_wh(tesla_reported, seconds_remaining)
         corrected_adjusted_wh = adjusted_wh + inflight_wh
@@ -816,7 +816,7 @@ class LoadManager:
         eligible_plugs: dict[str, PlugConfig] = {}
         outside_range: list[str] = []
         for name, plug in self.plugs.items():
-            if self._is_device_in_time_range(now, name, plug.time_range):
+            if self._is_device_in_time_range(now, plug.time_range):
                 eligible_plugs[name] = plug
             else:
                 outside_range.append(name)
@@ -831,7 +831,7 @@ class LoadManager:
             tesla_state is not None
             and self.tesla_config is not None
             and not self._is_device_in_time_range(
-                now, "tesla", self.tesla_config.time_range
+                now, self.tesla_config.time_range
             )
         ):
             eligible_tesla = None

@@ -192,18 +192,16 @@ class PendingEffect:
         timestamp: Wall clock time when the effect was created.
         data_point_at: The NBC data-point-at timestamp at creation time.
             Used alongside timestamp for dual-pruning checks.
-        power_delta_wh: Expected watt-hour impact of the action.
         target_amps: Target amps for "set_amps" actions; None otherwise.
-        power_watts: Expected impact of the action, in Watts.
+        power_watts: Expected power impact of the action in Watts.
     """
 
     device_name: str
     action: Literal["turn_on", "turn_off", "set_amps"]
     timestamp: datetime
     data_point_at: datetime
-    power_delta_wh: float
-    target_amps: int | None = None  # Target amps for set_amps actions
-    power_watts: float | None = None
+    power_watts: float
+    target_amps: int | None = None
 
 
 @dataclass
