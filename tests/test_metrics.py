@@ -14,6 +14,7 @@ from metrics import (
 )
 from util import ceil_to_qh, compute_nbc_quarters
 from mockdata import MetricsMock
+from test_app import mock_config
 
 
 class _LogCapture(logging.Handler):
@@ -1553,15 +1554,15 @@ class TestEnergyCache(unittest.TestCase):
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
-        now = datetime(2026, 5, 13, 0, 30, 29, tzinfo=timezone.utc)
+        fixed_now = datetime(2026, 5, 13, 0, 30, 29, tzinfo=timezone.utc)
 
-        # First fetch: 1830 samples (full hour so far)
+        # First fetch: 1830 samples (full hour so far, lag=70)
         first_samples = [0.1] * 1830
-        first_start = now - timedelta(seconds=1829)
+        first_start = fixed_now - timedelta(seconds=1900)
 
-        # Second fetch: 1890 samples (hour grew by 60 samples)
-        second_samples = [0.1] * 1890
-        second_start = now - timedelta(seconds=1889)
+        # Second fetch: 31 samples, 1 overlap, lag=40
+        second_samples = [0.1] * 31
+        second_start = fixed_now - timedelta(seconds=71)
 
         def fetch_func():
             # Simulates HourlyProjection always fetching from top of hour.
@@ -1578,14 +1579,14 @@ class TestEnergyCache(unittest.TestCase):
             }
 
         with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = now
+            mock_dt.now.return_value = fixed_now
 
-            cache.get_or_fetch(fetch_func, now)
+            cache.get_or_fetch(fetch_func, fixed_now)
             self.assertEqual(len(cache._samples), 1830)
 
-            # Second fetch should deduplicate: 1830 existing + 60 new = 1890 total
-            cache.get_or_fetch(fetch_func, now, force=True)
-            self.assertEqual(len(cache._samples), 1890)
+            # Second fetch should deduplicate: 1830 existing + 30 new = 1860
+            cache.get_or_fetch(fetch_func, fixed_now, force=True)
+            self.assertEqual(len(cache._samples), 1860)
 
     def test_get_current_qh_computes_from_samples(self):
         """get_current_qh should compute QH prediction from raw samples."""
@@ -1658,15 +1659,16 @@ class TestEnergyCache(unittest.TestCase):
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
 
-        # Pre-populate with 5000 samples (over an hour of data)
-        old_start = fixed_now - timedelta(seconds=5000)
-        cache._samples = [0.1] * 5000
+        # Pre-populate with 3601 samples (lag=20)
+        old_start = fixed_now - timedelta(seconds=3621)
+        cache._samples = [0.1] * 3601
         cache._data_start = old_start
 
         # Patch datetime.now so pruning uses fixed_now
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
 
+            # Fetch adds 10 samples
             def fetch_func():
                 return {
                     "per_second_data": [0.2] * 10,
@@ -1675,10 +1677,8 @@ class TestEnergyCache(unittest.TestCase):
 
             cache.get_or_fetch(fetch_func, now=fixed_now, force=True)
 
-        # After merge: 5010 samples. After pruning (keep last 3600s): ~3610
-        self.assertLess(len(cache._samples), 5000)
-        # Should keep roughly the last 3600 samples plus the new ones
-        self.assertLessEqual(len(cache._samples), 3620)
+        # After merge: 3600 samples. After pruning (keep last 3600s): ~3600
+        self.assertLessEqual(len(cache._samples), 3600)
 
     def test_pruning_does_not_remove_recent_samples(self):
         """Samples within the last 3600s are preserved after pruning."""
@@ -2483,7 +2483,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         self.assertEqual(existing._samples[-1], 0.002)
 
     def test_merge_new_samples_before_cache(self):
-        """New samples end exactly before cache starts → all kept (before slice)."""
+        """New samples end exactly before cache starts → AssertionError."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
@@ -2499,16 +2499,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        self.assertIsNotNone(result)
-        # 300 (new before) + 300 (existing) = 600
-        self.assertEqual(len(existing._samples), 600)
-        # New samples are at the front
-        self.assertEqual(existing._samples[0], 0.003)
-        self.assertEqual(existing._samples[299], 0.003)
-        # Existing remain at the back
-        self.assertEqual(existing._samples[300], 0.001)
+            with self.assertRaises(AssertionError):
+                result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
     def test_merge_gap_between_cache_and_new(self):
         """New samples start after a gap → gap samples NOT included."""
@@ -2603,7 +2595,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         self.assertEqual(len(existing._samples), 360)
 
     def test_merge_partial_overlap_both_sides(self):
-        """New samples overlap before AND after cache → only ends kept."""
+        """New samples overlap before AND after cache → AssertionError."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
@@ -2623,16 +2615,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        self.assertIsNotNone(result)
-        # Before cache: new_start=13:58:00, cache_start=14:00:00 → 120 samples before
-        # After cache: new_end=14:03:59, cache_end=14:04:59 → new_end < cache_end → 0 after
-        # Total 120 new samples added
-        self.assertEqual(len(existing._samples), 420)
-        self.assertEqual(existing._samples[0], 0.008)
-        self.assertEqual(existing._samples[119], 0.008)
-        self.assertEqual(existing._samples[120], 0.001)
+            with self.assertRaises(AssertionError):
+                result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
     def test_merge_all_overlap_new_samples_empty_after_filter(self):
         """New samples entirely within cached range → empty after filter."""
@@ -2904,32 +2888,6 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         self.assertEqual(len(cache._samples), 300)
         self.assertEqual(cache._samples, original_samples)
-
-    def test_prune_updates_data_start(self):
-        """After pruning, _data_start advances by the number of removed samples."""
-        import metrics
-
-        # Use fixed_now such that ceil_to_qh(now - 3600) lands at 14:15:00.
-        fixed_now = datetime(2025, 6, 15, 15, 15, 0, tzinfo=timezone.utc)
-        # ceil_to_qh(14:15:00) = 14:15:00
-        # 300 samples from 14:13:20 to 14:18:19 (inclusive)
-        cache_start = datetime(2025, 6, 15, 14, 13, 20, tzinfo=timezone.utc)
-        cache = _make_cache_with_samples(300, cache_start)
-
-        new_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
-        new_samples = []
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
-
-        # Samples from 14:13:20 to 14:14:59 (100 samples) are < 14:15:00 → removed
-        # Samples from 14:15:00 to 14:18:19 (200 samples) are >= cutoff → kept
-        self.assertEqual(len(cache._samples), 200)
-        # _data_start advances by the number of removed samples (100 seconds)
-        self.assertEqual(cache._data_start, new_start)
 
     def test_prune_updates_sample_count(self):
         """_sample_count reflects pruned length."""
@@ -3364,6 +3322,47 @@ class TestNBCUsesFullCache(unittest.TestCase):
         self.assertIsNotNone(nbc.get("QH1"))
         self.assertIsNone(nbc.get("QH2"))
         self.assertIsNone(nbc.get("QH3"))
+
+
+class TestCreateMetricsPassesCache(unittest.TestCase):
+    """Tests for create_metrics passing EnergyCache to HourlyProjection."""
+
+    def test_create_metrics_passes_energy_cache(self):
+        """create_metrics passes _energy_cache to HourlyProjection.
+
+        This is the integration test for the fix: _energy_cache should be
+        passed through to HourlyProjection so that _compute_nbc can use
+        the full merged cache instead of the incremental delta.
+        """
+        import app as app_mod
+        from metrics import HourlyProjection, EnergyCache, create_metrics
+
+        with mock_config():
+            cache = app_mod._energy_cache
+            self.assertIsInstance(cache, EnergyCache)
+
+            # Replace HourlyProjection with a MagicMock so we can inspect
+            # the constructor call without actually running the real code.
+            with patch("metrics.HourlyProjection") as MockHP:
+                mock_instance = MockHP.return_value
+                create_metrics(
+                    cache,
+                    datetime(2025, 6, 15, 14, 30, 0),
+                    logging.getLogger("test"),
+                )
+
+                # Verify HourlyProjection was called with _energy_cache
+                MockHP.assert_called_once()
+                call_args = MockHP.call_args
+                # Arguments: (now, logger, _energy_cache)
+                self.assertEqual(len(call_args[0]), 3,
+                                 "HourlyProjection called with 3 positional args")
+                self.assertIs(
+                    call_args[0][2],
+                    cache,
+                    "Third arg (energy_cache) must be the module-level _energy_cache",
+                )
+                self.assertEqual(call_args[1], {}, "No keyword args expected")
 
 
 

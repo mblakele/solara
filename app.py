@@ -33,6 +33,7 @@ from flask.typing import ResponseReturnValue
 from config import cfg as _cfg, get_timezone
 
 from metrics import (
+    create_metrics,
     EnergyCache,
     HourlyProjection,
     Metrics,
@@ -43,38 +44,6 @@ from mockdata import MetricsMock
 from util import CustomJSONProvider, ceil_to_qh, is_debug
 
 from tesla_oauth import bp
-
-# Module-level lock for thread-safe first-call detection on _create_metrics.
-_create_metrics_lock = threading.Lock()
-
-
-def _create_metrics(now: datetime, logger: logging.Logger) -> dict[str, Any] | None:
-    """Fetch metrics with incremental chart_start tracking via EnergyCache.
-
-    On the first call, EnergyCache has no samples, so chart_start is set to
-    3600 seconds ago (full hour of historical data). After that, chart_start
-    advances to the most recent sample timestamp from the cache.
-
-    Args:
-        now: current datetime in local timezone.
-        logger: Logger instance.
-
-    Returns:
-        Metrics dict from HourlyProjection, or None on failure.
-    """
-    # First call: fetch up to four QH periods.
-    # Subsequent calls: fetch incremental data from the last sample timestamp.
-    logger.debug("_create_metrics: last_sample_at %s", _energy_cache.last_sample_at)
-    chart_start = (
-        ceil_to_qh(now - timedelta(seconds=3600))
-        if _energy_cache.last_sample_at is None
-        else _energy_cache.last_sample_at
-    )
-
-    hp = HourlyProjection(now, logger, _energy_cache)
-    hp.populate(chart_start)
-    return hp.metrics
-
 
 app = Flask(__name__)
 app.logger.handlers.clear()
@@ -294,7 +263,7 @@ def index() -> ResponseReturnValue:
     else:
         # Real mode: use cached metrics to avoid hammering the API
         metrics_data, was_fresh = _energy_cache.get_or_fetch(
-            lambda: _create_metrics(datetime.now(pytz.timezone(_cfg.timezone)), logger),
+            lambda: create_metrics(_energy_cache, datetime.now(pytz.timezone(_cfg.timezone)), logger),
             now
         )
         if was_fresh:
@@ -445,7 +414,7 @@ def _get_load_manager():
                 def metrics_fetch():
                     now = datetime.now(timezone.utc)
                     return _energy_cache.get_or_fetch(
-                        lambda: _create_metrics(datetime.now(pytz.timezone(_cfg.timezone)), logger),
+                        lambda: create_metrics(_energy_cache, datetime.now(pytz.timezone(_cfg.timezone)), logger),
                         now
                     )[0]
 

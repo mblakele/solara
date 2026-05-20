@@ -828,45 +828,5 @@ class TestLagRecalculation(unittest.TestCase):
         self.assertGreaterEqual(lag, 0)
 
 
-class TestCreateMetricsPassesCache(unittest.TestCase):
-    """Tests for _create_metrics passing EnergyCache to HourlyProjection."""
-
-    def test_create_metrics_passes_energy_cache(self):
-        """_create_metrics passes _energy_cache to HourlyProjection.
-
-        This is the integration test for the fix: _energy_cache should be
-        passed through to HourlyProjection so that _compute_nbc can use
-        the full merged cache instead of the incremental delta.
-        """
-        import app as app_mod
-        from metrics import HourlyProjection, EnergyCache
-
-        with mock_config():
-            cache = app_mod._energy_cache
-            self.assertIsInstance(cache, EnergyCache)
-
-            # Replace HourlyProjection with a MagicMock so we can inspect
-            # the constructor call without actually running the real code.
-            with patch("app.HourlyProjection") as MockHP:
-                mock_instance = MockHP.return_value
-                app_mod._create_metrics(
-                    datetime(2025, 6, 15, 14, 30, 0),
-                    logging.getLogger("test"),
-                )
-
-                # Verify HourlyProjection was called with _energy_cache
-                MockHP.assert_called_once()
-                call_args = MockHP.call_args
-                # Arguments: (now, logger, _energy_cache)
-                self.assertEqual(len(call_args[0]), 3,
-                                 "HourlyProjection called with 3 positional args")
-                self.assertIs(
-                    call_args[0][2],
-                    cache,
-                    "Third arg (energy_cache) must be the module-level _energy_cache",
-                )
-                self.assertEqual(call_args[1], {}, "No keyword args expected")
-
-
 if __name__ == "__main__":
     unittest.main()

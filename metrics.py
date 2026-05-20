@@ -80,6 +80,35 @@ def cap_fetch_window(start_time: datetime, now: datetime) -> datetime:
     return start_time
 
 
+def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Logger) -> dict[str, Any] | None:
+    """Fetch metrics with incremental chart_start tracking via EnergyCache.
+
+    On the first call, EnergyCache has no samples, so chart_start is set to
+    3600 seconds ago (full hour of historical data). After that, chart_start
+    advances to the most recent sample timestamp from the cache.
+
+    Args:
+        evergy_cache: instance of EnergyCache.
+        now: current datetime in local timezone.
+        logger: Logger instance.
+
+    Returns:
+        Metrics dict from HourlyProjection, or None on failure.
+    """
+    # First call: fetch up to four QH periods.
+    # Subsequent calls: fetch incremental data from the last sample timestamp.
+    logger.debug("create_metrics: last_sample_at %s", energy_cache.last_sample_at)
+    chart_start = (
+        ceil_to_qh(now - timedelta(seconds=3600))
+        if energy_cache.last_sample_at is None
+        else energy_cache.last_sample_at
+    )
+
+    hp = HourlyProjection(now, logger, energy_cache)
+    hp.populate(chart_start)
+    return hp.metrics
+
+
 
 
 @dataclass
@@ -307,6 +336,47 @@ class EnergyCache:
             elapsed = now - self._last_fetch_at
             return elapsed.total_seconds() < self._ttl_seconds
 
+    @staticmethod
+    def merge_incremental(data_start: datetime,
+                          result_data_start: datetime,
+                          old_samples: [],
+                          new_samples: []
+                          ) -> [] | None:
+        """
+        TODO docstring
+        """
+        # Compute the cache's effective time range from its
+        # own _data_start so overlap detection is anchored
+        # to real sample positions.
+        cache_start_time = data_start
+        cache_end_time = data_start + timedelta(seconds=len(old_samples) - 1)
+
+        # Number of new samples strictly before / after the cache.
+        # Initialized here so they're always defined for the
+        # data_start update below.
+        after_count = 0
+
+        # Standard overlap detection:
+        # New samples should never arrive before the cache start.
+        assert(result_data_start >= cache_start_time)
+
+        # New samples after the cache end.
+        # Where the new samples end (from API's data_start).
+        new_end_time = result_data_start + timedelta(seconds=len(new_samples) - 1)
+        if new_end_time > cache_end_time:
+            after_count = int((new_end_time - cache_end_time).total_seconds())
+            # Don't double-count: after_count can't exceed remaining samples.
+            # TODO assert that these counts match exactly?
+            after_count = min(after_count, len(new_samples))
+            # TODO assert that any overlap has identical values?
+
+        # Build merged samples in time order:
+        #   before_samples + existing + after_samples
+        after_samples = list(new_samples[len(new_samples) - after_count:])
+
+        return list(old_samples) + after_samples
+
+
     def get_or_fetch(
         self, fetch_func: Callable[[], dict[str, Any] | None], now: datetime, force: bool = False
     ) -> tuple[dict[str, Any] | None, bool]:
@@ -358,74 +428,21 @@ class EnergyCache:
                 # Merge with existing samples (incremental fetch path).
                 if self._samples is not None and len(self._samples) > 0:
                     result_data_start = result.get("data_start")
-                    # Number of new samples strictly before / after the cache.
-                    # Initialized here so they're always defined for the
-                    # data_start update below.
-                    before_count = 0
-                    after_count = 0
-
                     if (self._last_sample_at is not None
-                            and self._data_start is not None
-                            and result_data_start is not None):
-                        # Compute the cache's effective time range from its
-                        # own _data_start so overlap detection is anchored
-                        # to real sample positions.
-                        cache_start_time = self._data_start
-                        cache_end_time = (self._data_start
-                                          + timedelta(
-                                              seconds=len(self._samples) - 1
-                                          ))
-
-                        # Where the new samples end (from API's data_start).
-                        new_end_time = (result_data_start
-                                        + timedelta(seconds=len(new_samples) - 1))
-
-                        # Standard overlap detection:
-                        # New samples before the cache start.
-                        before_count = 0
-                        if result_data_start < cache_start_time:
-                            before_count = int(
-                                (cache_start_time
-                                 - result_data_start
-                                 ).total_seconds()
-                            )
-                            before_count = min(before_count,
-                                               len(new_samples))
-
-                        # New samples after the cache end.
-                        after_count = 0
-                        if new_end_time > cache_end_time:
-                            after_count = int(
-                                (new_end_time - cache_end_time
-                                 ).total_seconds()
-                            )
-                            # Don't double-count: after_count can't exceed
-                            # remaining samples.
-                            after_count = min(after_count,
-                                              len(new_samples)
-                                              - before_count)
-
-                        # Build merged samples in time order:
-                        #   before_samples + existing + after_samples
-                        before_samples = list(new_samples[:before_count])
-                        after_samples = list(
-                            new_samples[len(new_samples) - after_count:]
-                        )
-                        self._samples = (before_samples + list(self._samples)
-                                         + after_samples)
-
+                        and self._data_start is not None
+                        and result_data_start is not None):
+                        merged_samples = self.merge_incremental(
+                            self._data_start,
+                            result_data_start,
+                            self._samples,
+                            new_samples)
+                        self._samples = merged_samples
                 elif new_samples:
                     self._samples = list(new_samples)
 
-                # Update data_start if we have samples.
+                # Update data_start if this looks like an initial fetch.
                 if self._samples and "data_start" in result:
-                    # If we already have samples, adjust if we prepended any.
-                    if self._data_start is not None:
-                        # Prepended samples shift the start time backward.
-                        if before_count > 0:
-                            self._data_start = result_data_start
-                        # Otherwise (append-only), start time doesn't change.
-                    else:
+                    if self._data_start is None:
                         self._data_start = result["data_start"]
 
                 if self._samples:
@@ -824,7 +841,7 @@ class HourlyProjection(MetricsBase):
         # Expose the actual API-reported data start so that EnergyCache can
         # update _data_start and _last_sample_at.  Without this key the
         # get_or_fetch merge block silently skips the _last_sample_at update,
-        # leaving it permanently None and causing every call to _create_metrics
+        # leaving it permanently None and causing every call to create_metrics
         # to request a full-hour fetch instead of an incremental one.
         if population:
             first_gid = next(iter(population))
