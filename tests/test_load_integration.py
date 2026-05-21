@@ -2051,14 +2051,14 @@ class TestAdaptiveSleep:
 
     def test_waiting_for_fresh_data_run_cycle_includes_sleep_hint_at(self):
         """Waiting for fresh data run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
-        now = datetime.now(timezone.utc)
-        data_point_at = now - timedelta(seconds=30)
+        fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
+        data_point_at = fixed_now - timedelta(seconds=10)
 
         class PendingQHReader:
             """Mock NBC reader where pending effects exist since the data point."""
 
             def get_current_qh(self, force=False, now=None):
-                return ("QH2", -800.0, 450, data_point_at)
+                return ("QH3", -800.0, 600, data_point_at)
 
         lm = LoadManager(
             metrics_fetch=lambda: None,
@@ -2090,7 +2090,11 @@ class TestAdaptiveSleep:
             power_watts=1000.0,
         )]
 
-        result = lm.run_cycle()
+        with patch("load_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            result = lm.run_cycle()
+
         assert result["status"] == "waiting_for_fresh_data"
         assert "sleep_hint_at" in result
         parsed = datetime.fromisoformat(result["sleep_hint_at"])

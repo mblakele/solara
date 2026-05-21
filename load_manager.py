@@ -1060,6 +1060,11 @@ class LoadManager:
             now = datetime.now(timezone.utc) # ok because lock may take time
 
             if not self.is_enabled_at(now):
+                if self.nbc_reader is not None:
+                    energy_cache = self.nbc_reader.energy_cache
+                    if energy_cache is not None:
+                        energy_cache.invalidate()
+
                 return {
                     "status": "disabled",
                     "diagnostics": {
