@@ -1,5 +1,6 @@
 {pkgs}: {
   deps = [
+    pkgs.vim
     pkgs.python312Packages.pytest_7
     pkgs.uv
     pkgs.jq
