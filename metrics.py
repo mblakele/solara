@@ -98,10 +98,11 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
     # First call: fetch up to four QH periods.
     # Subsequent calls: fetch incremental data from the last sample timestamp.
     logger.debug("create_metrics: last_sample_at %s", energy_cache.last_sample_at)
-    chart_start = (
+    chart_start = cap_chart_start(
         ceil_to_qh(now - timedelta(seconds=3600))
         if energy_cache.last_sample_at is None
-        else energy_cache.last_sample_at
+        else energy_cache.last_sample_at,
+        now
     )
 
     hp = HourlyProjection(now, logger, energy_cache)

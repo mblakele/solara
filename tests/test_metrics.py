@@ -3347,7 +3347,7 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
                 mock_instance = MockHP.return_value
                 create_metrics(
                     cache,
-                    datetime(2025, 6, 15, 14, 30, 0),
+                    datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
                     logging.getLogger("test"),
                 )
 
