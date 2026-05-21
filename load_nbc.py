@@ -491,9 +491,11 @@ class StateTracker:
         Returns:
             True if any effect has either timestamp after ``nbc_timestamp``.
         """
+        buffer = timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
         for effect in self.pending_effects:
-            if effect.timestamp > nbc_timestamp or effect.data_point_at > nbc_timestamp:
+            if effect.timestamp > nbc_timestamp - buffer:
                 return True
+
         return False
 
     def pending_since_count(self, nbc_timestamp: datetime) -> int:
