@@ -97,18 +97,27 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
     """
     # First call: fetch up to four QH periods.
     # Subsequent calls: fetch incremental data from the last sample timestamp.
-    logger.debug("create_metrics: last_sample_at %s", energy_cache.last_sample_at)
-    chart_start = cap_chart_start(
-        ceil_to_qh(now - timedelta(seconds=3600))
-        if energy_cache.last_sample_at is None
-        else energy_cache.last_sample_at,
-        now
+    logger.debug(
+        "create_metrics: len %d, last_sample_at %s",
+        len(energy_cache._samples or []),
+        energy_cache.last_sample_at
     )
+    try:
+        chart_start = cap_chart_start(
+            ceil_to_qh(now - timedelta(seconds=3600))
+            if energy_cache.last_sample_at is None
+            else energy_cache.last_sample_at,
+            now
+        )
 
-    hp = HourlyProjection(now, logger, energy_cache)
-    hp.populate(chart_start)
-    return hp.metrics
-
+        hp = HourlyProjection(now, logger, energy_cache)
+        hp.populate(chart_start)
+        return hp.metrics
+    except AssertionError as ae:
+        logger.error(ae)
+        # force clean cache and full fetch on next cycle
+        energy_cache.invalidate()
+        raise RetryableMetricsException(ae)
 
 
 
@@ -392,7 +401,12 @@ class EnergyCache:
         #   before_samples + existing + after_samples
         after_samples = list(new_samples[len(new_samples) - after_count:])
 
-        return list(old_samples) + after_samples
+        merged_samples = list(old_samples) + after_samples
+
+        if len(merged_samples) > 3600:
+            merged_samples = merged_samples[-3600:]
+
+        return merged_samples
 
 
     def get_or_fetch(
@@ -449,12 +463,23 @@ class EnergyCache:
                     if (self._last_sample_at is not None
                         and self._data_start is not None
                         and result_data_start is not None):
+                        old_count = len(self._samples)
                         merged_samples = self.merge_incremental(
                             self._data_start,
                             result_data_start,
                             self._samples,
                             new_samples)
+                        assert merged_samples is not None
                         self._samples = merged_samples
+                        # Truncation in merge_incremental drops leading samples.
+                        # Update _data_start to reflect the new start time so
+                        # the pruning loop below computes sample timestamps
+                        # correctly.
+                        dropped = old_count - len(merged_samples)
+                        if dropped > 0:
+                            self._data_start = (
+                                self._data_start + timedelta(seconds=dropped)
+                            )
                 elif new_samples:
                     self._samples = list(new_samples)
 
@@ -1183,14 +1208,16 @@ class HourlyProjection(MetricsBase):
         # This ensures _compute_nbc sees the full hour of data rather than
         # only the incremental delta from the API call.
         energy_cache = self.energy_cache
-        if nbc_seconds is not None and pop_data_start is not None and energy_cache is not None and energy_cache._data_start is not None:
-            cache_samples = self.energy_cache.samples
-            if cache_samples:
-                nbc_seconds = self.energy_cache.merge_incremental(
-                    self.energy_cache._data_start,
-                    pop_data_start,
-                    cache_samples,
-                    nbc_seconds)
+        if nbc_seconds is not None and pop_data_start is not None and energy_cache is not None:
+            if energy_cache._data_start is not None:
+                cache_samples = energy_cache.samples
+                if cache_samples:
+                    nbc_seconds = energy_cache.merge_incremental(  # type: ignore[assignment]
+                        energy_cache._data_start,
+                        pop_data_start,
+                        cache_samples,
+                        nbc_seconds)
+                    assert nbc_seconds is not None
 
         nbc_result = self._compute_nbc(nbc_seconds)
 

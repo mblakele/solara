@@ -2846,11 +2846,15 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         # _data_start advances by the number of removed samples (100 seconds)
         self.assertEqual(cache._data_start, new_start)
 
-    def test_prune_keeps_sample_at_cutoff_plus_one(self):
-        """Sample at cutoff + 1 second is kept (within 3600s window)."""
+    def test_prune_keeps_sample_at_cutoff(self):
+        """Sample at the exact cutoff boundary is kept (within 3600s window).
+
+        The pruning condition uses '<' (not '<='), so a sample exactly at
+        the cutoff timestamp should be retained.
+        """
         import metrics
 
-        # Use fixed_now such that ceil_to_qh(now - 3600) lands at 14:15:00.
+        # Use fixed_now such that ceil_to_qh(now - 3600s) lands at 14:15:00.
         fixed_now = datetime(2025, 6, 15, 15, 15, 0, tzinfo=timezone.utc)
         # ceil_to_qh(14:15:00) = 14:15:00
         # Create samples where last sample is at cutoff (14:15:00)
@@ -2867,7 +2871,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
             cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # 3600 samples from 13:15:00 to 14:14:59 are < 14:15:00 → removed
-        # Sample at 14:15:00 (cutoff) is kept
+        # Sample at 14:15:00 (cutoff) is kept (uses <, not <=)
         self.assertEqual(len(cache._samples), 1)
 
     def test_prune_no_samples_to_remove(self):
@@ -2990,27 +2994,37 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         self.assertEqual(len(cache._samples), 0)
 
     def test_prune_one_sample_kept(self):
-        """Exactly one sample within 3600s window → all older pruned, 1 kept."""
+        """3601-sample cache, empty fetch → truncate → prune → 1 kept.
+
+        Reproduces the production bug on 2026-05-21 where a production
+        server hit an AssertionError in compute_nbc_quarters. When the
+        cache held 3601 samples and the fetch returned empty data,
+        merge_incremental truncated to 3600 but left _data_start
+        pointing to the original time. This caused the pruning loop
+        to miscalculate sample timestamps and prune every sample,
+        leaving 0 instead of the expected 1 boundary sample.
+        """
         import metrics
 
-        # Use fixed_now such that ceil_to_qh(now - 3600) lands at 14:15:00.
         fixed_now = datetime(2025, 6, 15, 15, 15, 0, tzinfo=timezone.utc)
-        # ceil_to_qh(14:15:00) = 14:15:00
         # 3601 samples from 13:15:00 to 14:15:00 (inclusive)
+        # merge(3601 + 0) → 3601 → truncate to 3600
+        # Without fix: _data_start still 13:15:00 → all 3600 samples < 14:15:00 → 0 kept
+        # With fix: _data_start becomes 13:15:01 → samples at 13:15:01–14:14:59 pruned → 1 kept
         cache_start = datetime(2025, 6, 15, 13, 15, 0, tzinfo=timezone.utc)
-        cache = _make_cache_with_samples(3601, cache_start)  # 13:15:00 – 14:15:00
+        cache = _make_cache_with_samples(3601, cache_start)
 
-        fetcher = self._fetcher_returns(datetime(2025, 6, 15, 15, 15, 0, tzinfo=timezone.utc), [])
+        fetcher = self._fetcher_returns(
+            datetime(2025, 6, 15, 15, 15, 0, tzinfo=timezone.utc), [])
 
         with patch("metrics.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        # Samples from 13:15:00 to 14:14:59 (3600 samples) are < 14:15:00 → removed
-        # Sample at 14:15:00 (cutoff) is kept
+        # Prune should keep 1 sample at 14:15:00 (the boundary)
         self.assertEqual(len(cache._samples), 1)
-
+        self.assertEqual(cache._samples[0], 0.001)
 
 
 # ===========================================================================
