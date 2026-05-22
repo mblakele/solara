@@ -114,7 +114,9 @@ else:
                         level=logging.DEBUG if is_debug() else logging.INFO)
 
 # squelch internal log messages
-for noisy in ("gunicorn.access", "boto3", "botocore", "urllib3", "requests"):
+for noisy in (
+        "asyncio", "boto3", "botocore", "gunicorn.access",
+        "urllib3", "requests"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 def astimezone_filter(dt: datetime, tz_str: str) -> datetime:
