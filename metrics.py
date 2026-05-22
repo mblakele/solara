@@ -639,6 +639,14 @@ class EnergyCache:
                     }
             return None
 
+        # If QH1 is already complete, its data is stale — don't use it for
+        # load management decisions. Return None so the caller knows to wait
+        # for fresh incomplete data (this triggers the "no_incomplete_qh" path
+        # in run_cycle with a short sleep hint instead of making decisions on
+        # a completed quarter's Wh value).
+        if qh1_data.get("complete"):
+            return None
+
         seconds_remaining = qh_seconds_remaining(now)
         predicted_wh = qh1_data.get("predicted_wh", qh1_data.get("wh", 0))
         return {

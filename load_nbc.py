@@ -241,7 +241,6 @@ class NBCReader:
             return None
 
         qh_order = ["QH1", "QH2", "QH3", "QH4"]
-        last_complete: dict[str, Any] | None = None
         incomplete_result: dict[str, Any] | None = None
 
         for qh_name in qh_order:
@@ -271,26 +270,15 @@ class NBCReader:
                 }
                 # Don't break — keep scanning for the last complete QH fallback.
             else:
-                # Track the last complete QH as a fallback.
-                predicted_wh = qh_data.get("predicted_wh", qh_data.get("wh", 0))
-                now = metrics_data.get("_now")
-                if now is not None:
-                    remaining_seconds = 900 - (now.second + (now.minute % 15) * 60)
-                else:
-                    remaining_seconds = qh_data.get(
-                        "remaining_seconds", NBCPeriod.PERIOD_SECS - 1
-                    )
-                last_complete = {
-                    "qh_name": "QH1",
-                    "predicted_wh": predicted_wh,
-                    "seconds_remaining": remaining_seconds,
-                    "_data_lag_secs": metrics_data.get("_data_lag_secs", 0.0),
-                }
+                continue
 
-        # Return incomplete QH if found, otherwise fallback to last complete.
+        # Return incomplete QH if found; otherwise return None.
+        # Never return a complete quarter as a fallback — its data is stale
+        # and using it for load management causes incorrect decisions
+        # (e.g., turning off loads based on a completed quarter's 0 Wh).
         if incomplete_result is not None:
             return incomplete_result
-        return last_complete
+        return None
 
 
 class StateTracker:

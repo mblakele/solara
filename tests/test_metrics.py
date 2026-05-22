@@ -1734,8 +1734,12 @@ class TestEnergyCache(unittest.TestCase):
         self.assertEqual(result["qh_name"], "QH1")
         self.assertFalse(result.get("seconds_remaining", 0) == 0)
 
-    def test_get_current_qh_returns_complete_last_qh_when_all_done(self):
-        """When all 4 quarters are complete, get_current_qh returns QH1 (most recent)."""
+    def test_get_current_qh_returns_none_when_all_done(self):
+        """When all 4 quarters are complete, get_current_qh returns None.
+
+        Stale complete-quarter data must not be used for load management
+        decisions. This is the anti-regression test for the ecoflow chatter.
+        """
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
@@ -1757,11 +1761,71 @@ class TestEnergyCache(unittest.TestCase):
             cache.get_or_fetch(fetch_func, fixed_now)
             result = cache.get_current_qh(fixed_now)
 
-        self.assertIsNotNone(result)
-        self.assertEqual(result["qh_name"], "QH1")
-        # QH1 now represents the most recent complete window (12:45-13:00)
-        # seconds_remaining is derived from wall-clock, not 0
-        self.assertEqual(result["seconds_remaining"], 900)
+        # All quarters complete → must return None
+        self.assertIsNone(result)
+
+    def test_get_current_qh_returns_none_when_qh1_is_complete(self):
+        """When QH1 is complete with zero Wh (solar), return None instead of stale data.
+
+        This is the anti-regression test for the ecoflow chatter bug.
+        When all 4 quarters are complete and QH1 has 0 Wh (e.g., solar
+        generation during night), get_current_qh must return None so that
+        run_cycle correctly treats it as "no_incomplete_qh" and waits for
+        fresh data rather than making load management decisions on stale
+        quarter-end data.
+        """
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        fixed_now = datetime(2025, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
+        data_start = ceil_to_qh(fixed_now - timedelta(seconds=3600))
+
+        # 3600 samples of 0 = exactly one hour of zero energy (nighttime solar)
+        samples = [0.0] * 3600
+
+        def fetch_func():
+            return {
+                "per_second_data": samples,
+                "data_start": data_start,
+            }
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            cache.get_or_fetch(fetch_func, fixed_now)
+            result = cache.get_current_qh(fixed_now)
+
+        # Must return None — stale complete-quarter data must not be used
+        self.assertIsNone(result)
+
+    def test_get_current_qh_returns_none_when_all_quarters_complete_with_solar(self):
+        """When all quarters are complete with actual solar Wh, return None.
+
+        Even when QH1 has non-zero Wh from a completed quarter, returning
+        that stale value would cause incorrect load decisions. The system
+        should always wait for fresh incomplete data.
+        """
+        from metrics import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=60)
+        fixed_now = datetime(2025, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
+        data_start = ceil_to_qh(fixed_now - timedelta(seconds=3600))
+
+        # Solar generation: 0.5 Wh per second = 450 Wh per quarter
+        samples = [0.0005] * 3600
+
+        def fetch_func():
+            return {
+                "per_second_data": samples,
+                "data_start": data_start,
+            }
+
+        with patch("metrics.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            cache.get_or_fetch(fetch_func, fixed_now)
+            result = cache.get_current_qh(fixed_now)
+
+        # Must return None — complete quarters are stale
+        self.assertIsNone(result)
 
     def test_get_current_qh_returns_most_recent_qh(self):
         """get_current_qh returns QH1 (most recent window), not the last incomplete one."""

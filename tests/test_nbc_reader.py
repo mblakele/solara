@@ -311,7 +311,7 @@ def test_get_current_qh_direct_with_none_data():
 
 
 def test_get_current_qh_direct_with_no_incomplete_qh():
-    """get_current_qh_direct returns last complete QH when all are complete."""
+    """get_current_qh_direct returns None when all quarters are complete."""
     reader = NBCReader()
 
     metrics_data = {
@@ -330,8 +330,61 @@ def test_get_current_qh_direct_with_no_incomplete_qh():
 
     result = reader.get_current_qh_direct(metrics_data)
 
-    assert result is not None
-    qh_name, predicted_wh, _ = result
-    # All quarters complete or not started → return last complete QH, labeled QH1.
-    assert qh_name == "QH1"
-    assert predicted_wh == 300.0
+    # No incomplete QH → must return None
+    assert result is None
+
+
+def test_get_current_qh_direct_returns_none_when_all_quarters_complete():
+    """When all quarters are complete, return None to avoid stale data.
+
+    This is the anti-regression test for the ecoflow chatter bug.
+    When every quarter in the NBC data is marked complete, returning
+    the last complete quarter's Wh value would cause incorrect load
+    management decisions based on stale, completed-quarter data. The
+    correct behavior is to return None so run_cycle waits for fresh
+    incomplete data.
+    """
+    reader = NBCReader()
+
+    metrics_data = {
+        "devices": [
+            {
+                "name": "panel",
+                "nbc": {
+                    "QH1": {"wh": 200.0, "complete": True},
+                    "QH2": {"wh": 300.0, "complete": True},
+                    "QH3": {"wh": 150.0, "complete": True},
+                    "QH4": {"wh": 100.0, "complete": True},
+                },
+            }
+        ]
+    }
+
+    result = reader.get_current_qh_direct(metrics_data)
+
+    # All quarters complete → must return None
+    assert result is None
+
+
+def test_get_current_qh_direct_returns_none_when_all_quarters_complete_with_zero_wh():
+    """When all quarters are complete with 0 Wh (nighttime solar), return None."""
+    reader = NBCReader()
+
+    metrics_data = {
+        "devices": [
+            {
+                "name": "panel",
+                "nbc": {
+                    "QH1": {"wh": 0.0, "complete": True},
+                    "QH2": {"wh": 0.0, "complete": True},
+                    "QH3": {"wh": 0.0, "complete": True},
+                    "QH4": {"wh": 0.0, "complete": True},
+                },
+            }
+        ]
+    }
+
+    result = reader.get_current_qh_direct(metrics_data)
+
+    # All quarters complete, even with 0 Wh → must return None
+    assert result is None
