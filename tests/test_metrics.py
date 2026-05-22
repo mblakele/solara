@@ -506,7 +506,7 @@ class TestHourlyProjectionPopulateChartStart(unittest.TestCase):
         with patch.object(hp, "populate_internal", return_value={}) as mock_populate:
             hp.populate(old_chart_start)
 
-        expected_start = ceil_to_qh(instant)
+        expected_start = datetime(2026, 5, 19, 12, 0, 0, tzinfo=timezone.utc)
         mock_populate.assert_called_once_with(expected_start, hp.energy_cache)
 
     def test_populate_preserves_nearby_chart_start(self):
@@ -527,13 +527,14 @@ class TestCapChartStart(unittest.TestCase):
     """Tests for the cap_chart_start guard function."""
 
     def test_caps_old_chart_start(self):
-        """When chart_start >1h before now, return current QH boundary."""
+        """When chart_start >1h before now, return current QH3 start."""
         from metrics import cap_chart_start
 
-        instant = datetime(2026, 5, 19, 13, 0, 0, tzinfo=timezone.utc)
-        old_start = datetime(2026, 5, 19, 3, 59, 7, tzinfo=timezone.utc)
+        instant = datetime(2026, 5, 22, 13, 0, 1, tzinfo=timezone.utc)
+        old_start = datetime(2026, 5, 22, 3, 29, 7, tzinfo=timezone.utc)
+        expected_start = datetime(2026, 5, 22, 12, 15, 0, tzinfo=timezone.utc)
         result = cap_chart_start(old_start, instant)
-        self.assertEqual(result, ceil_to_qh(instant))
+        self.assertEqual(result, expected_start)
 
     def test_caps_old_chart_start_at_exact_boundary(self):
         """When chart_start is exactly 1h before now, it should NOT cap."""
@@ -572,8 +573,9 @@ class TestCapFetchWindow(unittest.TestCase):
 
         now = datetime(2026, 5, 19, 13, 7, 43, tzinfo=timezone.utc)
         old_start = now - timedelta(hours=9)
+        expected_start = ceil_to_qh(now - timedelta(hours=1))
         result = cap_fetch_window(old_start, now)
-        self.assertEqual(result, ceil_to_qh(now))
+        self.assertEqual(result, expected_start)
 
     def test_caps_old_start_at_exact_boundary(self):
         """When start_time is exactly 1h before now, it should NOT cap."""
@@ -599,8 +601,9 @@ class TestCapFetchWindow(unittest.TestCase):
 
         now = datetime(2026, 5, 19, 13, 30, 0, tzinfo=timezone.utc)
         old_start = now - timedelta(hours=2)
+        expected_start = ceil_to_qh(now - timedelta(hours=1))
         result = cap_fetch_window(old_start, now)
-        self.assertEqual(result, ceil_to_qh(now))
+        self.assertEqual(result, expected_start)
 
 
 class TestHourlyProjectionEdgeCases(unittest.TestCase):
@@ -2067,14 +2070,13 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         vue_mock = MagicMock()
         gid = 1
         fixed_now = datetime(2025, 6, 1, 12, 30, 10, tzinfo=timezone.utc)
-        chart_start = ceil_to_qh(fixed_now - timedelta(seconds=3600))
-        self.assertEqual(chart_start, datetime(2025, 6, 1, 11, 45, 0, tzinfo=timezone.utc))
+        chart_start = ceil_to_qh(fixed_now - timedelta(hours=1))
 
-        # Mock API to return some data
         vue_mock.get_chart_usage.return_value = (
-            [0.1] * 3543,
-            fixed_now - timedelta(seconds=3600),
+            [0.1] * 2710,
+            chart_start,
         )
+        self.assertEqual(chart_start, datetime(2025, 6, 1, 11, 45, 0, tzinfo=timezone.utc))
 
         fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
         result = fetcher()
@@ -2084,7 +2086,7 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         call_args = vue_mock.get_chart_usage.call_args
         # chart_start should now align to previous QH boundary 12:30
         chart_start = call_args[0][1]
-        self.assertEqual(chart_start, fixed_now.replace(minute=45, second=0))
+        self.assertEqual(chart_start, fixed_now.replace(hour=11, minute=45, second=0))
         self.assertEqual(call_args[0][2], fixed_now)
 
     def test_incremental_fetch_uses_last_sample_time(self):
@@ -2210,8 +2212,8 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         # Should have pruned old samples
         self.assertLess(len(cache._samples), 7200)
 
-    def test_stale_cache_falls_back_to_full_hour_fetch(self):
-        """When incremental window >1h, fetcher falls back to full-hour fetch."""
+    def test_stale_cache_falls_back_to_full_fetch(self):
+        """When incremental window >1h, fetcher falls back to full fetch."""
         from metrics import EnergyCache, _build_incremental_fetch
 
         cache = EnergyCache(ttl_seconds=60)
@@ -2220,26 +2222,27 @@ class TestBuildIncrementalFetch(unittest.TestCase):
 
         # Use a non-QH-boundary time so the test actually exercises the
         # fallback path (ceil_to_qh(now) != now).
-        now = datetime(2026, 5, 19, 13, 7, 43, tzinfo=timezone.utc)
-        old_start = now - timedelta(hours=9)
+        fixed_now = datetime(2026, 5, 19, 13, 7, 43, tzinfo=timezone.utc)
+        old_start = fixed_now - timedelta(hours=9)
 
-        # 1 hour of samples from 9h ago — the incremental window is 8h.
-        cache._samples = [0.1] * 3600
+        # cache holds samples from 9h ago — the incremental window is 8h.
+        cache._samples = [0.1] * 3456
         cache._data_start = old_start
 
+        expected_start = ceil_to_qh(fixed_now - timedelta(hours=1))
         vue_mock.get_chart_usage.return_value = (
-            [0.1] * 3600,
-            ceil_to_qh(now),
+            [0.2] * 3123,
+            expected_start,
         )
 
-        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
+        fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
         result = fetcher()
 
         vue_mock.get_chart_usage.assert_called_once()
         call_args = vue_mock.get_chart_usage.call_args
-        # Guard should have capped start_time to ceil_to_qh(now)
-        self.assertEqual(call_args[0][1], ceil_to_qh(now))
-        self.assertEqual(call_args[0][2], now)
+        # Guard should have capped start_time to ceil_to_qh(fixed_now)
+        self.assertEqual(call_args[0][1], expected_start)
+        self.assertEqual(call_args[0][2], fixed_now)
         self.assertIn("per_second_data", result)
 
 

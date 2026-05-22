@@ -37,8 +37,8 @@ MAX_FETCH_WINDOW = timedelta(hours=1)
 def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
     """Cap chart_start to prevent over-fetching after stale cache.
 
-    If chart_start is more than 1 hour before *now*, return the current
-    quarter-hour boundary.  Otherwise return chart_start unchanged.
+    If chart_start is more than 1 hour before *now*, return the earliest
+    appropriate quarter-hour boundary.  Otherwise return chart_start unchanged.
 
     This guard prevents the Emporia API from rejecting large 1-second
     resolution requests when the load manager has been idle for a long
@@ -52,16 +52,17 @@ def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
         A datetime no more than 1 hour before *now*, or *chart_start*
         unchanged if it is already within the 1-hour window.
     """
-    if now - chart_start > MAX_FETCH_WINDOW:
-        return ceil_to_qh(now)
-    return chart_start
+    if now - chart_start <= MAX_FETCH_WINDOW:
+        return chart_start
+
+    return ceil_to_qh(now - MAX_FETCH_WINDOW)
 
 
 def cap_fetch_window(start_time: datetime, now: datetime) -> datetime:
     """Cap a fetch start_time to prevent over-fetching after stale cache.
 
-    If *start_time* is more than 1 hour before *now*, return the current
-    quarter-hour boundary.  Otherwise return start_time unchanged.
+    If *start_time* is more than 1 hour before *now*, return the earliest
+    appropriate quarter-hour boundary.  Otherwise return start_time unchanged.
 
     Used by the incremental fetch builder to guard against stale
     EnergyCache state that would otherwise request hours of 1-second
@@ -75,9 +76,10 @@ def cap_fetch_window(start_time: datetime, now: datetime) -> datetime:
         A datetime no more than 1 hour before *now*, or *start_time*
         unchanged if it is already within the 1-hour window.
     """
-    if now - start_time > MAX_FETCH_WINDOW:
-        return ceil_to_qh(now)
-    return start_time
+    if now - start_time <= MAX_FETCH_WINDOW:
+        return start_time
+
+    return ceil_to_qh(now - MAX_FETCH_WINDOW)
 
 
 def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Logger) -> dict[str, Any] | None:
@@ -103,22 +105,20 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         energy_cache.last_sample_at
     )
     try:
-        chart_start = cap_chart_start(
-            ceil_to_qh(now - timedelta(seconds=3600))
+        chart_start = (
+            ceil_to_qh(now - MAX_FETCH_WINDOW)
             if energy_cache.last_sample_at is None
-            else energy_cache.last_sample_at,
-            now
+            else cap_chart_start(energy_cache.last_sample_at, now)
         )
-
         hp = HourlyProjection(now, logger, energy_cache)
         hp.populate(chart_start)
         return hp.metrics
+
     except AssertionError as ae:
         logger.error(ae)
         # force clean cache and full fetch on next cycle
         energy_cache.invalidate()
         raise RetryableMetricsException(ae)
-
 
 
 @dataclass
@@ -235,7 +235,7 @@ def _build_incremental_fetch(
         if energy_cache.data_start is None or energy_cache.samples is None or len(
             energy_cache.samples
         ) == 0:
-            start_time = ceil_to_qh(now)
+            start_time = ceil_to_qh(now - MAX_FETCH_WINDOW)
         else:
             last_sample_idx = len(energy_cache.samples)
             start_time = energy_cache.data_start + timedelta(seconds=last_sample_idx)
@@ -251,6 +251,9 @@ def _build_incremental_fetch(
                 now,
             )
             start_time = capped
+
+        # pyemvue throws error if start_time is earlier than end_time (now)
+        assert start_time <= now
 
         try:
             usage_data, data_start = vue.get_chart_usage(
