@@ -2228,7 +2228,8 @@ class TestClockSkew:
         assert abs(est.estimate - (-20.0)) < 5.0
 
     def test_diagnostics_include_skew(self):
-        """Full run_cycle with a plug action; diagnostics contain clock_skew."""
+        """Full run_cycle with a plug action and pending effect; diagnostics
+        contain clock_skew with measurement_count > 0."""
         fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
         plugs = {
             "heater": PlugConfig(
@@ -2240,6 +2241,18 @@ class TestClockSkew:
         }
         plug_ctrl = PlugController(plugs)
         energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
+
+        # data_start = 06:45:00 (QH-aligned), cache has ~1380 samples.
+        # data_lag_secs=0 (default), so data_point_at = 07:08:00.
+        # PENDING_EFFECT_MIN_SECS=60, gate threshold = 07:07:00.
+        # Effect at 07:06:00 < 07:07:00 → passes the gate.
+        #
+        # Meter timestamp of the edge = 07:06:20 (index 1280 = 06:45:00 + 1280s),
+        # so skew = 07:06:20 - 07:06:00 = +20 s, within the ±60 s window.
+        step_size = 2.0
+        energy_cache._samples[1280] += step_size  # type: ignore[index]
+
+        # Effect timestamp 07:06:00 (120 s before fixed_now) passes the gate.
         mgr = LoadManager(
             energy_cache=energy_cache,
             plug_ctrl=plug_ctrl,
@@ -2249,6 +2262,15 @@ class TestClockSkew:
             enabled=True,
             dry_run=True,
         )
+        mgr.state.pending_effects = [
+            PendingEffect(
+                device_name="heater",
+                action="turn_on",
+                timestamp=fixed_now - timedelta(seconds=120),
+                data_point_at=fixed_now - timedelta(seconds=120),
+                power_watts=2000.0,
+            ),
+        ]
 
         with patch("load_manager.datetime") as mock_dt:
             mock_dt.now.return_value = fixed_now
@@ -2256,8 +2278,10 @@ class TestClockSkew:
             result = mgr.run_cycle()
 
         assert "clock_skew" in result["diagnostics"]
-        assert "estimate_seconds" in result["diagnostics"]["clock_skew"]
-        assert "measurement_count" in result["diagnostics"]["clock_skew"]
+        skew = result["diagnostics"]["clock_skew"]
+        assert "estimate_seconds" in skew
+        assert "measurement_count" in skew
+        assert skew["measurement_count"] > 0
 
     def test_skew_measurement_with_mock(self):
         """End-to-end: pending effect with known local timestamp, step at meter
