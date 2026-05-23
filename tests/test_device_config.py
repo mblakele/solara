@@ -33,16 +33,15 @@ def test_load_missing_file_returns_defaults(tmp_path):
         assert device_config.get_tesla_config() is None
 
 
-def test_load_malformed_json_returns_defaults(tmp_path):
-    """Returns defaults when devices.json contains invalid JSON."""
+def test_load_malformed_json_raises_error(tmp_path):
+    """Raises DeviceConfigError when devices.json exists and is non-empty but invalid."""
     fake_file = tmp_path / "devices.json"
     fake_file.write_text("{invalid json content")
 
     with patch.object(device_config, "_DEVICES_FILE", fake_file):
         device_config.reload()
-
-    assert device_config.get_timezone() == "America/Los_Angeles"
-    assert device_config.get_homekit_plugs() == []
+        with pytest.raises(device_config.DeviceConfigError, match="invalid JSON"):
+            device_config.get_timezone()
 
 
 def test_load_valid_file(tmp_path):
@@ -256,3 +255,25 @@ def test_get_all_returns_full_config():
     with patch("device_config._load", return_value=full_config):
         result = device_config.get_all()
     assert result == full_config
+
+
+def test_load_empty_file_raises_error(tmp_path):
+    """Raises an error when devices.json exists but is empty."""
+    fake_file = tmp_path / "devices.json"
+    fake_file.write_text("")
+
+    with patch.object(device_config, "_DEVICES_FILE", fake_file):
+        device_config.reload()
+        with pytest.raises(device_config.DeviceConfigError):
+            device_config.get_timezone()
+
+
+def test_load_whitespace_only_file_raises_error(tmp_path):
+    """Raises an error when devices.json exists but contains only whitespace."""
+    fake_file = tmp_path / "devices.json"
+    fake_file.write_text("   \n  \t  ")
+
+    with patch.object(device_config, "_DEVICES_FILE", fake_file):
+        device_config.reload()
+        with pytest.raises(device_config.DeviceConfigError):
+            device_config.get_timezone()

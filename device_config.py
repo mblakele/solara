@@ -5,7 +5,8 @@ plugs, and Tesla vehicle config. Secrets (credentials, API keys) remain in
 environment variables via decouple.
 
 The file is cached on first load; call reload() to clear the cache.
-Returns sensible defaults when the file is missing or malformed.
+Returns sensible defaults when the file is missing.  Raises
+DeviceConfigError when the file exists but is malformed or empty.
 """
 
 from __future__ import annotations
@@ -19,16 +20,48 @@ _DEVICES_FILE = Path(__file__).parent / "devices.json"
 _cache: dict[str, Any] | None = None
 
 
+class DeviceConfigError(Exception):
+    """Raised when devices.json exists but is empty or malformed.
+
+    This exception prevents the application from starting with invalid
+    device configuration, helping catch misconfiguration early.
+    """
+
+
 def _load() -> dict[str, Any]:
-    """Load and cache devices.json. Returns empty dict if file missing."""
+    """Load and cache devices.json. Returns empty dict if file missing.
+
+    Raises:
+        DeviceConfigError: If the file exists but is empty or contains
+            invalid JSON.
+    """
     global _cache
     if _cache is not None:
         return _cache
     try:
-        with open(_DEVICES_FILE, encoding="utf-8") as f:
-            _cache = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        text = _DEVICES_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
         _cache = {}
+        return _cache
+    except OSError:
+        # Permission denied, encoding error, etc.
+        _cache = {}
+        return _cache
+
+    if not text.strip():
+        raise DeviceConfigError(
+            "devices.json exists but is empty. "
+            "Copy devices.json.example to devices.json and configure it."
+        )
+
+    try:
+        _cache = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise DeviceConfigError(
+            "devices.json exists but contains invalid JSON. "
+            f"Parsing error: {e}"
+        ) from e
+
     return _cache
 
 
