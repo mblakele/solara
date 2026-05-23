@@ -445,9 +445,10 @@ class StateTracker:
         """Scan per-second samples for a step matching the expected power.
 
         Walks the _samples list looking for a diff with the right sign
-        and magnitude (>= 50 % of power_watts). Samples are in kWh, so
-        the threshold is power_watts * 0.5 / 1000 (kWh). Returns meter
-        timestamps of any edges found, or None if no edge detected.
+        and magnitude (>= 50 % of power_watts). Samples are in kWh per
+        second, so the threshold in kWh is power_watts * 0.5 / 3_600_000.
+        Returns meter timestamps of any edges found, or None if no edge
+        detected.
 
         Args:
             energy_cache: The NBC energy cache with per-second samples.
@@ -463,8 +464,9 @@ class StateTracker:
         if samples is None or data_start is None or len(samples) < 2:
             return None
 
-        # Samples are in kWh. Threshold in kWh = power_watts * 0.5 / 1000.
-        threshold = power_watts * 0.5 / 1000.0
+        # Samples are in kWh per second.  A step of P watts over 1 second
+        # = P / 3_600_000 kWh.  Threshold is 50 % of that.
+        threshold = power_watts * 0.5 / 3_600_000.0
         edges: list[datetime] = []
 
         for k in range(1, len(samples)):

@@ -2118,6 +2118,37 @@ class TestAdaptiveSleep:
 class TestClockSkew:
     """Tests for the clock-skew estimation via pending effects."""
 
+    def test_detect_edge_realistic_turn_on(self):
+        """Edge detection with realistic per-second kWh values from Emporia API.
+
+        Real Emporia energy samples are in kWh per second. A 1000 W device
+        adds 1000/3_600_000 ≈ 0.000278 kWh per sample. The threshold must
+        match this scale (50 %% ≈ 0.000139 kWh), not the 0.5 kWh produced
+        by the old buggy formula (dividing by 1000 instead of 3_600_000).
+        """
+        tracker = StateTracker()
+        cache = EnergyCache()
+        data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # Base consumption ≈ 100 W → 100/3_600_000 kWh per sample.
+        base = 100.0 / 3_600_000.0
+        # Step at index 50: device turns on at 1000 W → delta = 1000/3_600_000.
+        step = 1000.0 / 3_600_000.0
+        samples = [base] * 50 + [base + step] + [base + step] * 150
+        with cache._lock:
+            cache._samples = samples
+            cache._data_start = data_start
+
+        edges = tracker._detect_skew_samples(
+            energy_cache=cache,
+            power_watts=1000.0,
+            action_direction=+1,
+        )
+
+        assert edges is not None
+        assert len(edges) == 1
+        assert edges[0] == data_start + timedelta(seconds=50)
+
     def test_detect_edge_turn_on(self):
         """Edge detection finds a rising step >= 50%% of power_watts."""
         tracker = StateTracker()
@@ -2125,9 +2156,9 @@ class TestClockSkew:
         data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
         # Constant samples of 0.001 kWh, then a jump at index 100.
-        # power_watts=1000 => threshold = 1000 * 0.5 / 1000 = 0.5 kWh.
-        # diff at index 100 = 0.61 - 0.01 = 0.6 >= 0.5 => edge detected.
-        samples = [0.01] * 100 + [0.61] + [0.61] * 100
+        # power_watts=1000 => threshold = 1000 * 0.5 / 3_600_000 = 0.000139 kWh.
+        # diff at index 100 = 0.001139 - 0.001 = 0.000139 >= threshold => edge.
+        samples = [0.001] * 100 + [0.001139] + [0.001139] * 100
         with cache._lock:
             cache._samples = samples
             cache._data_start = data_start
@@ -2148,10 +2179,10 @@ class TestClockSkew:
         cache = EnergyCache()
         data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-        # Constant samples of 0.61 kWh, then a drop at index 50.
-        # power_watts=1000 => threshold = 0.5 kWh.
-        # diff at index 50 = 0.01 - 0.61 = -0.6, abs = 0.6 >= 0.5 => edge.
-        samples = [0.61] * 50 + [0.01] + [0.01] * 100
+        # Constant 1000W base → 1000/3_600_000 kWh per sample.
+        # Drop at index 50: device turns off → diff = -1000/3_600_000.
+        base = 1000.0 / 3_600_000.0
+        samples = [base] * 50 + [0.0] + [0.0] * 100
         with cache._lock:
             cache._samples = samples
             cache._data_start = data_start
@@ -2173,7 +2204,7 @@ class TestClockSkew:
         data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
         # All constant — no steps at all.
-        samples = [0.01] * 200
+        samples = [0.0000278] * 200
         with cache._lock:
             cache._samples = samples
             cache._data_start = data_start
@@ -2193,9 +2224,10 @@ class TestClockSkew:
         cache = EnergyCache()
         data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-        # power_watts=1000 => threshold = 0.5 kWh.
-        # diff = 0.3 < 0.5 => should NOT be detected.
-        samples = [0.01] * 100 + [0.31] + [0.31] * 100
+        # power_watts=1000 => threshold = 1000*0.5/3_600_000 ≈ 0.000139 kWh.
+        # diff = 50/3_600_000 ≈ 0.0000139 < threshold => should NOT be detected.
+        base = 100.0 / 3_600_000.0
+        samples = [base] * 100 + [base + 50.0 / 3_600_000.0] + [base + 50.0 / 3_600_000.0] * 100
         with cache._lock:
             cache._samples = samples
             cache._data_start = data_start

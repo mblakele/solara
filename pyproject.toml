@@ -60,10 +60,6 @@ ignore_errors = true  # test data generator, less critical for types
 module = "conftest"
 ignore_errors = true  # test fixtures, less critical for types
 
-[[tool.mypy.overrides]]
-module = "tests.*"
-ignore_errors = true  # test code, less critical for types
-
 [tool.pylint.design]
 max-args = 7
 max-attributes = 11
