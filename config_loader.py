@@ -131,6 +131,7 @@ def load_plugs_from_file() -> dict[str, Any]:
             power_watts=float(entry["power_watts"]),
             priority=int(entry.get("priority", 0)),
             time_range=_parse_device_time_range(entry.get("time_range")),
+            sentinel=bool(entry.get("sentinel", False)),
         )
     return plugs
 
@@ -166,6 +167,7 @@ def load_vocolinc_plugs_from_file() -> dict[str, Any]:
             priority=int(entry.get("priority", 0)),
             controller_type="vocolinc",
             time_range=_parse_device_time_range(entry.get("time_range")),
+            sentinel=bool(entry.get("sentinel", False)),
         )
     return plugs
 

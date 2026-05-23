@@ -296,6 +296,11 @@ class LoadManager:
 
         self.plugs = self.plug_ctrl.plugs  # type: ignore[attr-defined]
 
+        # Collect sentinel plug names for fast lookup during cycles.
+        self.sentinel_names: frozenset[str] = frozenset(
+            name for name, plug in self.plugs.items() if plug.sentinel
+        )
+
         if tesla_ctrl is not None:
             self.tesla_ctrl = tesla_ctrl
         elif tesla_config is not None:
@@ -505,6 +510,8 @@ class LoadManager:
         has_too_large = False
 
         for name, plug in self.plugs.items():
+            if name in self.sentinel_names:
+                continue  # sentinels never participate in decisions
             if not self.state.can_toggle(name, now):
                 continue
             if not self._is_device_in_time_range(now, plug.time_range):
@@ -812,10 +819,33 @@ class LoadManager:
                 corrected_adjusted_wh,
             )
 
+        # ── Sentinel check ─────────────────────────────────────────────
+        # If any sentinel device is on, disable load management entirely.
+        sentinel_on = any(
+            self.state.devices.get(name, DeviceState(name=name)).actual_state
+            is True
+            for name in self.sentinel_names
+        )
+        if sentinel_on:
+            logger.info(
+                "[_cycle_async_phase] sentinel device is on, disabling load management"
+            )
+            return (
+                tesla_state,
+                tesla_error,
+                tesla_login_url,
+                [],
+                [],
+                corrected_gap_wh,
+                corrected_adjusted_wh,
+            )
+
         # Filter plugs by per-device time range: only eligible plugs reach the engine.
         eligible_plugs: dict[str, PlugConfig] = {}
         outside_range: list[str] = []
         for name, plug in self.plugs.items():
+            if name in self.sentinel_names:
+                continue  # sentinels never participate in decisions
             if self._is_device_in_time_range(now, plug.time_range):
                 eligible_plugs[name] = plug
             else:
@@ -1191,6 +1221,11 @@ class LoadManager:
                         self.state.clear_tesla_settle()
 
             if abs(gap_wh) <= self.engine.HYSTERESIS_WH:
+                sentinel_on = any(
+                    self.state.devices.get(name, DeviceState(name=name)).actual_state
+                    is True
+                    for name in self.sentinel_names
+                )
                 return {
                     "status": "dry-run" if self.dry_run else "ok",
                     "qh": qh_name,
@@ -1211,6 +1246,8 @@ class LoadManager:
                         "tesla_error": tesla_error,
                         "tesla_login_url": tesla_login_url,
                         "plugs_configured": plugs_configured,
+                        "sentinel_names": list(self.sentinel_names),
+                        "sentinel_on": sentinel_on,
                     },
                     "sleep_hint": self.config_interval_secs,
                     "sleep_hint_at": now_postfetch.isoformat(),
@@ -1249,6 +1286,14 @@ class LoadManager:
                     "tesla_error": tesla_error,
                     "tesla_login_url": tesla_login_url,
                     "plugs_configured": plugs_configured,
+                    "sentinel_names": list(self.sentinel_names),
+                    "sentinel_on": any(
+                        self.state.devices.get(
+                            name, DeviceState(name=name)
+                        ).actual_state
+                        is True
+                        for name in self.sentinel_names
+                    ),
                 },
                 "sleep_hint": self.config_interval_secs,
                 "sleep_hint_at": now_postfetch.isoformat(),

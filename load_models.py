@@ -144,7 +144,19 @@ class AbstractTeslaController(ABC):
 
 @dataclass
 class PlugConfig:
-    """Configuration for a smart plug load."""
+    """Configuration for a smart plug load.
+
+    Attributes:
+        name: Unique plug identifier.
+        accessory_id: Hardware accessory ID for the plug.
+        power_watts: Expected power draw in watts when on.
+        priority: Sort priority for load management decisions.
+        controller_type: Controller protocol — "homekit" or "vocolinc".
+        time_range: Optional (start, end) time window for device eligibility.
+        sentinel: When True, the plug is a privileged "sentinel" device —
+            tracked for diagnostics but never acted upon. If on, load
+            management disables entirely.
+    """
 
     name: str
     accessory_id: str
@@ -152,6 +164,7 @@ class PlugConfig:
     priority: int = 0
     controller_type: Literal["homekit", "vocolinc"] = "homekit"
     time_range: tuple[time, time] | None = None
+    sentinel: bool = False
 
 
 @dataclass

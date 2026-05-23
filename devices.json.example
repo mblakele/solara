@@ -12,6 +12,13 @@
         "power_watts": 4500,
         "priority": 10,
         "time_range": "06:00-22:00"
+      },
+      {
+        "name": "home_presence",
+        "accessory_id": "192.168.1.51",
+        "power_watts": 5,
+        "sentinel": true,
+        "description": "Low-power night-light or indicator used to detect home occupancy. When ON, load management is paused to avoid turning off lights the resident needs."
       }
     ],
     "vocolinc": [

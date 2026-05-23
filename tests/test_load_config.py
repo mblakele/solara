@@ -1176,3 +1176,355 @@ def test_authenticate_saves_refreshed_tokens(tmp_path):
 
     finally:
         lc.TESLA_TOKENS_FILE = original
+
+
+# --- Sentinel device tests ---
+
+
+def test_load_plug_sentinel_flag_parsed():
+    """Verify sentinel: true is parsed from devices.json into PlugConfig.sentinel."""
+    with patch("device_config._load", return_value={
+        "plugs": {
+            "homekit": [
+                {
+                    "name": "home_presence",
+                    "accessory_id": "sensor1",
+                    "power_watts": 5,
+                    "sentinel": True,
+                },
+            ]
+        }
+    }):
+        device_config.reload()
+        plugs = load_plugs_from_file()
+
+    assert plugs["home_presence"].sentinel is True
+
+
+def test_load_plug_no_sentinel_defaults_false():
+    """Verify sentinel defaults to False when not specified."""
+    with patch("device_config._load", return_value={
+        "plugs": {
+            "homekit": [
+                {
+                    "name": "water_heater",
+                    "accessory_id": "abc123",
+                    "power_watts": 4500,
+                },
+            ]
+        }
+    }):
+        device_config.reload()
+        plugs = load_plugs_from_file()
+
+    assert plugs["water_heater"].sentinel is False
+
+
+@patch("config._decouple_config")
+def test_sentinel_not_in_eligible_plugs(mock_config):
+    """In a cycle, a sentinel plug is excluded from eligible_plugs even when
+    inside its time range."""
+    mock_config.return_value = "America/Los_Angeles"
+
+    plugs = {
+        "heater": PlugConfig(
+            name="heater",
+            accessory_id="h1",
+            power_watts=2000.0,
+            priority=10,
+            time_range=(time(6, 0), time(18, 0)),
+        ),
+        "home_presence": PlugConfig(
+            name="home_presence",
+            accessory_id="s1",
+            power_watts=5.0,
+            sentinel=True,
+            time_range=(time(6, 0), time(18, 0)),
+        ),
+    }
+    plug_ctrl = PlugController(plugs)
+
+    mgr = LoadManager(
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=True,
+    )
+
+    # 12:00 PT is inside both plugs' time ranges
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.timezone = timezone
+        mock_dt.timedelta = timedelta
+        with patch.object(mgr.engine, "decide", return_value=[]) as mock_decide:
+            asyncio.run(
+                mgr._cycle_async_phase(
+                    gap_wh=1500.0,
+                    adjusted_wh=-2000.0,
+                    now=fake_now,
+                    seconds_remaining=600,
+                    dry_run=True,
+                )
+            )
+
+    call_kwargs = mock_decide.call_args.kwargs if hasattr(mock_decide.call_args, 'kwargs') else mock_decide.call_args[1]
+    ctx = call_kwargs.get("ctx")
+    assert "heater" in ctx.plugs
+    assert "home_presence" not in ctx.plugs
+
+
+@patch("config._decouple_config")
+def test_cycle_no_actions_when_sentinel_on(mock_config):
+    """When a sentinel's actual state is True, _cycle_async_phase returns
+    empty actions (skips decide)."""
+    mock_config.return_value = "America/Los_Angeles"
+
+    plugs = {
+        "home_presence": PlugConfig(
+            name="home_presence",
+            accessory_id="s1",
+            power_watts=5.0,
+            sentinel=True,
+        ),
+    }
+    plug_ctrl = PlugController(plugs)
+    # Set the sentinel to on
+    plug_ctrl._state["home_presence"] = True
+
+    mgr = LoadManager(
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=True,
+    )
+
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.timezone = timezone
+        mock_dt.timedelta = timedelta
+        with patch.object(mgr.engine, "decide", return_value=[]) as mock_decide:
+            result = asyncio.run(
+                mgr._cycle_async_phase(
+                    gap_wh=1500.0,
+                    adjusted_wh=-2000.0,
+                    now=fake_now,
+                    seconds_remaining=600,
+                    dry_run=True,
+                )
+            )
+
+            # engine.decide should NOT be called
+            mock_decide.assert_not_called()
+
+    # Returns 8-tuple: (tesla_state, tesla_error, tesla_login_url,
+    # succeeded_effects, results, gap_wh, adjusted_wh)
+    _, _, _, succeeded_effects, results, _, _ = result
+    assert succeeded_effects == []
+    assert results == []
+
+
+@patch("config._decouple_config")
+def test_cycle_actions_when_sentinel_off(mock_config):
+    """When a sentinel's actual state is False, the cycle proceeds normally
+    (decide is called)."""
+    mock_config.return_value = "America/Los_Angeles"
+
+    plugs = {
+        "home_presence": PlugConfig(
+            name="home_presence",
+            accessory_id="s1",
+            power_watts=5.0,
+            sentinel=True,
+        ),
+    }
+    plug_ctrl = PlugController(plugs)
+    # Set the sentinel to off
+    plug_ctrl._state["home_presence"] = False
+
+    mgr = LoadManager(
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=True,
+    )
+
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.timezone = timezone
+        mock_dt.timedelta = timedelta
+        with patch.object(mgr.engine, "decide", return_value=[]) as mock_decide:
+            asyncio.run(
+                mgr._cycle_async_phase(
+                    gap_wh=1500.0,
+                    adjusted_wh=-2000.0,
+                    now=fake_now,
+                    seconds_remaining=600,
+                    dry_run=True,
+                )
+            )
+
+        # engine.decide SHOULD be called even though there are no non-sentinel plugs
+        mock_decide.assert_called_once()
+
+
+@patch("config._decouple_config")
+def test_sentinel_state_still_tracked(mock_config):
+    """The sentinel's DeviceState entry is created during sync even though
+    no actions are taken on it."""
+    mock_config.return_value = "America/Los_Angeles"
+
+    plugs = {
+        "home_presence": PlugConfig(
+            name="home_presence",
+            accessory_id="s1",
+            power_watts=5.0,
+            sentinel=True,
+        ),
+    }
+    plug_ctrl = PlugController(plugs)
+    plug_ctrl._state["home_presence"] = True
+
+    mgr = LoadManager(
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=True,
+    )
+
+    assert "home_presence" not in mgr.state.devices
+
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.timezone = timezone
+        mock_dt.timedelta = timedelta
+        result = asyncio.run(
+            mgr._cycle_async_phase(
+                gap_wh=1500.0,
+                adjusted_wh=-2000.0,
+                now=fake_now,
+                seconds_remaining=600,
+                dry_run=True,
+            )
+        )
+
+    # Sentinel state should be tracked
+    dev = mgr.state.devices["home_presence"]
+    assert dev.actual_state is True
+    assert dev.desired_state is True
+
+    # But no actions were taken
+    _, _, _, succeeded_effects, results, _, _ = result
+    assert succeeded_effects == []
+    assert results == []
+
+
+@patch("config._decouple_config")
+def test_no_action_reason_skips_sentinel_plugs(mock_config):
+    """_determine_no_action_reason skips sentinel plugs when checking eligibility."""
+    mock_config.return_value = "America/Los_Angeles"
+
+    plugs = {
+        "home_presence": PlugConfig(
+            name="home_presence",
+            accessory_id="s1",
+            power_watts=2000.0,
+            sentinel=True,
+        ),
+    }
+    plug_ctrl = PlugController(plugs)
+
+    mgr = LoadManager(
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=False,
+    )
+
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.timezone = timezone
+        mock_dt.timedelta = timedelta
+        reason = mgr._determine_no_action_reason(
+            results=[],
+            gap_wh=1000.0,
+            now=fake_now,
+            seconds_remaining=600,
+            tesla_state=None,
+            tesla_configured=False,
+            tesla_error=None,
+        )
+
+    # The only plug is a sentinel, so no eligible devices
+    assert reason == "no_eligible"
+
+
+@patch("config._decouple_config")
+def test_diagnostics_include_sentinel_info(mock_config):
+    """Diagnostics dict includes sentinel_names and sentinel_on fields."""
+    mock_config.return_value = "America/Los_Angeles"
+
+    plugs = {
+        "home_presence": PlugConfig(
+            name="home_presence",
+            accessory_id="s1",
+            power_watts=5.0,
+            sentinel=True,
+        ),
+    }
+    plug_ctrl = PlugController(plugs)
+
+    mgr = LoadManager(
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=True,
+    )
+
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.timezone = timezone
+        mock_dt.timedelta = timedelta
+        result = mgr.run_cycle()
+
+    diag = result["diagnostics"]
+    assert "sentinel_names" in diag
+    assert "sentinel_on" in diag
+    assert diag["sentinel_names"] == ["home_presence"]
+    # Sentinel is off by default in the stub controller, so sentinel_on is False
+    assert diag["sentinel_on"] is False
