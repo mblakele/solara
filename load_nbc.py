@@ -557,33 +557,45 @@ class StateTracker:
 
         Checks both the wall clock timestamp and the data-point-at timestamp so
         that effects recorded with a future data-point-at are still detected.
+        Uses a 60-second buffer on both measures to catch effects taken just
+        before the NBC data point that have not yet been reflected in API data.
 
         Args:
             nbc_timestamp: The NBC data-point-at timestamp to compare against.
 
         Returns:
-            True if any effect has either timestamp after ``nbc_timestamp``.
+            True if any effect has either timestamp within 60 seconds after
+            ``nbc_timestamp``.
         """
         buffer = timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
         for effect in self.pending_effects:
             if effect.timestamp > nbc_timestamp - buffer:
                 return True
+            if effect.data_point_at > nbc_timestamp - buffer:
+                return True
 
         return False
 
     def pending_since_count(self, nbc_timestamp: datetime) -> int:
-        """Return the number of effects taken after the given timestamp by either measure.
+        """Return the number of effects taken after the given timestamp.
+
+        Uses a 60-second buffer on both the wall clock and data-point-at
+        timestamps, matching the buffer used by ``has_pending_effect_since``
+        so the count reflects the same set of effects that triggers the
+        waiting path.
 
         Args:
             nbc_timestamp: The NBC data-point-at timestamp to compare against.
 
         Returns:
             Count of effects whose wall clock or data-point-at timestamp is
-            after ``nbc_timestamp``.
+            within 60 seconds after ``nbc_timestamp``.
         """
+        buffer = timedelta(seconds=self.PENDING_EFFECT_MIN_SECS)
         return sum(
             1 for eff in self.pending_effects
-            if eff.timestamp > nbc_timestamp or eff.data_point_at > nbc_timestamp
+            if eff.timestamp > nbc_timestamp - buffer
+            or eff.data_point_at > nbc_timestamp - buffer
         )
 
     def prune_old_effects(
