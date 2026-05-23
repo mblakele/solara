@@ -122,7 +122,7 @@ class RepositoryEmpty:
     """Base repository with no data — used as a fallback."""
 
     def __init__(self, source='', encoding=DEFAULT_ENCODING):
-        pass  # noqa: W0107
+        pass
 
     def __contains__(self, key):
         return False

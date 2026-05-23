@@ -78,3 +78,26 @@ def get_tesla_config() -> dict[str, Any] | None:
     if not section or not section.get("vehicle_id"):
         return None
     return section
+
+
+def has_smartmeter() -> bool:
+    """Return True when a smartmeter section with target_wh exists."""
+    return bool(_load().get("smartmeter", {}).get("target_wh") is not None)
+
+
+def get_all_plugs() -> dict[str, Any]:
+    """Return the full plugs section from devices.json.
+
+    Returns:
+        Dictionary with 'homekit' and/or 'vocolinc' lists.
+    """
+    return _load().get("plugs", {})
+
+
+def get_all() -> dict[str, Any]:
+    """Return the complete devices.json contents.
+
+    Returns:
+        Full configuration dictionary.
+    """
+    return _load()

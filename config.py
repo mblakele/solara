@@ -71,8 +71,7 @@ class Config:
             if lower in ("false", "no"):
                 return False
         # Fallback to devices.json smartmeter section
-        sm = device_config._load().get("smartmeter", {})  # pylint: disable=W0212
-        return bool(sm.get("target_wh") is not None)  # type: ignore[return-value]
+        return device_config.has_smartmeter()
 
     @property
     def load_target_wh(self) -> int:
@@ -187,11 +186,11 @@ class Config:
 
     def get_plugins(self) -> dict[str, Any]:
         """Return all plug configuration from devices.json."""
-        return device_config._load().get("plugs", {})  # pylint: disable=W0212
+        return device_config.get_all_plugs()
 
     def get_all(self) -> dict[str, Any]:
         """Return full devices.json contents as a dict."""
-        return device_config._load()  # pylint: disable=W0212
+        return device_config.get_all()
 
     def reload(self) -> None:
         """Clear all cached configuration."""

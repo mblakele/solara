@@ -127,7 +127,7 @@ class NBCReader:
             qh_data = self.energy_cache.get_current_qh(now=now)
             if qh_data is None:
                 return None
-            fetched_at = self.energy_cache._last_fetch_at  # pylint: disable=W0212
+            fetched_at = self.energy_cache.last_fetch_at
             if fetched_at is None:
                 fetched_at = now
             lag_secs = getattr(
@@ -168,7 +168,7 @@ class NBCReader:
             qh_data = self.energy_cache.get_current_qh(now=now)
             if qh_data is None:
                 return None
-            fetched_at = self.energy_cache._last_fetch_at  # pylint: disable=W0212
+            fetched_at = self.energy_cache.last_fetch_at
             if fetched_at is None:
                 fetched_at = now
             lag_secs = getattr(

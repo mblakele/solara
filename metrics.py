@@ -332,6 +332,15 @@ class EnergyCache:
         """
         return self._data_start
 
+    @property
+    def last_fetch_at(self) -> datetime | None:
+        """Timestamp of the last API fetch, or None if no fetch has occurred.
+
+        Returns:
+            datetime of the last fetch, or None.
+        """
+        return self._last_fetch_at
+
     def is_valid(self, now: datetime) -> bool:
         """Check if cache has non-expired data.
 

@@ -1322,6 +1322,18 @@ class TestEnergyCache(unittest.TestCase):
         self.assertIsNone(cache._data_start)
         self.assertIsNone(cache._last_fetch_at)
 
+    def test_last_fetch_at_property(self):
+        """last_fetch_at property exposes the internal _last_fetch_at field."""
+        from metrics import EnergyCache
+        from datetime import datetime, timezone
+
+        cache = EnergyCache()
+        self.assertIsNone(cache.last_fetch_at)
+
+        now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
+        cache._last_fetch_at = now
+        self.assertEqual(cache.last_fetch_at, now)
+
     def test_is_valid_false_when_empty(self):
         """is_valid returns False when cache has no data."""
         from metrics import EnergyCache

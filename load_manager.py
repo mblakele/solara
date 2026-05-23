@@ -138,7 +138,6 @@ class LoadManager:
 
     """
 
-    # pylint: disable=too-many-locals, too-many-statements
     def __init__(  # noqa: C901
         self,
         config: LoadManagerConfig | None = None,
@@ -1058,7 +1057,7 @@ class LoadManager:
 
         return None
 
-    def run_cycle(self, force: bool = False) -> dict[str, Any]:  # pylint: disable=too-many-locals
+    def run_cycle(self, force: bool = False) -> dict[str, Any]:
         """Execute one load management cycle. Returns status dict.
 
         Thread-safe: acquires lock for entire cycle to prevent race conditions

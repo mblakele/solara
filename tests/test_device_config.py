@@ -200,3 +200,59 @@ def test_get_tesla_config_returns_section():
     assert result is not None
     assert result["vehicle_id"] == "5YJ3E1EA4KF123456"
     assert result["home_lat"] == 37.0
+
+
+# --- New public accessor tests ---
+
+
+def test_has_smartmeter_true():
+    """Returns True when smartmeter section with target_wh exists."""
+    with patch("device_config._load", return_value={
+        "smartmeter": {"device": "EM1-ABC", "target_wh": -750}
+    }):
+        assert device_config.has_smartmeter() is True
+
+
+def test_has_smartmeter_false_no_target_wh():
+    """Returns False when smartmeter exists but has no target_wh."""
+    with patch("device_config._load", return_value={
+        "smartmeter": {"device": "EM1-ABC"}
+    }):
+        assert device_config.has_smartmeter() is False
+
+
+def test_has_smartmeter_false_when_missing():
+    """Returns False when smartmeter section is absent."""
+    with patch("device_config._load", return_value={}):
+        assert device_config.has_smartmeter() is False
+
+
+def test_get_all_plugs_returns_plugs_section():
+    """Returns the full plugs section from devices.json."""
+    plugs_data = {
+        "homekit": [{"name": "heater", "accessory_id": "hk123"}],
+        "vocolinc": [{"name": "lamp", "device_name": "Lamp1"}],
+    }
+    with patch("device_config._load", return_value={"plugs": plugs_data}):
+        result = device_config.get_all_plugs()
+    assert result == plugs_data
+
+
+def test_get_all_plugs_returns_empty_when_missing():
+    """Returns empty dict when plugs section is absent."""
+    with patch("device_config._load", return_value={}):
+        result = device_config.get_all_plugs()
+    assert result == {}
+
+
+def test_get_all_returns_full_config():
+    """Returns the complete devices.json contents."""
+    full_config = {
+        "timezone": "America/New_York",
+        "smartmeter": {"device": "EM1-ABC", "target_wh": -750},
+        "plugs": {"homekit": []},
+        "tesla": {"vehicle_id": "123"},
+    }
+    with patch("device_config._load", return_value=full_config):
+        result = device_config.get_all()
+    assert result == full_config
