@@ -114,7 +114,7 @@ project-root
 ├── energy_aggregator.py # TOU (time-of-use) energy aggregation logic
 ├── load_manager.py     # OAuth handling & load-shedding management
 ├── load_models.py      # Shared data models (PendingEffect, TeslaState, etc.)
-├── load_nbc.py         # NBC state tracking, GapMinder bin-packing, Tesla decisions
+├── load_nbc.py         # NBCReader, StateTracker, GapMinder bin-packing, Tesla decisions
 ├── metrics.py          # NBC (net-billing-cycle) calculation metrics, EnergyCache with
                        # per-second sample storage, incremental fetch merging, and pruning
 ├── mockdata.py         # Test data generation utilities
@@ -135,7 +135,9 @@ project-root
 - **Guard functions** `metrics.py`: `cap_chart_start()`, `cap_fetch_window()` —
   prevent over-fetching when cache is stale; pure functions, independently tested
 - NBC calculation in `metrics.py` (`EnergyCache` with incremental fetch, sample
-  merging, and pruning; `NBCReader` with `get_current_qh(force=False)`)
+  merging, and pruning; `get_current_qh()` helper)
+- NBCReader in `load_nbc.py` with `get_current_qh(force=False)` — fetches fresh data
+  when cache is valid but has no incomplete QH, enabling 5-second cycle polling
 - `HourlyProjection` in `metrics.py` with `populate()` (uses `cap_chart_start`
   guard), `predict()`, and per-device prediction via `_predict_device()`
 - TOU in `energy_aggregator.py`

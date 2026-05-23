@@ -388,3 +388,139 @@ def test_get_current_qh_direct_returns_none_when_all_quarters_complete_with_zero
 
     # All quarters complete, even with 0 Wh → must return None
     assert result is None
+
+
+# --- NBCReader.get_current_qh() fall-through fetch tests ---
+# These tests verify the fix for the bug where the cache is valid but
+# contains no incomplete QH — the reader should fall through to the
+# fetch path instead of immediately returning None.
+
+
+def test_get_current_qh_falls_through_to_fetch_when_cache_valid_no_incomplete_qh():
+    """Cache valid with complete QH → fetch returns incomplete QH → return fetched QH."""
+    fixed_now = datetime(2026, 5, 7, 15, 35, 30, tzinfo=timezone.utc)
+    # 3600 samples = 4 full quarters, all complete. QH1 is complete.
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 3600
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
+        cache._last_sample_at = fixed_now - timedelta(seconds=1)
+        cache._sample_count = 3600
+        cache._last_fetch_at = fixed_now
+
+    reader = NBCReader(energy_cache=cache)
+
+    # Verify cache is valid and QH is complete (no incomplete QH in cache).
+    assert cache.is_valid(now=fixed_now) is True
+    qh_from_cache = cache.get_current_qh(now=fixed_now)
+    assert qh_from_cache is None, "Cache should have no incomplete QH (QH1 is complete)"
+
+    fetch_called = False
+
+    def mock_fetch():
+        nonlocal fetch_called
+        fetch_called = True
+        # Fresh data has an incomplete QH2 (new quarter started).
+        return {
+            "devices": [
+                {
+                    "nbc": {
+                        "QH1": {
+                            "complete": False,
+                            "predicted_wh": -1500.0,
+                            "remaining_seconds": 600,
+                        }
+                    },
+                    "name": "test-device",
+                }
+            ]
+        }
+
+    reader._metrics_fetch = mock_fetch
+
+    result = reader.get_current_qh(now=fixed_now)
+
+    # The fetch must have been called (core of the fix).
+    assert fetch_called is True, "Expected _metrics_fetch to be called when cache has no incomplete QH"
+    # The result should come from the fetch, not None.
+    assert result is not None
+    qh_name, predicted_wh, seconds_remaining, data_point_at = result
+    assert qh_name == "QH1"
+    assert predicted_wh == -1500.0
+
+
+def test_get_current_qh_returns_none_when_fetch_fails_with_valid_complete_cache():
+    """Cache valid with complete QH → fetch returns None → return None (graceful)."""
+    fixed_now = datetime(2026, 5, 7, 15, 35, 30, tzinfo=timezone.utc)
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 3600
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
+        cache._last_sample_at = fixed_now - timedelta(seconds=1)
+        cache._sample_count = 3600
+        cache._last_fetch_at = fixed_now
+
+    reader = NBCReader(energy_cache=cache)
+
+    fetch_called = False
+
+    def mock_fetch():
+        nonlocal fetch_called
+        fetch_called = True
+        return None  # API failure
+
+    reader._metrics_fetch = mock_fetch
+
+    result = reader.get_current_qh(now=fixed_now)
+
+    assert fetch_called is True
+    assert result is None
+
+
+def test_get_current_qh_still_returns_from_cache_when_incomplete_qh_present():
+    """Cache valid with incomplete QH → return from cache (existing behavior preserved)."""
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    # 1200 samples covers 20 minutes, incomplete QH1 (300 samples).
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache._samples = samples
+        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache._last_sample_at = fixed_now - timedelta(seconds=1)
+        cache._sample_count = 1200
+        cache._last_fetch_at = fixed_now
+
+    reader = NBCReader(energy_cache=cache)
+
+    fetch_called = False
+
+    def mock_fetch():
+        nonlocal fetch_called
+        fetch_called = True
+        return {
+            "devices": [
+                {
+                    "nbc": {
+                        "QH1": {
+                            "complete": False,
+                            "predicted_wh": -999.0,
+                        }
+                    },
+                    "name": "test-device",
+                }
+            ]
+        }
+
+    reader._metrics_fetch = mock_fetch
+
+    result = reader.get_current_qh(now=fixed_now)
+
+    # Cache has incomplete QH → should NOT call fetch.
+    assert fetch_called is False
+    assert result is not None
+    qh_name, predicted_wh, _, _ = result
+    assert qh_name == "QH1"
+    # Should be from cache (predicted_wh from cache samples), not from fetch.
+    assert predicted_wh != -999.0

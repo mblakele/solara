@@ -125,23 +125,28 @@ class NBCReader:
         # Fast path: cache is valid — read directly from it.
         if not force and self.energy_cache.is_valid(now=now):
             qh_data = self.energy_cache.get_current_qh(now=now)
-            if qh_data is None:
-                return None
-            fetched_at = self.energy_cache.last_fetch_at
-            if fetched_at is None:
-                fetched_at = now
-            lag_secs = getattr(
-                self.energy_cache, "_data_lag_secs", 0.0
-            )
-            data_point_at = fetched_at - timedelta(seconds=lag_secs)
-            return (  # type: ignore[return-value]
-                qh_data["qh_name"],
-                qh_data.get("predicted_wh", 0),
-                qh_data.get("seconds_remaining", 0),
-                data_point_at,
-            )
+            if qh_data is not None:
+                # Cache hit with incomplete QH — return it.
+                fetched_at = self.energy_cache.last_fetch_at
+                if fetched_at is None:
+                    fetched_at = now
+                lag_secs = getattr(
+                    self.energy_cache, "_data_lag_secs", 0.0
+                )
+                data_point_at = fetched_at - timedelta(seconds=lag_secs)
+                return (  # type: ignore[return-value]
+                    qh_data["qh_name"],
+                    qh_data.get("predicted_wh", 0),
+                    qh_data.get("seconds_remaining", 0),
+                    data_point_at,
+                )
+            # Cache is valid but no incomplete QH (QH1 is complete) — fall
+            # through to the fetch path below so we can check for a newer
+            # incomplete quarter that may have started since the cache was
+            # populated.
 
-        # Try to fetch fresh data via _metrics_fetch when the cache is not valid.
+        # Try to fetch fresh data via _metrics_fetch when the cache is not
+        # valid, or when the cache is valid but has no incomplete QH.
         if hasattr(self, "_metrics_fetch") and self._metrics_fetch is not None:
             metrics_data = self._metrics_fetch()
             if metrics_data is None:
