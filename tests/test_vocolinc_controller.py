@@ -273,7 +273,12 @@ def test_composite_turns_on_both_types():
 
             assert isinstance(mgr.plug_ctrl, CompositePlugController)
 
-            result = mgr.run_cycle()
+            with patch("load_manager.datetime") as mock_dt:
+                mock_dt.now.return_value = fixed_now
+                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                mock_dt.timezone = timezone
+                mock_dt.timedelta = timedelta
+                result = mgr.run_cycle()
 
             assert result["status"] == "ok"
             action_names = [a["device"] for a in result["actions"]]

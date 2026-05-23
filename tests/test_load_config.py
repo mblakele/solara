@@ -1329,10 +1329,11 @@ def test_cycle_no_actions_when_sentinel_on(mock_config):
             mock_decide.assert_not_called()
 
     # Returns 8-tuple: (tesla_state, tesla_error, tesla_login_url,
-    # succeeded_effects, results, gap_wh, adjusted_wh)
-    _, _, _, succeeded_effects, results, _, _ = result
+    # succeeded_effects, results, gap_wh, adjusted_wh, sentinel_on)
+    _, _, _, succeeded_effects, results, _, _, sentinel_on = result
     assert succeeded_effects == []
     assert results == []
+    assert sentinel_on is True
 
 
 @patch("config._decouple_config")
@@ -1437,9 +1438,10 @@ def test_sentinel_state_still_tracked(mock_config):
     assert dev.desired_state is True
 
     # But no actions were taken
-    _, _, _, succeeded_effects, results, _, _ = result
+    _, _, _, succeeded_effects, results, _, _, sentinel_on = result
     assert succeeded_effects == []
     assert results == []
+    assert sentinel_on is True
 
 
 @patch("config._decouple_config")
@@ -1528,3 +1530,56 @@ def test_diagnostics_include_sentinel_info(mock_config):
     assert diag["sentinel_names"] == ["home_presence"]
     # Sentinel is off by default in the stub controller, so sentinel_on is False
     assert diag["sentinel_on"] is False
+
+
+# --- Sentinel disabled status tests ---
+
+
+@patch("config._decouple_config")
+def test_run_cycle_disabled_when_sentinel_on(mock_config):
+    """When a sentinel's actual state is True, run_cycle returns status: 'disabled'."""
+    mock_config.return_value = "America/Los_Angeles"
+
+    plugs = {
+        "home_presence": PlugConfig(
+            name="home_presence",
+            accessory_id="s1",
+            power_watts=5.0,
+            sentinel=True,
+        ),
+    }
+    plug_ctrl = PlugController(plugs)
+    # Set the sentinel to on
+    plug_ctrl._state["home_presence"] = True
+
+    mgr = LoadManager(
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=True,
+    )
+
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 5, 0)).astimezone(timezone.utc)
+    data_point_at = fake_now - timedelta(seconds=30)
+
+    with patch("load_manager.datetime") as mock_dt, \
+         patch.object(mgr.nbc_reader, "get_current_qh") as mock_qh:
+        mock_dt.now.return_value = fake_now
+        mock_dt.timezone = timezone
+        mock_dt.timedelta = timedelta
+        mock_qh.return_value = (
+            "QH1",
+            -5.0,
+            570,
+            data_point_at,
+        )
+        result = mgr.run_cycle()
+
+    assert result["status"] == "disabled"
+    assert result["diagnostics"]["reason"] == "sentinel_on"
+    assert result["diagnostics"]["sentinel_names"] == ["home_presence"]
+    assert result["diagnostics"]["sentinel_on"] is True

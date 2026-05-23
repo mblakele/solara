@@ -715,6 +715,7 @@ class LoadManager:
         list[dict[str, str]],
         float,
         float,
+        bool,
     ]:
         """Run the async portion of a cycle in a single event loop.
 
@@ -728,28 +729,37 @@ class LoadManager:
         corrected_adjusted_wh before calling decide(), so the gap never
         drifts as seconds_remaining shrinks.
 
-        Args:
-            gap_wh: Pre-computed Wh gap (target - adjusted). Passed in rather
-                than recomputed so decide() and the hysteresis guard use the
-                identical value.
-            adjusted_wh: NBC prediction adjusted for still-pending effects.
-            now: current datetime.
-            seconds_remaining: Seconds left in the current quarter-hour.
-            dry_run: When True, log actions without executing them.
-            qh_name: Current quarter-hour name (e.g. "QH1").  Used to
-                auto-expire the Tesla amp-increase settle window on a QH
-                boundary so new-quarter deficits are never suppressed.
-
         Returns:
             Tuple of (tesla_state, tesla_error, tesla_login_url,
-            succeeded_effects, results).  succeeded_effects are the
-            PendingEffect objects for actions that executed successfully;
-            the caller commits them to state.pending_effects.  results are
-            the serialisable dicts for the response payload.
+            succeeded_effects, results, gap_wh, adjusted_wh, sentinel_on).
+            The final bool is True when any sentinel device was detected on
+            during sync, allowing the caller to disable the cycle.
         """
         # Sync actual plug states before making decisions so the engine sees
         # external changes (user toggles, other automations, etc.)
         await self._sync_plug_states()
+
+        # If any sentinel device is on, disable load management entirely.
+        # Placed after _sync_plug_states so device state is populated.
+        sentinel_on: bool = any(
+            self.state.devices.get(name, DeviceState(name=name)).actual_state
+            is True
+            for name in self.sentinel_names
+        )
+        if sentinel_on:
+            logger.info(
+                "[_cycle_async_phase] sentinel device is on, disabling load management"
+            )
+            return (
+                None,
+                None,
+                None,
+                [],
+                [],
+                0.0,
+                0.0,
+                True,
+            )
 
         tesla_state, tesla_error, tesla_login_url = (
             await self._fetch_tesla_state_async()
@@ -777,7 +787,7 @@ class LoadManager:
 
         # Hysteresis guard uses corrected gap so in-flight Tesla draw is counted.
         if abs(corrected_gap_wh) <= self.engine.HYSTERESIS_WH:
-            return tesla_state, tesla_error, tesla_login_url, [], [], corrected_gap_wh, corrected_adjusted_wh
+            return tesla_state, tesla_error, tesla_login_url, [], [], corrected_gap_wh, corrected_adjusted_wh, False
 
         # ── Settle-window suppression ──────────────────────────────────────────
         # After a Tesla amp increase is confirmed the NBC prediction needs a few
@@ -816,27 +826,7 @@ class LoadManager:
                 [],
                 corrected_gap_wh,
                 corrected_adjusted_wh,
-            )
-
-        # ── Sentinel check ─────────────────────────────────────────────
-        # If any sentinel device is on, disable load management entirely.
-        sentinel_on = any(
-            self.state.devices.get(name, DeviceState(name=name)).actual_state
-            is True
-            for name in self.sentinel_names
-        )
-        if sentinel_on:
-            logger.info(
-                "[_cycle_async_phase] sentinel device is on, disabling load management"
-            )
-            return (
-                tesla_state,
-                tesla_error,
-                tesla_login_url,
-                [],
-                [],
-                corrected_gap_wh,
-                corrected_adjusted_wh,
+                False,
             )
 
         # Filter plugs by per-device time range: only eligible plugs reach the engine.
@@ -899,7 +889,7 @@ class LoadManager:
                         {"device": action.device_name, "action": action.action}
                     )
 
-        return tesla_state, tesla_error, tesla_login_url, succeeded_effects, results, corrected_gap_wh, corrected_adjusted_wh
+        return tesla_state, tesla_error, tesla_login_url, succeeded_effects, results, corrected_gap_wh, corrected_adjusted_wh, False
 
     @staticmethod
     def _plug_states_from_candidates(
@@ -1176,12 +1166,41 @@ class LoadManager:
                 results,
                 gap_wh,
                 adjusted_wh,
+                sentinel_on,
             ) = asyncio.run(
                 self._cycle_async_phase(
                     gap_wh, adjusted_wh, now_postfetch, seconds_remaining, self.dry_run, qh_name,
                     data_point_at=data_point_at,
                 )
             )
+
+            # ── Sentinel-on: disable load management ───────────────────────
+            # _cycle_async_phase returned sentinel_on=True, so disable the cycle.
+            if sentinel_on:
+                return {
+                    "status": "disabled",
+                    "qh": qh_name,
+                    "predicted_wh": predicted_wh,
+                    "adjusted_wh": adjusted_wh,
+                    "target_wh": self.target_wh,
+                    "actions": [],
+                    "diagnostics": {
+                        "gap_wh": None,
+                        "hysteresis_wh": self.engine.HYSTERESIS_WH,
+                        "seconds_remaining": seconds_remaining,
+                        "data_point_at": data_point_at,
+                        "reason": "sentinel_on",
+                        "pending_effects_count": 0,
+                        "tesla_configured": tesla_configured,
+                        "tesla_state": None,
+                        "tesla_error": None,
+                        "plugs_configured": plugs_configured,
+                        "sentinel_names": list(self.sentinel_names),
+                        "sentinel_on": True,
+                    },
+                    "sleep_hint": self.config_interval_secs,
+                    "sleep_hint_at": now_postfetch.isoformat(),
+                }
 
             # ── Stage 6: commit succeeded effects, build result ────────────
             for effect in succeeded_effects:
