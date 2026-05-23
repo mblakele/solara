@@ -1119,9 +1119,16 @@ class LoadManager:
                     return early
 
             # ── Stage 4: accept fresh data, compute gap ────────────────────
+            # ── Measure clock skew from pending effects BEFORE pruning ──────
+            # We measure skew from effects that have been reflected in the NBC
+            # data — these are exactly the effects that will be pruned below.
+            # Measuring first ensures we capture the skew before cleanup.
+            skew_diag = self._measure_clock_skew()
+
             pruned = self.state.prune_old_effects(data_point_at, now=now_postfetch)
             if pruned > 0:
                 logger.debug("Pruned %d old pending effects", pruned)
+
             self.state.last_data_point_at = data_point_at
             # Adjust prediction with still-pending effects so decide() accounts
             # for actions already taken this quarter-hour.
@@ -1198,6 +1205,7 @@ class LoadManager:
                         "data_point_at": data_point_at,
                         "reason": "hysteresis",
                         "pending_effects_count": len(self.state.pending_effects),
+                        **skew_diag,
                         "tesla_configured": tesla_configured,
                         "tesla_state": _tesla_state_to_dict(tesla_state),
                         "tesla_error": tesla_error,
@@ -1235,6 +1243,7 @@ class LoadManager:
                     "reason": reason,
                     "pending_effects_count": len(self.state.pending_effects),
                     "candidates": candidate_details,
+                    **skew_diag,
                     "tesla_configured": tesla_configured,
                     "tesla_state": _tesla_state_to_dict(tesla_state),
                     "tesla_error": tesla_error,
@@ -1286,6 +1295,53 @@ class LoadManager:
             return await self.tesla_ctrl.set_charge_amps(action.target_amps)
         logger.warning("Unknown Tesla action: %s", action.action)
         return False
+
+    def _measure_clock_skew(self) -> dict[str, Any]:
+        """Scan per-second data for edges from pending plug effects.
+
+        For each pending plug effect (turn_on/turn_off, not Tesla),
+        searches the energy cache for a step matching the expected
+        power change. Computes skew = meter_timestamp - local_timestamp
+        for each edge found and feeds it to the skew estimator.
+
+        The ``data_point_at`` is pre-adjusted (offset by ~20s) at effect
+        creation time, so comparing against ``effect.timestamp`` directly
+        gives the true clock skew between meter and local clock.
+
+        Returns:
+            Diagnostics dict with clock_skew info.
+        """
+        measurements: list[float] = []
+
+        for effect in self.state.pending_effects:
+            if effect.action not in ("turn_on", "turn_off"):
+                continue
+            if effect.device_name == "tesla":
+                continue
+
+            direction = +1 if effect.action == "turn_on" else -1
+            edges = self.state._detect_skew_samples(
+                energy_cache=self.nbc_reader.energy_cache,
+                power_watts=effect.power_watts,
+                action_direction=direction,
+            )
+            if edges is None:
+                continue
+
+            for edge_time in edges:
+                skew = (edge_time - effect.timestamp).total_seconds()
+                self.state._skew_estimator.record(skew)
+                measurements.append(skew)
+
+        return {
+            "clock_skew": {
+                "estimate_seconds": self.state._skew_estimator.estimate,
+                "measurement_count": len(
+                    self.state._skew_estimator.measurements
+                ),
+                "last_cycle_measurements": measurements,
+            }
+        }
 
     def close(self) -> None:
         """Close the LoadManager and release resources.

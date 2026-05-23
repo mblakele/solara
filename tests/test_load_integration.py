@@ -19,7 +19,7 @@ from load_manager import (
     TeslaState,
     GapMinder,
 )
-from load_nbc import DecideContext
+from load_nbc import DecideContext, _ClockSkewEstimator
 from tests.helpers import _make_metrics_with_wh
 from metrics import EnergyCache
 
@@ -2110,3 +2110,215 @@ class TestAdaptiveSleep:
         hint_at = datetime.fromisoformat(result["sleep_hint_at"])
         assert hint_at >= before - timedelta(seconds=2)
         assert hint_at <= after + timedelta(seconds=2)
+
+
+# --- Clock skew estimation tests ---
+
+
+class TestClockSkew:
+    """Tests for the clock-skew estimation via pending effects."""
+
+    def test_detect_edge_turn_on(self):
+        """Edge detection finds a rising step >= 50%% of power_watts."""
+        tracker = StateTracker()
+        cache = EnergyCache()
+        data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # Constant samples of 0.001 kWh, then a jump at index 100.
+        # power_watts=1000 => threshold = 1000 * 0.5 / 1000 = 0.5 kWh.
+        # diff at index 100 = 0.61 - 0.01 = 0.6 >= 0.5 => edge detected.
+        samples = [0.01] * 100 + [0.61] + [0.61] * 100
+        with cache._lock:
+            cache._samples = samples
+            cache._data_start = data_start
+
+        edges = tracker._detect_skew_samples(
+            energy_cache=cache,
+            power_watts=1000.0,
+            action_direction=+1,
+        )
+
+        assert edges is not None
+        assert len(edges) == 1
+        assert edges[0] == data_start + timedelta(seconds=100)
+
+    def test_detect_edge_turn_off(self):
+        """Edge detection finds a falling step >= 50%% of power_watts."""
+        tracker = StateTracker()
+        cache = EnergyCache()
+        data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # Constant samples of 0.61 kWh, then a drop at index 50.
+        # power_watts=1000 => threshold = 0.5 kWh.
+        # diff at index 50 = 0.01 - 0.61 = -0.6, abs = 0.6 >= 0.5 => edge.
+        samples = [0.61] * 50 + [0.01] + [0.01] * 100
+        with cache._lock:
+            cache._samples = samples
+            cache._data_start = data_start
+
+        edges = tracker._detect_skew_samples(
+            energy_cache=cache,
+            power_watts=1000.0,
+            action_direction=-1,
+        )
+
+        assert edges is not None
+        assert len(edges) == 1
+        assert edges[0] == data_start + timedelta(seconds=50)
+
+    def test_detect_edge_no_match(self):
+        """No edge detected when no step matches expected power."""
+        tracker = StateTracker()
+        cache = EnergyCache()
+        data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # All constant — no steps at all.
+        samples = [0.01] * 200
+        with cache._lock:
+            cache._samples = samples
+            cache._data_start = data_start
+
+        edges = tracker._detect_skew_samples(
+            energy_cache=cache,
+            power_watts=1000.0,
+            action_direction=+1,
+        )
+
+        assert edges is not None
+        assert len(edges) == 0
+
+    def test_detect_edge_small_step(self):
+        """Step below 50%% threshold is skipped."""
+        tracker = StateTracker()
+        cache = EnergyCache()
+        data_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # power_watts=1000 => threshold = 0.5 kWh.
+        # diff = 0.3 < 0.5 => should NOT be detected.
+        samples = [0.01] * 100 + [0.31] + [0.31] * 100
+        with cache._lock:
+            cache._samples = samples
+            cache._data_start = data_start
+
+        edges = tracker._detect_skew_samples(
+            energy_cache=cache,
+            power_watts=1000.0,
+            action_direction=+1,
+        )
+
+        assert edges is not None
+        assert len(edges) == 0
+
+    def test_skew_estimator_stable(self):
+        """Feed 10 samples near -20 s; verify estimate converges to ~-20 s."""
+        est = _ClockSkewEstimator()
+        for skew in [-21.0, -19.5, -22.0, -18.0, -20.5,
+                     -21.0, -19.0, -20.0, -21.5, -19.5]:
+            est.record(skew)
+
+        assert abs(est.estimate - (-20.0)) < 5.0
+
+    def test_skew_estimator_robust_to_outlier(self):
+        """Feed 9 samples at -20 s and 1 at +100 s; verify outlier is rejected."""
+        est = _ClockSkewEstimator()
+        for _ in range(9):
+            est.record(-20.0)
+        est.record(100.0)
+
+        assert abs(est.estimate - (-20.0)) < 5.0
+
+    def test_diagnostics_include_skew(self):
+        """Full run_cycle with a plug action; diagnostics contain clock_skew."""
+        fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+        plugs = {
+            "heater": PlugConfig(
+                name="heater",
+                accessory_id="h1",
+                power_watts=2000.0,
+                priority=10,
+            ),
+        }
+        plug_ctrl = PlugController(plugs)
+        energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
+        mgr = LoadManager(
+            energy_cache=energy_cache,
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=None,
+            target_wh=-500,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=True,
+        )
+
+        with patch("load_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            result = mgr.run_cycle()
+
+        assert "clock_skew" in result["diagnostics"]
+        assert "estimate_seconds" in result["diagnostics"]["clock_skew"]
+        assert "measurement_count" in result["diagnostics"]["clock_skew"]
+
+    def test_skew_measurement_with_mock(self):
+        """End-to-end: pending effect with known local timestamp, step at meter
+        time = local_time - 20, verify skew = -20 s."""
+        fixed_now = datetime(2026, 5, 6, 7, 10, 00, tzinfo=timezone.utc)
+
+        # data_lag_secs=10 means data_point_at = now - 10s, well within
+        # the 120s stale threshold, so run_cycle proceeds to the skew stage.
+        energy_cache = _make_energy_cache_with_prediction(
+            -2000.0, fixed_now, data_lag_secs=10
+        )
+
+        # The cache data_start is aligned to the previous QH boundary.
+        # data_start = now.floor_to_qh() - 15 minutes = 07:00 - 00:15 = 06:45.
+        # With data_lag_secs=10, data_point_at = 07:10:00 - 00:00:10 = 07:09:50.
+        #
+        # PENDING_EFFECT_MIN_SECS = 60, so the effect must have timestamp
+        # before nbc_timestamp - 60s = 07:08:50 to avoid the "waiting" gate.
+        # We use local_effect_time = now - 120s = 07:08:00.
+        # Edge at local_effect_time - 20s = 07:07:40.
+        # Edge index = (07:07:40 - 06:45:00).total_seconds() = 1360.
+        edge_index = 1360
+        power_watts = 1000.0  # threshold = power/2000 = 0.5 kWh
+
+        mgr = LoadManager(
+            energy_cache=energy_cache,
+            plug_ctrl=PlugController({}),
+            tesla_ctrl=None,
+            target_wh=-500,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=False,
+        )
+
+        # Create a pending effect from a simulated previous cycle.
+        local_effect_time = fixed_now - timedelta(seconds=120)
+        mgr.state.pending_effects.append(
+            PendingEffect(
+                device_name="plug",
+                action="turn_on",
+                timestamp=local_effect_time,
+                data_point_at=local_effect_time - timedelta(seconds=20),
+                power_watts=power_watts,
+            )
+        )
+
+        # Inject step into the cache BEFORE run_cycle.
+        # diff = sample[1421] - sample[1420] = (sample_value + 0.5) - sample_value
+        #      = 0.5 >= threshold = 0.5 => edge detected.
+        with energy_cache._lock:
+            assert len(energy_cache._samples) > edge_index + 1
+            original_value = energy_cache._samples[edge_index]
+            energy_cache._samples[edge_index + 1] = original_value + 0.5
+
+        with patch("load_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            result = mgr.run_cycle()
+
+        assert result["status"] in ("ok", "dry-run")
+        skew_data = result["diagnostics"]["clock_skew"]
+        measurements = skew_data["last_cycle_measurements"]
+        assert len(measurements) > 0
+        assert abs(measurements[0] - (-20.0)) < 5.0
