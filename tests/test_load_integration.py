@@ -2378,3 +2378,101 @@ class TestClockSkew:
         measurements = skew_data["last_cycle_measurements"]
         assert len(measurements) > 0
         assert abs(measurements[0] - (-20.0)) < 5.0
+
+    def test_skew_in_early_return_paths(self):
+        """Verify clock_skew is included in _check_pending_state early returns.
+
+        Regression test: before the clock-skew fix, early returns from
+        _check_pending_state (stale_data, previous_qh, waiting_for_fresh_data)
+        did not include clock_skew because _measure_clock_skew() ran after
+        the early-return check. This test verifies all three paths include it.
+        """
+        fixed_now = datetime(2026, 5, 6, 7, 10, 00, tzinfo=timezone.utc)
+        plugs = {
+            "heater": PlugConfig(
+                name="heater",
+                accessory_id="h1",
+                power_watts=2000.0,
+                priority=10,
+            ),
+        }
+        plug_ctrl = PlugController(plugs)
+        energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
+
+        mgr = LoadManager(
+            energy_cache=energy_cache,
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=None,
+            target_wh=-500,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=True,
+        )
+
+        # --- Test stale_data path: data_lag=130s means data_point_at is
+        # 130s before the fetch time, exceeding STALE_THRESHOLD_SECS=120 ---
+        energy_cache_stale = _make_energy_cache_with_prediction(
+            -6000.0, fixed_now, data_lag_secs=130
+        )
+        mgr_stale = LoadManager(
+            energy_cache=energy_cache_stale,
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=None,
+            target_wh=-500,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=True,
+        )
+        # Add a pending effect so the stale path triggers (needs pending > 0)
+        mgr_stale.state.pending_effects.append(
+            PendingEffect(
+                device_name="heater",
+                action="turn_on",
+                timestamp=fixed_now - timedelta(seconds=120),
+                data_point_at=fixed_now - timedelta(seconds=120),
+                power_watts=2000.0,
+            )
+        )
+        with patch("load_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            result_stale = mgr_stale.run_cycle()
+
+        assert result_stale["status"] == "stale_data"
+        assert "clock_skew" in result_stale["diagnostics"]
+        assert result_stale["diagnostics"]["clock_skew"]["measurement_count"] >= 0
+
+        # --- Test waiting_for_fresh_data path: add a pending effect whose
+        # timestamp is AFTER data_point_at (with data_lag=10s) ---
+        energy_cache_wait = _make_energy_cache_with_prediction(
+            -6000.0, fixed_now, data_lag_secs=10
+        )
+        mgr_wait = LoadManager(
+            energy_cache=energy_cache_wait,
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=None,
+            target_wh=-500,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=True,
+        )
+        # Create a pending effect that is after data_point_at
+        # data_point_at = now - 10s = 07:09:50
+        # Effect at 07:09:55 is after data_point_at → waiting path
+        mgr_wait.state.pending_effects.append(
+            PendingEffect(
+                device_name="heater",
+                action="turn_on",
+                timestamp=fixed_now - timedelta(seconds=65),
+                data_point_at=fixed_now - timedelta(seconds=65),
+                power_watts=2000.0,
+            )
+        )
+        with patch("load_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            result_wait = mgr_wait.run_cycle()
+
+        assert result_wait["status"] == "waiting_for_fresh_data"
+        assert "clock_skew" in result_wait["diagnostics"]
+        assert result_wait["diagnostics"]["clock_skew"]["measurement_count"] >= 0

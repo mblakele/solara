@@ -919,6 +919,7 @@ class LoadManager:
         now_postfetch: datetime,
         data_point_at: datetime,
         seconds_remaining: int,
+        skew_diag: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Check for stale NBC data or unconfirmed pending effects.
 
@@ -939,6 +940,7 @@ class LoadManager:
                 recorded (fetched_at minus API lag). Used for accurate stale
                 and waiting detection.
             seconds_remaining: Seconds left in the current QH (for diag).
+            skew_diag: Clock skew diagnostics dict to include in the result.
 
         Returns:
             An early-exit status dict, or None to continue.
@@ -949,11 +951,14 @@ class LoadManager:
             "gap_wh": None,
             "hysteresis_wh": self.engine.HYSTERESIS_WH,
             "seconds_remaining": seconds_remaining,
+            "data_point_at": data_point_at,
             "tesla_configured": tesla_configured,
             "tesla_state": None,
             "tesla_error": None,
             "plugs_configured": plugs_configured,
         }
+        if skew_diag is not None:
+            base_diag.update(skew_diag)
 
         # data_point_at is the timestamp of the most recent per-second data
         # point — what stale detection and waiting detection should use.
@@ -1128,22 +1133,24 @@ class LoadManager:
             # TODO assert now_postfetch is same QH as local now? retryable exception?
             logger.debug("now %s postfetch %s", now, now_postfetch)
 
+            # ── Stage 3.5: Measure clock skew so all paths include it ────────
+            # Measure skew from pending effects while they're still in the cache.
+            skew_diag = self._measure_clock_skew()
+
             # ── Stage 3: pending-state check ───────────────────────────────
             if not force:
                 early = self._check_pending_state(
-                    now_postfetch, data_point_at, seconds_remaining
+                    now_postfetch, data_point_at, seconds_remaining, skew_diag
                 )
                 if early is not None:
                     early["sleep_hint_at"] = now_postfetch.isoformat()
                     return early
 
             # ── Stage 4: accept fresh data, compute gap ────────────────────
-            # ── Measure clock skew from pending effects BEFORE pruning ──────
-            # We measure skew from effects that have been reflected in the NBC
-            # data — these are exactly the effects that will be pruned below.
-            # Measuring first ensures we capture the skew before cleanup.
-            skew_diag = self._measure_clock_skew()
-
+            # ── Prune old effects after skew measurement ────────────────────
+            # Effects may have been pruned by _check_pending_state() in its
+            # early-return path; this call is a no-op in that case and ensures
+            # pruning also happens when force=True bypasses the check.
             pruned = self.state.prune_old_effects(data_point_at, now=now_postfetch)
             if pruned > 0:
                 logger.debug("Pruned %d old pending effects", pruned)
@@ -1375,6 +1382,17 @@ class LoadManager:
             Diagnostics dict with clock_skew info.
         """
         measurements: list[float] = []
+        energy_cache = getattr(self.nbc_reader, "energy_cache", None)
+        if energy_cache is None:
+            return {
+                "clock_skew": {
+                    "estimate_seconds": self.state._skew_estimator.estimate,
+                    "measurement_count": len(
+                        self.state._skew_estimator.measurements
+                    ),
+                    "last_cycle_measurements": measurements,
+                }
+            }
 
         for effect in self.state.pending_effects:
             if effect.action not in ("turn_on", "turn_off"):
@@ -1384,7 +1402,7 @@ class LoadManager:
 
             direction = +1 if effect.action == "turn_on" else -1
             edges = self.state._detect_skew_samples(
-                energy_cache=self.nbc_reader.energy_cache,
+                energy_cache=energy_cache,
                 power_watts=effect.power_watts,
                 action_direction=direction,
             )
