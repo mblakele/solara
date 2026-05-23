@@ -149,7 +149,8 @@ class PlugConfig:
     Attributes:
         name: Unique plug identifier.
         accessory_id: Hardware accessory ID for the plug.
-        power_watts: Expected power draw in watts when on.
+        power_watts: Expected power draw in watts when on (None for sentinel
+            plugs, which never need a power value).
         priority: Sort priority for load management decisions.
         controller_type: Controller protocol — "homekit" or "vocolinc".
         time_range: Optional (start, end) time window for device eligibility.
@@ -160,7 +161,7 @@ class PlugConfig:
 
     name: str
     accessory_id: str
-    power_watts: float
+    power_watts: float | None = None
     priority: int = 0
     controller_type: Literal["homekit", "vocolinc"] = "homekit"
     time_range: tuple[time, time] | None = None

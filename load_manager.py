@@ -439,9 +439,8 @@ class LoadManager:
             # turn-on debounce for devices currently off or unknown.
             currently_on = dev_state is not None and dev_state.desired_state is True
             can_toggle = self.state.can_toggle(name, now, turning_on=not currently_on)
-            capacity_wh = StateTracker.watts_to_wh(
-                plug.power_watts, seconds_remaining
-            )
+            power = plug.power_watts if plug.power_watts is not None else 0.0
+            capacity_wh = StateTracker.watts_to_wh(power, seconds_remaining)
             detail: dict[str, Any] = {
                 "name": name,
                 "power_watts": plug.power_watts,
@@ -524,8 +523,9 @@ class LoadManager:
 
             if eligible:
                 has_eligible = True
+                power = plug.power_watts if plug.power_watts is not None else 0.0
                 capacity_wh = StateTracker.watts_to_wh(
-                    plug.power_watts, seconds_remaining
+                    power, seconds_remaining
                 )
                 abs_gap = abs(gap_wh)
                 if capacity_wh > abs_gap:

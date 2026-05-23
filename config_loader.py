@@ -128,7 +128,7 @@ def load_plugs_from_file() -> dict[str, Any]:
         plugs[name] = PlugConfig(
             name=name,
             accessory_id=entry["accessory_id"],
-            power_watts=float(entry["power_watts"]),
+            power_watts=float(entry["power_watts"]) if entry.get("power_watts") is not None else None,
             priority=int(entry.get("priority", 0)),
             time_range=_parse_device_time_range(entry.get("time_range")),
             sentinel=bool(entry.get("sentinel", False)),
@@ -163,7 +163,7 @@ def load_vocolinc_plugs_from_file() -> dict[str, Any]:
         plugs[name] = PlugConfig(
             name=name,
             accessory_id=entry["device_name"],
-            power_watts=float(entry["power_watts"]),
+            power_watts=float(entry["power_watts"]) if entry.get("power_watts") is not None else None,
             priority=int(entry.get("priority", 0)),
             controller_type="vocolinc",
             time_range=_parse_device_time_range(entry.get("time_range")),

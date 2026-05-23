@@ -1201,7 +1201,28 @@ def test_load_plug_sentinel_flag_parsed():
     assert plugs["home_presence"].sentinel is True
 
 
-def test_load_plug_no_sentinel_defaults_false():
+def test_load_plug_sentinel_without_power_watts():
+    """Sentinel plugs may omit power_watts since it is never used for decisions."""
+    with patch("device_config._load", return_value={
+        "plugs": {
+            "homekit": [
+                {
+                    "name": "floorlamp",
+                    "accessory_id": "sensor1",
+                    "sentinel": True,
+                },
+            ]
+        }
+    }):
+        device_config.reload()
+        plugs = load_plugs_from_file()
+
+    assert plugs["floorlamp"].sentinel is True
+    assert plugs["floorlamp"].power_watts is None
+
+
+@patch("config._decouple_config")
+def test_load_plug_no_sentinel_defaults_false(mock_config):
     """Verify sentinel defaults to False when not specified."""
     with patch("device_config._load", return_value={
         "plugs": {
