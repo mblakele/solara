@@ -806,8 +806,15 @@ class GapMinder:
         Returns:
             List of PendingEffect objects.
         """
-        remaining_gap = gap
         actions: list[PendingEffect] = []
+        if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
+            logger.debug(
+                "[_decide_turn_on] skipped (too little time: %d sec)",
+                ctx.seconds_remaining,
+            )
+            return actions
+
+        remaining_gap = gap
 
         # Collect eligible loads that are currently off
         candidates: list[tuple[int, str, Any]] = []
@@ -817,13 +824,6 @@ class GapMinder:
                 logger.debug(
                     "[_decide_turn_on] %s: skipped (debounce)",
                     name,
-                )
-                continue
-            if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
-                logger.debug(
-                    "[_decide_turn_on] %s: skipped (too little time: %d s)",
-                    name,
-                    ctx.seconds_remaining,
                 )
                 continue
             dev_state = ctx.state.devices.get(name)
