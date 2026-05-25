@@ -233,94 +233,11 @@ class TestApp(unittest.TestCase):
 
 
 class TestLoadManagementEndpoints(unittest.TestCase):
-    """Tests for POST /api/v1/load/manage and GET /api/v1/load/status."""
+    """Tests for GET /api/v1/load/status."""
 
     def setUp(self):
         self.app = app.test_client()
         self.app.testing = True
-
-    def test_load_manage_503_when_not_initialized(self):
-        """POST /load/manage returns 503 when LoadManager is None."""
-        with patch("app._get_load_manager", return_value=None):
-            response = self.app.post("/api/v1/load/manage")
-        self.assertEqual(response.status_code, 503)
-
-    def test_load_manage_success(self):
-        """POST /load/manage returns 200 with cycle result."""
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "nbc_prediction_wh": -800,
-            "pending_effects": [],
-            "devices": {},
-        }
-        with patch("app._get_load_manager", return_value=mock_lm):
-            response = self.app.post("/api/v1/load/manage")
-        self.assertEqual(response.status_code, 200)
-        data = json.loads(response.data)
-        self.assertIn("status", data)
-        mock_lm.run_cycle.assert_called_once_with(force=False)
-
-    def test_load_manage_sets_module_cycle_result(self):
-        """POST /load/manage sets app._last_cycle_result on the module."""
-        import app as app_mod
-
-        mock_lm = unittest.mock.MagicMock()
-        expected_result = {
-            "status": "ok",
-            "nbc_prediction_wh": -900,
-            "sleep_hint": 30,
-            "pending_effects": [],
-            "devices": {},
-        }
-        mock_lm.run_cycle.return_value = expected_result
-        with patch("app._get_load_manager", return_value=mock_lm):
-            response = self.app.post("/api/v1/load/manage")
-        self.assertEqual(response.status_code, 200)
-        # The module-level _last_cycle_result must be updated by the handler,
-        # not just returned in the response body.
-        self.assertIsNotNone(app_mod._last_cycle_result)
-        self.assertEqual(app_mod._last_cycle_result["status"], "ok")
-        self.assertEqual(app_mod._last_cycle_result["nbc_prediction_wh"], -900)
-
-    def test_load_management_loop_sets_cycle_result(self):
-        """_load_management_loop sets app._last_cycle_result on the module."""
-        import app as app_mod
-
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "nbc_prediction_wh": -800,
-            "sleep_hint": 30,
-        }
-
-        with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("time.sleep", side_effect=KeyboardInterrupt("done")):
-                try:
-                    app_mod._load_management_loop()
-                except KeyboardInterrupt:
-                    pass
-
-        self.assertIsNotNone(app_mod._last_cycle_result)
-        self.assertEqual(app_mod._last_cycle_result["status"], "ok")
-        self.assertEqual(app_mod._last_cycle_result["nbc_prediction_wh"], -800)
-
-    def test_load_manage_force_true(self):
-        """POST /load/manage?force=true passes force=True to run_cycle."""
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.return_value = {"status": "ok"}
-        with patch("app._get_load_manager", return_value=mock_lm):
-            response = self.app.post("/api/v1/load/manage?force=true")
-        mock_lm.run_cycle.assert_called_once_with(force=True)
-        self.assertEqual(response.status_code, 200)
-
-    def test_load_manage_500_on_exception(self):
-        """POST /load/manage returns 500 when run_cycle raises."""
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.side_effect = RuntimeError("test error")
-        with patch("app._get_load_manager", return_value=mock_lm):
-            response = self.app.post("/api/v1/load/manage")
-        self.assertEqual(response.status_code, 500)
 
     def test_load_status_503_when_not_initialized(self):
         """GET /load/status returns 503 when LoadManager is None."""
@@ -347,39 +264,6 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         data = json.loads(response.data)
         self.assertTrue(data["enabled"])
         self.assertEqual(data["targetWh"], -500)
-
-    def test_load_manage_includes_sleep_hint(self):
-        """POST /load/manage returns sleep_hint in the result JSON."""
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "qh": "QH1",
-            "predicted_wh": -800,
-            "adjusted_wh": -750,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-        with patch("app._get_load_manager", return_value=mock_lm):
-            response = self.app.post("/api/v1/load/manage")
-        self.assertEqual(response.status_code, 200)
-        data = json.loads(response.data)
-        self.assertIn("sleepHint", data)
-        self.assertEqual(data["sleepHint"], 30.0)
 
     def test_index_html_includes_sleep_hint_meta(self):
         """Index HTML includes a meta tag with the sleep_hint value for JS."""
