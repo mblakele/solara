@@ -363,8 +363,8 @@ def tou() -> ResponseReturnValue:
 # === Load Management State ===
 
 # Shared cache to avoid hammering the pyemvue API.
-# TTL overshoots the load management cycle interval, which forces refresh.
-_energy_cache = EnergyCache(ttl_seconds=35)
+# TTL is long by design: refreshes mostly happen in load management run_cycle.
+_energy_cache = EnergyCache(ttl_seconds=60)
 
 _load_manager = None
 _load_manager_lock = threading.Lock()
