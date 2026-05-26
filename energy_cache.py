@@ -446,8 +446,8 @@ class EnergyCache:
         seconds_from_start = (now - offset_start).total_seconds()
         seconds_in_period = seconds_from_start % self._quantization_seconds
         # Seems to take pyemvue API ca 20-sec to settle.
-        # 0-15.67 is unreliable: 16-sec may be optimal.
-        seconds_remaining = (self._quantization_seconds - seconds_in_period + 15.75) % self._quantization_seconds
+        # 0-15.67 is unreliable: 17-sec may be optimal.
+        seconds_remaining = (self._quantization_seconds - seconds_in_period + 17.0) % self._quantization_seconds
         logger.debug("EnergyCache.sleep_interval_adjust: %.1f > %.1f", interval_seconds, seconds_remaining)
         return max(5.0, min(interval_seconds, seconds_remaining))
 

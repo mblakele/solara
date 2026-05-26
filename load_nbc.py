@@ -286,51 +286,6 @@ class NBCReader:
         return None
 
 
-@dataclass
-class _ClockSkewEstimator:
-    """Simple trimmed-mean clock skew estimator.
-
-    Maintains a rolling window of skew measurements. The estimate is the
-    median of the last N measurements, rejecting outliers beyond +/-60 s
-    from the median (likely mis-detected edges).
-
-    Attributes:
-        measurements: Rolling list of skew seconds (meter - local).
-        estimate: Current best estimate, updated on each new measurement.
-    """
-
-    measurements: list[float] = field(default_factory=list)
-    estimate: float = 0.0
-    _max_samples: int = 10
-
-    def record(self, skew_seconds: float) -> None:
-        """Record a new skew measurement and update the running estimate.
-
-        Adds the value, trims the window to 10 samples, then computes
-        a trimmed mean (reject values beyond +/-60 s from the median).
-
-        Args:
-            skew_seconds: Computed skew = meter_timestamp - local_timestamp.
-        """
-        self.measurements.append(skew_seconds)
-        if len(self.measurements) > 10:
-            self.measurements = self.measurements[-10:]
-        self._compute_estimate()
-
-    def _compute_estimate(self) -> None:
-        """Compute the trimmed-mean estimate from current measurements."""
-        if not self.measurements:
-            self.estimate = 0.0
-            return
-        sorted_vals = sorted(self.measurements)
-        median = sorted_vals[len(sorted_vals) // 2]
-        clipped = [v for v in sorted_vals if abs(v - median) <= 60]
-        if clipped:
-            self.estimate = sum(clipped) / len(clipped)
-        else:
-            self.estimate = median
-
-
 class StateTracker:
     """In-memory state of managed devices and pending effects."""
 
@@ -408,7 +363,6 @@ class StateTracker:
         # the new load.
         self.last_tesla_increase_at: datetime | None = None
         self.last_tesla_increase_qh: str | None = None
-        self._skew_estimator = _ClockSkewEstimator()
 
     def estimated_current_wh(self, nbc_predicted_wh: float, seconds_remaining:
   int) -> float:
@@ -436,46 +390,6 @@ class StateTracker:
             adjusted += effect.power_watts * seconds_remaining / NBCPeriod.PERIOD_SECS
         return adjusted
 
-    def _detect_skew_samples(
-        self,
-        energy_cache: Any,
-        power_watts: float,
-        action_direction: int,
-    ) -> list[datetime] | None:
-        """Scan per-second samples for a step matching the expected power.
-
-        Walks the _samples list looking for a diff with the right sign
-        and magnitude (>= 50 % of power_watts). Samples are in kWh per
-        second, so the threshold in kWh is power_watts * 0.5 / 3_600_000.
-        Returns meter timestamps of any edges found, or None if no edge
-        detected.
-
-        Args:
-            energy_cache: The NBC energy cache with per-second samples.
-            power_watts: Expected wattage of the device (positive value).
-            action_direction: +1 for turn_on, -1 for turn_off.
-
-        Returns:
-            List of meter timestamps where edge(s) detected, or None if
-            _samples/_data_start is unavailable.
-        """
-        samples = energy_cache._samples
-        data_start = energy_cache._data_start
-        if samples is None or data_start is None or len(samples) < 2:
-            return None
-
-        # Samples are in kWh per second.  A step of P watts over 1 second
-        # = P / 3_600_000 kWh.  Threshold is 50 % of that.
-        threshold = power_watts * 0.5 / 3_600_000.0
-        edges: list[datetime] = []
-
-        for k in range(1, len(samples)):
-            diff = samples[k] - samples[k - 1]
-            if diff * action_direction > 0 and abs(diff) >= threshold:
-                edge_time = data_start + timedelta(seconds=k)
-                edges.append(edge_time)
-
-        return edges
 
     def tesla_inflight_wh(
         self, reported_amps: int | None, seconds_remaining: int
@@ -730,10 +644,6 @@ class GapMinder:
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
     MIN_SECONDS_TO_ACT = 45
-    # Capacity discount applied to turn-on decisions.  A load is only turned on
-    # if its discounted capacity fits in the gap, reserving headroom for solar
-    # variability and NBC prediction error.  Acts as damping to reduce overshoot.
-    TURN_ON_MARGIN = 1.0 # was 0.85 TODO TESTING
     # During the post-amp-increase settle window, suppress turn-off decisions
     # only if the apparent deficit is below this threshold.  Deficits larger
     # than this are treated as genuine even during the settle period (e.g. a
@@ -837,18 +747,12 @@ class GapMinder:
 
         for _, name, plug in candidates:
             capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
-            # Apply turn-on margin: only commit if the discounted capacity fits in
-            # the gap.  This reserves headroom for solar variability and NBC
-            # prediction error, acting as damping to reduce overshoot.
-            discounted_capacity = capacity * self.TURN_ON_MARGIN
-
-            if discounted_capacity <= remaining_gap:
+            if capacity <= remaining_gap:
                 logger.debug(
                     "[_decide_turn_on] %s: turning on "
-                    "(capacity=%.1f Wh, discounted=%.1f Wh fits in gap %.1f Wh)",
+                    "(capacity=%.1f Wh fits in gap %.1f Wh)",
                     name,
                     capacity,
-                    discounted_capacity,
                     remaining_gap,
                 )
                 actions.append(
