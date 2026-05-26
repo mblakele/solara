@@ -27,7 +27,7 @@ def mock_config(**overrides: Any):
     defaults = {
         "VUE_USERNAME": None,
         "MOCK_ERROR": False,
-        "MOCK": False,
+        "MOCK": True,
     }
     config_values = {**defaults, **overrides}
 

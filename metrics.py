@@ -822,12 +822,13 @@ class HourlyProjection(MetricsBase):
             if energy_cache._data_start is not None:
                 cache_samples = energy_cache.samples
                 if cache_samples:
-                    nbc_seconds = energy_cache.merge_incremental(  # type: ignore[assignment]
+                    merged = energy_cache.merge_incremental(
                         energy_cache._data_start,
                         pop_data_start,
                         cache_samples,
                         nbc_seconds)
-                    assert nbc_seconds is not None
+                    if merged is not None:
+                        nbc_seconds = merged.samples
 
         nbc_result = self._compute_nbc(nbc_seconds)
 

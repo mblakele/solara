@@ -112,11 +112,11 @@ project-root
 ├── app.py              # Flask application entrypoint & route definitions
 ├── conftest.py         # Pytest shared fixtures & configuration
 ├── energy_aggregator.py # TOU (time-of-use) energy aggregation logic
+├── energy_cache.py     # EnergyCache with per-second sample storage, incremental
+                       # fetch merging, and pruning
 ├── load_manager.py     # OAuth handling & load-shedding management
 ├── load_models.py      # Shared data models (PendingEffect, TeslaState, etc.)
 ├── load_nbc.py         # NBCReader, StateTracker, GapMinder bin-packing, Tesla decisions
-├── metrics.py          # NBC (net-billing-cycle) calculation metrics, EnergyCache with
-                       # per-second sample storage, incremental fetch merging, and pruning
 ├── mockdata.py         # Test data generation utilities
 ├── quantization.py     # Detect N-second constant-value windows (quantization) in per-second data
 ├── util.py             # Shared utilities (JSON helpers, timezone handling)
@@ -135,8 +135,9 @@ project-root
 
 - **Guard functions** `metrics.py`: `cap_chart_start()`, `cap_fetch_window()` —
   prevent over-fetching when cache is stale; pure functions, independently tested
-- NBC calculation in `metrics.py` (`EnergyCache` with incremental fetch, sample
-  merging, and pruning; `get_current_qh()` helper)
+- `EnergyCache` in `energy_cache.py` with `get_or_fetch()`, `is_valid()`,
+  `sleep_interval_adjust()`, and quantization detection
+- NBC calculation in `metrics.py` (`get_current_qh()` helper)
 - NBCReader in `load_nbc.py` with `get_current_qh(force=False)` — fetches fresh data
   when cache is valid but has no incomplete QH, enabling 5-second cycle polling
 - `HourlyProjection` in `metrics.py` with `populate()` (uses `cap_chart_start`
@@ -192,7 +193,7 @@ project-root
   Emporia API lag. Min toggle interval: 60 seconds.
 
 ### EnergyCache & Incremental Fetch
-- `EnergyCache` (metrics.py) stores per-second energy samples with metadata:
+- `EnergyCache` (energy_cache.py) stores per-second energy samples with metadata:
   - `_samples`: list[float] — per-second Wh values
   - `_data_start`: datetime — start time of the sample window
   - `_sample_count`, `_last_sample_at`: metadata for diagnostics

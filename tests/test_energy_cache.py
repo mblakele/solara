@@ -1,9 +1,12 @@
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from energy_cache import EnergyCache
+from load_models import PendingEffect
 from mockdata import MetricsMock
 from test_app import mock_config
 from util import ceil_to_qh, compute_nbc_quarters
@@ -14,11 +17,11 @@ class TestEnergyCache(unittest.TestCase):
     def test_import_exists(self):
         """EnergyCache class must be importable from metrics."""
         # This test fails until EnergyCache is implemented.
-        from metrics import EnergyCache  # noqa: F401
+        from energy_cache import EnergyCache  # noqa: F401
 
     def test_initial_state_empty(self):
         """Fresh EnergyCache has no samples, no start time, no fetch timestamp."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache()
         self.assertIsNone(cache._samples)
@@ -27,7 +30,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_last_fetch_at_property(self):
         """last_fetch_at property exposes the internal _last_fetch_at field."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
         from datetime import datetime, timezone
 
         cache = EnergyCache()
@@ -39,7 +42,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_is_valid_false_when_empty(self):
         """is_valid returns False when cache has no data."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache()
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
@@ -47,7 +50,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_is_valid_true_after_fetch(self):
         """is_valid returns True after a successful fetch within TTL."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
@@ -63,7 +66,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_is_valid_false_after_ttl_expiry(self):
         """is_valid returns False after TTL expires."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=0)  # TTL of 0 means always expired
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
@@ -79,7 +82,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_or_fetch_miss_on_first_call(self):
         """First call to get_or_fetch should invoke fetch_func and return was_fresh=True."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fetch_count = 0
@@ -102,7 +105,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_or_fetch_hit_within_ttl(self):
         """Second call within TTL should return cached data with was_fresh=False."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fetch_count = 0
@@ -125,7 +128,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_or_fetch_miss_after_ttl_expiry(self):
         """After TTL expires, get_or_fetch should call fetch_func again."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=0)  # Always expired
         fetch_count = 0
@@ -147,7 +150,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_or_fetch_force_bypasses_cache(self):
         """force=True should always call fetch_func even if cache is valid."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fetch_count = 0
@@ -170,7 +173,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_or_fetch_stores_last_fetch_at_only_on_api_call(self):
         """_last_fetch_at should only be set when data comes from the API, not on cache hit."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fetch_count = 0
@@ -195,7 +198,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_or_fetch_none_result(self):
         """When fetch_func returns None, cache stores None and is_valid returns False."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
 
@@ -207,7 +210,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_invalidate_clears_cache(self):
         """After invalidate, next call fetches fresh data."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fetch_count = 0
@@ -231,14 +234,14 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_current_qh_returns_none_when_empty(self):
         """get_current_qh returns None when cache has no data."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache()
         self.assertIsNone(cache.get_current_qh(datetime.now(timezone.utc)))
 
     def test_get_or_fetch_merges_samples(self):
         """New samples from fetch_func should be appended to existing _samples."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -269,7 +272,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_or_fetch_skips_overlapping_samples(self):
         """Overlapping samples from full-hour fetches should be deduplicated."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2026, 5, 13, 0, 30, 29, tzinfo=timezone.utc)
@@ -308,7 +311,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_current_qh_computes_from_samples(self):
         """get_current_qh should compute QH prediction from raw samples."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         # data_start at QH boundary 12:00 + 1200 = 12:20:00, now at 12:20:00
@@ -333,7 +336,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_thread_safety_concurrent_access(self):
         """Concurrent reads and writes should not corrupt the sample list."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
         cache = EnergyCache(ttl_seconds=60)
@@ -372,7 +375,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_pruning_removes_samples_older_than_3600s(self):
         """Samples older than 3600 seconds from now are pruned after get_or_fetch."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
@@ -400,7 +403,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_pruning_does_not_remove_recent_samples(self):
         """Samples within the last 3600s are preserved after pruning."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
@@ -425,7 +428,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_current_qh_returns_incomplete_qh(self):
         """get_current_qh returns the first incomplete quarter with extrapolated prediction."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
@@ -458,7 +461,7 @@ class TestEnergyCache(unittest.TestCase):
         Stale complete-quarter data must not be used for load management
         decisions. This is the anti-regression test for the ecoflow chatter.
         """
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
@@ -492,7 +495,7 @@ class TestEnergyCache(unittest.TestCase):
         fresh data rather than making load management decisions on stale
         quarter-end data.
         """
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
@@ -522,7 +525,7 @@ class TestEnergyCache(unittest.TestCase):
         that stale value would cause incorrect load decisions. The system
         should always wait for fresh incomplete data.
         """
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 13, 0, 0, tzinfo=timezone.utc)
@@ -547,7 +550,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_current_qh_returns_most_recent_qh(self):
         """get_current_qh returns QH1 (most recent window), not the last incomplete one."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         fixed_now = datetime(2025, 6, 1, 12, 37, 30, tzinfo=timezone.utc)
@@ -578,7 +581,7 @@ class TestEnergyCache(unittest.TestCase):
         seconds_remaining value must come from wall-clock time to stay
         monotonic and correct across cache refreshes.
         """
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         # Start at :07:30 — in QH1 (0-899).  Seconds into hour = 7*60+30 = 450.
         # Expected: QH1, remaining = 900 - 450 = 450
@@ -609,7 +612,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_current_qh_seconds_remaining_decreases_monotonically(self):
         """seconds_remaining must decrease as wall-clock time advances."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
 
@@ -646,7 +649,7 @@ class TestEnergyCache(unittest.TestCase):
 
     def test_get_or_fetch_populates_samples_from_nested_device_data(self):
         """get_or_fetch populates self._samples when per_second_data is nested in devices."""
-        from metrics import EnergyCache
+        from energy_cache import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
         now = datetime.now(timezone.utc)
@@ -671,5 +674,55 @@ class TestEnergyCache(unittest.TestCase):
         self.assertIsNotNone(cache._samples)
         self.assertEqual(len(cache._samples), 150)
         self.assertEqual(all(v > 0 for v in cache._samples), True)
+
+
+class TestEnergyCacheAttributes(unittest.TestCase):
+    """Verify EnergyCache instance attributes have correct types."""
+
+    def test_attributes_initial_types(self) -> None:
+        """All EnergyCache attributes are None or have the expected initial types."""
+        cache = EnergyCache()
+
+        self.assertIsNone(cache._samples)
+        self.assertIsNone(cache._data_start)
+        self.assertIsNone(cache._last_fetch_at)
+        self.assertIsNone(cache._sample_count)
+        self.assertIsNone(cache._last_sample_at)
+        self.assertIsNone(cache._data)
+        self.assertIsNone(cache._quantization_seconds)
+        self.assertIsNone(cache._quantization_offset)
+        self.assertIsNone(cache._quantization_confidence)
+        self.assertIsInstance(cache._ttl_seconds, int)
+        self.assertIsInstance(cache._lock, type(threading.Lock()))
+
+    def test_get_or_fetch_return_type(self) -> None:
+        """get_or_fetch returns (dict | None, bool)."""
+        cache = EnergyCache()
+        now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
+
+        def fetch_func() -> dict[str, Any] | None:
+            return {
+                "per_second_data": [0.001],
+                "data_start": now,
+            }
+
+        result, was_fresh = cache.get_or_fetch(fetch_func, now)
+        self.assertIsInstance(result, dict)
+        self.assertIsInstance(was_fresh, bool)
+        self.assertTrue(was_fresh)
+        self.assertEqual(result["per_second_data"], [0.001])
+
+    def test_is_valid_return_type(self) -> None:
+        """is_valid returns bool."""
+        cache = EnergyCache()
+        now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
+        self.assertIsInstance(cache.is_valid(now), bool)
+
+    def test_sleep_interval_adjust_return_type(self) -> None:
+        """sleep_interval_adjust returns float."""
+        cache = EnergyCache()
+        now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
+        result = cache.sleep_interval_adjust(30.0, now)
+        self.assertIsInstance(result, float)
 
 
