@@ -317,7 +317,7 @@ class MetricsBase:
         if not self.vue:
             return
 
-        self.logger.debug({"keys": self.vue_keys})
+        #self.logger.debug({"keys": self.vue_keys})
         try:
             encoding = locale.getpreferredencoding()
             vkf = open(self.vue_keys, encoding=encoding)
@@ -342,9 +342,7 @@ class MetricsBase:
                     "Vue authentication failed: check credentials"
                 ) from inner_ex
 
-        if login_ok:
-            self.logger.debug("login ok")
-        else:
+        if not login_ok:
             # Token login returned False — fall back to password auth.
             self.logger.debug("token login failed, trying password")
             try:
@@ -378,9 +376,9 @@ class MetricsBase:
         )
         if len(self.device_info) > 0 and "last" in self.vue_auth:
             age = rt_start - self.vue_auth["last"]
-            self.logger.debug({"age": age})
+            #self.logger.debug({"age": age})
             if age < age_limit:
-                self.logger.debug({"device_info": self.device_info})
+                #self.logger.debug({"device_info": self.device_info})
                 return
 
         try:
