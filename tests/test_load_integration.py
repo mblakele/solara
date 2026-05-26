@@ -21,7 +21,7 @@ from load_manager import (
 )
 from load_nbc import DecideContext, _ClockSkewEstimator
 from tests.helpers import _make_metrics_with_wh
-from metrics import EnergyCache
+from energy_cache import EnergyCache
 
 
 # --- Excess solar helpers ---

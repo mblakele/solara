@@ -32,9 +32,9 @@ from flask.typing import ResponseReturnValue
 
 from config import cfg as _cfg, get_timezone
 
+from energy_cache import EnergyCache
 from metrics import (
     create_metrics,
-    EnergyCache,
     HourlyProjection,
     Metrics,
     TOUReporter,
@@ -237,8 +237,7 @@ def error_retryable(e: RetryableMetricsException) -> Response:
 def index() -> ResponseReturnValue:
     """Main index endpoint serving HTML or JSON based on Accept header.
 
-    Uses EnergyCache to avoid hammering the pyemvue API. In mock mode,
-    falls back to MetricsMock for deterministic test data.
+    In mock mode, falls back to MetricsMock for deterministic test data.
     """
     logger.debug("index")
     is_mock_error = _cfg.is_mock_error
@@ -364,8 +363,8 @@ def tou() -> ResponseReturnValue:
 # === Load Management State ===
 
 # Shared cache to avoid hammering the pyemvue API.
-# EnergyCache TTL (30s) undershoots the load management cycle interval.
-_energy_cache = EnergyCache(ttl_seconds=30)
+# TTL overshoots the load management cycle interval, which forces refresh.
+_energy_cache = EnergyCache(ttl_seconds=35)
 
 _load_manager = None
 _load_manager_lock = threading.Lock()
@@ -417,7 +416,8 @@ def _get_load_manager():
                     now = datetime.now(timezone.utc)
                     return _energy_cache.get_or_fetch(
                         lambda: create_metrics(_energy_cache, datetime.now(pytz.timezone(_cfg.timezone)), logger),
-                        now
+                        now,
+                        force=True
                     )[0]
 
                 _load_manager = LoadManager(
@@ -456,40 +456,11 @@ def _load_management_loop() -> None:
             logger.error("Error in load management loop: %s", e)
         else:
             interval_secs = result.get("sleep_hint", interval_secs_config)
-        logger.debug("Load management sleeping %d", interval_secs)
-        time.sleep(interval_secs)
 
-
-@app.route("/api/v1/load/manage", methods=["POST"])
-def load_manage() -> Response:
-    """Manually trigger a load management cycle.
-
-    Accept optional ?force=true to bypass stale-data check (debug only).
-    Returns JSON with status, current NBC prediction, pending effects, device states.
-    Requires ``X-API-Key`` header matching ``LOAD_MANAGE_API_KEY`` env var when set.
-    """
-    global _last_cycle_result
-    required_key = _cfg.load_manage_api_key  # type: ignore[arg-type]
-    if required_key:
-        provided_key = request.headers.get("X-API-Key", "")
-        if not provided_key or provided_key != required_key:
-            return abort(401, "Unauthorized: valid X-API-Key header required")
-    force = request.args.get("force", "false").lower() == "true"
-    lm = _get_load_manager()
-    if lm is None:
-        return abort(503, "LoadManager not initialized")
-
-    try:
-        result = lm.run_cycle(force=force)
-    except Exception as e:
-        logger.error("Manual load management cycle failed: %s", e)
-        return abort(500, f"Load management cycle failed: {e}")
-
-    with _load_manager_lock:
-        _last_cycle_result = result
-
-    payload = camelize(result)
-    return _json_response(payload)
+        interval_secs_adjusted = _energy_cache.sleep_interval_adjust(
+            interval_secs, datetime.now(pytz.timezone(_cfg.timezone)))
+        logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
+        time.sleep(interval_secs_adjusted)
 
 
 @app.route("/api/v1/load/status")

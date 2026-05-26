@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from metrics import EnergyCache
+from energy_cache import EnergyCache
 from load_manager import NBCReader
 
 

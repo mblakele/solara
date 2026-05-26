@@ -118,6 +118,7 @@ project-root
 ├── metrics.py          # NBC (net-billing-cycle) calculation metrics, EnergyCache with
                        # per-second sample storage, incremental fetch merging, and pruning
 ├── mockdata.py         # Test data generation utilities
+├── quantization.py     # Detect N-second constant-value windows (quantization) in per-second data
 ├── util.py             # Shared utilities (JSON helpers, timezone handling)
 ├── pyproject.toml      # Project metadata, dependencies & script entrypoints
 ├── render.yaml         # Render.com deployment configuration
@@ -145,6 +146,7 @@ project-root
 - Data models in `load_models.py` (`PendingEffect`, `TeslaState`)
 - Routes in `app.py`
 - Test data generation in `mockdata.py`
+- Quantization detection in `quantization.py`
 - Timezones in `util.py`
 
 ### Actions Generation Flow

@@ -18,7 +18,7 @@ from load_manager import (
 )
 import device_config
 
-from metrics import EnergyCache
+from energy_cache import EnergyCache
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 import pytest

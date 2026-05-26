@@ -22,7 +22,7 @@ from load_manager import (
 )
 from load_models import TeslaAuthError
 import device_config
-from metrics import EnergyCache
+from energy_cache import EnergyCache
 from tests.helpers import _make_metrics_with_wh
 
 
