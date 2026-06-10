@@ -8,9 +8,7 @@ code consistency, maintainability, and adherence to project standards.
 
 ## General Advice
 
-Take time to think things through.
-
-No blame games. Don't ask whether a bug or error might be pre-existing or might pre-date your changes. Don't try to dig into git. Just fix it.
+Don't ask whether a bug or error might be pre-existing or might pre-date your changes. Don't try to dig into git. Just fix it.
 
 When something is ambiguous or two consecutive attempts have not resolved a
 failing test, **stop and ask** rather than continuing to iterate blindly.
@@ -22,6 +20,10 @@ Write tests first, then diagnose and fix bugs.
 Always invoke tools using the structured function-calling API. Never emit tool calls as inline XML or markdown text.
 
 Never try to work around permission errors.
+
+### Editing
+Prefer `batch_str_replace` over repeated `str_replace` calls whenever you
+have multiple independent edits planned. Emit all edits in one call.
 
 ### Communication Style
 
@@ -95,6 +97,10 @@ Key capabilities:
 - `LOAD_TARGET_WH` — Target Wh per quarter-hour for load decisions (default: `-500`)
 - `LOAD_NBC_DEVICE` — Device name for NBC predictions
 - `LOAD_MANAGE_INTERVAL_SECS` — Seconds between load management cycles (default: 30)
+- `LOAD_TELEGRAM_DEVICES` — JSON string of device→actions whitelist for Telegram notifications.
+  Notifications are **only sent** when this whitelist is configured AND at least one
+  action matches. If omitted or empty, no Telegram notifications are sent.
+  Example: `{"pool_pump": ["turn_on", "turn_off"], "jackery": ["turn_on"]}`
 - Emporia VUE credentials are stored in `.vue-keys.json` rather than environment variables
 
 ---
@@ -109,26 +115,48 @@ This is a flat-layout Python project. All source files live at the project root 
 
 ```
 project-root
-├── app.py              # Flask application entrypoint & route definitions
-├── conftest.py         # Pytest shared fixtures & configuration
-├── energy_aggregator.py # TOU (time-of-use) energy aggregation logic
-├── energy_cache.py     # EnergyCache with per-second sample storage, incremental
-                       # fetch merging, and pruning
-├── load_manager.py     # OAuth handling & load-shedding management
-├── load_models.py      # Shared data models (PendingEffect, TeslaState, etc.)
-├── load_nbc.py         # NBCReader, StateTracker, GapMinder bin-packing, Tesla decisions
-├── mockdata.py         # Test data generation utilities
-├── quantization.py     # Detect N-second constant-value windows (quantization) in per-second data
-├── util.py             # Shared utilities (JSON helpers, timezone handling)
-├── pyproject.toml      # Project metadata, dependencies & script entrypoints
-├── render.yaml         # Render.com deployment configuration
-├── env.example         # Template for required environment variables
-├── tests/              # All pytest tests
-├── templates/          # Jinja2 HTML templates (index, TOU, error pages)
-├── docs/               # Supplementary documentation (e.g., LOADMANAGER.md)
-├── .opencode/plans/    # Agent planning scratch space (writable during planning)
-├── devices.json        # Local device configuration — never commit
-└── .env                # Local secrets — never commit
+├── app.py                 # Flask application entrypoint & route definitions (/, /health,
+                           # /api/v1/tou, /api/v1/load/status, /api/tesla/callback)
+├── clock.py               # Clock protocol (now()) with FakeClock for tests
+├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
+                           # load_tesla_config(), load_plug_configs(), etc.
+├── config_loader.py       # LazyConfig deferred env loading (config.get(), config.set())
+├── conftest.py            # Pytest shared fixtures & configuration
+├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS, etc.)
+├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
+                           # get_tesla_config, get_homekit_plugs, etc.)
+├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
+├── energy_cache.py        # EnergyCache with per-second sample storage, incremental
+                           # fetch merging, and pruning
+ ├── load_controllers.py   # Load manager controllers: PlugController/RealPlugController,
+                            # TeslaController/RealTeslaController, VocolincController/RealVocolincController,
+                            # and factory functions (load_controller_from_env,
+                            # fleet_telemetry_config_create)
+ ├── load_manager.py       # OAuth handling, pipeline stages (_stage_*), load-shedding management,
+                             # _last_tesla_at_home preserves at_home across telemetry snapshots
+ ├── load_models.py        # Shared data models (CycleContext, CycleResult, PendingEffect,
+                            # TeslaChargeState, TeslaDriveState, TeslaLocation, TeslaCallbackPayload,
+                            # TeslaEvent, TeslaEventKind, TeslaVehicleTelemetry,
+                            # parse_tesla_event_payload, update_tesla_telemetry,
+                            # get_active_tesla_telemetry, FleetTelemetryProvisionConfig)
+├── load_nbc.py            # NBCReader, StateTracker, GapMinder bin-packing, Tesla decisions
+ ├── mockdata.py            # Test data generation utilities
+ ├── mqtt_telemetry.py      # Tesla MQTT message parsing (on_message, tesla_state_from_snapshot)
+  ├── quantization.py        # Detect N-second constant-value windows (quantization) in per-second data
+  ├── sse_event.py            # SSEBroadcaster thread-safe pub/sub + event_stream generator for Flask
+├── telegram.py            # TelegramSender, NotificationEvent, config loading helpers
+├── telegram_client.py     # Async Telegram Bot API client using aiohttp
+├── util.py                # Shared utilities (JSON helpers, timezone handling)
+├── pyproject.toml         # Project metadata, dependencies & script entrypoints
+├── render.yaml            # Render.com deployment configuration
+├── env.example            # Template for required environment variables
+├── tests/                 # All pytest tests
+├── templates/             # Jinja2 HTML templates (index, TOU, error pages)
+├── docs/                  # Supplementary documentation (e.g., LOADMANAGER.md, SSE_STREAMING.md)
+├── .opencode/plans/       # Agent planning scratch space (writable during planning)
+├── devices.json           # Local device configuration — never commit
+├── .env                   # Local secrets — never commit
+├── .tesla-callback-config # Tesla callback registration config (client_id, registration_url)
 ```
 
 ### Key entry points
@@ -138,17 +166,47 @@ project-root
 - `EnergyCache` in `energy_cache.py` with `get_or_fetch()`, `is_valid()`,
   `sleep_interval_adjust()`, and quantization detection
 - NBC calculation in `metrics.py` (`get_current_qh()` helper)
-- NBCReader in `load_nbc.py` with `get_current_qh(force=False)` — fetches fresh data
-  when cache is valid but has no incomplete QH, enabling 5-second cycle polling
 - `HourlyProjection` in `metrics.py` with `populate()` (uses `cap_chart_start`
   guard), `predict()`, and per-device prediction via `_predict_device()`
 - TOU in `energy_aggregator.py`
+- Load controller factories in `load_controllers.py` (`load_controller_from_env`, etc.)
+- `init_tesla_state()` / `_init_from_rest()` in `load_controllers.py` — initializes
+  vehicle state from telemetry with REST fallback when initial telemetry is missing
+  (waits up to 60 s for telemetry, then falls back to REST API with minimal calls)
 - OAuth in `load_manager.py`
-- Data models in `load_models.py` (`PendingEffect`, `TeslaState`)
+- Tesla callback config dotfile: `.tesla-callback-config` (auto-created, auto-updated)
+- Pipeline orchestration in `load_manager.py` (`_stage_enabled_check`, `_stage_nbc_fetch`,
+  `_stage_pending_check`, `_stage_compute_gap`, `_stage_async_phase`, `_stage_commit`,
+  `_stage_build_result`) — each independently testable
+- `_fetch_tesla_state_async()` in `load_manager.py` — fetches Tesla state from MQTT
+  telemetry with a fast path; returns telemetry state as long as `ChargeAmts` is present
+  (does NOT require `Location`). Preserves `at_home` from `_last_tesla_at_home` when
+  `Location` is absent in the snapshot. Delegates to controller's `init_tesla_state()`
+  (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
+- Data models in `load_models.py`
 - Routes in `app.py`
 - Test data generation in `mockdata.py`
 - Quantization detection in `quantization.py`
 - Timezones in `util.py`
+- Deferred config in `config_loader.py` (`LazyConfig`, `config.get()`, `config.set()`)
+- Tesla config in `config.py` (`TeslaConfig` dataclass, `load_tesla_config()`)
+- Tesla telemetry intervals in `config.py` (`tesla_telemetry_chargestate_interval`,
+  `tesla_telemetry_location_interval`, `tesla_telemetry_chargeamps_interval`,
+  `tesla_telemetry_detailedchargestate_interval`)
+- FleetTelemetryProvisionConfig in `load_models.py` (all interval fields including
+  `detailedchargestate_interval_sec`)
+- Tesla fleet-telemetry provisioning in `load_controllers.py` (`fleet_telemetry_config_create`)
+- DetailedChargeState parsing in `mqtt_telemetry.py` (`tesla_state_from_snapshot`)
+- Device config accessors in `device_config.py` (`get_telegram_config`, `get_tesla_config`, etc.)
+- Integrity validations in `device_config.py` (`validate_telegram_devices`, `_validate_integrity` — called after every `_load()` to ensure `telegram.devices` keys match plug names)
+- Telegram client in `telegram_client.py` (`TelegramClient`, `TelegramConfig`)
+- Telegram sender in `telegram.py` (`TelegramSender`, `NotificationEvent`)
+- SSE broadcaster and endpoint tests in `tests/test_sse.py` (`SSEBroadcaster`, `event_stream`)
+- Pipeline stage tests in `tests/test_pipeline_stages.py`
+- Pipeline stage tests in `tests/test_pipeline_stages.py`
+- CycleContext tests in `tests/test_cycle_context.py`
+- Tesla callback config tests in `tests/test_tesla_callback_config.py`
+- Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 
 ### Actions Generation Flow
 - GapMinder.decide() generates actions as a list of PendingEffect objects
@@ -170,18 +228,19 @@ project-root
 - app.py / route (lines 171-195) serves HTML or JSON based on Accept header
 - Returns model.metrics which includes:
   - devices: list with gid, lag, name, prediction, nbc (clock-boundary quarter-hour data),
-    prev_hour_data, scales, smoothing
+    prev_hour_data
   - api_response: timing info
   - instant: timestamp
 - Template templates/index.html displays NBC QH1-QH4 values with dynamic time-range labels,
   minute/hour usage, predictions
 
 ### Device State Tracking
-- StateTracker class (load_nbc.py lines 315–578) maintains:
-  - devices: dict[str, DeviceState] - desired/actual state, current_amps, last_toggle
-  - pending_effects: list[PendingEffect] - actions taken since last NBC data point,
-    pruned when fresh data arrives via `prune_old_effects()`
-  - last_data_point_at, last_nbc_predicted_wh
+ - StateTracker class (load_nbc.py lines 315–578) maintains:
+   - devices: dict[str, DeviceState] - desired/actual state, current_amps, last_toggle
+   - pending_effects: list[PendingEffect] - actions taken since last NBC data point,
+     pruned when fresh data arrives via `prune_old_effects()`
+   - last_data_point_at, last_nbc_predicted_wh
+   - registered: bool - whether Tesla callback is registered via dotfile
 - Key methods:
   - `estimated_current_wh()`: adjusts raw NBC prediction with pending effect deltas
   - `has_pending_effect_since()`: checks if any action was taken after given timestamp
@@ -192,11 +251,25 @@ project-root
   The threshold is 120 seconds from the most recent per-second data point, accounting for
   Emporia API lag. Min toggle interval: 60 seconds.
 
+### Telegram Notifications
+- `TelegramConfig` (telegram_client.py) — frozen config dataclass with bot_token and chat_id
+- `TelegramClient` (telegram_client.py) — async aiohttp client, fire-and-forget, returns `bool`, never raises
+- `TelegramSender` (telegram.py) — high-level sender with config loading from env vars and devices.json
+- `NotificationEvent` (telegram.py) — frozen dataclass for structured notifications with `format_message()`
+- `load_telegram_config()` (telegram.py) — loads config from env vars (priority) or devices.json
+- `load_telegram_devices()` (telegram.py) — loads device whitelist dict from `LOAD_TELEGRAM_DEVICES` env var or devices.json
+- `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`
+- Whitelist gate: Telegram notifications are only sent when a telegram.devices whitelist is explicitly configured AND at least one action matches it. Without a whitelist, notifications are blocked to prevent unintended messages to unconfigured devices.
+- Plug notifications use emoji format: `🔵 device → ON` / `🔴 device → OFF`
+
 ### EnergyCache & Incremental Fetch
-- `EnergyCache` (energy_cache.py) stores per-second energy samples with metadata:
-  - `_samples`: list[float] — per-second Wh values
-  - `_data_start`: datetime — start time of the sample window
-  - `_sample_count`, `_last_sample_at`: metadata for diagnostics
+- `EnergyCache` (energy_cache.py) stores per-second energy samples with metadata in a
+  frozen `EnergyCacheData` dataclass:
+  - `samples`: list[float] — per-second Wh values
+  - `data_start`: datetime — start time of the sample window
+  - `sample_count`, `last_sample_at`: metadata for diagnostics
+  - `full_metrics_dict`: dict[str, Any] | None — metrics dict refreshed on every fetch (not just the first),
+    returned on cache hits to preserve keys like `devices`, `nbc`, `instant`
 - `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that returns
   only new samples since the last data point. Returns `None` on API error.
 - `_merge_samples(existing, new_data)`: merges new samples into existing cache, updating
@@ -205,7 +278,9 @@ project-root
   unbounded memory growth. Called automatically by `get_or_fetch()`.
 - `get_or_fetch(fetcher, force=False)`: returns cached data if valid (within TTL), otherwise
   calls the fetcher. When an incremental fetcher is available, it merges new samples into
-  existing cache instead of replacing them entirely.
+  existing cache instead of replacing them entirely. On cache hits, returns the full metrics
+  dict (including `devices`) if stored from a prior fetch. Always updates `full_metrics_dict`
+  on every fetch to keep predictions current.
 
 ### Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
@@ -239,6 +314,10 @@ When asked to plan changes, break tasks into subtasks that each fit within a
 **32k–48k token budget per subtask**. If a task requires touching more than 3
 files or ~200 lines of code, split it into sequential subtasks and plan them
 separately. Document each subtask in the overall plan file in `.opencode/plans/`.
+
+## Plan files
+When writing or updating `.opencode/plans/*.md`, always use bash (e.g. `cat > .opencode/plans/foo.md << 'EOF'...`)
+rather than the Write or Edit tools, which fail due to path matching issues.
 
 ### Plan Implementation
 
@@ -409,6 +488,17 @@ def clean_env(monkeypatch):
     config.set('DATABASE_URL', 'sqlite:///:memory:')
     config.set('DEBUG', 'True')
 ```
+- **Use `FakeClock` for time-based tests.** Never patch `datetime.now` directly
+  — it is fragile and often patches the wrong module namespace. Always inject a
+  `FakeClock` into the object under test. Example:
+  ```python
+  from clock import FakeClock
+  fake_now = FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
+  mgr._clock = fake_now
+  ```
+  The `FakeClock` implements the same `Clock` protocol as `RealClock` so it works
+  anywhere a real clock is used (load management time-range checks, NBC quarter-hour
+  boundaries, stale-data detection, sleep-hint calculations, etc.).
 - **Never add special-case code solely to make tests pass.** For example, do not
   add `if os.getenv("TESTING"):` branches in production code paths.
 - **Updating test data is allowed and expected** when modernizing hardcoded dates

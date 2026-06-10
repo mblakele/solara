@@ -128,10 +128,8 @@ def test_default_state(stub_tesla_config):
     assert state is not None
     assert not state.is_charging
     assert state.current_amps is None
-    assert state.soc_percent == 50.0
     assert not state.plugged_in
-    assert state.at_home
-    assert not state.at_charge_limit
+    assert not state.at_home
 
 
 def test_set_mock_state(stub_tesla_config):
@@ -140,10 +138,8 @@ def test_set_mock_state(stub_tesla_config):
     new_state = TeslaState(
         is_charging=True,
         current_amps=32,
-        soc_percent=75.0,
         plugged_in=True,
         at_home=False,
-        at_charge_limit=True,
     )
     ctrl.set_mock_state(new_state)
 
@@ -151,7 +147,6 @@ def test_set_mock_state(stub_tesla_config):
     assert state.is_charging
     assert state.current_amps == 32
     assert not state.at_home
-    assert state.at_charge_limit
 
 
 def test_start_charging(stub_tesla_config):
@@ -171,10 +166,8 @@ def test_stop_charging(stub_tesla_config):
         TeslaState(
             is_charging=True,
             current_amps=24,
-            soc_percent=60.0,
             plugged_in=True,
             at_home=True,
-            at_charge_limit=False,
         )
     )
     result = asyncio.run(ctrl.stop_charging())
@@ -202,6 +195,30 @@ def test_set_charge_amps_clamps_to_range(stub_tesla_config):
     assert state.current_amps == 48
 
 
+def test_set_charge_amps_hard_max_enforced():
+    """HARD_MAX_AMPS must clamp even when config max is higher.
+
+    Belt-and-suspenders: if config loading provides charge_amps_max
+    above the safe hard limit, the controller must not honour it.
+    """
+    ctrl = TeslaController(
+        TeslaConfig(
+            client_id="test-id",
+            client_secret="test-secret",
+            redirect_uri="http://localhost/callback",
+            vehicle_id="vehicle-123",
+            home_lat=37.0,
+            home_lon=-122.0,
+            home_radius_m=500,
+            charge_amps_min=5,
+            charge_amps_max=60,  # anomalously high
+        )
+    )
+    asyncio.run(ctrl.set_charge_amps(55))
+    state = asyncio.run(ctrl.get_charging_state())
+    assert state.current_amps == 48  # clamped to HARD_MAX_AMPS
+
+
 def test_set_charge_amps_starts_charging(stub_tesla_config):
     """set_charge_amps also sets is_charging to True."""
     ctrl = TeslaController(stub_tesla_config)
@@ -216,16 +233,14 @@ def test_is_at_home_returns_mock_value(stub_tesla_config):
     """is_at_home returns the mocked value."""
     ctrl = TeslaController(stub_tesla_config)
     result = asyncio.run(ctrl.is_at_home())
-    assert result
+    assert not result
 
     ctrl.set_mock_state(
         TeslaState(
             is_charging=False,
             current_amps=None,
-            soc_percent=50.0,
             plugged_in=False,
             at_home=False,
-            at_charge_limit=False,
         )
     )
     result = asyncio.run(ctrl.is_at_home())
@@ -239,48 +254,12 @@ def test_is_plugged_in_returns_mock_value(stub_tesla_config):
         TeslaState(
             is_charging=False,
             current_amps=None,
-            soc_percent=50.0,
             plugged_in=True,
             at_home=True,
-            at_charge_limit=False,
         )
     )
     result = asyncio.run(ctrl.is_plugged_in())
     assert result
-
-
-def test_is_at_charge_limit_returns_mock_value(stub_tesla_config):
-    """is_at_charge_limit returns the mocked value."""
-    ctrl = TeslaController(stub_tesla_config)
-    ctrl.set_mock_state(
-        TeslaState(
-            is_charging=True,
-            current_amps=48,
-            soc_percent=90.0,
-            plugged_in=True,
-            at_home=True,
-            at_charge_limit=True,
-        )
-    )
-    result = asyncio.run(ctrl.is_at_charge_limit())
-    assert result
-
-
-def test_get_charge_limit_pct_returns_none_when_limited(stub_tesla_config):
-    """get_charge_limit_pct returns None when at charge limit."""
-    ctrl = TeslaController(stub_tesla_config)
-    ctrl.set_mock_state(
-        TeslaState(
-            is_charging=True,
-            current_amps=48,
-            soc_percent=90.0,
-            plugged_in=True,
-            at_home=True,
-            at_charge_limit=True,
-        )
-    )
-    result = asyncio.run(ctrl.get_charge_limit_pct())
-    assert result is None
 
 
 def test_authenticate_noop(stub_tesla_config):
@@ -288,23 +267,3 @@ def test_authenticate_noop(stub_tesla_config):
     ctrl = TeslaController(stub_tesla_config)
     asyncio.run(ctrl.authenticate())
 
-
-def test_get_charge_limit_pct_returns_soc_when_not_limited(stub_tesla_config):
-    """get_charge_limit_pct returns SOC percentage when not at charge limit."""
-    ctrl = TeslaController(stub_tesla_config)
-    # Default state has soc_percent=50.0, at_charge_limit=False
-    result = asyncio.run(ctrl.get_charge_limit_pct())
-    assert result == 50.0
-
-    ctrl.set_mock_state(
-        TeslaState(
-            is_charging=True,
-            current_amps=32,
-            soc_percent=75.0,
-            plugged_in=True,
-            at_home=True,
-            at_charge_limit=False,
-        )
-    )
-    result = asyncio.run(ctrl.get_charge_limit_pct())
-    assert result == 75.0

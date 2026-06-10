@@ -37,14 +37,14 @@ class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
         result = compute_nbc_quarter(values)
 
         self.assertIsNotNone(result)
-        self.assertFalse(result["complete"])
-        self.assertEqual(result["samples_used"], 360)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.samples_used, 360)
 
         expected_prediction_w = 3.0  # 1000 * 0.003
         expected_predicted_wh = 2100.0  # 480 + 540 * 3.0
 
-        self.assertAlmostEqual(result["prediction_w"], expected_prediction_w, places=6)
-        self.assertAlmostEqual(result["predicted_wh"], expected_predicted_wh, places=6)
+        self.assertAlmostEqual(result.prediction_w, expected_prediction_w, places=6)
+        self.assertAlmostEqual(result.predicted_wh, expected_predicted_wh, places=6)
 
     def test_prediction_uses_all_60_when_60_available(self):
         """With exactly 60 samples available, prediction must use all 60 — not fewer.
@@ -68,14 +68,14 @@ class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
         result = compute_nbc_quarter(values)
 
         self.assertIsNotNone(result)
-        self.assertFalse(result["complete"])
-        self.assertEqual(result["samples_used"], 60)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.samples_used, 60)
 
         expected_prediction_w = 2.0  # 1000 * (30*0.001 + 30*0.003) / 60
         expected_predicted_wh = 1800.0  # 120 + 840 * 2.0
 
-        self.assertAlmostEqual(result["prediction_w"], expected_prediction_w, places=6)
-        self.assertAlmostEqual(result["predicted_wh"], expected_predicted_wh, places=6)
+        self.assertAlmostEqual(result.prediction_w, expected_prediction_w, places=6)
+        self.assertAlmostEqual(result.predicted_wh, expected_predicted_wh, places=6)
 
     def test_prediction_uses_all_samples_when_fewer_than_60(self):
         """With only 30 samples available, prediction must use all 30 — not try to use 60.
@@ -92,14 +92,71 @@ class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
         result = compute_nbc_quarter(values)
 
         self.assertIsNotNone(result)
-        self.assertFalse(result["complete"])
-        self.assertEqual(result["samples_used"], 30)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.samples_used, 30)
 
         expected_prediction_w = 2.0
         expected_predicted_wh = 1800.0  # 60 + 870 * 2.0
 
-        self.assertAlmostEqual(result["prediction_w"], expected_prediction_w, places=6)
-        self.assertAlmostEqual(result["predicted_wh"], expected_predicted_wh, places=6)
+        self.assertAlmostEqual(result.prediction_w, expected_prediction_w, places=6)
+        self.assertAlmostEqual(result.predicted_wh, expected_predicted_wh, places=6)
+
+
+    def test_custom_prediction_window_30(self):
+        """With prediction_window_seconds=30, prediction must use only last 30 samples.
+
+        Layout: 300 samples of 0.001 kWh/s (1 W) followed by 30 samples of 0.003 kWh/s (3 W).
+
+        With window=30: values[-30:] = all 0.003
+            prediction_w = 1000 * 0.003 = 3.0 W
+            raw_wh = 1000 * (300*0.001 + 30*0.003) = 390 Wh
+            remaining_seconds = 900 - 330 = 570
+            predicted_wh = 390 + 570 * 3.0 = 2100 Wh
+
+        With default 60, the window would dilute to 2.0 W and 1662 Wh.
+        """
+        values = [0.001] * 300 + [0.003] * 30
+        result = compute_nbc_quarter(values, prediction_window_seconds=30)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.samples_used, 330)
+        self.assertAlmostEqual(result.prediction_w, 3.0, places=6)
+        self.assertAlmostEqual(result.predicted_wh, 2100.0, places=6)
+
+    def test_prediction_window_capped_by_available_samples(self):
+        """When prediction_window_seconds exceeds available samples, use all samples.
+
+        Layout: 100 samples of 0.002 kWh/s. Request window=200.
+        window = min(200, 100) = 100, uses all 100 samples.
+        """
+        values = [0.002] * 100
+        result = compute_nbc_quarter(values, prediction_window_seconds=200)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.samples_used, 100)
+        expected_prediction_w = 2.0  # 1000 * 0.002
+        expected_predicted_wh = 1800.0  # 200 + 800 * 2.0
+        self.assertAlmostEqual(result.prediction_w, expected_prediction_w, places=6)
+        self.assertAlmostEqual(result.predicted_wh, expected_predicted_wh, places=6)
+
+    def test_default_prediction_window_60_when_none(self):
+        """With prediction_window_seconds=None, fall back to 60-second window.
+
+        Same data as test_prediction_capped_at_60_samples_when_more_available,
+        verifying the None default matches the existing hardcoded 60.
+        """
+        values = [0.001] * 300 + [0.003] * 60
+        result = compute_nbc_quarter(values, prediction_window_seconds=None)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.samples_used, 360)
+        expected_prediction_w = 3.0
+        expected_predicted_wh = 2100.0
+        self.assertAlmostEqual(result.prediction_w, expected_prediction_w, places=6)
+        self.assertAlmostEqual(result.predicted_wh, expected_predicted_wh, places=6)
 
 
 if __name__ == "__main__":  # pragma: no cover

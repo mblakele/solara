@@ -17,7 +17,7 @@ from typing import Any
 
 import device_config
 
-from config import cfg as _cfg
+from config import Config, _config
 
 
 logger = logging.getLogger(__name__)
@@ -136,14 +136,19 @@ def load_plugs_from_file() -> dict[str, Any]:
     return plugs
 
 
-def load_vocolinc_credentials() -> tuple[str, str] | None:
+def load_vocolinc_credentials(config: Config | None = None) -> tuple[str, str] | None:
     """Load VOCOlinc username and password from environment variables.
+
+    Args:
+        config: Optional Config instance. Falls back to module-level
+            singleton when None.
 
     Returns:
         Tuple of (username, password) or None if not configured.
     """
-    username = _cfg.vocolinc_username
-    password = _cfg.vocolinc_password
+    cfg = config if config is not None else _config
+    username = cfg.vocolinc_username
+    password = cfg.vocolinc_password
     if username and password:
         return (username, password)
     return None
@@ -172,42 +177,77 @@ def load_vocolinc_plugs_from_file() -> dict[str, Any]:
     return plugs
 
 
-def load_tesla_config() -> Any:  # type: ignore[return-value]
+def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[return-value]
     """Load Tesla configuration.
 
-    Secrets (client_id, client_secret) come from environment variables via
-    decouple. Device settings (vehicle_id, GPS coords, charge limits) come
-    from devices.json.
+    Secrets and device identifiers (client_id, client_secret, vehicle_id,
+    redirect_uri) come from environment variables via decouple.
+    Home coordinates (home_lat, home_lon) are optional — when both are
+    provided the decision engine will gate Tesla charging on the vehicle
+            being at home. When either is missing, Tesla charging is allowed
+            regardless of location.
+
+    Non-secret device defaults (home_radius_m, charge limits, time_range)
+    come from devices.json.
+
+    Args:
+        config: Optional Config instance. Falls back to module-level
+            singleton when None.
 
     Returns:
-        TeslaConfig if fully configured, or None if required fields are missing.
+        TeslaConfig if vehicle_id, client_id, and client_secret are present,
+        or None if any of those required fields are missing.
+        home_lat/home_lon will be None when not configured.
     """
     from load_models import TeslaConfig
 
-    dc = device_config.get_tesla_config()
-    if dc is None:
+    cfg = config if config is not None else _config
+
+    vehicle_id = cfg.tesla_vehicle_id
+    if not vehicle_id:
         return None
 
-    client_id = _cfg.tesla_client_id
+    client_id = cfg.tesla_client_id
     if not client_id:
         return None
 
-    private_key_path = _cfg.tesla_private_key_path or None
+    private_key_path = cfg.tesla_private_key_path or None
 
-    client_secret: str | None = _cfg.tesla_client_secret
+    vehicle_command_proxy_url = cfg.tesla_vehicle_command_proxy_url or None
+
+    client_secret: str | None = cfg.tesla_client_secret
     if not client_secret:
         return None
+
+    redirect_uri = cfg.tesla_redirect_uri
+    if not redirect_uri:
+        return None
+
+    home_lat = cfg.tesla_home_lat
+    home_lon = cfg.tesla_home_lon
+
+    dc = device_config.get_tesla_config()
+    home_radius_m = 500.0
+    charge_amps_min = 5
+    charge_amps_max = 48
+    time_range = None
+    if dc is not None:
+        home_radius_m = float(dc.get("home_radius_m", 500))
+        charge_amps_min = int(dc.get("charge_amps_min", 5))
+        charge_amps_max = int(dc.get("charge_amps_max", 48))
+        time_range = _parse_device_time_range(dc.get("time_range"))
 
     return TeslaConfig(
         client_id=client_id,
         client_secret=client_secret,
-        redirect_uri=dc["redirect_uri"],
-        vehicle_id=dc["vehicle_id"],
-        home_lat=float(dc.get("home_lat", 0)),
-        home_lon=float(dc.get("home_lon", 0)),
-        home_radius_m=float(dc.get("home_radius_m", 500)),
-        charge_amps_min=int(dc.get("charge_amps_min", 5)),
-        charge_amps_max=int(dc.get("charge_amps_max", 48)),
+        redirect_uri=redirect_uri,
+        vehicle_id=vehicle_id,
+        home_lat=home_lat,
+        home_lon=home_lon,
+        home_radius_m=home_radius_m,
+        charge_amps_min=charge_amps_min,
+        charge_amps_max=charge_amps_max,
         private_key_path=private_key_path,
-        time_range=_parse_device_time_range(dc.get("time_range")),
+        time_range=time_range,
+        vehicle_command_proxy_url=vehicle_command_proxy_url,
     )

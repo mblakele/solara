@@ -30,6 +30,16 @@
       }
     ]
   },
+  "telegram": {
+    "enabled": false,
+    "alert_on_auth_error": true,
+    "bot_token": "",
+    "chat_id": "",
+    "devices": {
+      "water_heater": ["turn_on", "turn_off"],
+      "floor_lamp": ["turn_on"]
+    }
+  },
   "tesla": {
     "vehicle_id": "",
     "redirect_uri": "http://localhost:8000/callback",

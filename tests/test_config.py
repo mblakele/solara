@@ -119,9 +119,9 @@ class TestConfigSingleton:
 
     def test_singleton_is_instance(self):
         """The cfg module-level variable is a Config instance."""
-        from config import Config, cfg
+        from config import Config, _config
 
-        assert isinstance(cfg, Config)
+        assert isinstance(_config, Config)
 
 
 class TestBackwardCompatFunctions:
@@ -146,13 +146,13 @@ class TestBackwardCompatFunctions:
         import config as cfg_mod
 
         # Create a fresh singleton to pick up the new env var
-        original_cfg = cfg_mod.cfg
+        original_cfg = cfg_mod._config
         try:
-            cfg_mod.cfg = Config()
+            cfg_mod._config = Config()
             assert get_timezone() == "Europe/London"
         finally:
             # Restore original singleton so other tests are not polluted
-            cfg_mod.cfg = original_cfg
+            cfg_mod._config = original_cfg
 
     def test_get_timezone_lazy_eval(self):
         """get_timezone() picks up env changes without replacing singleton."""
@@ -176,19 +176,140 @@ class TestConfigTeslaProperties:
         """Clear decouple config before each test."""
         _decouple_config.clear_all()
 
-    def tesla_client_id_default(self):
+    def test_tesla_client_id_default(self):
         """Returns None when TESLA_CLIENT_ID is not set."""
         from config import Config
 
         cfg = Config()
         assert cfg.tesla_client_id is None
 
-    def tesla_redirect_uri_default(self):
+    def test_tesla_redirect_uri_default(self):
         """Returns empty string when TESLA_REDIRECT_URI is not set."""
         from config import Config
 
         cfg = Config()
         assert cfg.tesla_redirect_uri == ""
+
+
+class TestConfigTeslaTelemetryProperties:
+    """Tests for Tesla fleet-telemetry (MQTT) config properties."""
+
+    @pytest.fixture(autouse=True)
+    def fresh_config(self):
+        """Clear decouple config before each test."""
+        _decouple_config.clear_all()
+
+    def test_mqtt_host_default(self):
+        """Returns 'localhost' when MQTT_HOST is not set."""
+        from config import Config
+
+        cfg = Config()
+        assert cfg.mqtt_host == "localhost"
+
+    def test_mqtt_host_from_env(self):
+        """Returns host from MQTT_HOST env var."""
+        _decouple_config.set("MQTT_HOST", "192.168.1.50")
+
+        from config import Config
+
+        cfg = Config()
+        assert cfg.mqtt_host == "192.168.1.50"
+
+    def test_mqtt_port_default(self):
+        """Returns 1883 when MQTT_PORT is not set."""
+        from config import Config
+
+        cfg = Config()
+        assert cfg.mqtt_port == 1883
+
+    def test_mqtt_port_from_env(self):
+        """Returns port from MQTT_PORT env var."""
+        _decouple_config.set("MQTT_PORT", "8883")
+
+        from config import Config
+
+        cfg = Config()
+        assert cfg.mqtt_port == 8883
+
+    def test_mqtt_topic_base_default(self):
+        """Returns 'tesla/telemetry' when MQTT_TOPIC_BASE is not set."""
+        from config import Config
+
+        cfg = Config()
+        assert cfg.mqtt_topic_base == "tesla/telemetry"
+
+    def test_mqtt_topic_base_from_env(self):
+        """Returns topic base from MQTT_TOPIC_BASE env var."""
+        _decouple_config.set("MQTT_TOPIC_BASE", "vehicles/1")
+
+        from config import Config
+
+        cfg = Config()
+        assert cfg.mqtt_topic_base == "vehicles/1"
+
+    def test_tesla_telemetry_chargeamps_interval_default(self):
+        """Returns 15 when TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC is not set."""
+        from config import Config
+
+        cfg = Config()
+        assert cfg.tesla_telemetry_chargeamps_interval == 15
+
+    def test_tesla_telemetry_chargeamps_interval_from_env(self):
+        """Returns value from TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC env var."""
+        _decouple_config.set("TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC", "30")
+
+        from config import Config
+
+        cfg = Config()
+        assert cfg.tesla_telemetry_chargeamps_interval == 30
+
+    def test_tesla_telemetry_location_interval_default(self):
+        """Returns 120 when TESLA_TELEMETRY_LOCATION_INTERVAL_SEC is not set."""
+        from config import Config
+
+        cfg = Config()
+        assert cfg.tesla_telemetry_location_interval == 120
+
+    def test_tesla_telemetry_location_interval_from_env(self):
+        """Returns value from TESLA_TELEMETRY_LOCATION_INTERVAL_SEC env var."""
+        _decouple_config.set("TESLA_TELEMETRY_LOCATION_INTERVAL_SEC", "60")
+
+        from config import Config
+
+        cfg = Config()
+        assert cfg.tesla_telemetry_location_interval == 60
+
+    def test_tesla_telemetry_chargestate_interval_default(self):
+        """Returns 15 when TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC is not set."""
+        from config import Config
+
+        cfg = Config()
+        assert cfg.tesla_telemetry_chargestate_interval == 15
+
+    def test_tesla_telemetry_chargestate_interval_from_env(self):
+        """Returns value from TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC env var."""
+        _decouple_config.set("TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC", "30")
+
+        from config import Config
+
+        cfg = Config()
+        assert cfg.tesla_telemetry_chargestate_interval == 30
+
+    def test_tesla_telemetry_detailedchargestate_interval_default(self):
+        """Returns 15 when TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC is not set."""
+        from config import Config
+
+        cfg = Config()
+        assert cfg.tesla_telemetry_detailedchargestate_interval == 15
+
+    def test_tesla_telemetry_detailedchargestate_interval_from_env(self):
+        """Returns value from TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC env var."""
+        _decouple_config.set("TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC", "30")
+
+        from config import Config
+
+        cfg = Config()
+        assert cfg.tesla_telemetry_detailedchargestate_interval == 30
 
 
 class TestConfigPlugControllerProperties:

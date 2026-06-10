@@ -324,17 +324,6 @@ repeated auth failures, delete `.tesla-tokens.json` and re-authenticate.
 
 ## API Endpoints
 
-### POST /api/v1/load/manage
-
-Manually trigger a load management cycle. Append `?force=true` to bypass stale-data check (debug only).
-
-Requires `X-API-Key` header matching `LOAD_MANAGE_API_KEY` env var when set.
-
-```bash
-curl -X POST http://localhost:8000/api/v1/load/manage \
-  -H "X-API-Key: your-api-key"
-```
-
 ### GET /api/v1/load/status
 
 Read-only endpoint returning current state: enabled flag, target Wh, device states,

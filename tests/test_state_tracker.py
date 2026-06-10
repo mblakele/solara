@@ -10,16 +10,10 @@ from load_manager import (
     DeviceState,
     PendingEffect,
     StateTracker,
+    TeslaVehicleTelemetry,
 )
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
-
-def test_watts_to_wh():
-    """Test calculation of wh impact of a load in watts."""
-    watts = 300
-    wh = StateTracker.watts_to_wh(watts, 600)
-    assert wh == 50
-
 
 def test_can_toggle_true_when_never_toggled():
     """True when device never toggled."""
@@ -139,6 +133,42 @@ def test_has_pending_effect_since_outside_buffer():
     assert tracker.has_pending_effect_since(nbc_ts) is False
 
 
+def test_watts_to_wh():
+    """Test calculation of wh impact of a load in watts."""
+    wh = StateTracker.watts_to_wh(300, 600)
+    assert wh == 50
+
+
+def test_wh_to_watts():
+    """Test conversion of watt-hours to average power in watts."""
+    w = StateTracker.wh_to_watts(50, 600)
+    assert w == pytest.approx(300.0)
+
+
+def test_watts_to_amps():
+    """Test conversion of power in watts to integer amps."""
+    amps = StateTracker.watts_to_amps(2400)
+    assert amps == 10
+
+
+def test_delta_amps_to_wh():
+    """Test conversion of amp change over duration to watt-hours."""
+    wh = StateTracker.delta_amps_to_wh(10, 600)
+    assert wh == pytest.approx(400.0)
+
+
+def test_wh_to_amps():
+    """Test conversion of watt-hours to float amp change over duration."""
+    amps = StateTracker.wh_to_amps(400, 600)
+    assert amps == 10.0
+
+
+def test_wh_to_amps_non_integer():
+    """wh_to_amps returns float for non-integer ratios."""
+    amps = StateTracker.wh_to_amps(250, 656)
+    assert amps == pytest.approx(5.7165, rel=1e-3)
+
+
 def test_estimated_current_wh_adds_pending():
     """Adds pending effect delta to NBC prediction."""
     tracker = StateTracker()
@@ -153,7 +183,7 @@ def test_estimated_current_wh_adds_pending():
         )
     )
     estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=900)
-    assert pytest.approx(estimated) == 1200.0
+    assert pytest.approx(estimated) == 1050.0
 
 
 def test_estimated_current_wh_no_pending():
@@ -182,7 +212,7 @@ def test_estimated_current_wh_multiple_effects():
         ),
     ])
     estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=900)
-    assert pytest.approx(estimated) == 1100.0
+    assert pytest.approx(estimated) == 1025.0
 
 
 def test_estimated_current_wh_dynamic_power_watts():
@@ -200,14 +230,14 @@ def test_estimated_current_wh_dynamic_power_watts():
             power_watts=2000.0,
         )
     )
-    # At 600s remaining: 2000W * 600/900 = 1333.33... Wh
+    # At 600s remaining: 2000W * 600/3600 = 333.33... Wh
     estimated = tracker.estimated_current_wh(1000.0, seconds_remaining=600)
-    assert pytest.approx(estimated) == 1000.0 + 2000.0 * 600 / 900
-    # At 300s remaining: 2000W * 300/900 = 666.67... Wh
+    assert pytest.approx(estimated) == 1000.0 + 2000.0 * 600 / 3600
+    # At 300s remaining: 2000W * 300/3600 = 166.67... Wh
     estimated_late = tracker.estimated_current_wh(
         1000.0, seconds_remaining=300
     )
-    assert pytest.approx(estimated_late) == 1000.0 + 2000.0 * 300 / 900
+    assert pytest.approx(estimated_late) == 1000.0 + 2000.0 * 300 / 3600
 
 
 def test_pending_since_count_empty():
@@ -215,6 +245,40 @@ def test_pending_since_count_empty():
     tracker = StateTracker()
     now = datetime.now(timezone.utc)
     assert tracker.pending_since_count(now) == 0
+
+
+def test_prune_old_effects_boundary_not_pruned_early():
+    """Boundary: effect with data_point_at == dp_cutoff survives one more cycle.
+
+    When the latest data_point_at advances exactly prediction_window_seconds
+    past the effect's data_point_at, the dp_cutoff equals the effect's
+    data_point_at.  With strict > the effect is prematurely pruned even
+    though the data has only just caught up — the next cycle may still need
+    the adjustment.
+
+    With >= the effect survives because data_point_at >= dp_cutoff is True,
+    giving the predictor one more cycle to absorb the effect before pruning.
+    """
+    tracker = StateTracker(prediction_window_seconds=60)
+    T = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    tracker.pending_effects.append(
+        PendingEffect(
+            device_name="boundary",
+            action="turn_on",
+            timestamp=T - timedelta(seconds=80),   # wall age > 60 s
+            data_point_at=T - timedelta(seconds=60),  # dp age == 60 s (boundary)
+            power_watts=1000.0,
+        )
+    )
+
+    # now_postfetch is ahead of data_point_at (wall clock advanced more
+    # than data did, as happens in real cycles with API latency).
+    pruned = tracker.prune_old_effects(T, T + timedelta(seconds=34))
+
+    # Boundary case: the effect should NOT be pruned yet.
+    assert pruned == 0, "effect at dp_cutoff boundary should survive"
+    assert len(tracker.pending_effects) == 1
 
 
 def test_pending_since_count_uses_buffer():
@@ -292,3 +356,339 @@ def test_misleading_count_has_pending_but_count_is_zero():
 
     assert tracker.has_pending_effect_since(nbc_ts) is True
     assert tracker.pending_since_count(nbc_ts) >= 1
+
+
+class TestTeslaTelemetryState:
+    """Tests for Tesla telemetry state fields on StateTracker (TeslaVehicleTelemetry)."""
+
+    def test_has_fresh_telemetry_default_false(self) -> None:
+        """has_fresh_telemetry defaults to False on a fresh StateTracker."""
+        tracker = StateTracker()
+        assert tracker.has_fresh_telemetry is False
+
+    def test_tesla_telemetry_state_default_none(self) -> None:
+        """tesla_telemetry_state defaults to None on a fresh StateTracker."""
+        tracker = StateTracker()
+        assert tracker.tesla_telemetry_state is None
+
+    def test_to_dict_includes_has_fresh_telemetry(self) -> None:
+        """to_dict() includes the has_fresh_telemetry field."""
+        tracker = StateTracker()
+        d = tracker.to_dict()
+        assert "has_fresh_telemetry" in d
+        assert d["has_fresh_telemetry"] is False
+
+    def test_to_dict_includes_tesla_telemetry_state(self) -> None:
+        """to_dict() includes the tesla_telemetry_state field."""
+        tracker = StateTracker()
+        d = tracker.to_dict()
+        assert "tesla_telemetry_state" in d
+        assert d["tesla_telemetry_state"] is None
+
+
+class TestTeslaInflightWh:
+    """Tests for StateTracker.tesla_inflight_wh()."""
+
+    def test_no_command_returns_zero(self) -> None:
+        """Returns 0 when no command has been issued."""
+        tracker = StateTracker()
+        result = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900)
+        assert result == 0.0
+
+    def test_no_report_returns_zero(self) -> None:
+        """Returns 0 when no amps data is reported."""
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 18
+        result = tracker.tesla_inflight_wh(reported_amps=None, seconds_remaining=900)
+        assert result == 0.0
+
+    def test_charging_at_commanded_level_returns_zero(self) -> None:
+        """Returns 0 when car is already at the commanded amp level."""
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 18
+        result = tracker.tesla_inflight_wh(reported_amps=18, seconds_remaining=900)
+        assert result == 0.0
+
+    def test_charging_at_reduced_level_returns_partial_delta(self) -> None:
+        """Returns positive Wh when car is charging below commanded level."""
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 18
+        # delta = 18 - 5 = 13 A, 900s remaining, 240V
+        # wh = 13 * 240 * 900 / 3600 = 780 Wh
+        result = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900)
+        assert pytest.approx(result) == 13 * 240 * 900 / 3600
+
+    def test_charging_stopped_clears_command_and_returns_zero(self) -> None:
+        """When car stops charging (amps=0), cleans up and returns 0.
+
+        This is the regression test for the leak after charging completes.
+        """
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 18
+        result = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900)
+        assert result == 0.0
+        # last_commanded_amps should be cleared so it doesn't leak
+        assert tracker.last_commanded_amps is None
+
+    def test_one_amp_with_old_command_clears_state(self) -> None:
+        """When car reports 1 amp and the command is old (beyond settle),
+        treat it as stale and clear last_commanded_amps.
+
+        A delta of 1 from a previous command is stale — the car never reached
+        that level, so the in-flight correction should be zero.
+        """
+        tracker = StateTracker(prediction_window_seconds=60)
+        tracker.last_commanded_amps = 18
+        tracker.last_tesla_command_at = fixed_now - timedelta(seconds=200)
+        result = tracker.tesla_inflight_wh(
+            reported_amps=1, seconds_remaining=900, now=fixed_now,
+        )
+        assert result == 0.0
+        assert tracker.last_commanded_amps is None
+
+    def test_one_amp_during_ramp_up_does_not_clear_state(self) -> None:
+        """When car reports 1 amp during ramp-up (command is recent),
+        do NOT clear last_commanded_amps — the car is still ramping.
+
+        The car briefly reports 1A while transitioning from stopped to the
+        commanded amp level.  Clearing state here would lose the in-flight
+        delta and cause the next cycle to over-allocate.
+        """
+        tracker = StateTracker(prediction_window_seconds=60)
+        tracker.last_commanded_amps = 20
+        tracker.last_tesla_command_at = fixed_now - timedelta(seconds=10)
+        result = tracker.tesla_inflight_wh(
+            reported_amps=1, seconds_remaining=900, now=fixed_now,
+        )
+        assert result == 0.0  # not confirmed yet, but no inflight Wh to report
+        # last_commanded_amps must survive — the ramp is still in progress
+        assert tracker.last_commanded_amps == 20
+
+    def test_positive_delta_returns_positive_wh(self) -> None:
+        """Positive amp delta (car charging less than commanded) returns positive Wh."""
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 18
+        # Car is at 10 A, commanded 18 A, 450s remaining
+        # delta = 8 A, wh = 8 * 240 * 450 / 3600 = 240
+        result = tracker.tesla_inflight_wh(reported_amps=10, seconds_remaining=450)
+        assert pytest.approx(result) == 8 * 240 * 450 / 3600
+
+    def test_negative_delta_returns_negative_wh(self) -> None:
+        """Negative amp delta (car charging more than commanded) returns negative Wh."""
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 10
+        # Car is at 15 A but only commanded 10 A, 900s remaining
+        # delta = -5 A, wh = -5 * 240 * 900 / 3600 = -300
+        result = tracker.tesla_inflight_wh(reported_amps=15, seconds_remaining=900)
+        assert pytest.approx(result) == -5 * 240 * 900 / 3600
+
+    def test_no_command_stays_none_when_called(self) -> None:
+        """Calling with no command doesn't mutate state."""
+        tracker = StateTracker()
+        assert tracker.last_commanded_amps is None
+        tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900)
+        assert tracker.last_commanded_amps is None
+
+    def test_one_amp_with_data_point_at_keeps_alive(self) -> None:
+        """When wall clock past settle but data_point_at recent, keep command."""
+        tracker = StateTracker(prediction_window_seconds=60)  # settle = 60s
+        tracker.last_commanded_amps = 20
+        command_dp = fixed_now - timedelta(seconds=10)
+        # Wall clock is 200s past (well past 60s settle)
+        tracker.last_tesla_command_at = fixed_now - timedelta(seconds=200)
+        tracker.last_tesla_command_data_point_at = command_dp
+        # But data_point_at has only advanced 55s (within 60s settle)
+        result = tracker.tesla_inflight_wh(
+            reported_amps=1, seconds_remaining=900,
+            now=fixed_now, data_point_at=command_dp + timedelta(seconds=55),
+        )
+        assert result == 0.0
+        assert tracker.last_commanded_amps == 20  # not cleared
+
+    def test_settle_expired_car_below_target_clears(self) -> None:
+        """After settle window, car below target → clear stale state, return 0."""
+        tracker = StateTracker(prediction_window_seconds=60)
+        tracker.last_commanded_amps = 24
+        # Increase recorded 200s ago — well past 60s settle window
+        tracker.record_tesla_amp_increase(
+            fixed_now - timedelta(seconds=200), qh_name="QH1",
+        )
+        result = tracker.tesla_inflight_wh(
+            reported_amps=10, seconds_remaining=746, now=fixed_now,
+        )
+        assert result == 0.0
+        assert tracker.last_commanded_amps is None
+
+    def test_settle_active_car_below_target_preserves_state(self) -> None:
+        """During settle window, car below target → return delta, keep state."""
+        tracker = StateTracker(prediction_window_seconds=60)
+        tracker.last_commanded_amps = 24
+        # Increase recorded 30s ago — within 60s settle window
+        tracker.record_tesla_amp_increase(
+            fixed_now - timedelta(seconds=30), qh_name="QH1",
+        )
+        result = tracker.tesla_inflight_wh(
+            reported_amps=10, seconds_remaining=746, now=fixed_now,
+        )
+        # delta = 24 - 10 = 14 A, wh = 14 * 240 * 746 / 3600 = 696.27
+        assert pytest.approx(result) == 14 * 240 * 746 / 3600
+        assert tracker.last_commanded_amps == 24
+
+    def test_one_amp_with_both_expired_via_data(self) -> None:
+        """When both wall and data measures exceed settle, clear state."""
+        tracker = StateTracker(prediction_window_seconds=60)  # settle = 120s
+        tracker.last_commanded_amps = 20
+        command_dp = fixed_now - timedelta(seconds=200)
+        tracker.last_tesla_command_at = fixed_now - timedelta(seconds=200)
+        tracker.last_tesla_command_data_point_at = command_dp
+        # Both timestamps are past 120s settle
+        result = tracker.tesla_inflight_wh(
+            reported_amps=1, seconds_remaining=900,
+            now=fixed_now, data_point_at=command_dp + timedelta(seconds=200),
+        )
+        assert result == 0.0
+        assert tracker.last_commanded_amps is None  # cleared as stale
+
+
+class TestEffectiveSettleSecs:
+    """Tests for StateTracker.effective_settle_secs."""
+
+    def test_default_prediction_window(self) -> None:
+        """With default prediction_window_seconds=60, settle is 60."""
+        tracker = StateTracker()
+        assert tracker.effective_settle_secs == 60
+
+    def test_custom_prediction_window_30(self) -> None:
+        """With prediction_window_seconds=30, settle is 30."""
+        tracker = StateTracker(prediction_window_seconds=30)
+        assert tracker.effective_settle_secs == 30
+
+    def test_small_prediction_window(self) -> None:
+        """With prediction_window_seconds=10, settle is 10."""
+        tracker = StateTracker(prediction_window_seconds=10)
+        assert tracker.effective_settle_secs == 10
+
+
+class TestPostDecreaseSettle:
+    """Tests for post-decrease settle window (symmetric to amp-increase settle)."""
+
+    def test_record_decrease_sets_state(self) -> None:
+        """record_tesla_amp_decrease sets last_tesla_decrease_at and qh."""
+        tracker = StateTracker()
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1")
+        assert tracker.last_tesla_decrease_at == fixed_now
+        assert tracker.last_tesla_decrease_qh == "QH1"
+
+    def test_decrease_clears_increase_settle(self) -> None:
+        """Recording a decrease clears any prior increase settle state."""
+        tracker = StateTracker()
+        tracker.record_tesla_amp_increase(fixed_now - timedelta(seconds=10), "QH1")
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1")
+        assert tracker.last_tesla_increase_at is None
+        assert tracker.last_tesla_increase_qh is None
+
+    def test_decrease_settle_suppresses(self) -> None:
+        """Within the settle window, is_settling_after_amp_decrease returns True."""
+        tracker = StateTracker(prediction_window_seconds=60)
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1")
+        # 30 s later — well within 60 s window
+        assert tracker.is_settling_after_amp_decrease(
+            fixed_now + timedelta(seconds=30), current_qh="QH1",
+        ) is True
+
+    def test_decrease_settle_expires(self) -> None:
+        """After the settle window, is_settling_after_amp_decrease returns False."""
+        tracker = StateTracker(prediction_window_seconds=30)  # settle = 30s
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1")
+        # 61 s later — past 30 s window
+        assert tracker.is_settling_after_amp_decrease(
+            fixed_now + timedelta(seconds=61), current_qh="QH1",
+        ) is False
+
+    def test_decrease_settle_expires_on_qh_change(self) -> None:
+        """A new quarter-hour expires the decrease settle."""
+        tracker = StateTracker()
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1")
+        assert tracker.is_settling_after_amp_decrease(
+            fixed_now + timedelta(seconds=10), current_qh="QH2",
+        ) is False
+
+    def test_increase_settle_clears_decrease_settle(self) -> None:
+        """Recording an increase clears any prior decrease settle state."""
+        tracker = StateTracker()
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1")
+        tracker.record_tesla_amp_increase(fixed_now, "QH1")
+        assert tracker.last_tesla_decrease_at is None
+        assert tracker.last_tesla_decrease_qh is None
+
+    def test_clear_tesla_settle_clears_both(self) -> None:
+        """clear_tesla_settle clears both increase and decrease state."""
+        tracker = StateTracker()
+        tracker.record_tesla_amp_increase(fixed_now, "QH1")
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1")
+        tracker.clear_tesla_settle()
+        assert tracker.last_tesla_increase_at is None
+        assert tracker.last_tesla_decrease_at is None
+
+    def test_decrease_settle_with_data_point_at_lag_persists(self) -> None:
+        """When data_point_at lags, settle persists even after wall clock expiry."""
+        tracker = StateTracker(prediction_window_seconds=60)  # settle = 60s
+        record_dp = fixed_now - timedelta(seconds=50)  # data lags clock by 50s
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1", data_point_at=record_dp)
+        # Wall clock advanced 130 s (past 60 s settle), but data only advanced 50 s
+        advanced_wall = fixed_now + timedelta(seconds=130)
+        advanced_dp = record_dp + timedelta(seconds=50)
+        assert tracker.is_settling_after_amp_decrease(
+            advanced_wall, current_qh="QH1", data_point_at=advanced_dp,
+        ) is True
+
+    def test_decrease_settle_with_both_expired(self) -> None:
+        """When both wall clock and data_point_at exceed settle, window expires."""
+        tracker = StateTracker(prediction_window_seconds=60)  # settle = 60s
+        record_dp = fixed_now - timedelta(seconds=50)
+        tracker.record_tesla_amp_decrease(fixed_now, "QH1", data_point_at=record_dp)
+        # Both advanced past 60 s
+        advanced_wall = fixed_now + timedelta(seconds=130)
+        advanced_dp = record_dp + timedelta(seconds=130)  # also past 60 s
+        assert tracker.is_settling_after_amp_decrease(
+            advanced_wall, current_qh="QH1", data_point_at=advanced_dp,
+        ) is False
+
+
+class TestIncreaseSettleDataPointAt:
+    """Tests for is_settling_after_amp_increase with data_point_at dual checking."""
+
+    def test_settle_with_data_point_at_lag_persists(self) -> None:
+        """When data_point_at lags, settle persists even after wall clock expiry."""
+        tracker = StateTracker(prediction_window_seconds=60)  # settle = 60s
+        record_dp = fixed_now - timedelta(seconds=50)
+        tracker.record_tesla_amp_increase(fixed_now, "QH1", data_point_at=record_dp)
+        advanced_wall = fixed_now + timedelta(seconds=130)  # past wall settle
+        advanced_dp = record_dp + timedelta(seconds=50)  # still within data settle
+        assert tracker.is_settling_after_amp_increase(
+            advanced_wall, current_qh="QH1", data_point_at=advanced_dp,
+        ) is True
+
+    def test_settle_with_both_expired(self) -> None:
+        """When both measures exceed settle, window expires."""
+        tracker = StateTracker(prediction_window_seconds=60)  # settle = 60s
+        record_dp = fixed_now - timedelta(seconds=50)
+        tracker.record_tesla_amp_increase(fixed_now, "QH1", data_point_at=record_dp)
+        advanced_wall = fixed_now + timedelta(seconds=130)
+        advanced_dp = record_dp + timedelta(seconds=130)
+        assert tracker.is_settling_after_amp_increase(
+            advanced_wall, current_qh="QH1", data_point_at=advanced_dp,
+        ) is False
+
+    def test_settle_with_data_point_at_none_falls_back_to_wall(self) -> None:
+        """When data_point_at is None, falls back to wall-only check."""
+        tracker = StateTracker(prediction_window_seconds=30)  # settle = 30s
+        tracker.record_tesla_amp_increase(fixed_now, "QH1")
+        # Within wall window — should be True
+        assert tracker.is_settling_after_amp_increase(
+            fixed_now + timedelta(seconds=20), current_qh="QH1",
+        ) is True
+        # Past wall window — should be False
+        assert tracker.is_settling_after_amp_increase(
+            fixed_now + timedelta(seconds=40), current_qh="QH1",
+        ) is False

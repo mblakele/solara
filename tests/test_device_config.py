@@ -173,20 +173,22 @@ def test_get_tesla_config_none_when_missing():
         assert device_config.get_tesla_config() is None
 
 
-def test_get_tesla_config_none_when_no_vehicle_id():
-    """Returns None when vehicle_id is empty or missing."""
+def test_get_tesla_config_returns_section_even_without_vehicle_id():
+    """Returns the tesla section even when vehicle_id is missing.
+
+    vehicle_id may come from env vars rather than devices.json.
+    The amp limits (charge_amps_min/max) must still be readable.
+    """
     with patch("device_config._load", return_value={
-        "tesla": {"redirect_uri": "http://localhost"}
+        "tesla": {"charge_amps_min": 5, "charge_amps_max": 24}
     }):
-        assert device_config.get_tesla_config() is None
-
-    with patch("device_config._load", return_value={
-        "tesla": {"vehicle_id": ""}
-    }):
-        assert device_config.get_tesla_config() is None
+        result = device_config.get_tesla_config()
+    assert result is not None
+    assert result["charge_amps_min"] == 5
+    assert result["charge_amps_max"] == 24
 
 
-def test_get_tesla_config_returns_section():
+def test_get_tesla_config_returns_section_with_vehicle_id():
     """Returns the full tesla section when vehicle_id is present."""
     with patch("device_config._load", return_value={
         "tesla": {
@@ -199,6 +201,44 @@ def test_get_tesla_config_returns_section():
     assert result is not None
     assert result["vehicle_id"] == "5YJ3E1EA4KF123456"
     assert result["home_lat"] == 37.0
+
+
+def test_get_tesla_config_returns_section_with_empty_vehicle_id():
+    """Returns the tesla section even when vehicle_id is empty string.
+
+    The empty-vehicle_id case should be treated the same as missing —
+    the section still exists and its other fields are valid.
+    """
+    with patch("device_config._load", return_value={
+        "tesla": {"vehicle_id": "", "charge_amps_max": 32}
+    }):
+        result = device_config.get_tesla_config()
+    assert result is not None
+    assert result["charge_amps_max"] == 32
+
+
+def test_get_telegram_config_returns_section_when_present():
+    """Returns the telegram section when it exists."""
+    telegram_data = {
+        "enabled": True,
+        "bot_token": "123:ABC",
+        "chat_id": "-100123456",
+    }
+    with patch("device_config._load", return_value={"telegram": telegram_data}):
+        result = device_config.get_telegram_config()
+    assert result == telegram_data
+
+
+def test_get_telegram_config_returns_none_when_missing():
+    """Returns None when telegram section is absent."""
+    with patch("device_config._load", return_value={}):
+        assert device_config.get_telegram_config() is None
+
+
+def test_get_telegram_config_returns_none_when_empty_section():
+    """Returns None when telegram section exists but is empty dict."""
+    with patch("device_config._load", return_value={"telegram": {}}):
+        assert device_config.get_telegram_config() is None
 
 
 # --- New public accessor tests ---

@@ -5,7 +5,7 @@ Call Emporia VUE API and marshal predicted usage.
 import dataclasses
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import json
 import locale
 import logging
@@ -15,21 +15,35 @@ import requests
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 
+from clock import Clock, RealClock
 from energy_cache import EnergyCache
-from energy_aggregator import EnergyDataAggregator
+from energy_aggregator import EnergyDataAggregator, TOUBuckets
 from util import (
     CustomJSONProvider,
+    NBCQuarterSet,
     ceil_to_qh,
     compute_nbc_quarters,
     custom_json_default,
     is_debug,
-    qh_seconds_remaining,
 )
 
-from config import cfg as _cfg
+from config import Config, _config
 
 
 logger = logging.getLogger(__name__)
+
+_CLOCK: Clock = RealClock()
+
+
+def set_clock(clock: Clock) -> None:
+    """Override the module-level clock for testing.
+
+    Args:
+        clock: A ``Clock`` instance (typically ``FakeClock`` in tests).
+    """
+    global _CLOCK  # noqa: PLW0603
+    _CLOCK = clock
+
 
 MAX_FETCH_WINDOW = timedelta(hours=1)
 
@@ -39,6 +53,10 @@ def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
 
     If chart_start is more than 1 hour before *now*, return the earliest
     appropriate quarter-hour boundary.  Otherwise return chart_start unchanged.
+
+    Also guards against chart_start being in the future (which causes the
+    Emporia API to return a 400 when start > end).  A future chart_start
+    indicates corrupted cache state; fall back to a full-hour fetch.
 
     This guard prevents the Emporia API from rejecting large 1-second
     resolution requests when the load manager has been idle for a long
@@ -52,6 +70,9 @@ def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
         A datetime no more than 1 hour before *now*, or *chart_start*
         unchanged if it is already within the 1-hour window.
     """
+    if chart_start > now:
+        return ceil_to_qh(now - MAX_FETCH_WINDOW)
+
     if now - chart_start <= MAX_FETCH_WINDOW:
         return chart_start
 
@@ -112,13 +133,23 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         )
         hp = HourlyProjection(now, logger, energy_cache)
         hp.populate(chart_start)
+        logger.debug(
+            "create_metrics result: devices=%d, data_start=%s, "
+            "per_second_data_total=%d",
+            len(hp.metrics.get("devices", [])),
+            hp.metrics.get("data_start"),
+            sum(
+                len(d.get("per_second_data", []))
+                for d in hp.metrics.get("devices", [])
+            ) if hp.metrics.get("devices") else 0,
+        )
         return hp.metrics
 
     except AssertionError as ae:
         logger.error(ae)
         # force clean cache and full fetch on next cycle
         energy_cache.invalidate()
-        raise RetryableMetricsException(ae)
+        raise RetryableMetricsException(ae) from ae
 
 
 @dataclass
@@ -126,7 +157,6 @@ class _PopulationResult:
     """Intermediate results from populating one device — no mutation of API objects."""
 
     per_second_data: list[float]
-    scales: dict[str, Any]
     chart_data: list[float]
     nbc_seconds: list[float]
     nbc_data_start: datetime
@@ -144,10 +174,35 @@ class _PredictionData:
 
 @dataclass(frozen=True)
 class _MinuteData:
-    """Per-minute prediction and remaining time."""
-
+    """Minute-scale prediction data (internal, not serialized directly)."""
     predicted: float
     minutes_remaining: float
+
+
+@dataclass(frozen=True)
+class DevicePrediction:
+    """Prediction result for one device.
+
+    Replaces the dict return from _predict_device() with a typed dataclass.
+    """
+
+    lag: timedelta
+    minute_predicted: float
+    prediction: float
+    prediction_min: float
+    prediction_max: float
+    seconds_remaining: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dict for backward compat with intermediate callers."""
+        return {
+            "lag": self.lag,
+            "minute_predicted": self.minute_predicted,
+            "prediction": self.prediction,
+            "prediction_min": self.prediction_min,
+            "prediction_max": self.prediction_max,
+            "seconds_remaining": self.seconds_remaining,
+        }
 
 
 @dataclass
@@ -170,14 +225,11 @@ class DeviceMetrics:
         default_factory=lambda: _MinuteData(predicted=0.0, minutes_remaining=0.0),
         repr=False,
     )
-    scales: dict[str, Any] = dataclasses.field(  # type: ignore[assignment]
-        default_factory=dict, repr=False
-    )
-    smoothing: dict[str, float] = dataclasses.field(  # type: ignore[assignment]
-        default_factory=dict, repr=False
-    )
-    nbc: dict[str, Any] = dataclasses.field(  # type: ignore[assignment]
-        default_factory=dict, repr=False
+    nbc: NBCQuarterSet = dataclasses.field(  # type: ignore[assignment]
+        default_factory=lambda: NBCQuarterSet(
+            qh1=None, qh2=None, qh3=None, qh4=None
+        ),
+        repr=False,
     )
     timezone: str = ""
 
@@ -195,11 +247,28 @@ class DeviceMetrics:
             "prediction_max": round(self.prediction.max_value, 14),
             "minute_predicted": round(self.minute_data.predicted, 14),
             "minutes_remaining": round(self.minute_data.minutes_remaining, 14),
-            "scales": self.scales,
-            "smoothing": {k: round(v, 14) for k, v in self.smoothing.items()},
             "timezone": self.timezone,
-            "nbc": self.nbc,
+            "nbc": self.nbc.to_dict(),
             "per_second_data": self.per_second_data,
+        }
+
+
+@dataclass(frozen=True)
+class TOUResult:
+    """Result of a TOU (Time-of-Use) query.
+
+    Wraps TOUBuckets and NBC total for the requested date range.
+    Replaces the dict return from _get_tou_model().
+    """
+
+    buckets: TOUBuckets
+    nbc: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dict for backward compat."""
+        return {
+            "buckets": self.buckets.to_dict(),
+            "nbc": self.nbc,
         }
 
 
@@ -282,7 +351,7 @@ class RetryableMetricsException(Exception):
 
     def __init__(self, message, *args):
         self.message = message
-        self.instant = datetime.now(timezone.utc) # ok
+        self.instant = _CLOCK.now()
         super().__init__(message, *args)
 
 
@@ -302,7 +371,12 @@ class MetricsBase:
     vue_auth: ClassVar[dict[str, Any]] = {}
     vue_keys: ClassVar[str] = ".vue-keys.json"
 
-    def __init__(self, logger_next: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        logger_next: Optional[logging.Logger] = None,
+        config: Config | None = None,
+    ) -> None:
+        self._cfg = config if config is not None else _config
         self.logger = logger_next or logger
         self.vue_init()
         self.get_device_info()
@@ -316,6 +390,8 @@ class MetricsBase:
 
         if not self.vue:
             return
+
+        cfg = getattr(self, '_cfg', _config)
 
         #self.logger.debug({"keys": self.vue_keys})
         try:
@@ -333,8 +409,8 @@ class MetricsBase:
             self.logger.exception("keys failed: will use password")
             try:
                 login_ok = self.vue.login(
-                    username=_cfg.vue_username,
-                    password=_cfg.vue_password,
+                    username=cfg.vue_username,
+                    password=cfg.vue_password,
                     token_storage_file=self.vue_keys,
                 )
             except Exception as inner_ex:
@@ -347,8 +423,8 @@ class MetricsBase:
             self.logger.debug("token login failed, trying password")
             try:
                 login_ok = self.vue.login(
-                    username=_cfg.vue_username,
-                    password=_cfg.vue_password,
+                    username=cfg.vue_username,
+                    password=cfg.vue_password,
                     token_storage_file=self.vue_keys,
                 )
             except Exception as inner_ex:
@@ -362,14 +438,14 @@ class MetricsBase:
                 "Vue authentication failed: check credentials"
             )
 
-        self.vue_auth["last"] = datetime.now(timezone.utc) # ok
+        self.vue_auth["last"] = _CLOCK.now()
 
     def get_device_info(self) -> None:
         """
         Wrapper for vue get_devices,
         filtering results for ZIG001 devices.
         """
-        rt_start = datetime.now(timezone.utc) # ok
+        rt_start = _CLOCK.now()
         age_limit = timedelta(hours=24)
         self.logger.debug(
             {"device_info_len": len(self.device_info), "vue_auth": self.vue_auth}
@@ -421,20 +497,21 @@ class HourlyProjection(MetricsBase):
         instant: datetime,
         logger_next: Optional[logging.Logger] = None,
         energy_cache: Optional["EnergyCache"] = None,
+        config: Config | None = None,
     ) -> None:
         self.metrics: dict[str, Any] = {
             "api_response": {},
-            "debug": is_debug(),
+            "debug": is_debug(config),
             "devices": [],
         }
 
-        super().__init__(logger_next)
+        super().__init__(logger_next, config=config)
 
         self.instant = instant
         self.metrics["instant"] = self.instant
         self.energy_cache = energy_cache  # Merged samples for NBC computation
 
-    def populate(self, chart_start: datetime) -> dict[int, dict[str, Any]]:
+    def populate(self, chart_start: datetime) -> dict[int, DevicePrediction]:
         """Fetch recent data using second granularity to minimize lag.
 
         The caller must compute chart_start. On the first call, use
@@ -506,7 +583,7 @@ class HourlyProjection(MetricsBase):
         if predictions:
             first_gid = next(iter(predictions))
             pred_result = predictions[first_gid]
-            lag_td: timedelta = pred_result.get("lag", timedelta(0))
+            lag_td: timedelta = pred_result.lag
             self.metrics["_data_lag_secs"] = lag_td.total_seconds()
 
         return predictions
@@ -535,44 +612,9 @@ class HourlyProjection(MetricsBase):
             self.logger.debug({"usage_data": usage_data_local})
             raise RetryableMetricsException("No data for hour")
         self.metrics["api_response"]["get_chart_usage/" + str(chan.channel_num)] = (
-            datetime.now(timezone.utc) - chart_start # ok
+            _CLOCK.now() - chart_start
         )
         return usage_data_local, usage_data_start_local, chan.channel_num
-
-    def _process_offset_scales(
-        self, scales: dict[str, Any], usage_data_local: list[float], usage_data_end: datetime
-    ) -> list[float]:
-        """Process minute-scale offset data (1MIN–10MIN) and return chart_data.
-
-        Computes usage for each minute scale from the tail of the dataset
-        and stores results in the provided scales dict. Returns the last 300
-        data points as chart_data without mutating any API objects.
-
-        Args:
-            scales: Dict to populate with minute-scale entries (mutated in-place).
-            usage_data_local: Per-second usage data for the current hour.
-            usage_data_end: End time of the usage data window.
-
-        Returns:
-            Last 300 data points as chart_data.
-        """
-        usage_data_len = len(usage_data_local)
-        usage_minutes = max(1, min(10, usage_data_end.minute))
-        self.logger.debug(
-            {
-                "usage_data": usage_data_local[:3],
-                "usage_data_start": usage_data_end - timedelta(seconds=usage_data_len),
-                "usage_data_len": usage_data_len,
-                "usage_minutes": usage_minutes,
-            }
-        )
-        for usm in range(1, 1 + usage_minutes):
-            uss = 60 * usm
-            scale = str(usm) + "MIN"
-            offset_data = usage_data_local[-uss:]
-            offset_start = usage_data_end - timedelta(minutes=usm)
-            scales[scale] = self.data_for_scale(offset_data, offset_start, scale)
-        return usage_data_local[-300:]
 
     def populate_internal(
         self, chart_start: datetime, energy_cache: Optional["EnergyCache"] = None
@@ -597,58 +639,9 @@ class HourlyProjection(MetricsBase):
                 results[vdi.device_gid] = result
         return results
 
-    def populate_scale(
-        self, dig: Any, scale: str, data_start: datetime, data: list[float]
-    ) -> None:
-        """
-        Populate N seconds of usage data for a scale
-        of 1H or M minutes.
-        """
-        #self.logger.debug(
-        #    {"dig": dig, "scale": scale, "data_start": data_start, "data": data[:3]}
-        #)
-        if not hasattr(dig, "scales"):
-            dig.scales = {}
-        if scale not in dig.scales:
-            dig.scales[scale] = {}
-        dig.scales[scale] = self.data_for_scale(data, data_start, scale)
-
-    @staticmethod
-    def data_for_scale(
-        data: list[float], data_start: datetime, scale: str
-    ) -> dict[str, Any]:
-        """Calculate usage statistics for a given scale (hour or minutes).
-
-        Args:
-            data: kWh values per second/minute. Negative values indicate solar export.
-            data_start: Start time of the first data point.
-            scale: Scale identifier ('1H', '1MIN'-'10MIN').
-
-        Returns:
-            Dict with keys: usage (Wh), seconds, instant, and optionally
-                data/data_len/data_start if DEBUG is enabled.
-        """
-        dsi: dict[str, object] = {}
-        data_len = len(data)
-
-        if is_debug():
-            dsi["data"] = data[:3]
-            dsi["data_len"] = data_len
-            dsi["data_start"] = data_start
-
-        usage = 1000.0 * sum(data)
-        if not scale == "1H" and data_len != 0:
-            usage = usage * 60.0 / data_len
-
-        dsi["scale"] = scale
-        dsi["instant"] = data_start + timedelta(seconds=data_len)
-        dsi["seconds"] = data_len
-        dsi["usage"] = usage
-        return dsi
-
     def predict(
         self, population: dict[int, _PopulationResult]
-    ) -> dict[int, dict[str, Any]]:
+    ) -> dict[int, DevicePrediction]:
         """Predict consumption or surplus at end of current hour.
 
         Uses the minute-scale usage rate to extrapolate remaining
@@ -659,18 +652,21 @@ class HourlyProjection(MetricsBase):
             population: Results from populate(), mapping gid -> PopulationResult.
 
         Returns:
-            Dict of gid -> prediction results for each device.
+            Dict of gid -> DevicePrediction for each device.
         """
-        predictions: dict[int, dict[str, Any]] = {}
+        predictions: dict[int, DevicePrediction] = {}
         for gid, pop_result in population.items():
-            pred_result = self._predict_device(pop_result.scales)
+            pred_result = self._predict_device(
+                pop_result.per_second_data, pop_result.nbc_data_start
+            )
             predictions[gid] = pred_result
         return predictions
 
     def _compute_nbc(
         self,
-        usage_data_local: list[float]
-    ) -> dict[str, Any]:
+        usage_data_local: list[float],
+        prediction_window_seconds: int | None = None,
+    ) -> NBCQuarterSet:
         """Compute NBC values for each quarter hour in the current hour.
 
         Delegates to ``compute_nbc_quarters`` in util. Quarter boundaries are
@@ -680,12 +676,18 @@ class HourlyProjection(MetricsBase):
 
         Args:
             usage_data_local: Per-second kWh data for the current hour.
+            prediction_window_seconds: Number of trailing seconds to use for
+                rate extrapolation of the incomplete quarter. Passed through
+                to ``compute_nbc_quarters``. Defaults to 60 when ``None``.
 
         Returns:
-            Dict with keys QH1-QH4, each containing NBC metrics or None if
-            the quarter has not yet started.
+            An ``NBCQuarterSet`` with QH1-QH4 containing NBC metrics or
+            ``None`` if the quarter has not yet started.
         """
-        result = compute_nbc_quarters(usage_data_local)
+        result = compute_nbc_quarters(
+            usage_data_local,
+            prediction_window_seconds=prediction_window_seconds,
+        )
         self.logger.debug("_compute_nbc len %d (%s)", len(usage_data_local), result)
         return result
 
@@ -703,7 +705,7 @@ class HourlyProjection(MetricsBase):
             energy_cache: Optional merged sample cache for NBC computation.
 
         Returns:
-            PopulationResult with computed scales, or None on error.
+            PopulationResult with computed per-device data, or None on error.
         """
         # Store cache reference for _compute_device_metrics to use for NBC.
         if energy_cache is not None:
@@ -720,17 +722,10 @@ class HourlyProjection(MetricsBase):
                 )
                 return None
 
-            scales: dict[str, Any] = {}
-            scales[Scale.HOUR.value] = self.data_for_scale(
-                usage_data_local, usage_data_start_local, Scale.HOUR.value
-            )
-
-            usage_data_end = usage_data_start_local + timedelta(seconds=len(usage_data_local))
-            chart_data = self._process_offset_scales(scales, usage_data_local, usage_data_end)
+            chart_data = usage_data_local[-300:]
 
             return _PopulationResult(
                 per_second_data=usage_data_local,
-                scales=scales,
                 chart_data=chart_data,
                 nbc_seconds=usage_data_local,
                 nbc_data_start=usage_data_start_local,
@@ -738,14 +733,17 @@ class HourlyProjection(MetricsBase):
             )
         return None
 
-    def _predict_device(self, scales: dict[str, Any]) -> dict[str, Any]:
-        """Compute prediction and smoothing for one device from its scales.
+    def _predict_device(
+        self, per_second_data: list[float], data_start: datetime
+    ) -> DevicePrediction:
+        """Compute prediction for one device from raw per-second data.
 
         Args:
-            scales: Computed scale entries (1H, 1MIN-10MIN) from population.
+            per_second_data: Per-second kWh values for the current hour.
+            data_start: Start time of the per-second data.
 
         Returns:
-            Dict with prediction, min/max bounds, smoothing, lag, etc.
+            DevicePrediction with prediction, min/max bounds, lag, etc.
         """
         hour_next = (
             self.instant
@@ -756,48 +754,39 @@ class HourlyProjection(MetricsBase):
                 microseconds=self.instant.microsecond,
             )
         )
-        hour = scales[Scale.HOUR.value]
-        seconds_remaining_hour = (hour_next - hour["instant"]).total_seconds() # hour, not NBC QH period
+        hour_instant = data_start + timedelta(seconds=len(per_second_data))
+        hour_usage = 1000.0 * sum(per_second_data)
+        seconds_remaining_hour = (hour_next - hour_instant).total_seconds()
 
-        minute_predicted = (
-            seconds_remaining_hour * scales[Scale.MINUTE.value]["usage"] / 60.0
-        )
-        prediction = hour["usage"] + minute_predicted
+        def _minute_usage(data: list[float]) -> float:
+            """Compute Wh/minute usage rate from last 60 seconds of data."""
+            tail = data[-60:]
+            total_wh = 1000.0 * sum(tail)
+            return total_wh * 60.0 / len(tail) if len(tail) != 0 else 0.0
 
-        smoothing: dict[str, float] = {}
-        prediction_min = prediction
-        prediction_max = prediction
-        for scale in scales.keys():
-            if not scale.endswith("MIN"):
-                continue
-            sval = hour["usage"] + (
-                seconds_remaining_hour * scales[scale]["usage"] / 60.0
-            )
-            prediction_min = min(sval, prediction_min)
-            prediction_max = max(sval, prediction_max)
-            smoothing[scale] = sval
+        minute_predicted = seconds_remaining_hour * _minute_usage(per_second_data) / 60.0
+        prediction = hour_usage + minute_predicted
 
         lag = (
-            self.instant - hour["instant"]
-            if hour["instant"] < self.instant
+            self.instant - hour_instant
+            if hour_instant < self.instant
             else timedelta(0)
         )
 
-        return {
-            "lag": lag,
-            "minute_predicted": minute_predicted,
-            "prediction": prediction,
-            "prediction_min": prediction_min,
-            "prediction_max": prediction_max,
-            "seconds_remaining": seconds_remaining_hour,
-            "smoothing": smoothing,
-        }
+        return DevicePrediction(
+            lag=lag,
+            minute_predicted=minute_predicted,
+            prediction=prediction,
+            prediction_min=prediction,
+            prediction_max=prediction,
+            seconds_remaining=seconds_remaining_hour,
+        )
 
     def _compute_device_metrics(
         self,
         vdi: Any,
         pop_result: _PopulationResult,
-        pred_result: dict[str, Any],
+        pred_result: DevicePrediction,
     ) -> DeviceMetrics:
         """Build a DeviceMetrics from population and prediction results.
 
@@ -812,42 +801,71 @@ class HourlyProjection(MetricsBase):
         Returns:
             DeviceMetrics instance with all derived fields.
         """
-        nbc_seconds = pop_result.nbc_seconds
         pop_data_start = pop_result.nbc_data_start
-        # Use merged cache samples for NBC computation when available.
-        # This ensures _compute_nbc sees the full hour of data rather than
-        # only the incremental delta from the API call.
         energy_cache = self.energy_cache
-        if nbc_seconds is not None and pop_data_start is not None and energy_cache is not None:
-            if energy_cache._data_start is not None:
-                cache_samples = energy_cache.samples
-                if cache_samples:
-                    merged = energy_cache.merge_incremental(
-                        energy_cache._data_start,
-                        pop_data_start,
-                        cache_samples,
-                        nbc_seconds)
-                    if merged is not None:
-                        nbc_seconds = merged.samples
 
-        nbc_result = self._compute_nbc(nbc_seconds)
+        def _maybe_merge_with_cache(raw_data: list[float] | None) -> list[float]:
+            """Merge raw incremental data with cached samples when available.
+
+            When the cache holds a previous fetch (e.g. a full hour) and the
+            API returns only an incremental delta (~60 samples), this produces
+            a complete, gapless time series by appending the delta to the
+            cached data.
+
+            Args:
+                raw_data: Per-second data from the API (incremental delta).
+
+            Returns:
+                Merged data list, or the original input when no cache is
+                available or merge yields nothing.
+            """
+            if raw_data is None:
+                return raw_data or []
+            if energy_cache is None or energy_cache._data is None:
+                return raw_data
+            merged = energy_cache.merge_incremental(
+                energy_cache._data,
+                raw_data,
+                pop_data_start,
+            )
+            if merged is not None and merged.samples is not None:
+                return merged.samples
+            return raw_data
+
+        nbc_seconds = _maybe_merge_with_cache(pop_result.nbc_seconds)
+        # Use raw API samples for per_second_data so that the EnergyCache
+        # re-ingests only genuinely new points.  _maybe_merge_with_cache
+        # returns the full merged cache (old + new), which EnergyCache then
+        # re-extracts and mis-labels with the incremental data_start.  That
+        # mismatch inflates merged_last_sample_at into the future, which
+        # causes the next call to send start > end to the Emporia API (400).
+        # NBC still uses nbc_seconds (merged) for prediction accuracy.
+        per_second_data = list(pop_result.per_second_data) if pop_result.per_second_data is not None else []
+
+        # Determine the prediction window from quantization data, if available.
+        prediction_window_seconds: int | None = None
+        if energy_cache is not None and energy_cache.data is not None:
+            qs = energy_cache.quantization_seconds
+            qc = energy_cache.quantization_confidence
+            if qs is not None and qc is not None and qc >= 0.9:
+                prediction_window_seconds = qs
+
+        nbc_result = self._compute_nbc(nbc_seconds, prediction_window_seconds)
 
         return DeviceMetrics(
             gid=vdi.device_gid,
             name=vdi.device_name,
-            lag=pred_result["lag"],
-            per_second_data=pop_result.per_second_data,
+            lag=pred_result.lag,
+            per_second_data=per_second_data,
             prediction=_PredictionData(
-                value=pred_result["prediction"],
-                min_value=pred_result["prediction_min"],
-                max_value=pred_result["prediction_max"],
+                value=pred_result.prediction,
+                min_value=pred_result.prediction_min,
+                max_value=pred_result.prediction_max,
             ),
             minute_data=_MinuteData(
-                predicted=pred_result["minute_predicted"],
-                minutes_remaining=pred_result["seconds_remaining"] / 60.0,
+                predicted=pred_result.minute_predicted,
+                minutes_remaining=pred_result.seconds_remaining / 60.0,
             ),
-            scales=pop_result.scales,
-            smoothing=pred_result["smoothing"],
             nbc=nbc_result,
             timezone=getattr(vdi, "time_zone", None) or "",
         )
@@ -869,18 +887,19 @@ class TOUReporter(MetricsBase):
         start_date: datetime,
         end_date: datetime,
         logger_next: Optional[logging.Logger] = None,
+        config: Config | None = None,
     ) -> None:
-        super().__init__(logger_next)
+        super().__init__(logger_next, config=config)
 
         self.start_date = start_date
         self.end_date = end_date
-        self.tou_result: Optional[dict[str, float]] = None
+        self.tou_result: Optional[TOUBuckets] = None
         self.nbc_result: Optional[float] = None
 
         self.fetch_usage_data()
-        if is_debug():
+        if is_debug(config):
             filename = (
-                datetime.now().isoformat() # ok
+                _CLOCK.now().isoformat()
                 + f"_{start_date}_{end_date if end_date else 'None'}_"
             )
             with open(filename, "w", encoding="utf-8") as f:
@@ -946,29 +965,31 @@ class TOUReporter(MetricsBase):
         NBC is the sum of all 15-minute period values in Wh across the
         entire reporting period.
         """
-        combined_buckets: dict[str, float] = {
-            "total": 0.0,
-            "peak": 0.0,
-            "part_peak": 0.0,
-            "off_peak": 0.0,
-        }
+        total = 0.0
+        peak = 0.0
+        part_peak = 0.0
+        off_peak = 0.0
 
         nbc_total_wh = 0.0
 
         for data_chunk in self.usage_data_list:
-            chunk_buckets = EnergyDataAggregator.aggregate_from_15min(
+            chunk_buckets: TOUBuckets = EnergyDataAggregator.aggregate_from_15min(
                 data_chunk["start"], data_chunk["data"]
             )
 
-            for bucket in combined_buckets:
-                combined_buckets[bucket] += chunk_buckets[bucket]
+            total += chunk_buckets.total
+            peak += chunk_buckets.peak
+            part_peak += chunk_buckets.part_peak
+            off_peak += chunk_buckets.off_peak
 
             # Sum positive 15-min periods only (imports); negatives are exports, ignored
             for usage_kwh in data_chunk["data"]:
                 if usage_kwh is not None and usage_kwh > 0:
                     nbc_total_wh += usage_kwh * 1000.0
 
-        self.tou_result = combined_buckets
+        self.tou_result = TOUBuckets(
+            total=total, peak=peak, part_peak=part_peak, off_peak=off_peak,
+        )
         self.nbc_result = nbc_total_wh
 
 

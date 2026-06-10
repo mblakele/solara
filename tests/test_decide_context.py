@@ -53,10 +53,8 @@ class TestDecideContextConstruction:
         tesla = TeslaState(
             is_charging=True,
             current_amps=10,
-            soc_percent=50.0,
             plugged_in=True,
             at_home=True,
-            at_charge_limit=False,
         )
         dp_at = fixed_now - timedelta(seconds=5)
         ctx = DecideContext(
@@ -262,10 +260,8 @@ class TestDecideTeslaAmpsWithContext:
         tesla = TeslaState(
             is_charging=True,
             current_amps=5,
-            soc_percent=60.0,
             plugged_in=True,
             at_home=True,
-            at_charge_limit=False,
         )
         ctx = DecideContext(
             now=fixed_now,
@@ -284,7 +280,33 @@ class TestDecideTeslaAmpsWithContext:
         assert len(actions) == 1
         assert actions[0].action == "set_amps"
         assert actions[0].device_name == "tesla"
-        assert actions[0].target_amps == 8
+        assert actions[0].target_amps == 16
+
+    def test_tesla_amps_skipped_when_just_started_charging(self):
+        """Tesla amps increase skipped when current_amps < charge_amps_min."""
+        engine = GapMinder(hysteresis_wh=3)
+        state = StateTracker()
+        tesla = TeslaState(
+            is_charging=True,
+            current_amps=1,
+            plugged_in=True,
+            at_home=True,
+        )
+        ctx = DecideContext(
+            now=fixed_now,
+            seconds_remaining=711,
+            state=state,
+            plugs={},
+            tesla=tesla,
+        )
+
+        actions = engine.decide(
+            ctx=ctx,
+            predicted_wh=-561.258618125,
+            target_wh=-9.0,
+        )
+
+        assert len(actions) == 0
 
     def test_tesla_amps_reduce_with_context(self):
         """Tesla amps reduce decision works with DecideContext."""
@@ -293,10 +315,8 @@ class TestDecideTeslaAmpsWithContext:
         tesla = TeslaState(
             is_charging=True,
             current_amps=48,
-            soc_percent=60.0,
             plugged_in=True,
             at_home=True,
-            at_charge_limit=False,
         )
         plugs: dict[str, PlugConfig] = {}
         ctx = DecideContext(

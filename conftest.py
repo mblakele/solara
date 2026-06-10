@@ -25,7 +25,7 @@ def _close_all_aiohttp_sessions():
 
 
 @pytest.fixture(autouse=True)
-def clean_env():
+def clean_env(monkeypatch):
     """Prevent .env from polluting tests via decouple.
 
     Clears device_config cache so each test starts with a fresh read of
@@ -50,6 +50,13 @@ def clean_env():
     # Clear VUE credentials so mock mode is used by default
     config.set("VUE_USERNAME", "")
     config.set("VUE_PASSWORD", "")
+
+    # Clear Tesla telemetry config
+    config.set("TESLA_TELEMETRY_CALLBACK_URL", "")
+    config.set("TESLA_TELEMETRY_LOCATION_INTERVAL_SEC", "")
+    config.set("TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC", "")
+    config.set("TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC", "")
+    monkeypatch.setenv("PUBLIC_URL", "")
 
     # Ensure mock mode is off by default (tests enable it explicitly)
     config.set("MOCK", "False")

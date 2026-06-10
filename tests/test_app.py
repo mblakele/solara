@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import patch
 
@@ -583,6 +583,47 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_index_html_handles_none_predicted_wh(self):
+        """Index template renders when predicted_wh is None (no crash)."""
+        from decouple import config as dc_config
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.dry_run = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_lm.state.to_dict.return_value = {}
+        mock_lm.run_cycle.return_value = {
+            "status": "ok",
+            "predicted_wh": None,
+            "target_wh": -500,
+            "actions": [],
+            "diagnostics": {
+                "gap_wh": -300,
+                "hysteresis_wh": 50,
+                "seconds_remaining": 45,
+                "reason": "ok",
+                "pending_effects_count": 0,
+                "candidates": [],
+                "tesla_configured": False,
+                "tesla_state": None,
+                "tesla_error": None,
+                "tesla_login_url": None,
+                "plugs_configured": 0,
+            },
+        }
+
+        with mock_config():
+            dc_config.set("LOAD_MANAGE_ENABLED", "True")
+            import app as app_mod
+
+            app_mod._load_manager = mock_lm
+            app_mod._load_manager_init_failed = False
+            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            response = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(response.status_code, 200)
+
 
 class TestTrimOutputDevice(unittest.TestCase):
     """Tests for the _trim_output_device helper in app.py."""
@@ -627,7 +668,6 @@ class TestTrimOutputDevice(unittest.TestCase):
             "name": "order-device",
             "per_second_data": [1, 2, 3],
             "prediction": 42.0,
-            "scales": {},
             "nbc": {},
         }
         result = app_mod._trim_output_device(device)
@@ -635,7 +675,7 @@ class TestTrimOutputDevice(unittest.TestCase):
         keys = list(result.keys())
         self.assertEqual(keys[-1], "per_second_data")
         # Verify other keys are in their original relative order.
-        self.assertEqual(keys[:-1], ["gid", "name", "prediction", "scales", "nbc"])
+        self.assertEqual(keys[:-1], ["gid", "name", "prediction", "nbc"])
 
     def test_empty_per_second_data(self):
         """_trim_output_device handles empty per_second_data gracefully."""
@@ -652,7 +692,380 @@ class TestTrimOutputDevice(unittest.TestCase):
         self.assertEqual(len(result["per_second_data"]), 0)
 
 
-class TestLagRecalculation(unittest.TestCase):
+class TestCamelizeFunction(unittest.TestCase):
+    """Tests for the camelize() function used to convert JSON responses."""
+
+    def test_simple_snake_to_camel(self):
+        """Top-level snake_case keys are converted to camelCase."""
+        import app as app_mod
+
+        data = {"prediction_min": 10.0, "prediction_max": 20.0}
+        result = app_mod.camelize(data)
+
+        self.assertEqual(result["predictionMin"], 10.0)
+        self.assertEqual(result["predictionMax"], 20.0)
+        # Original keys should not exist.
+        self.assertNotIn("prediction_min", result)
+        self.assertNotIn("prediction_max", result)
+
+    def test_no_underscore_keys_unchanged(self):
+        """Keys without underscores are left as-is."""
+        import app as app_mod
+
+        data = {"abc": "value", "nested": {"key": 42}}
+        result = app_mod.camelize(data)
+
+        self.assertEqual(result["abc"], "value")
+        self.assertEqual(result["nested"]["key"], 42)
+
+    def test_nested_dicts_recursively(self):
+        """CamelCase conversion recurses into nested dicts."""
+        import app as app_mod
+
+        data = {"outer_key": {"inner_key": {"deep_key": "value"}}}
+        result = app_mod.camelize(data)
+
+        self.assertIn("outerKey", result)
+        self.assertIn("innerKey", result["outerKey"])
+        self.assertIn("deepKey", result["outerKey"]["innerKey"])
+        self.assertEqual(result["outerKey"]["innerKey"]["deepKey"], "value")
+
+    def test_lists_are_traversed(self):
+        """Items in lists are camelize'd individually."""
+        import app as app_mod
+
+        data = {"items": [{"key_a": 1}, {"key_b": 2}]}
+        result = app_mod.camelize(data)
+
+        self.assertEqual(result["items"][0]["keyA"], 1)
+        self.assertEqual(result["items"][1]["keyB"], 2)
+
+    def test_multiple_underscores(self):
+        """Keys with multiple underscores: first segment stays lowercase, rest are camelCased."""
+        import app as app_mod
+
+        data = {"sleep_hint_at": "2025-01-15T12:00:00+00:00"}
+        result = app_mod.camelize(data)
+
+        self.assertIn("sleepHintAt", result)
+        self.assertEqual(
+            result["sleepHintAt"], "2025-01-15T12:00:00+00:00"
+        )
+
+    def test_non_dict_values_pass_through(self):
+        """Scalars and non-container types are returned unchanged."""
+        import app as app_mod
+
+        self.assertEqual(app_mod.camelize(42), 42)
+        self.assertEqual(app_mod.camelize("hello"), "hello")
+        self.assertIsNone(app_mod.camelize(None))
+        self.assertEqual(app_mod.camelize(True), True)
+        self.assertEqual(app_mod.camelize([1, 2, 3]), [1, 2, 3])
+
+
+class TestCamelizeEndToEnd(unittest.TestCase):
+    """Tests that camelize produces JSON output matching the template's data expectations."""
+
+    def test_json_camel_keys_match_template_snake_keys(self):
+        """Every camelCase key in the JSON response corresponds to a snake_case key
+        the template accesses, verifying the camelize transformation is correct
+        for the full index endpoint payload structure."""
+        import app as app_mod
+
+        # Representative payload shape matching what the index route produces.
+        payload = {
+            "devices": [
+                {
+                    "gid": 42,
+                    "lag": "PT2S",
+                    "name": "test-device",
+                    "prediction": 100.0,
+                    "prediction_min": 90.0,
+                    "prediction_max": 110.0,
+                    "minute_predicted": 50.0,
+                    "minutes_remaining": 18.0,
+                    "timezone": "America/Los_Angeles",
+                    "nbc": {
+                        "QH1": {
+                            "complete": False,
+                            "raw_wh": -100.0,
+                            "wh": 0,
+                            "predicted_wh": 50.0,
+                            "samples_used": 600,
+                        },
+                        "QH2": {
+                            "complete": True,
+                            "raw_wh": 500.0,
+                            "wh": 500.0,
+                        },
+                        "QH3": None,
+                        "QH4": None,
+                    },
+                    "per_second_data": [0.001, 0.002],
+                }
+            ],
+            "instant": "2025-01-01T12:00:00+00:00",
+            "api_response": {"total": "PT0.00075S"},
+            "load_management": {
+                "enabled": True,
+                "dry_run": True,
+                "target_wh": -500,
+                "nbc_device": "test_nbc",
+                "sleep_hint": 30.0,
+                "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+            },
+        }
+
+        camel = app_mod.camelize(payload)
+
+        # Top-level keys
+        self.assertIn("devices", camel)
+        self.assertIn("instant", camel)
+        self.assertIn("apiResponse", camel)
+        self.assertIn("loadManagement", camel)
+
+        # Device-level keys
+        device = camel["devices"][0]
+        self.assertIn("gid", device)
+        self.assertIn("lag", device)
+        self.assertIn("prediction", device)
+        self.assertIn("predictionMin", device)
+        self.assertIn("predictionMax", device)
+        self.assertIn("minutePredicted", device)
+        self.assertIn("minutesRemaining", device)
+        self.assertIn("perSecondData", device)
+
+        # NBC — underscore keys in incomplete quarter
+        nbc = device["nbc"]
+        self.assertIn("QH1", nbc)
+        self.assertTrue("predictedWh" in nbc["QH1"])
+        self.assertTrue("samplesUsed" in nbc["QH1"])
+
+        # Load management
+        lm = camel["loadManagement"]
+        self.assertIn("sleepHint", lm)
+        self.assertIn("sleepHintAt", lm)
+
+    def test_camelize_preserves_numeric_types(self):
+        """Numeric values (int, float) pass through camelize without rounding or conversion."""
+        import app as app_mod
+
+        data = {"prediction_min": 0.123456789012345, "prediction_max": 1}
+        result = app_mod.camelize(data)
+
+        # Float should stay a float.
+        self.assertIsInstance(result["predictionMin"], float)
+        self.assertAlmostEqual(result["predictionMin"], 0.123456789012345)
+        # Int should stay an int.
+        self.assertIsInstance(result["predictionMax"], int)
+        self.assertEqual(result["predictionMax"], 1)
+
+
+class TestEndToEndMetricsPipeline(unittest.TestCase):
+    """Structured end-to-end tests that validate the full device dict shape
+    through the index route, exercising the dataclass-to-dict serialization
+    chain (DeviceMetrics.to_dict → camelize → JSON provider)."""
+
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
+
+    def _get_index_json(self, instant_minute=42):
+        """Helper: get / with Accept: application/json in mock mode."""
+        with mock_config():
+            return self.app.get(
+                f"/?instant_minute={instant_minute}",
+                headers={"Accept": "application/json"},
+            )
+
+    def test_top_level_keys_present(self):
+        """Response contains the expected top-level keys."""
+        resp = self._get_index_json()
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+
+        self.assertIn("devices", data)
+        self.assertIn("instant", data)
+        self.assertIn("apiResponse", data)
+        self.assertIn("loadManagement", data)
+
+    def test_device_has_all_required_camel_keys(self):
+        """Every device in the JSON response has all the camelCase keys
+        that the template and JS consumers expect."""
+        resp = self._get_index_json()
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+
+        required_keys = [
+            "gid", "lag", "name", "prediction", "predictionMin",
+            "predictionMax", "minutePredicted", "minutesRemaining",
+            "timezone", "nbc", "perSecondData",
+        ]
+
+        for device in data["devices"]:
+            for key in required_keys:
+                self.assertIn(
+                    key, device,
+                    f"Device {device.get('name')} missing key '{key}'",
+                )
+
+    def test_nbc_camel_structure(self):
+        """NBC quarters have correctly camelCased keys in the JSON."""
+        resp = self._get_index_json()
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+
+        for device in data["devices"]:
+            nbc = device["nbc"]
+            # QH1 incomplete → should have predictedWh and samplesUsed.
+            qh1 = nbc["QH1"]
+            self.assertIn("predictedWh", qh1)
+            self.assertIn("samplesUsed", qh1)
+
+            # QH2 complete → should have rawWh and wh.
+            self.assertIn("rawWh", nbc["QH2"])
+            self.assertIn("wh", nbc["QH2"])
+
+            # QH3 complete, QH4 None.
+            self.assertIsNotNone(nbc["QH3"])
+            self.assertIsNone(nbc["QH4"])
+
+    def test_index_with_different_instant_minute(self):
+        """NBC endpoint with different instant_minute still produces valid structure."""
+        resp = self._get_index_json(instant_minute=10)
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+
+        self.assertIn("devices", data)
+        for device in data["devices"]:
+            self.assertIn("nbc", device)
+            nbc = device["nbc"]
+            # At minute=10 only QH1 should be present (incomplete).
+            self.assertIsNotNone(nbc["QH1"])
+            self.assertIsNotNone(nbc["QH1"].get("predictedWh"))
+            self.assertIsNone(nbc["QH2"])
+            self.assertIsNone(nbc["QH3"])
+            self.assertIsNone(nbc["QH4"])
+
+    def test_lag_is_valid_iso_duration(self):
+        """Lag value is a valid ISO 8601 duration string (serializable by JSON provider)."""
+        import isodate
+
+        resp = self._get_index_json()
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+
+        lag_str = data["devices"][0]["lag"]
+        self.assertIsInstance(lag_str, str)
+        # Should parse as a valid ISO 8601 duration.
+        delta = isodate.parse_duration(lag_str)
+        self.assertGreaterEqual(delta.total_seconds(), 0)
+
+
+class TestIndexEndpointPerSecondData(unittest.TestCase):
+    """Tests that the index endpoint perSecondData contains the most recent
+    300 samples after full and incremental fetches via the real-mode path."""
+
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
+
+    def _make_metrics(self, samples, data_start, now=None):
+        """Build a minimal metrics dict shaped like create_metrics() output."""
+        if now is None:
+            now = datetime.now(timezone.utc)
+        return {
+            "devices": [
+                {
+                    "gid": 1,
+                    "name": "test-device",
+                    "lag": timedelta(seconds=2),
+                    "per_second_data": list(samples),
+                }
+            ],
+            "instant": now,
+            "api_response": {},
+            "_fetched_at": now,
+            "data_start": data_start,
+        }
+
+    def test_full_fetch_trims_to_300_samples(self):
+        """After a full fetch with >300 samples, perSecondData is the last 300."""
+        import app as app_mod
+        from energy_cache import EnergyCache
+
+        now = datetime.now(timezone.utc)
+        data_start = now - timedelta(seconds=500)
+        samples_500 = list(range(500))
+        metrics_dict = self._make_metrics(samples_500, data_start, now)
+
+        fresh_cache = EnergyCache(ttl_seconds=0)
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod, "_energy_cache", fresh_cache):
+                with patch("app.create_metrics", return_value=metrics_dict):
+                    resp = self.app.get("/", headers={"Accept": "application/json"})
+
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        psd = data["devices"][0]["perSecondData"]
+
+        self.assertEqual(len(psd), 300,
+            f"Expected 300 samples from full fetch, got {len(psd)}")
+        self.assertEqual(psd[0], 200,
+            "First of the 300 should be sample index 200")
+        self.assertEqual(psd[-1], 499,
+            "Last sample should be 499 (most recent)")
+
+    def test_incremental_fetch_returns_300_from_merged_cache(self):
+        """After an incremental fetch (30 new samples on top of 500 existing),
+        perSecondData contains 300 samples from the merged cache — not just
+        the 30-sample delta."""
+        import app as app_mod
+        from energy_cache import EnergyCache
+
+        now = datetime.now(timezone.utc)
+        full_start = now - timedelta(seconds=500)
+
+        full_samples = list(range(500))
+        full_metrics = self._make_metrics(full_samples, full_start, now)
+
+        incr_start = full_start + timedelta(seconds=500)
+        incr_samples = list(range(500, 530))
+        incr_metrics = self._make_metrics(incr_samples, incr_start, now)
+
+        fetch_count = 0
+
+        def controlled_create_metrics(*_args, **_kwargs):
+            nonlocal fetch_count
+            fetch_count += 1
+            return full_metrics if fetch_count == 1 else incr_metrics
+
+        fresh_cache = EnergyCache(ttl_seconds=0)
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod, "_energy_cache", fresh_cache):
+                with patch("app.create_metrics", side_effect=controlled_create_metrics):
+                    resp1 = self.app.get("/", headers={"Accept": "application/json"})
+                    self.assertEqual(resp1.status_code, 200)
+
+                    resp2 = self.app.get("/", headers={"Accept": "application/json"})
+
+        self.assertEqual(resp2.status_code, 200)
+        data2 = json.loads(resp2.data)
+        psd = data2["devices"][0]["perSecondData"]
+
+        self.assertEqual(len(psd), 300,
+            f"Expected 300 samples from merged cache, got {len(psd)} "
+            f"(incremental delta only has 30)")
+        self.assertEqual(psd[-1], 529,
+            "Last sample should be 529, the most recent merged sample")
+        self.assertEqual(psd[0], 230,
+            "First sample should be 230 (last 300 of the merged 530)")
+
+
+if __name__ == "__main__":
+    unittest.main()
     """Tests that lag is recalculated per request, not frozen by cache."""
 
     def setUp(self):
@@ -710,6 +1123,43 @@ class TestLagRecalculation(unittest.TestCase):
         self.assertIn("lag", data["devices"][0])
         lag = self._lag_to_seconds(data["devices"][0]["lag"])
         self.assertGreaterEqual(lag, 0)
+
+
+class TestBuildLoadManagementPayloadLocked(unittest.TestCase):
+    """Tests for _build_load_management_payload_locked().
+
+    This function is called while _load_manager_lock is held.  It must
+    NOT call _get_load_manager() because that function also tries to
+    acquire _load_manager_lock, causing a non-reentrant Lock deadlock.
+    """
+
+    def setUp(self):
+        import app as app_mod
+        app_mod._load_manager = None
+        app_mod._last_cycle_result = None
+
+    def test_does_not_call_get_load_manager(self):
+        """Locked variant reads _load_manager directly, not via _get_load_manager."""
+        import app as app_mod
+        from app import _build_load_management_payload_locked
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.dry_run = False
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_lm.state.to_dict.return_value = {"devices": {}}
+        mock_lm.config_interval_secs = 30
+
+        app_mod._load_manager = mock_lm
+
+        with patch("app._get_load_manager", side_effect=Exception("would deadlock")):
+            with app_mod._load_manager_lock:
+                result = _build_load_management_payload_locked()
+
+        self.assertEqual(result["enabled"], True)
+        self.assertEqual(result["target_wh"], -500)
+        self.assertEqual(result["state"], {"devices": {}})
 
 
 if __name__ == "__main__":

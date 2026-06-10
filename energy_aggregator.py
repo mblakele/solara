@@ -4,12 +4,35 @@ Energy data aggregation for Time-of-Use (TOU) reporting.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Any, List, Tuple
 
 import pytz
 
 from config import get_timezone
+
+
+@dataclass(frozen=True)
+class TOUBuckets:
+    """Time-of-Use bucket totals in Wh.
+
+    Replaces the dict return from _aggregate() with a typed dataclass.
+    """
+
+    total: float = 0.0
+    peak: float = 0.0
+    part_peak: float = 0.0
+    off_peak: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dict for backward compat."""
+        return {
+            "total": self.total,
+            "peak": self.peak,
+            "part_peak": self.part_peak,
+            "off_peak": self.off_peak,
+        }
 
 
 class EnergyDataAggregator:
@@ -28,13 +51,6 @@ class EnergyDataAggregator:
 
     Units: All results in Watt-hours (Wh). Negative totals indicate net export.
     """
-
-    _BUCKET_DEFAULTS: dict[str, float] = {
-        "total": 0.0,
-        "peak": 0.0,
-        "part_peak": 0.0,
-        "off_peak": 0.0,
-    }
 
     @staticmethod
     def classify_hour(hour: int) -> str:
@@ -66,7 +82,7 @@ class EnergyDataAggregator:
         start_time: datetime,
         data: list[float],
         step: timedelta,
-    ) -> dict[str, float]:
+    ) -> TOUBuckets:
         """Aggregate index-based data into TOU buckets.
 
         Each element in *data* represents one time step starting from
@@ -79,10 +95,12 @@ class EnergyDataAggregator:
             step: Time delta between consecutive data points.
 
         Returns:
-            Dictionary with bucket totals in Wh:
-            {'total', 'peak', 'part_peak', 'off_peak'}
+            TOUBuckets with bucket totals in Wh.
         """
-        buckets: dict[str, float] = dict(EnergyDataAggregator._BUCKET_DEFAULTS)
+        total = 0.0
+        peak = 0.0
+        part_peak = 0.0
+        off_peak = 0.0
 
         local_tz = pytz.timezone(get_timezone())
         if start_time.tzinfo is None:
@@ -96,15 +114,22 @@ class EnergyDataAggregator:
             timestamp = start_local + step * idx
             usage_wh = usage_kwh * 1000.0
             bucket = EnergyDataAggregator.classify_hour(timestamp.hour)
-            buckets[bucket] += usage_wh
-            buckets["total"] += usage_wh
+            if bucket == "peak":
+                peak += usage_wh
+            elif bucket == "part_peak":
+                part_peak += usage_wh
+            else:
+                off_peak += usage_wh
+            total += usage_wh
 
-        return buckets
+        return TOUBuckets(
+            total=total, peak=peak, part_peak=part_peak, off_peak=off_peak,
+        )
 
     @staticmethod
     def aggregate_from_hourly(
         hourly_data: List[Tuple[datetime, float]],
-    ) -> Dict[str, float]:
+    ) -> TOUBuckets:
         """
         Aggregate hourly energy data into TOU buckets.
 
@@ -113,10 +138,12 @@ class EnergyDataAggregator:
                         Timestamp should be hour-aligned.
 
         Returns:
-            Dictionary with bucket totals in Wh:
-            {'total': float, 'peak': float, 'part_peak': float, 'off_peak': float}
+            TOUBuckets with bucket totals in Wh.
         """
-        buckets: Dict[str, float] = dict(EnergyDataAggregator._BUCKET_DEFAULTS)
+        total = 0.0
+        peak = 0.0
+        part_peak = 0.0
+        off_peak = 0.0
 
         for timestamp, usage_kwh in hourly_data:
             if usage_kwh is None:
@@ -124,15 +151,22 @@ class EnergyDataAggregator:
             usage_wh = usage_kwh * 1000.0
             local_hour = EnergyDataAggregator._get_local_hour(timestamp)
             bucket = EnergyDataAggregator.classify_hour(local_hour)
-            buckets[bucket] += usage_wh
-            buckets["total"] += usage_wh
+            if bucket == "peak":
+                peak += usage_wh
+            elif bucket == "part_peak":
+                part_peak += usage_wh
+            else:
+                off_peak += usage_wh
+            total += usage_wh
 
-        return buckets
+        return TOUBuckets(
+            total=total, peak=peak, part_peak=part_peak, off_peak=off_peak,
+        )
 
     @staticmethod
     def aggregate_from_seconds(
         start_time: datetime, usage_data: List[float]
-    ) -> Dict[str, float]:
+    ) -> TOUBuckets:
         """
         Aggregate per-second energy data into TOU buckets.
 
@@ -141,8 +175,7 @@ class EnergyDataAggregator:
             usage_data: List of kWh values, one per second.
 
         Returns:
-            Dictionary with bucket totals in Wh:
-            {'total': float, 'peak': float, 'part_peak': float, 'off_peak': float}
+            TOUBuckets with bucket totals in Wh.
         """
         return EnergyDataAggregator._aggregate(
             start_time, usage_data, timedelta(seconds=1)
@@ -151,7 +184,7 @@ class EnergyDataAggregator:
     @staticmethod
     def aggregate_from_minutes(
         start_time: datetime, usage_data: List[float]
-    ) -> Dict[str, float]:
+    ) -> TOUBuckets:
         """
         Aggregate per-minute energy data into TOU buckets.
 
@@ -160,8 +193,7 @@ class EnergyDataAggregator:
             usage_data: List of kWh values, one per minute.
 
         Returns:
-            Dictionary with bucket totals in Wh:
-            {'total': float, 'peak': float, 'part_peak': float, 'off_peak': float}
+            TOUBuckets with bucket totals in Wh.
         """
         return EnergyDataAggregator._aggregate(
             start_time, usage_data, timedelta(minutes=1)
@@ -170,7 +202,7 @@ class EnergyDataAggregator:
     @staticmethod
     def aggregate_from_15min(
         start_time: datetime, usage_data: List[float]
-    ) -> Dict[str, float]:
+    ) -> TOUBuckets:
         """Aggregate 15-minute energy data into TOU buckets.
 
         Args:
@@ -178,8 +210,7 @@ class EnergyDataAggregator:
             usage_data: List of kWh values, one per 15-minute period.
 
         Returns:
-            Dictionary with bucket totals in Wh:
-            {'total': float, 'peak': float, 'part_peak': float, 'off_peak': float}
+            TOUBuckets with bucket totals in Wh.
         """
         return EnergyDataAggregator._aggregate(
             start_time, usage_data, timedelta(minutes=15)

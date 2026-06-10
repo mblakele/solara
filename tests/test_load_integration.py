@@ -1,6 +1,7 @@
 """Integration tests for LoadManager run_cycle scenarios."""
 
 import asyncio
+import dataclasses
 from datetime import datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch, MagicMock
@@ -19,9 +20,11 @@ from load_manager import (
     TeslaState,
     GapMinder,
 )
+from load_models import CandidateDetailPlug, CycleDiagnostics, CycleResult
 from load_nbc import DecideContext
 from tests.helpers import _make_metrics_with_wh
 from energy_cache import EnergyCache
+from tests.helpers import FakeClock
 
 
 # --- Excess solar helpers ---
@@ -75,12 +78,14 @@ def _make_energy_cache_with_prediction(
 def _make_excess_manager(
     now: datetime,
     predicted_wh: float = -2000.0,
+    clock: FakeClock | None = None,
 ) -> tuple[LoadManager, PlugController, TeslaController]:
     """Create LoadManager with stub controllers and mock metrics.
 
     Args:
         predicted_wh: Target Wh prediction for the incomplete quarter.
         now: Fixed time for sample timestamps. Required.
+        clock: Optional FakeClock for deterministic time. Defaults to RealClock.
 
     Returns:
         Tuple of (LoadManager, PlugController, TeslaController).
@@ -118,6 +123,8 @@ def _make_excess_manager(
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(predicted_wh, now=now)
+    if clock is None:
+        clock = FakeClock(now)
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -127,6 +134,7 @@ def _make_excess_manager(
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=clock,
     )
     return mgr, plug_ctrl, tesla_ctrl
 
@@ -137,8 +145,11 @@ def _make_excess_manager(
 def _make_overn_target_manager(
     now: datetime,
     predicted_wh: float = 2000.0,
+    clock: FakeClock | None = None,
 ) -> tuple[LoadManager, PlugController]:
     """Create LoadManager for over-target scenario with both plugs ON."""
+    if clock is None:
+        clock = FakeClock(now)
     plugs = {
         "pool_pump": PlugConfig(
             name="pool_pump",
@@ -173,13 +184,14 @@ def _make_overn_target_manager(
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=clock,
     )
 
     mgr.state.devices["pool_pump"] = DeviceState(
-        name="pool_pump", last_toggle=now - timedelta(seconds=120), desired_state=True
+        name="pool_pump", last_toggle=clock.now() - timedelta(seconds=120), desired_state=True
     )
     mgr.state.devices["water_heater"] = DeviceState(
-        name="water_heater", last_toggle=now - timedelta(seconds=120), desired_state=True
+        name="water_heater", last_toggle=clock.now() - timedelta(seconds=120), desired_state=True
     )
 
     return mgr, plug_ctrl
@@ -189,10 +201,11 @@ def _make_overn_target_manager(
 
 
 def _make_tesla_manager(
-    tesla_state: TeslaState, predicted_wh: float = -2000.0
+    tesla_state: TeslaState, predicted_wh: float = -2000.0,
 ) -> tuple[LoadManager, TeslaController]:
     """Create LoadManager with a mocked Tesla controller."""
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    clock = FakeClock(fixed_now)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
@@ -223,6 +236,7 @@ def _make_tesla_manager(
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=clock,
     )
     return mgr, tesla_ctrl
 
@@ -232,35 +246,29 @@ def _make_tesla_manager(
 
 class TestLoadIntegration(unittest.TestCase):
 
- def test_turns_on_plugs_in_priority_order(self):
-     """Excess solar: turns on plugs in priority order."""
-     fixed_now = datetime(2026, 5, 6, 7, 8, 0, tzinfo=timezone.utc) # 07:08:00
+    def test_turns_on_plugs_in_priority_order(self):
+      """Excess solar: turns on plugs in priority order."""
+      fixed_now = datetime(2026, 5, 6, 7, 8, 0, tzinfo=timezone.utc) # 07:08:00
 
-     # in priority order:
-     # p200 pool pump turns on
-     # p100 water heater would fit gap without pool pump, but stays off
-     mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-1000.0)
-     samples = mgr.nbc_reader.energy_cache._samples
-     assert len(samples) == 900 + 8 * 60
-     asyncio.run(plug_ctrl.set_state("pool_pump", False))
-     asyncio.run(plug_ctrl.set_state("water_heater", False))
+      # in priority order:
+      # p200 pool pump turns on
+      # p100 water heater would fit gap without pool pump, but stays off
+      mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-1000.0)
+      samples = mgr.nbc_reader.energy_cache._samples
+      assert len(samples) == 900 + 8 * 60
+      asyncio.run(plug_ctrl.set_state("pool_pump", False))
+      asyncio.run(plug_ctrl.set_state("water_heater", False))
 
-     def dt_constructor(*args, **kwargs):
-         return datetime(*args, **kwargs)
+      result = mgr.run_cycle()
 
-     with patch("load_manager.datetime") as mock_dt:
-         mock_dt.now.return_value = fixed_now
-         mock_dt.side_effect = dt_constructor
-         result = mgr.run_cycle()
-
-     assert result["status"] == "ok"
-     assert result["qh"] == "QH1"
-     self.assertAlmostEqual(result["diagnostics"]["gap_wh"], 500.0)
-     assert result["diagnostics"]["seconds_remaining"] == 420
-     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
-     pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
-     assert wh_state is False
-     assert pp_state
+      assert result.status == "ok"
+      assert result.qh == "QH1"
+      self.assertAlmostEqual(result.diagnostics.gap_wh, 500.0)
+      assert result.diagnostics.seconds_remaining == 420
+      wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
+      pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
+      assert wh_state is False
+      assert pp_state
 
 
 def test_turns_off_plugs_in_priority_order():
@@ -274,12 +282,9 @@ def test_turns_off_plugs_in_priority_order():
     # p200 pool pump (potential savings 333.3 Wh) stays on
     mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-200.0)
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    assert result["status"] == "ok"
+    assert result.status == "ok"
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
     pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
     assert wh_state is False
@@ -291,10 +296,7 @@ def test_plug_states_updated():
     fixed_now = datetime(2026, 5, 6, 15, 7, 30, tzinfo=timezone.utc)
     mgr, plug_ctrl, _ = _make_excess_manager(now=fixed_now, predicted_wh=-6000.0)
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        mgr.run_cycle()
+    mgr.run_cycle()
 
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
     pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
@@ -327,14 +329,10 @@ def test_excess_solar_qh_boundary_returns_stale_data():
 
     mgr.nbc_reader.get_current_qh = patched_get  # type: ignore[method-assign]
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        result = mgr.run_cycle()
-
     # Must detect stale data — NOT turn on plugs based on old QH prediction
-    assert result["status"] == "stale_data"
-    assert result["diagnostics"]["reason"] == "previous_qh"
+    result = mgr.run_cycle()
+    assert result.status == "stale_data"
+    assert result.diagnostics.reason == "previous_qh"
     # Plugs must NOT have been touched
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
     pp_state = asyncio.run(plug_ctrl.get_state("pool_pump"))
@@ -353,7 +351,7 @@ def test_turns_off_all_on_plugs():
 
     result = mgr.run_cycle()
 
-    action_names = [a["device"] for a in result["actions"]]
+    action_names = [a.device_name for a in result.actions]
     assert "pool_pump" in action_names
     assert "water_heater" in action_names
 
@@ -364,42 +362,28 @@ def test_turns_off_all_on_plugs():
 def test_skip_tesla_not_at_home():
     """Tesla not at home: no Tesla actions."""
     state = TeslaState(
-        is_charging=False, current_amps=None, soc_percent=50.0,
-        plugged_in=True, at_home=False, at_charge_limit=False,
+        is_charging=False, current_amps=None,
+        plugged_in=True, at_home=False,
     )
     mgr, _ = _make_tesla_manager(state)
 
     result = mgr.run_cycle()
 
-    tesla_actions = [a for a in result.get("actions", []) if a["device"] == "tesla"]
+    tesla_actions = [a for a in result.actions if a.device_name == "tesla"]
     assert len(tesla_actions) == 0
 
 
 def test_skip_tesla_not_plugged_in():
     """Tesla not plugged in: no Tesla actions."""
     state = TeslaState(
-        is_charging=False, current_amps=None, soc_percent=50.0,
-        plugged_in=False, at_home=True, at_charge_limit=False,
+        is_charging=False, current_amps=None,
+        plugged_in=False, at_home=True,
     )
     mgr, _ = _make_tesla_manager(state)
 
     result = mgr.run_cycle()
 
-    tesla_actions = [a for a in result.get("actions", []) if a["device"] == "tesla"]
-    assert len(tesla_actions) == 0
-
-
-def test_skip_tesla_at_charge_limit():
-    """Tesla at charge limit: no Tesla actions."""
-    state = TeslaState(
-        is_charging=True, current_amps=48, soc_percent=90.0,
-        plugged_in=True, at_home=True, at_charge_limit=True,
-    )
-    mgr, _ = _make_tesla_manager(state)
-
-    result = mgr.run_cycle()
-
-    tesla_actions = [a for a in result.get("actions", []) if a["device"] == "tesla"]
+    tesla_actions = [a for a in result.actions if a.device_name == "tesla"]
     assert len(tesla_actions) == 0
 
 
@@ -409,12 +393,14 @@ def test_skip_tesla_at_charge_limit():
 def test_stale_data_skips_cycle():
     """NBC data >120s old with pending effects returns stale_data status."""
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+    clock = FakeClock(fixed_now)
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    fetched_at = datetime.now(timezone.utc) - timedelta(seconds=130)
+    fetched_at = clock.now() - timedelta(seconds=130)
     metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
+    metrics_data["_data_lag_secs"] = 130
 
     def metrics_fetch():
         return metrics_data
@@ -429,9 +415,10 @@ def test_stale_data_skips_cycle():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=clock,
     )
 
-    now = datetime.now(timezone.utc)
+    now = clock.now()
     mgr.state.pending_effects.append(
         PendingEffect(
             device_name="plug", action="turn_on",
@@ -443,7 +430,7 @@ def test_stale_data_skips_cycle():
 
     result = mgr.run_cycle()
 
-    assert result["status"] == "stale_data"
+    assert result.status == "stale_data"
 
 
 def test_stale_no_pending_effects_proceeds():
@@ -476,16 +463,13 @@ def test_stale_no_pending_effects_proceeds():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
-    # use fixed_now inside LoadManager
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
 
     assert len(mgr.state.pending_effects) == 0
-    assert result["status"] != "stale_data"
+    assert result.status != "stale_data"
 
 
 def test_stale_data_from_previous_qh():
@@ -530,6 +514,7 @@ def test_stale_data_from_previous_qh():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     # Add a pending effect so the stale-check path is triggered.
@@ -550,18 +535,15 @@ def test_stale_data_from_previous_qh():
 
     mgr.nbc_reader.get_current_qh = patched_get  # type: ignore[method-assign]
 
-    with patch("load_manager.datetime") as mock_dt_cls:
-        mock_dt_cls.now.return_value = fixed_now
-        mock_dt_cls.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
     import logging
     logger = logging.getLogger(__name__)
     logger.debug("Load management cycle result: %s", result)
 
-    assert result["status"] == "stale_data"
+    assert result.status == "stale_data"
     # Verify the reason indicates QH boundary detection, not age-based stale.
-    assert result["diagnostics"]["reason"] == "previous_qh"
+    assert result.diagnostics.reason == "previous_qh"
 
 
 # --- Pending effect tests ---
@@ -610,7 +592,7 @@ def test_waits_for_fresh_data():
     # timestamp (now) may be after the API's data_point_at, but with fresh
     # fetch the NBC reader returns current time as data point. The cycle
     # proceeds and may return "ok" or still wait depending on timing.
-    assert result["status"] in ("waiting_for_fresh_data", "ok")
+    assert result.status in ("waiting_for_fresh_data", "ok")
 
 
 # --- Data-point-age stale detection tests ---
@@ -636,7 +618,7 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(
-        -2000.0, fixed_now, data_lag_secs=130  # data_point_at = now - 130s → stale (>120s)
+        -2000.0, fixed_now, data_lag_secs=130  # data_point_at = now - 140s → stale (>120s)
     )
     mgr = LoadManager(
         metrics_fetch=metrics_fetch,
@@ -661,7 +643,7 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
 
     result = mgr.run_cycle()
 
-    assert result["status"] == "stale_data"
+    assert result.status == "stale_data"
 
 
 def test_waiting_detection_uses_data_point_age_not_fetch_time():
@@ -691,6 +673,7 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     mgr.state.last_data_point_at = fetched_at
@@ -704,17 +687,13 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
         )
     )
 
-    # use fixed_now inside LoadManager
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle(force=True)
+    result = mgr.run_cycle(force=True)
 
     # With force=True, fresh data is always fetched. The pending effect
     # timestamp (now) may be after the API's data_point_at, but with fresh
     # fetch the NBC reader returns current time as data point. The cycle
     # proceeds and may return "ok" or still wait depending on timing.
-    assert result["status"] in ("waiting_for_fresh_data", "ok")
+    assert result.status in ("waiting_for_fresh_data", "ok")
 
 
 def test_full_lifecycle_action_wait_resolve():
@@ -740,45 +719,48 @@ def test_full_lifecycle_action_wait_resolve():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result_1 = mgr.run_cycle()
+    result_1 = mgr.run_cycle()
 
-    assert result_1["status"] == "ok"
-    assert len(result_1["actions"]) > 0
+    assert result_1.status == "ok"
+    assert len(result_1.actions) > 0
     assert len(mgr.state.pending_effects) > 0
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result_2 = mgr.run_cycle()
+    result_2 = mgr.run_cycle()
 
-    assert result_2["status"] == "waiting_for_fresh_data"
+    assert result_2.status == "waiting_for_fresh_data"
 
 
 def test_pending_since_count():
-    """pending_since_count returns correct count of recent effects."""
-    tracker = StateTracker()
+    """pending_since_count returns correct count of recent effects.
+
+    Uses explicit ``prediction_window_seconds=61`` so the test stays
+    correct when the default is tuned.
+    """
+    tracker = StateTracker(prediction_window_seconds=61)
     base_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    buf = timedelta(seconds=61)
     tracker.pending_effects.extend([
+        # "a" is exactly at the boundary → excluded by strict ``>`` check
         PendingEffect(
             device_name="a", action="turn_on",
-            timestamp=base_time - timedelta(seconds=60),
+            timestamp=base_time - buf,
             data_point_at=base_time - timedelta(seconds=80),
             power_watts=1000.0,
         ),
+        # "b" is well within the buffer → always counted
         PendingEffect(
             device_name="b", action="turn_on",
             timestamp=base_time + timedelta(seconds=30),
             data_point_at=base_time + timedelta(seconds=10),
             power_watts=1000.0,
         ),
+        # "c" is well after base → always counted
         PendingEffect(
             device_name="c", action="turn_off",
-            timestamp=base_time + timedelta(seconds=60),
+            timestamp=base_time + timedelta(seconds=59),
             data_point_at=base_time + timedelta(seconds=40),
             power_watts=-1000.0,
         ),
@@ -790,22 +772,30 @@ def test_pending_since_count():
 
 
 def test_prune_old_effects():
-    """prune_old_effects removes effects before the data point that are old enough."""
-    tracker = StateTracker()
+    """prune_old_effects removes effects before the data point that are old enough.
+
+    Uses explicit ``prediction_window_seconds=61`` so the test stays
+    correct when the default is tuned.
+    """
+    tracker = StateTracker(prediction_window_seconds=61)
     base_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    oldness = 62  # 1 s past the 61 s threshold
     tracker.pending_effects.extend([
+        # "old1": exceeds both age thresholds → pruned
         PendingEffect(
             device_name="old1", action="turn_on",
-            timestamp=base_time - timedelta(seconds=60),
+            timestamp=base_time - timedelta(seconds=oldness),
             data_point_at=base_time - timedelta(seconds=80),
             power_watts=1000.0,
         ),
+        # "old2": wall-clock age is below MIN_SECS → kept
         PendingEffect(
             device_name="old2", action="turn_off",
             timestamp=base_time - timedelta(seconds=30),
             data_point_at=base_time - timedelta(seconds=50),
             power_watts=-1000.0,
         ),
+        # "recent": future timestamp → kept
         PendingEffect(
             device_name="recent", action="turn_on",
             timestamp=base_time + timedelta(seconds=10),
@@ -815,8 +805,8 @@ def test_prune_old_effects():
     ])
 
     # data_point_at = base_time
-    # old1 (60s old): exactly at boundary — pruned (60s >= MIN_SECS)
-    # old2 (30s old): below MIN_SECS — kept
+    # old1 (62s old): exceeds the 61 s threshold on both wall and dp — pruned
+    # old2 (30s old): below the 61 s threshold — kept
     # recent (future): above data_point_at — kept
     pruned = tracker.prune_old_effects(base_time, base_time)
     assert pruned == 1
@@ -825,11 +815,12 @@ def test_prune_old_effects():
 
 
 def test_prune_old_effects_respects_minimum_age():
-    """prune_old_effects does not prune effects younger than PENDING_EFFECT_MIN_SECS in data-point time.
+    """prune_old_effects does not prune effects younger than prediction_window_seconds in data-point time.
 
-    Uses wall-clock ``now`` so the test is not sensitive to a frozen datetime.
+    Uses explicit ``prediction_window_seconds=61`` and wall-clock ``now``
+    so the test is not sensitive to a frozen datetime.
     """
-    tracker = StateTracker()
+    tracker = StateTracker(prediction_window_seconds=61)
     now = datetime.now(timezone.utc)
     dp = now  # data_point_at is "now"
 
@@ -860,6 +851,57 @@ def test_prune_old_effects_respects_minimum_age():
     assert {e.device_name for e in tracker.pending_effects} == {"young", "recent"}
 
 
+def test_pending_since_count_uses_prediction_window():
+    """pending_since_count uses prediction_window_seconds as the buffer."""
+    tracker = StateTracker(prediction_window_seconds=30)
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    buf30 = timedelta(seconds=30)
+    tracker.pending_effects.extend([
+        # Exactly at the boundary (older than 30 s) → excluded by strict > check
+        PendingEffect(
+            device_name="old", action="turn_on",
+            timestamp=base - buf30,
+            data_point_at=base - timedelta(seconds=40),
+            power_watts=1000.0,
+        ),
+        # Well within 30 s buffer → counted
+        PendingEffect(
+            device_name="recent", action="turn_off",
+            timestamp=base + timedelta(seconds=10),
+            data_point_at=base + timedelta(seconds=5),
+            power_watts=-1000.0,
+        ),
+    ])
+    assert tracker.pending_since_count(base) == 1
+
+
+def test_prune_old_effects_uses_prediction_window():
+    """prune_old_effects uses prediction_window_seconds as the age threshold."""
+    tracker = StateTracker(prediction_window_seconds=30)
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    oldness = 31  # just past 30 s threshold
+    tracker.pending_effects.extend([
+        # Exceeds both age thresholds → pruned
+        PendingEffect(
+            device_name="old", action="turn_on",
+            timestamp=base - timedelta(seconds=oldness),
+            data_point_at=base - timedelta(seconds=40),
+            power_watts=1000.0,
+        ),
+        # Below 30 s threshold → kept
+        PendingEffect(
+            device_name="young", action="turn_off",
+            timestamp=base - timedelta(seconds=20),
+            data_point_at=base - timedelta(seconds=25),
+            power_watts=-1000.0,
+        ),
+    ])
+    pruned = tracker.prune_old_effects(base, base)
+    assert pruned == 1
+    assert len(tracker.pending_effects) == 1
+    assert tracker.pending_effects[0].device_name == "young"
+
+
 # --- Pending effect lifecycle tests ---
 
 
@@ -878,16 +920,14 @@ def test_adjusted_wh_in_response():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    assert "predicted_wh" in result
-    assert "adjusted_wh" in result
-    assert result["predicted_wh"] == result["adjusted_wh"]
+    assert result.predicted_wh is not None
+    assert result.adjusted_wh is not None
+    assert result.predicted_wh == result.adjusted_wh
 
 
 def test_stale_data_includes_pending_count():
@@ -905,6 +945,7 @@ def test_stale_data_includes_pending_count():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     mgr.state.pending_effects.extend([
@@ -922,13 +963,10 @@ def test_stale_data_includes_pending_count():
         ),
     ])
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    assert result["status"] == "stale_data"
-    assert result["diagnostics"]["pending_effects_count"] == 2
+    assert result.status == "stale_data"
+    assert result.diagnostics.pending_effects_count == 2
 
 
 def test_stale_data_prunes_old_effects():
@@ -953,6 +991,7 @@ def test_stale_data_prunes_old_effects():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     # Cache created with data_lag_secs=180, fetch_offset_secs=0 (default).
@@ -979,7 +1018,7 @@ def test_stale_data_prunes_old_effects():
     # Run the cycle once to trigger decide() which may add new actions.
     result = mgr.run_cycle(force=True)
 
-    assert result["status"] == "ok"
+    assert result.status == "ok"
     # Old effect (turn_on, -280s) should be pruned. New action (turn_on) may
     # have been added by decide(). The original turn_off should remain.
     assert all(
@@ -1004,6 +1043,7 @@ def test_check_pending_state_prunes_in_waiting_path():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     # data_point_at = fixed_now - 10s.
@@ -1024,12 +1064,9 @@ def test_check_pending_state_prunes_in_waiting_path():
         ),
     ])
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    assert result["status"] == "waiting_for_fresh_data"
+    assert result.status == "waiting_for_fresh_data"
     # The old effect should have been pruned; the recent one should remain.
     assert len(mgr.state.pending_effects) == 1
     assert mgr.state.pending_effects[0].device_name == "heater"
@@ -1057,6 +1094,7 @@ def test_stale_data_includes_candidates():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     mgr.state.pending_effects.append(
@@ -1068,19 +1106,16 @@ def test_stale_data_includes_candidates():
         )
     )
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    assert result["status"] == "stale_data"
-    candidates = result["diagnostics"]["candidates"]
+    assert result.status == "stale_data"
+    candidates = result.candidates
     assert candidates is not None
     heater_candidate = next(
-        (c for c in candidates if c["name"] == "heater"), None
+        (c for c in candidates if c.name == "heater"), None
     )
     assert heater_candidate is not None
-    assert heater_candidate["power_watts"] == 2000.0
+    assert heater_candidate.power_watts == 2000.0
 
 
 def test_waiting_for_fresh_data_includes_count():
@@ -1099,6 +1134,7 @@ def test_waiting_for_fresh_data_includes_count():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     mgr.state.last_data_point_at = fetched_at
@@ -1111,13 +1147,10 @@ def test_waiting_for_fresh_data_includes_count():
         )
     )
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    assert result["status"] == "waiting_for_fresh_data"
-    assert result["diagnostics"]["pending_effects_count"] == 1
+    assert result.status == "waiting_for_fresh_data"
+    assert result.diagnostics.pending_effects_count == 1
 
 
 def test_waiting_for_fresh_data_includes_candidates():
@@ -1143,6 +1176,7 @@ def test_waiting_for_fresh_data_includes_candidates():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     mgr.state.last_data_point_at = fetched_at
@@ -1155,16 +1189,13 @@ def test_waiting_for_fresh_data_includes_candidates():
         )
     )
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    assert result["status"] == "waiting_for_fresh_data"
-    candidates = result["diagnostics"]["candidates"]
+    assert result.status == "waiting_for_fresh_data"
+    candidates = result.candidates
     assert candidates is not None
     heater_candidate = next(
-        (c for c in candidates if c["name"] == "heater"), None
+        (c for c in candidates if c.name == "heater"), None
     )
     assert heater_candidate is not None
 
@@ -1187,14 +1218,15 @@ def test_cache_hits_within_ttl():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
 
     result_1 = mgr.run_cycle(force=True)
     result_2 = mgr.run_cycle(force=True)
 
     # Both calls should succeed (cache is valid within TTL).
-    assert result_1["status"] == "ok"
-    assert result_2["status"] == "ok"
+    assert result_1.status == "ok"
+    assert result_2.status == "ok"
 
 
 def test_disabled_returns_early():
@@ -1218,7 +1250,7 @@ def test_disabled_returns_early():
 
     result = mgr.run_cycle()
 
-    assert result["status"] == "disabled"
+    assert result.status == "disabled"
 
 
 # --- Dry-run tests ---
@@ -1246,15 +1278,13 @@ def test_dry_run_returns_dry_run_status():
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
+        clock=FakeClock(fixed_now),
     )
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    assert result["status"] == "dry-run"
-    action_names = [a["device"] for a in result["actions"]]
+    assert result.status == "dry-run"
+    action_names = [a.device_name for a in result.actions]
     assert "water_heater" in action_names
 
 
@@ -1282,10 +1312,7 @@ def test_dry_run_does_not_execute():
         dry_run=True,
     )
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
     wh_state = asyncio.run(plug_ctrl.get_state("water_heater"))
     assert not wh_state
@@ -1315,36 +1342,42 @@ def test_dry_run_state_not_mutated():
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
+        clock=FakeClock(fixed_now),
     )
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        first_result = mgr.run_cycle()
+    first_result = mgr.run_cycle()
 
-    assert first_result["status"] == "dry-run"
-    first_actions = [a["device"] for a in first_result["actions"]]
+    assert first_result.status == "dry-run"
+    first_actions = [a.device_name for a in first_result.actions]
     assert "water_heater" in first_actions
 
     dev_state = mgr.state.devices.get("water_heater")
     if dev_state is not None:
         assert dev_state.desired_state is not True
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        second_result = mgr.run_cycle()
+    second_result = mgr.run_cycle()
 
-    assert second_result["status"] == "dry-run"
-    second_actions = [a["device"] for a in second_result["actions"]]
+    assert second_result.status == "dry-run"
+    second_actions = [a.device_name for a in second_result.actions]
     assert "water_heater" in second_actions
 
 
 # --- Tesla amp adjustment tests ---
 
 
+@patch("load_manager.get_telemetry_snapshot", return_value={"Location": {"latitude": 37.0, "longitude": -122.0}})
+@patch("load_manager.has_telemetry", return_value=True)
+@patch(
+    "load_manager.tesla_state_from_snapshot",
+    return_value=TeslaState(
+        is_charging=True,
+        current_amps=5,
+        plugged_in=True,
+        at_home=True,
+    ),
+)
 @patch("load_manager.load_tesla_config", return_value=None)
-def test_tesla_amp_adjustment(_mock_load_tesla):
+def test_tesla_amp_adjustment(_mock_tesla_state, _mock_has_telemetry, _mock_load_tesla, _mock_snapshot):
     """After plugs, residual gap triggers Tesla set_charge_amps."""
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     plugs = {
@@ -1372,11 +1405,9 @@ def test_tesla_amp_adjustment(_mock_load_tesla):
     tesla_ctrl.set_mock_state(
         TeslaState(
             is_charging=True,
-            current_amps=None,
-            soc_percent=50.0,
+            current_amps=5,
             plugged_in=True,
             at_home=True,
-            at_charge_limit=False,
         )
     )
 
@@ -1389,14 +1420,13 @@ def test_tesla_amp_adjustment(_mock_load_tesla):
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
+        clock=FakeClock(fixed_now),
     )
+    mgr.tesla_config = tesla_config
 
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)  # keep constructor working
-        result = mgr.run_cycle()
+    result = mgr.run_cycle()
 
-    action_devices = [a["device"] for a in result.get("actions", [])]
+    action_devices = [a.device_name for a in result.actions]
     assert "small_plug" in action_devices
     assert "tesla" in action_devices
 
@@ -1462,8 +1492,10 @@ def test_turn_off_only_device_even_when_savings_exceed_gap():
 class TestAdaptiveSleep:
     """Tests for the adaptive sleep hint returned by run_cycle()."""
 
-    def _make_manager(self, interval=30):
+    def _make_manager(self, interval=30, **kwargs):
         """Create a minimal LoadManager with stub controllers."""
+        fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
+        clock = FakeClock(fixed_now)
         plug_ctrl = PlugController({})
         tesla_ctrl = TeslaController(
             TeslaConfig(
@@ -1488,25 +1520,45 @@ class TestAdaptiveSleep:
             tesla_ctrl=tesla_ctrl,
             target_wh=-500,
             config_interval_secs=interval,
+            clock=clock,
+            **kwargs,
         )
 
     def _make_cycle_result(self, **overrides):
-        """Build a minimal cycle result dict for _calculate_adaptive_sleep."""
-        base = {
-            "status": "ok",
-            "nbc_prediction_wh": -1000.0,
-            "qh": "QH2",
-            "predicted_wh": -1000.0,
-            "adjusted_wh": -1000.0,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -500,
-                "seconds_remaining": 450,
-                "reason": "ok",
-            },
+        """Build a minimal CycleResult for _calculate_adaptive_sleep."""
+        diagnostics = CycleDiagnostics(
+            gap_wh=-500,
+            seconds_remaining=450,
+            reason="ok",
+        )
+        base = CycleResult(
+            status="ok",
+            qh="QH2",
+            predicted_wh=-1000.0,
+            adjusted_wh=-1000.0,
+            target_wh=-500,
+            actions=[],
+            diagnostics=diagnostics,
+            sleep_hint=0.0,
+            sleep_hint_at=None,
+        )
+        # Fields that belong on CycleDiagnostics
+        diag_fields = {
+            "gap_wh", "seconds_remaining", "reason",
+            "tesla_configured", "tesla_state", "tesla_error",
+            "tesla_login_url", "plugs_configured",
         }
-        base.update(overrides)
+        # Candidates belongs on CycleResult, not diagnostics
+        all_result_fields = diag_fields | {"candidates"}
+        diag_overrides = {k: v for k, v in overrides.items() if k in diag_fields}
+        result_overrides = {k: v for k, v in overrides.items() if k not in all_result_fields}
+        if diag_overrides:
+            base = dataclasses.replace(
+                base,
+                diagnostics=dataclasses.replace(base.diagnostics, **diag_overrides),
+            )
+        if result_overrides:
+            base = dataclasses.replace(base, **result_overrides)
         return base
 
     # --- Scenario 1: Actions taken (ok / dry-run) → config_interval ---
@@ -1516,7 +1568,7 @@ class TestAdaptiveSleep:
         """When no deficit and actions taken, sleep_hint uses QH timing multiplier."""
         lm = self._make_manager(interval=30)
         result = self._make_cycle_result(
-            status=status, nbc_prediction_wh=0.0  # no deficit (target is -500)
+            status=status, predicted_wh=0.0  # no deficit (target is -500)
         )
         hint = lm._calculate_adaptive_sleep(result)
         # No deficit, early in QH (450s > 300) → 1.5x config = 45
@@ -1551,14 +1603,14 @@ class TestAdaptiveSleep:
         hint = lm._calculate_adaptive_sleep(result)
         assert hint == 20.0
 
-    def test_waiting_for_fresh_data_clamped_to_max(self):
-        """When seconds_remaining exceeds 2*interval, sleep_hint is clamped."""
+    def test_waiting_for_fresh_data_clamped_to_prediction_window(self):
+        """When seconds_remaining exceeds prediction_window, sleep_hint is clamped to fallback 60."""
         lm = self._make_manager(interval=30)
         result = self._make_cycle_result(
             status="waiting_for_fresh_data", seconds_remaining=120.0
         )
         hint = lm._calculate_adaptive_sleep(result)
-        assert hint == 60.0  # 2 * interval
+        assert hint == 60.0  # fallback prediction_window
 
     # --- Scenario 5: No deficit (predicted >= target) → longer sleep early in QH ---
 
@@ -1567,7 +1619,7 @@ class TestAdaptiveSleep:
         lm = self._make_manager(interval=30)
         result = self._make_cycle_result(
             status="ok",
-            nbc_prediction_wh=0.0,  # no deficit (target is -500)
+            predicted_wh=0.0,  # no deficit (target is -500)
             seconds_remaining=600,  # 10 min left in QH
         )
         print(f"DEBUG: result={result}")
@@ -1581,7 +1633,7 @@ class TestAdaptiveSleep:
         lm = self._make_manager(interval=30)
         result = self._make_cycle_result(
             status="ok",
-            nbc_prediction_wh=0.0,  # no deficit (target is -500)
+            predicted_wh=0.0,  # no deficit (target is -500)
             seconds_remaining=120,  # 2 min left in QH
         )
         hint = lm._calculate_adaptive_sleep(result)
@@ -1608,13 +1660,19 @@ class TestAdaptiveSleep:
         lm = self._make_manager()
         result = self._make_cycle_result(
             status="ok",
-            nbc_prediction_wh=-2000.0,  # deficit of 1500 Wh
+            predicted_wh=-2000.0,  # deficit of 1500 Wh
             seconds_remaining=450,
         )
         # Add candidates with 1000W capacity
-        result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 1000.0}
-        ]
+        result = dataclasses.replace(
+            result,
+            candidates=[
+                CandidateDetailPlug(
+                    name="heater", power_watts=1000.0,
+                    capacity_wh=0.0, can_toggle=True,
+                )
+            ],
+        )
         hint = lm._calculate_adaptive_sleep(result)
         # time_to_close = (1500 / 1000) * 3600 = 5400s
         # proportion = 450 / 5400 = 0.0833
@@ -1626,13 +1684,19 @@ class TestAdaptiveSleep:
         lm = self._make_manager()
         result = self._make_cycle_result(
             status="ok",
-            nbc_prediction_wh=-600.0,  # deficit of 100 Wh
+            predicted_wh=-600.0,  # deficit of 100 Wh
             seconds_remaining=450,
         )
         # Add candidates with 1000W capacity
-        result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 1000.0}
-        ]
+        result = dataclasses.replace(
+            result,
+            candidates=[
+                CandidateDetailPlug(
+                    name="heater", power_watts=1000.0,
+                    capacity_wh=0.0, can_toggle=True,
+                )
+            ],
+        )
         hint = lm._calculate_adaptive_sleep(result)
         # time_to_close = (100 / 1000) * 3600 = 360s
         # proportion = 450 / 360 = 1.25
@@ -1644,12 +1708,18 @@ class TestAdaptiveSleep:
         lm = self._make_manager()
         result = self._make_cycle_result(
             status="ok",
-            nbc_prediction_wh=-510.0,  # deficit of only 10 Wh
+            predicted_wh=-510.0,  # deficit of only 10 Wh
             seconds_remaining=899,  # almost full QH remaining
         )
-        result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 100.0}
-        ]
+        result = dataclasses.replace(
+            result,
+            candidates=[
+                CandidateDetailPlug(
+                    name="heater", power_watts=100.0,
+                    capacity_wh=0.0, can_toggle=True,
+                )
+            ],
+        )
         hint = lm._calculate_adaptive_sleep(result)
         # time_to_close = (10 / 100) * 3600 = 360s
         # proportion = 899 / 360 ≈ 2.5 → clamped to 2.0
@@ -1669,7 +1739,7 @@ class TestAdaptiveSleep:
         """Sleep hints scale with a custom config interval."""
         lm = self._make_manager(interval=60)
         result = self._make_cycle_result(
-            status="ok", nbc_prediction_wh=0.0  # no deficit (target is -500)
+            status="ok", predicted_wh=0.0  # no deficit (target is -500)
         )
         hint = lm._calculate_adaptive_sleep(result)
         # No deficit, early in QH (450s > 300) → 1.5x config = 90
@@ -1683,9 +1753,15 @@ class TestAdaptiveSleep:
             predicted_wh=-2000.0,  # large deficit
             seconds_remaining=10,
         )
-        result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 50.0}
-        ]
+        result = dataclasses.replace(
+            result,
+            candidates=[
+                CandidateDetailPlug(
+                    name="heater", power_watts=50.0,
+                    capacity_wh=0.0, can_toggle=True,
+                )
+            ],
+        )
         hint = lm._calculate_adaptive_sleep(result)
         assert hint >= 5.0
 
@@ -1697,9 +1773,15 @@ class TestAdaptiveSleep:
             predicted_wh=-501.0,  # tiny deficit
             seconds_remaining=899,
         )
-        result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 10.0}
-        ]
+        result = dataclasses.replace(
+            result,
+            candidates=[
+                CandidateDetailPlug(
+                    name="heater", power_watts=10.0,
+                    capacity_wh=0.0, can_toggle=True,
+                )
+            ],
+        )
         hint = lm._calculate_adaptive_sleep(result)
         assert hint <= 60.0  # 2 * interval
 
@@ -1710,19 +1792,15 @@ class TestAdaptiveSleep:
         # Force a cycle — it will return early due to no incomplete QH,
         # but should still include sleep_hint
         result = lm.run_cycle(force=True)
-        assert "sleep_hint" in result
+        assert result.sleep_hint is not None
 
     def test_disabled_run_cycle_includes_sleep_hint(self):
         """Disabled run_cycle returns sleep_hint = config_interval."""
-        mock_cfg = MagicMock()
-        mock_cfg.load_manage_enabled = False
-
-        with patch("load_manager._cfg", mock_cfg):
-            lm = self._make_manager(interval=30)
+        lm = self._make_manager(interval=30, enabled=False)
 
         result = lm.run_cycle()
-        assert result["status"] == "disabled"
-        assert result["sleep_hint"] == 30
+        assert result.status == "disabled"
+        assert result.sleep_hint == 30
 
     def test_stale_data_run_cycle_includes_sleep_hint(self):
         """Stale data run_cycle returns sleep_hint = 5."""
@@ -1734,6 +1812,9 @@ class TestAdaptiveSleep:
 
             def get_current_qh(self, force=False, now=None):
                 return ("QH3", -1000.0, 600, data_point_at)
+
+            def get_data_lag_secs(self) -> int:
+                return 10
 
         lm = LoadManager(
             metrics_fetch=lambda: None,
@@ -1766,11 +1847,11 @@ class TestAdaptiveSleep:
         )]
 
         result = lm.run_cycle()
-        assert result["status"] == "stale_data"
-        assert result["sleep_hint"] == 5.0
+        assert result.status == "stale_data"
+        assert result.sleep_hint == 5.0
 
     def test_waiting_for_fresh_data_run_cycle_includes_sleep_hint(self):
-        """Waiting for fresh data returns sleep_hint = min(seconds_remaining, 2*interval)."""
+        """Waiting for fresh data returns sleep_hint capped by prediction_window."""
         fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
         data_point_at = fixed_now - timedelta(seconds=10)  # recent data point
 
@@ -1779,6 +1860,9 @@ class TestAdaptiveSleep:
 
             def get_current_qh(self, force=False, now=None):
                 return ("QH3", -1000.0, 600, data_point_at)
+
+            def get_data_lag_secs(self) -> int:
+                return 10
 
         lm = LoadManager(
             metrics_fetch=lambda: None,
@@ -1796,6 +1880,7 @@ class TestAdaptiveSleep:
             ),
             target_wh=-500,
             config_interval_secs=30,
+            clock=FakeClock(fixed_now),
         )
         lm.nbc_reader = FreshQHReader()
         lm.enabled = True
@@ -1810,14 +1895,11 @@ class TestAdaptiveSleep:
             power_watts=1000.0,
         )]
 
-        with patch("load_manager.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = lm.run_cycle()
+        result = lm.run_cycle()
 
-        assert result["status"] == "waiting_for_fresh_data"
+        assert result.status == "waiting_for_fresh_data"
         # sleep_hint should be min(seconds_remaining, 2*interval)
-        assert result["sleep_hint"] <= 60
+        assert result.sleep_hint <= 60
 
     def test_ok_run_cycle_includes_sleep_hint(self):
         """Normal ok run_cycle returns sleep_hint = config_interval."""
@@ -1826,7 +1908,7 @@ class TestAdaptiveSleep:
         result = lm.run_cycle(force=True)
         # force=True bypasses stale check, but may hit no_incomplete_qh or hysteresis
         # Either way, sleep_hint should be present
-        assert "sleep_hint" in result
+        assert result.sleep_hint is not None
 
     def test_hysteresis_run_cycle_includes_sleep_hint(self):
         """Hysteresis run_cycle returns sleep_hint = config_interval."""
@@ -1835,7 +1917,7 @@ class TestAdaptiveSleep:
         result = lm.run_cycle(force=True)
         # With no plugs and no tesla, the cycle will likely hit hysteresis or
         # return ok with empty actions. Either way, sleep_hint should be present.
-        assert "sleep_hint" in result
+        assert result.sleep_hint is not None
 
     def test_no_incomplete_qh_run_cycle_includes_sleep_hint(self):
         """No incomplete QH returns sleep_hint = 5."""
@@ -1856,8 +1938,8 @@ class TestAdaptiveSleep:
         lm.enabled = True
 
         result = lm.run_cycle()
-        assert result["status"] == "no_incomplete_qh"
-        assert result["sleep_hint"] == 5.0
+        assert result.status == "no_incomplete_qh"
+        assert result.sleep_hint == 5.0
 
     def test_sleep_hint_clamped_to_min_even_with_zero_seconds_remaining(self):
         """Sleep hint is never less than 5 even with zero seconds remaining."""
@@ -1867,9 +1949,15 @@ class TestAdaptiveSleep:
             predicted_wh=-2000.0,  # deficit
             seconds_remaining=0,
         )
-        result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 100.0}
-        ]
+        result = dataclasses.replace(
+            result,
+            candidates=[
+                CandidateDetailPlug(
+                    name="heater", power_watts=100.0,
+                    capacity_wh=0.0, can_toggle=True,
+                )
+            ],
+        )
         hint = lm._calculate_adaptive_sleep(result)
         assert hint >= 5.0
 
@@ -1881,50 +1969,22 @@ class TestAdaptiveSleep:
             predicted_wh=-501.0,  # tiny deficit
             seconds_remaining=9999,
         )
-        result["diagnostics"]["candidates"] = [
-            {"name": "heater", "power_watts": 10.0}
-        ]
-        hint = lm._calculate_adaptive_sleep(result)
-        assert hint <= 60.0  # 2 * interval
-
-    def test_sleep_hint_uses_nbc_prediction_wh_from_diagnostics(self):
-        """_calculate_adaptive_sleep reads predicted_wh from nbc_prediction_wh key."""
-        lm = self._make_manager()
-        result = self._make_cycle_result(
-            status="ok",
-            nbc_prediction_wh=0.0,  # no deficit
-            predicted_wh=-1000.0,  # different value — nbc_prediction_wh should be used
-            seconds_remaining=600,
+        result = dataclasses.replace(
+            result,
+            candidates=[
+                CandidateDetailPlug(
+                    name="heater", power_watts=10.0,
+                    capacity_wh=0.0, can_toggle=True,
+                )
+            ],
         )
         hint = lm._calculate_adaptive_sleep(result)
-        # With no deficit (nbc_prediction_wh=0 >= target=-500), early in QH
-        # should return config_interval * 1.5 = 45
-        assert hint == 45.0
-
-    def test_sleep_hint_defaults_to_zero_when_nbc_prediction_missing(self):
-        """When nbc_prediction_wh is missing, defaults to 0 (no deficit)."""
-        lm = self._make_manager()
-        result = self._make_cycle_result()
-        del result["nbc_prediction_wh"]
-        hint = lm._calculate_adaptive_sleep(result)
-        # With no nbc_prediction_wh, defaults to 0 which is >= target=-500
-        # so treated as no deficit → early QH multiplier (1.5x) = 45
-        assert hint == 45.0
-
-    def test_sleep_hint_defaults_to_zero_when_seconds_remaining_missing(self):
-        """When seconds_remaining is missing, defaults to config_interval."""
-        lm = self._make_manager()
-        result = self._make_cycle_result(nbc_prediction_wh=0.0)  # no deficit
-        del result["diagnostics"]["seconds_remaining"]
-        hint = lm._calculate_adaptive_sleep(result)
-        # No deficit, seconds_remaining defaults to 30 (<=300 → late QH)
-        # → 1.25x config = 37.5
-        assert hint == 37.5
+        assert hint <= 60.0  # 2 * interval
 
     def test_sleep_hint_handles_missing_candidates_key(self):
         """When diagnostics has no candidates key, treats as zero capacity."""
         lm = self._make_manager()
-        result = self._make_cycle_result(nbc_prediction_wh=-2000.0)  # deficit
+        result = self._make_cycle_result(predicted_wh=-2000.0)  # deficit
         # Base diagnostics has no "candidates" key — that's the point.
         hint = lm._calculate_adaptive_sleep(result)
         # No candidates → zero capacity → minimum sleep
@@ -1934,41 +1994,26 @@ class TestAdaptiveSleep:
         """When candidates is None, treats as zero capacity."""
         lm = self._make_manager()
         result = self._make_cycle_result()
-        result["diagnostics"]["candidates"] = None
-        # Add deficit to trigger proportional path
-        result["nbc_prediction_wh"] = -2000.0
+        result = dataclasses.replace(
+            result,
+            predicted_wh=-2000.0,
+            candidates=None,
+        )
         hint = lm._calculate_adaptive_sleep(result)
         assert hint == 5.0
 
-    def test_sleep_hint_handles_missing_diagnostics(self):
-        """When diagnostics is missing, treats as zero capacity."""
+    def test_sleep_hint_handles_none_predicted_wh(self):
+        """When predicted_wh is None, falls through to deficit path with zero gap."""
         lm = self._make_manager()
         result = self._make_cycle_result()
-        del result["diagnostics"]
-        # Add deficit to trigger proportional path
-        result["nbc_prediction_wh"] = -2000.0
+        result = dataclasses.replace(
+            result,
+            predicted_wh=None,
+        )
         hint = lm._calculate_adaptive_sleep(result)
+        # None predicted_wh → skips no-deficit check → gap defaults to 0.0
+        # → zero capacity path → minimum sleep
         assert hint == 5.0
-
-    def test_sleep_hint_handles_missing_predicted_wh(self):
-        """When nbc_prediction_wh is missing, defaults to 0."""
-        lm = self._make_manager()
-        result = self._make_cycle_result()
-        del result["nbc_prediction_wh"]
-        hint = lm._calculate_adaptive_sleep(result)
-        # With no deficit (nbc_prediction_wh defaults to 0 >= target=-500),
-        # returns config_interval * timing_multiplier (early in QH → 1.5x)
-        assert hint == 45.0
-
-    def test_sleep_hint_handles_missing_status(self):
-        """When status is missing, treated as unknown → falls through to deficit path."""
-        lm = self._make_manager()
-        result = self._make_cycle_result(nbc_prediction_wh=0.0)  # no deficit
-        del result["status"]
-        hint = lm._calculate_adaptive_sleep(result)
-        # No status → falls through to predicted_wh check.
-        # predicted_wh=0 >= target=-500 → no deficit path, early QH (450s > 300)
-        assert hint == 45.0  # config_interval * 1.5 (early in QH)
 
     # --- sleep_hint_at tests ---
 
@@ -1976,23 +2021,19 @@ class TestAdaptiveSleep:
         """run_cycle() returns sleep_hint_at in the result dict."""
         lm = self._make_manager(interval=30)
         result = lm.run_cycle(force=True)
-        assert "sleep_hint_at" in result
+        assert result.sleep_hint_at is not None
 
     def test_disabled_run_cycle_includes_sleep_hint_at(self):
         """Disabled run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
-        mock_cfg = MagicMock()
-        mock_cfg.load_manage_enabled = False
-
-        with patch("load_manager._cfg", mock_cfg):
-            lm = self._make_manager(interval=30)
+        lm = self._make_manager(interval=30, enabled=False)
 
         result = lm.run_cycle()
-        assert result["status"] == "disabled"
-        assert "sleep_hint_at" in result
+        assert result.status == "disabled"
+        assert result.sleep_hint_at is not None
         # Should be a valid ISO 8601 string that parses to a UTC datetime
         from datetime import datetime
 
-        parsed = datetime.fromisoformat(result["sleep_hint_at"])
+        parsed = datetime.fromisoformat(result.sleep_hint_at)
         assert parsed.tzinfo is not None
 
     def test_stale_data_run_cycle_includes_sleep_hint_at(self):
@@ -2005,6 +2046,9 @@ class TestAdaptiveSleep:
 
             def get_current_qh(self, force=False, now=None):
                 return ("QH3", -1000.0, 600, data_point_at)
+
+            def get_data_lag_secs(self) -> int:
+                return 10
 
         lm = LoadManager(
             metrics_fetch=lambda: None,
@@ -2036,17 +2080,17 @@ class TestAdaptiveSleep:
         )]
 
         result = lm.run_cycle()
-        assert result["status"] == "stale_data"
-        assert "sleep_hint_at" in result
-        parsed = datetime.fromisoformat(result["sleep_hint_at"])
+        assert result.status == "stale_data"
+        assert result.sleep_hint_at is not None
+        parsed = datetime.fromisoformat(result.sleep_hint_at)
         assert parsed.tzinfo is not None
 
     def test_no_incomplete_qh_run_cycle_includes_sleep_hint_at(self):
         """No incomplete QH run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
         lm = self._make_manager(interval=30)
         result = lm.run_cycle(force=True)
-        assert "sleep_hint_at" in result
-        parsed = datetime.fromisoformat(result["sleep_hint_at"])
+        assert result.sleep_hint_at is not None
+        parsed = datetime.fromisoformat(result.sleep_hint_at)
         assert parsed.tzinfo is not None
 
     def test_waiting_for_fresh_data_run_cycle_includes_sleep_hint_at(self):
@@ -2059,6 +2103,9 @@ class TestAdaptiveSleep:
 
             def get_current_qh(self, force=False, now=None):
                 return ("QH3", -800.0, 600, data_point_at)
+
+            def get_data_lag_secs(self) -> int:
+                return 10
 
         lm = LoadManager(
             metrics_fetch=lambda: None,
@@ -2076,6 +2123,7 @@ class TestAdaptiveSleep:
             ),
             target_wh=-500,
             config_interval_secs=30,
+            clock=FakeClock(fixed_now),
         )
         lm.nbc_reader = PendingQHReader()
         lm.enabled = True
@@ -2090,23 +2138,20 @@ class TestAdaptiveSleep:
             power_watts=1000.0,
         )]
 
-        with patch("load_manager.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = lm.run_cycle()
+        result = lm.run_cycle()
 
-        assert result["status"] == "waiting_for_fresh_data"
-        assert "sleep_hint_at" in result
-        parsed = datetime.fromisoformat(result["sleep_hint_at"])
+        assert result.status == "waiting_for_fresh_data"
+        assert result.sleep_hint_at is not None
+        parsed = datetime.fromisoformat(result.sleep_hint_at)
         assert parsed.tzinfo is not None
 
     def test_sleep_hint_at_is_recent(self):
-        """sleep_hint_at should be within a few seconds of datetime.now(timezone.utc)."""
+        """sleep_hint_at should be within a few seconds of the manager's clock."""
         lm = self._make_manager(interval=30)
-        before = datetime.now(timezone.utc)
+        fmgr_clock = lm._clock  # type: ignore[attr-defined]
         result = lm.run_cycle(force=True)
-        after = datetime.now(timezone.utc)
 
-        hint_at = datetime.fromisoformat(result["sleep_hint_at"])
-        assert hint_at >= before - timedelta(seconds=2)
-        assert hint_at <= after + timedelta(seconds=2)
+        hint_at = datetime.fromisoformat(result.sleep_hint_at)
+        # The manager uses a FakeClock, so sleep_hint_at equals the fake time.
+        # Verify it matches the clock we used to create the manager.
+        assert abs((hint_at - fmgr_clock.now()).total_seconds()) < 2

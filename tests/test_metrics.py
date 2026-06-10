@@ -5,8 +5,9 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import requests
-from energy_cache import EnergyCache
+from energy_cache import EnergyCache, EnergyCacheData
 from metrics import (
+    DevicePrediction,
     HourlyProjection,
     Metrics,
     MetricsBase,
@@ -16,7 +17,7 @@ from metrics import (
 from util import ceil_to_qh, compute_nbc_quarters
 from mockdata import MetricsMock
 from test_app import mock_config
-
+from clock import FakeClock
 
 class TestTOUReporterAggregate(unittest.TestCase):
     """Test that TOUReporter.aggregate_tou correctly uses EnergyDataAggregator."""
@@ -49,7 +50,7 @@ class TestTOUReporterAggregate(unittest.TestCase):
         # Should not raise AttributeError for missing EnergyDataAggregator
         reporter.aggregate_tou()
         self.assertIsNotNone(reporter.tou_result)
-        self.assertIn("total", reporter.tou_result)
+        self.assertIsNotNone(reporter.tou_result.total)
 
 
 class TestMetrics(unittest.TestCase):
@@ -77,59 +78,11 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(device_a["name"], "MOCK")
         self.assertEqual(device_a["timezone"], "America/Los_Angeles")
         self.assertIn("prediction", device_a)
-        self.assertIn("scales", device_a)
-        self.assertIn("smoothing", device_a)
 
         # Device B: positive (load only)
         device_b = devices[1]
         self.assertEqual(device_b["name"], "SOLAR+LOAD")
         self.assertIn("prediction", device_b)
-        self.assertIn("scales", device_b)
-
-    def test_mock_scales(self):
-        # Device A: negative usage (solar export)
-        device_a = self.metrics_data["devices"][0]
-        scales_a = device_a["scales"]
-
-        self.assertIn("1H", scales_a)
-        self.assertIn("1MIN", scales_a)
-        self.assertIn("10MIN", scales_a)
-
-        hour_data_a = scales_a["1H"]
-        # At default instant_minute=42, len(data) == 42*60 = 2520
-        self.assertEqual(hour_data_a["seconds"], 42 * 60)
-        self.assertIsInstance(hour_data_a["instant"], datetime)
-        self.assertLess(hour_data_a["usage"], 0)
-
-        # Device B: positive usage (load only)
-        device_b = self.metrics_data["devices"][1]
-        scales_b = device_b["scales"]
-        hour_data_b = scales_b["1H"]
-        self.assertEqual(hour_data_b["seconds"], 42 * 60)
-        self.assertGreater(hour_data_b["usage"], 0)
-
-    def test_mock_smoothing(self):
-        device = self.metrics_data["devices"][0]
-        smoothing = device["smoothing"]
-
-        self.assertIn("1MIN", smoothing)
-        self.assertIn("10MIN", smoothing)
-        # Values are dynamically computed; just verify they're numeric
-        self.assertIsInstance(smoothing["1MIN"], float)
-
-    def test_data_for_scale_logic(self):
-        # Testing the static method directly with sample data
-        data = [0.1, 0.2, 0.3]  # kWh
-        data_start = datetime(2023, 1, 1, 12, 0, tzinfo=timezone.utc)
-
-        # Test Hour scale (direct sum * 1000)
-        result_h = Metrics.data_for_scale(data, data_start, "1H")
-        self.assertAlmostEqual(result_h["usage"], 600.0)
-
-        # Test Minute scale (sum * 1000 * 60 / len)
-        # (0.6 * 1000 * 60 / 3) = 12000 Wh/min equivalent
-        result_m = Metrics.data_for_scale(data, data_start, "1MIN")
-        self.assertAlmostEqual(result_m["usage"], 12000.0)
 
     def test_mock_nbc_structure(self):
         """Verify nbc field exists with QH1–QH4 keys."""
@@ -187,12 +140,12 @@ class TestMetrics(unittest.TestCase):
         """Verify MetricsMock().tou_result has non-zero values with all four keys."""
         mock = MetricsMock()
         tou = mock.tou_result
-        self.assertIn("total", tou)
-        self.assertIn("peak", tou)
-        self.assertIn("part_peak", tou)
-        self.assertIn("off_peak", tou)
-        self.assertGreater(tou["total"], 0)
-        self.assertGreater(tou["peak"], 0)
+        self.assertIsNotNone(tou.total)
+        self.assertIsNotNone(tou.peak)
+        self.assertIsNotNone(tou.part_peak)
+        self.assertIsNotNone(tou.off_peak)
+        self.assertGreater(tou.total, 0)
+        self.assertGreater(tou.peak, 0)
 
     def test_mock_device_b_positive_consumption(self):
         """Verify Device B has positive consumption (load-only scenario)."""
@@ -271,89 +224,89 @@ class TestComputeNBCQuartersEdgeCases(unittest.TestCase):
         """With empty per_second_data, all quarters should be None."""
         result = compute_nbc_quarters([])
 
-        for qh in ["QH1", "QH2", "QH3", "QH4"]:
-            self.assertIsNone(result[qh])
+        for attr in ["qh1", "qh2", "qh3", "qh4"]:
+            self.assertIsNone(getattr(result, attr))
 
     def test_n_zero_returns_all_none(self):
         """With n=0 (no seconds observed), all quarters should be None."""
         data = []
         result = compute_nbc_quarters(data)
 
-        for qh in ["QH1", "QH2", "QH3", "QH4"]:
-            self.assertIsNone(result[qh])
+        for attr, name in [("qh1", "QH1"), ("qh2", "QH2"), ("qh3", "QH3"), ("qh4", "QH4")]:
+            self.assertIsNone(getattr(result, attr), f"{name} should be None")
 
     def test_n_900_completes_qh1(self):
         """n=900 should complete QH1, leave others None."""
         data = [0.002] * 900
         result = compute_nbc_quarters(data)
 
-        self.assertTrue(result["QH1"]["complete"])
-        self.assertAlmostEqual(result["QH1"]["raw_wh"], 900 * 0.002 * 1000)
-        self.assertIsNone(result["QH2"])
-        self.assertIsNone(result["QH3"])
-        self.assertIsNone(result["QH4"])
+        self.assertTrue(result.qh1.complete)
+        self.assertAlmostEqual(result.qh1.raw_wh, 900 * 0.002 * 1000)
+        self.assertIsNone(result.qh2)
+        self.assertIsNone(result.qh3)
+        self.assertIsNone(result.qh4)
 
     def test_n_901_partial_qh1(self):
         """n=901 should complete QH2, partial QH1 with 1 sample."""
         data = [0.005] * 901
         result = compute_nbc_quarters(data)
 
-        self.assertTrue(result["QH2"]["complete"])
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertEqual(result["QH1"]["samples_used"], 1)
+        self.assertTrue(result.qh2.complete)
+        self.assertFalse(result.qh1.complete)
+        self.assertEqual(result.qh1.samples_used, 1)
 
     def test_n_3600_completes_all_quarters(self):
         """n=3600 (past end of QH4) should complete all quarters."""
         data = [0.002] * 3600
         result = compute_nbc_quarters(data)
 
-        for qh in ["QH1", "QH2", "QH3", "QH4"]:
-            self.assertTrue(result[qh]["complete"])
+        for attr in ["qh1", "qh2", "qh3", "qh4"]:
+            self.assertTrue(getattr(result, attr).complete)
 
     def test_negative_raw_wh_clamped_to_zero_in_complete(self):
         """Complete quarters with negative raw_wh should have wh=0."""
         data = [-0.002] * 900
         result = compute_nbc_quarters(data)
 
-        self.assertTrue(result["QH1"]["complete"])
-        self.assertEqual(result["QH1"]["wh"], 0)
+        self.assertTrue(result.qh1.complete)
+        self.assertEqual(result.qh1.wh, 0)
 
     def test_negative_raw_wh_clamped_to_zero_in_partial(self):
         """Partial quarters with negative predicted_wh should have wh=0."""
         data = [-0.002] * 1500
         result = compute_nbc_quarters(data)
 
-        self.assertFalse(result["QH1"]["complete"])
+        self.assertFalse(result.qh1.complete)
         # predicted_wh will be negative, clamped to 0
-        self.assertLess(result["QH1"]["raw_wh"], 0)
-        self.assertEqual(result["QH1"]["wh"], 0)
+        self.assertLess(result.qh1.raw_wh, 0)
+        self.assertEqual(result.qh1.wh, 0)
 
     def test_partial_qh_has_predicted_wh(self):
         """Incomplete quarters should include predicted_wh field."""
         data = [0.002] * 1500
         result = compute_nbc_quarters(data)
 
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertIn("predicted_wh", result["QH1"])
+        self.assertFalse(result.qh1.complete)
+        self.assertIsNotNone(result.qh1.predicted_wh)
 
     def test_partial_qh_has_remaining_seconds(self):
         """Incomplete quarters should include remaining_seconds field."""
         data = [0.002] * 1500
         result = compute_nbc_quarters(data)
 
-        self.assertIn("remaining_seconds", result["QH1"])
+        self.assertIsNotNone(result.qh1.remaining_seconds)
         # QH1 ends at index 1799, n=1500 → remaining = 1800 - 1500
-        self.assertEqual(result["QH1"]["remaining_seconds"], 300)
+        self.assertEqual(result.qh1.remaining_seconds, 300)
 
     def test_partial_qh_has_samples_used(self):
         """Incomplete quarters should include samples_used field."""
         data = [0.002] * 1500
         result = compute_nbc_quarters(data)
 
-        self.assertIn("samples_used", result["QH1"])
+        self.assertIsNotNone(result.qh1.samples_used)
         # lookback = max(1500-60, 900) to 1500 = max(1440, 900)=1440 to 1500
         # samples = 60 (or less if lookback_start < start_idx)
-        self.assertGreater(result["QH1"]["samples_used"], 0)
+        self.assertGreater(result.qh1.samples_used, 0)
 
     def test_partial_qh_lookback_cannot_cross_boundary(self):
         """Lookback window should not cross quarter boundary."""
@@ -364,9 +317,9 @@ class TestComputeNBCQuartersEdgeCases(unittest.TestCase):
         data = [0.005] * 901  # uniform positive values
         result = compute_nbc_quarters(data)
 
-        self.assertFalse(result["QH1"]["complete"])
+        self.assertFalse(result.qh1.complete)
         # lookback is data[900:901] → 2 elements (indices 900 and 901)
-        self.assertEqual(result["QH1"]["samples_used"], 1)
+        self.assertEqual(result.qh1.samples_used, 1)
 
     def test_partial_qh_lookback_clamped_to_start_idx(self):
         """Lookback start should be clamped to quarter start index."""
@@ -375,41 +328,7 @@ class TestComputeNBCQuartersEdgeCases(unittest.TestCase):
         data = [0.005] * 910
         result = compute_nbc_quarters(data)
 
-        self.assertEqual(result["QH1"]["samples_used"], 10)
-
-
-class TestDataForScaleEdgeCases(unittest.TestCase):
-    """Tests for HourlyProjection.data_for_scale edge cases."""
-
-    def test_empty_data_list(self):
-        """data_for_scale with empty data list should handle gracefully."""
-        from datetime import datetime, timezone
-
-        result = HourlyProjection.data_for_scale(
-            [], datetime.now(timezone.utc), "1H"
-        )
-        self.assertEqual(result["usage"], 0.0)
-
-    def test_single_data_point(self):
-        """data_for_scale with a single data point should work."""
-        from datetime import datetime, timezone
-
-        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
-        result = HourlyProjection.data_for_scale([0.5], fixed_now, "1H")
-
-        # data_len is only present when DEBUG mode is on
-        self.assertGreaterEqual(result["usage"], 0.0)
-
-    def test_scale_key_stored_as_is(self):
-        """The scale parameter should be stored as the 'scale' key."""
-        from datetime import datetime, timezone
-
-        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
-        result = HourlyProjection.data_for_scale(
-            [0.5, 0.6], fixed_now, "CUSTOM_SCALE"
-        )
-
-        self.assertEqual(result["scale"], "CUSTOM_SCALE")
+        self.assertEqual(result.qh1.samples_used, 10)
 
 
 class TestHourlyProjectionErrorPaths(unittest.TestCase):
@@ -449,6 +368,16 @@ class TestHourlyProjectionPopulateChartStart(unittest.TestCase):
 
     chart_start is a required parameter of populate().
     """
+
+    def setUp(self):
+        self._p1 = patch.object(MetricsBase, "vue_init")
+        self._p2 = patch.object(MetricsBase, "get_device_info")
+        self._p1.start()
+        self._p2.start()
+
+    def tearDown(self):
+        self._p1.stop()
+        self._p2.stop()
 
     def test_init(self):
         """HourlyProjection() requires passing instant."""
@@ -544,6 +473,23 @@ class TestCapChartStart(unittest.TestCase):
         result = cap_chart_start(qh_start, instant)
         self.assertEqual(result, qh_start)
 
+    def test_caps_future_chart_start(self):
+        """When chart_start is in the future (> now), fall back to full-hour fetch.
+
+        A future chart_start indicates corrupted cache state (last_sample_at was
+        set to a timestamp past the current instant).  Passing it through would
+        cause the Emporia API to receive start > end and return a 400.
+        See bugs/2026-05-30-api-httperror.log for the concrete failure.
+        """
+        from metrics import cap_chart_start, ceil_to_qh, MAX_FETCH_WINDOW
+
+        now = datetime(2026, 5, 30, 23, 40, 21, tzinfo=timezone.utc)
+        future_start = datetime(2026, 5, 30, 23, 44, 59, tzinfo=timezone.utc)
+        expected = ceil_to_qh(now - MAX_FETCH_WINDOW)
+        result = cap_chart_start(future_start, now)
+        self.assertEqual(result, expected)
+        self.assertLess(result, now)
+
 
 class TestCapFetchWindow(unittest.TestCase):
     """Tests for the cap_fetch_window guard function."""
@@ -590,51 +536,6 @@ class TestCapFetchWindow(unittest.TestCase):
 class TestHourlyProjectionEdgeCases(unittest.TestCase):
     """Tests for HourlyProjection edge cases."""
 
-    def test_predict_device_missing_extra_min_scales(self):
-        """_predict_device with only 1MIN (no other MIN scales) should still compute prediction."""
-        from datetime import timedelta, timezone
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-        # Set up the instant attribute that _predict_device needs
-        hp.instant = now.replace(minute=30)
-
-        # Only 1H and 1MIN — no other MIN scales like 5MIN, 10MIN
-        scales = {
-            "1H": {"usage": 60.0, "instant": now},
-            "1MIN": {"usage": 2.5, "instant": now + timedelta(minutes=1)},
-        }
-
-        result = hp._predict_device(scales)
-
-        self.assertIn("prediction", result)
-        # smoothing should only have "1MIN" key, not 5MIN/10MIN
-        self.assertIn("smoothing", result)
-
-    def test_predict_device_with_partial_scales(self):
-        """_predict_device with only some MIN scales should compute smoothing for those."""
-        from datetime import timedelta, timezone
-
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-        # Set up the instant attribute that _predict_device needs
-        hp.instant = now.replace(minute=30)
-
-        # 1H + "5MIN" only (no other MIN scales like 2MIN, 3MIN)
-        # _predict_device needs "1MIN" for minute_predicted calculation.
-        scales = {
-            "1H": {"usage": 60.0, "instant": now},
-            "5MIN": {"usage": 3.0, "instant": now + timedelta(minutes=5)},
-            "1MIN": {"usage": 2.0, "instant": now + timedelta(minutes=1)},
-        }
-
-        result = hp._predict_device(scales)
-
-        self.assertIn("prediction", result)
-
-
 class TestTOUReporterEdgeCases(unittest.TestCase):
     """Tests for TOUReporter edge cases."""
 
@@ -653,7 +554,7 @@ class TestTOUReporterEdgeCases(unittest.TestCase):
 
         self.assertIsNotNone(tou.tou_result)
         for bucket in ["total", "peak", "part_peak", "off_peak"]:
-            self.assertEqual(tou.tou_result[bucket], 0.0)
+            self.assertEqual(getattr(tou.tou_result, bucket), 0.0)
 
     def test_aggregate_tou_with_none_values_in_data(self):
         """aggregate_tou should skip None values in 15-min data."""
@@ -740,7 +641,7 @@ class TestDeviceMetricsDataClass(unittest.TestCase):
             "gid", "lag", "name", "per_second_data",
             "prediction", "prediction_min", "prediction_max",
             "minute_predicted", "minutes_remaining",
-            "scales", "smoothing", "timezone", "nbc"
+            "timezone", "nbc"
         }
         self.assertEqual(set(d.keys()), expected_keys)
 
@@ -771,12 +672,7 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
         # First call (token-based) returns False → triggers password fallback
         vue_mock.login.side_effect = [False, True]
 
-        with patch.object(MetricsBase, "vue", vue_mock), \
-             patch("metrics._cfg") as cfg_mock:
-
-            # Set up config so password auth works
-            cfg_mock.vue_username = "testuser"
-            cfg_mock.vue_password = "testpass"
+        with patch.object(MetricsBase, "vue", vue_mock):
 
             # Create a fake .vue-keys.json so the file read doesn't fail
             import tempfile, os
@@ -795,6 +691,11 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
                 base.vue_keys = keys_file
                 base.logger = MagicMock()
 
+                # Inject config via DI (same path as __init__ sets self._cfg)
+                from config import Config
+
+                base._cfg = Config(overrides={"VUE_USERNAME": "testuser", "VUE_PASSWORD": "testpass"})
+
                 # Mock open to return our temp file content for token login
                 original_open = __builtins__["open"]
 
@@ -804,8 +705,8 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
                 with patch("builtins.open", mock_file_open):
                     base.vue_init()
 
-                # Token login was called first (returned False), then password auth succeeded
-                self.assertEqual(vue_mock.login.call_count, 2)
+                    # Token login failed (False), password login succeeded (True)
+                    self.assertEqual(vue_mock.login.call_count, 2)
             finally:
                 os.unlink(keys_file)
 
@@ -817,8 +718,7 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
         # Both login attempts fail
         vue_mock.login.side_effect = [False, False]
 
-        with patch.object(MetricsBase, "vue", vue_mock), \
-             patch("metrics._cfg") as cfg_mock:
+        with patch.object(MetricsBase, "vue", vue_mock):
 
             import tempfile, os
 
@@ -834,15 +734,17 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
                 base.vue_keys = keys_file
                 base.logger = MagicMock()
 
+                # Inject config via DI (same path as __init__ sets self._cfg)
+                from config import Config
+
+                base._cfg = Config(overrides={"VUE_USERNAME": "u", "VUE_PASSWORD": "p"})
+
                 original_builtins_open = __builtins__["open"]
 
                 def mock_file_open(*args, **kwargs):
                     return original_builtins_open(keys_file)
 
                 with patch("builtins.open", mock_file_open):
-                    cfg_mock.vue_username = "u"
-                    cfg_mock.vue_password = "p"
-
                     with self.assertRaises(Exception) as ctx:  # VueAuthenticationError
                         base.vue_init()
 
@@ -994,69 +896,6 @@ class TestFetchChannelDataErrors(unittest.TestCase):
         self.assertIn("No data for hour", str(ctx.exception))
 
 
-class TestProcessOffsetScalesEdgeCases(unittest.TestCase):
-    """Tests for _process_offset_scales edge cases."""
-
-    def test_process_minute_0_boundary(self):
-        """When minute=0, max(1, min(10, 0)) = 1 so only '1MIN' scale is computed."""
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-        hp.instant = now.replace(minute=30)
-        hp.logger = MagicMock()
-        scales: dict[str, Any] = {}
-
-        # usage_data_end has minute=0
-        end_time = now.replace(minute=0)
-
-        # 61 seconds of data (one minute worth)
-        usage_data = [0.5] * 61
-
-        result = hp._process_offset_scales(scales, usage_data, end_time)
-
-        # Only "1MIN" should be in scales (minute=0 → max(1, min(10, 0)) = 1)
-        self.assertIn("1MIN", scales)
-
-    def test_process_minute_6_plus(self):
-        """When minute >= 6, scales should include '1MIN' through '6MIN'."""
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-        hp.instant = now.replace(minute=30)
-        hp.logger = MagicMock()
-        scales: dict[str, Any] = {}
-
-        # usage_data_end has minute=6
-        end_time = now.replace(minute=6)
-
-        # 390 seconds of data (6 minutes worth + a bit more for the tail)
-        usage_data = [0.5] * 391
-
-        result = hp._process_offset_scales(scales, usage_data, end_time)
-
-        # Should have "1MIN" through "6MIN"
-        for i in range(1, 7):
-            self.assertIn(f"{i}MIN", scales)
-
-    def test_process_returns_last_300(self):
-        """Returns last 300 data points from the usage_data_local."""
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-        hp.instant = now.replace(minute=30)
-        hp.logger = MagicMock()
-        scales: dict[str, Any] = {}
-
-        end_time = now.replace(minute=42)
-        # 2520 seconds of data (minute=42 → 42*60 = 2520)
-        usage_data = [float(i % 10) for i in range(2520)]
-
-        result = hp._process_offset_scales(scales, usage_data, end_time)
-
-        # Should return exactly the last 300 elements
-        self.assertEqual(len(result), min(300, len(usage_data)))
-
-
 class TestComputeNBCEdgeCases(unittest.TestCase):
     """Tests for _compute_nbc edge cases."""
 
@@ -1075,7 +914,7 @@ class TestComputeNBCEdgeCases(unittest.TestCase):
         result = hp._compute_nbc(short_data)
 
         # n should be clamped to len(data)=10
-        self.assertFalse(result["QH1"]["complete"])
+        self.assertFalse(result.qh1.complete)
 
 
 class TestPopulateDeviceErrors(unittest.TestCase):
@@ -1121,41 +960,20 @@ class TestPopulateDeviceErrors(unittest.TestCase):
 class TestPredictDeviceEdgeCases(unittest.TestCase):
     """Tests for _predict_device edge cases."""
 
-    def test_no_minute_scales(self):
-        """With only 1H and no extra MIN scales, smoothing has just '1MIN'."""
-        hp = HourlyProjection.__new__(HourlyProjection)
-        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-        hp.instant = now.replace(minute=30)
-        scales: dict[str, Any] = {
-            "1H": {"usage": 60.0, "instant": now},
-            # _predict_device requires at least a 1MIN scale to compute minute_predicted.
-            "1MIN": {"usage": 2.5, "instant": now + timedelta(minutes=1)},
-        }
-
-        result = hp._predict_device(scales)
-
-        self.assertIn("prediction", result)
-        # With only 1MIN (no other MIN scales), smoothing has just one entry.
-        self.assertEqual(result["smoothing"], {"1MIN": result["prediction"]})
-
     def test_lag_zero(self):
-        """When hour['instant'] >= instant, lag is timedelta(0)."""
+        """When hour_instant >= instant, lag is timedelta(0)."""
         hp = HourlyProjection.__new__(HourlyProjection)
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
-        # Set instant to be AFTER the hour data point
+        # Set instant to be BEFORE the data end time
         hp.instant = now.replace(minute=45)
+        data_start = now.replace(minute=44, second=0)
+        data = [0.001] * 120  # ends at minute=46
 
-        scales: dict[str, Any] = {
-            "1H": {"usage": 60.0, "instant": now.replace(minute=45)},
-            # _predict_device requires at least a 1MIN scale to compute minute_predicted.
-            "1MIN": {"usage": 2.5, "instant": now.replace(minute=46)},
-        }
+        result = hp._predict_device(data, data_start)
 
-        result = hp._predict_device(scales)
-
-        self.assertEqual(result["lag"], timedelta(0))
+        self.assertIsInstance(result, DevicePrediction)
+        self.assertEqual(result.lag, timedelta(0))
 
 
 class TestTOUReporterFetchErrors(unittest.TestCase):
@@ -1227,36 +1045,6 @@ class TestTOUReporterFetchErrors(unittest.TestCase):
                 tou.fetch_usage_data()
 
                 self.assertEqual(tou.usage_data_list, [])
-
-
-class TestDataForScaleDebugMode(unittest.TestCase):
-    """Tests for data_for_scale debug mode behavior."""
-
-    def test_debug_mode_off_no_extra_keys(self):
-        """When DEBUG is off, data_for_scale result has no 'data'/'data_len' keys."""
-        from unittest.mock import patch
-
-        now = datetime.now(timezone.utc)
-        data = [0.1, 0.2]
-
-        with patch("metrics.is_debug", return_value=False):
-            result = HourlyProjection.data_for_scale(data, now, "1H")
-
-        self.assertNotIn("data", result)
-        self.assertNotIn("data_len", result)
-
-    def test_debug_mode_on_has_extra_keys(self):
-        """When DEBUG is on, data_for_scale result includes 'data'/'data_len'."""
-        from unittest.mock import patch
-
-        now = datetime.now(timezone.utc)
-        data = [0.1, 0.2]
-
-        with patch("metrics.is_debug", return_value=True):
-            result = HourlyProjection.data_for_scale(data, now, "1H")
-
-        self.assertIn("data", result)
-        self.assertEqual(result["data_len"], 2)
 
 
 class TestHourlyProjectionNoPredictions(unittest.TestCase):
@@ -1357,7 +1145,7 @@ class TestBuildIncrementalFetch(unittest.TestCase):
 
     def test_incremental_fetch_merges_samples(self):
         """New samples from API are appended to existing cache samples via get_or_fetch."""
-        from metrics import EnergyCache, _build_incremental_fetch
+        import metrics
 
         cache = EnergyCache(ttl_seconds=60)
         vue_mock = MagicMock()
@@ -1377,12 +1165,10 @@ class TestBuildIncrementalFetch(unittest.TestCase):
             old_start + timedelta(seconds=300),
         )
 
-        fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
+        fetcher = metrics._build_incremental_fetch(cache, vue_mock, gid, fixed_now)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # Cache should have merged samples: 300 + 60 = 360
         self.assertEqual(len(cache._samples), 360)
@@ -1435,10 +1221,7 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         )
 
         fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
-        # Patch datetime.now so pruning uses our test time
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # After merging: 7200 + 600 = 7800 samples
         # After pruning (keep only last 3600s): should be ~4200 samples
@@ -1564,17 +1347,13 @@ class TestIncrementalFetchIntegration(unittest.TestCase):
         # Build incremental fetcher (to verify)
         _fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
 
-        # Patch datetime.now so pruning doesn't wipe out 2025 data
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
+        # First fetch: full range
+        cache.get_or_fetch(fetch_func_1, fixed_now)
+        self.assertEqual(len(cache._samples), 2642)
 
-            # First fetch: full range
-            cache.get_or_fetch(fetch_func_1, fixed_now)
-            self.assertEqual(len(cache._samples), 2642)
-
-            # Second call with force=True to simulate incremental fetch
-            cache.get_or_fetch(fetch_func_2, fixed_now, force=True)
-            self.assertEqual(len(cache._samples), 2684)
+        # Second call with force=True to simulate incremental fetch
+        cache.get_or_fetch(fetch_func_2, fixed_now, force=True)
+        self.assertEqual(len(cache._samples), 2684)
 
 
 if __name__ == "__main__":
@@ -1589,7 +1368,7 @@ These tests verify:
 - Incremental fetch computes correct API start times
 - Pruning removes old samples without gaps or duplicates
 - HourlyProjection.fetch_channel_data() and _populate_device() work correctly
-- Prediction math uses scales correctly
+- Prediction math uses per-second data correctly
 - Full pipeline produces no gaps or duplicates
 
 All tests use mocked Emporia VUE API via pyemvue.
@@ -1612,18 +1391,6 @@ from metrics import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _patch_now(target_dt: datetime) -> unittest.mock._patch:
-    """Return a patch that makes metrics.datetime.now() return *target_dt*.
-
-    Args:
-        target_dt: The datetime value to return from datetime.now().
-
-    Returns:
-        A patch context manager.
-    """
-    return unittest.mock.patch("metrics.datetime.now", return_value=target_dt)
 
 
 def _make_cache_with_samples(count: int, start: datetime | None = None) -> "metrics.EnergyCache":
@@ -1651,8 +1418,6 @@ def _make_cache_with_samples(count: int, start: datetime | None = None) -> "metr
 
 
 def _make_hourly_mock(
-    hour_usage: float = 1.0,
-    n_minutes: int = 5,
     n_seconds: int = 100,
     samples: list[float] | None = None,
     instant: datetime | None = None,
@@ -1661,8 +1426,6 @@ def _make_hourly_mock(
     """Build a HourlyProjection with mocked VUE API.
 
     Args:
-        hour_usage: Simulated hour-scale usage (kWh).
-        n_minutes: Number of minute-scale entries to generate.
         n_seconds: Number of per-second samples to return from API.
         samples: Optional list of per-second samples for previous hour.
         instant: Override the "now" instant.
@@ -1674,14 +1437,7 @@ def _make_hourly_mock(
     if instant is None:
         instant = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
     if chart_start is None:
-        # _process_offset_scales computes usage_minutes from usage_data_end.minute.
-        # usage_data_end = chart_start + timedelta(seconds=n_seconds), so
-        # usage_data_end.minute = (chart_start.minute + n_seconds // 60) % 60.
-        # We need that to be >= min(n_minutes, 10) for the test to see all minute scales.
-        needed_minute = min(n_minutes, 10)
-        added_minutes = n_seconds // 60
-        minute_val = (needed_minute - added_minutes) % 60
-        chart_start = instant.replace(minute=minute_val, second=0, microsecond=0)
+        chart_start = instant.replace(second=0, microsecond=0) - timedelta(seconds=n_seconds)
 
     # Generate per-second samples for the current hour
     per_second_data = [0.001] * n_seconds
@@ -1697,8 +1453,6 @@ def _make_hourly_mock(
     mock_vdi.channels = [mock_channel]
     mock_vdi.time_zone = None
 
-    # Build scale mock
-    minute_secs = [60 * (i + 1) for i in range(n_minutes)]
     mock_vue = MagicMock()
 
     # The channel must iterate over itself so _populate_device's for-loop works
@@ -1713,15 +1467,6 @@ def _make_hourly_mock(
         "data_start": chart_start,
     }
     mock_channel.samples = samples or []
-    mock_channel.scales = {
-        "1H": {"instant": chart_start, "usage": hour_usage},
-    }
-    for i, secs in enumerate(minute_secs):
-        key = f"{i + 1}MIN"
-        mock_channel.scales[key] = {
-            "instant": instant,
-            "usage": hour_usage / 3600.0 * secs,
-        }
 
     # Return a mock object that has .channels and .vue
     mock = MagicMock()
@@ -1774,10 +1519,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(existing._samples), 360)  # 300 + 60
@@ -1798,11 +1541,9 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            with self.assertRaises(AssertionError):
-                result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        with self.assertRaises(AssertionError):
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
     def test_merge_gap_between_cache_and_new(self):
         """New samples start after a gap → gap samples NOT included."""
@@ -1818,10 +1559,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(existing._samples), 360)  # 300 + 60, gap skipped
@@ -1842,10 +1581,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         # 10 new but 1 overlap = 9 new samples added
@@ -1865,10 +1602,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         new_samples = [0.006] * 6
 
         fetcher = self._fetcher_returns(new_start, new_samples)
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         # 6 new - 6 overlap = 0 new samples added
@@ -1888,10 +1623,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(existing._samples), 360)
@@ -1914,11 +1647,9 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            with self.assertRaises(AssertionError):
-                result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        with self.assertRaises(AssertionError):
+            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
     def test_merge_all_overlap_new_samples_empty_after_filter(self):
         """New samples entirely within cached range → empty after filter."""
@@ -1934,10 +1665,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         # No new samples: entirely within cache
@@ -1955,10 +1684,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(cache_start, [])
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(result[0]["per_second_data"]), 0)
@@ -1978,10 +1705,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         # _data_start should NOT change after merge
         self.assertIsNotNone(result)
@@ -2000,10 +1725,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(existing._sample_count, 360)
@@ -2021,10 +1744,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
 
@@ -2045,10 +1766,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
         self.assertEqual(len(existing._samples), 600)
@@ -2070,10 +1789,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         # Old values preserved
         self.assertEqual(existing._samples[0], 0.0)
@@ -2112,10 +1829,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         original_count = len(cache._samples)
         fetcher = lambda: {"per_second_data": [], "data_start": fixed_now}
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # Samples from 14:13:20 to 14:14:59 (100 samples) are < 14:15:00 → removed
         # Sample at 14:15:00 (cutoff) is NOT removed (uses <, not <=)
@@ -2137,10 +1852,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         new_samples = []
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # Samples from 14:13:20 to 14:14:59 (100 samples) are < 14:15:00 → removed
         # Samples from 14:15:00 to 14:18:19 (200 samples) are >= cutoff → kept
@@ -2167,10 +1880,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         original_start = cache._data_start
         fetcher = self._fetcher_returns(datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc), [])
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # 3600 samples from 13:15:00 to 14:14:59 are < 14:15:00 → removed
         # Sample at 14:15:00 (cutoff) is kept (uses <, not <=)
@@ -2187,10 +1898,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         original_samples = list(cache._samples)
         fetcher = lambda: None
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         self.assertEqual(len(cache._samples), 300)
         self.assertEqual(cache._samples, original_samples)
@@ -2205,10 +1914,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         fetcher = lambda: None
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         self.assertEqual(cache._sample_count, len(cache._samples))
 
@@ -2222,12 +1929,10 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         fetcher = lambda: None
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        assert(len(cache._samples) > 0)
+        assert len(cache._samples) > 0
 
         expected_last = cache._data_start + timedelta(seconds=len(cache._samples) - 1)
         self.assertEqual(cache._last_sample_at, expected_last)
@@ -2242,10 +1947,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         fetcher = lambda: None
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         self.assertEqual(len(cache._samples), 0)
 
@@ -2264,10 +1967,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         new_samples = []
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # Without _data_start, pruning can't compute times → no pruning
         self.assertEqual(len(cache._samples), 500)
@@ -2286,10 +1987,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         new_samples = []
         fetcher = self._fetcher_returns(new_start, new_samples)
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # All 3600 samples are >= 3600s old (from 14:10:00 to 15:09:59)
         # cutoff = 15:10:00, so all samples < cutoff
@@ -2319,10 +2018,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         fetcher = self._fetcher_returns(
             datetime(2025, 6, 15, 15, 15, 0, tzinfo=timezone.utc), [])
 
-        with patch("metrics.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            cache.get_or_fetch(fetcher, fixed_now, force=True)
+        metrics.set_clock(FakeClock(fixed_now))
+        cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # Prune should keep 1 sample at 14:15:00 (the boundary)
         self.assertEqual(len(cache._samples), 1)
@@ -2346,7 +2043,6 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIsInstance(result, _PopulationResult)
         self.assertIsNotNone(result.per_second_data)
-        self.assertIsNotNone(result.scales)
         self.assertIsNotNone(result.chart_data)
         self.assertIsNotNone(result.nbc_seconds)
         self.assertIsNotNone(result.nbc_data_start)
@@ -2359,25 +2055,6 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         result = hp._populate_device(mock.channels[0], datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
 
         self.assertEqual(len(result.per_second_data), expected_length)
-
-    def test_populate_device_scales_has_hour_entry(self):
-        """scales dict has '1H' key with correct usage."""
-        hp, mock = _make_hourly_mock(n_seconds=3600)
-
-        result = hp._populate_device(mock.channels[0], datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
-
-        self.assertIn("1H", result.scales)
-        self.assertIn("usage", result.scales["1H"])
-
-    def test_populate_device_scales_has_minute_entries(self):
-        """scales dict has '1MIN' through '10MIN' entries."""
-        hp, mock = _make_hourly_mock(n_seconds=3600, n_minutes=10)
-
-        result = hp._populate_device(mock.channels[0], datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
-
-        for i in range(1, 11):
-            key = f"{i}MIN"
-            self.assertIn(key, result.scales)
 
     def test_populate_device_chart_data_is_last_300(self):
         """chart_data has exactly 300 elements (last 300 seconds)."""
@@ -2472,6 +2149,16 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
 class TestNBCUsesFullCache(unittest.TestCase):
     """Tests verifying _compute_nbc uses energy_cache.samples over incremental delta."""
 
+    def setUp(self):
+        self._p1 = patch.object(MetricsBase, "vue_init")
+        self._p2 = patch.object(MetricsBase, "get_device_info")
+        self._p1.start()
+        self._p2.start()
+
+    def tearDown(self):
+        self._p1.stop()
+        self._p2.stop()
+
     def test_nbc_uses_full_cache_on_incremental_fetch(self):
         """_compute_nbc should use energy_cache.samples, not incremental delta.
 
@@ -2505,22 +2192,22 @@ class TestNBCUsesFullCache(unittest.TestCase):
         incremental_samples = [0.001] * 60
         pop_result = _PopulationResult(
             per_second_data=incremental_samples,
-            scales={},
+
             chart_data=incremental_samples[-300:],
             nbc_seconds=incremental_samples,
             nbc_data_start=full_hour_start + timedelta(seconds=3540),
             nbc_sample_count=60,
         )
 
-        pred_result = {
-            "lag": timedelta(seconds=5),
-            "minute_predicted": 1.0,
-            "prediction": 60.0,
-            "prediction_min": 55.0,
-            "prediction_max": 65.0,
-            "seconds_remaining": 900.0,
-            "smoothing": {"1MIN": 1.0},
-        }
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+
+        )
 
         # Build a minimal mock VDeviceUsageInfo
         mock_vdi = MagicMock()
@@ -2536,16 +2223,16 @@ class TestNBCUsesFullCache(unittest.TestCase):
         nbc = device_metrics.nbc
 
         # QH1 — always present (has data points)
-        self.assertIsNotNone(nbc.get("QH1"), "QH1 should have data")
+        self.assertIsNotNone(nbc.qh1, "QH1 should have data")
 
         # QH2, QH3 — should be computed from full cache (3600 samples)
-        self.assertIsNotNone(nbc.get("QH2"),
+        self.assertIsNotNone(nbc.qh2,
                              "QH2 should be computed from full cache, not incremental delta")
-        self.assertIsNotNone(nbc.get("QH3"),
+        self.assertIsNotNone(nbc.qh3,
                              "QH3 should be computed from full cache, not incremental delta")
 
         # QH4 — may be partial (samples 2700-3599), but still present
-        self.assertIsNotNone(nbc.get("QH4"),
+        self.assertIsNotNone(nbc.qh4,
                              "QH4 should be present (partial) from full cache")
 
     def test_nbc_falls_back_to_pop_result_when_no_cache(self):
@@ -2564,22 +2251,22 @@ class TestNBCUsesFullCache(unittest.TestCase):
         full_samples = [0.001] * 3600
         pop_result = _PopulationResult(
             per_second_data=full_samples,
-            scales={},
+
             chart_data=full_samples[-300:],
             nbc_seconds=full_samples,
             nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
             nbc_sample_count=3600,
         )
 
-        pred_result = {
-            "lag": timedelta(seconds=5),
-            "minute_predicted": 1.0,
-            "prediction": 60.0,
-            "prediction_min": 55.0,
-            "prediction_max": 65.0,
-            "seconds_remaining": 900.0,
-            "smoothing": {"1MIN": 1.0},
-        }
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+
+        )
 
         mock_vdi = MagicMock()
         mock_vdi.device_gid = 1234
@@ -2591,10 +2278,10 @@ class TestNBCUsesFullCache(unittest.TestCase):
         # With the fallback path (energy_cache=None), NBC should be computed
         # from pop_result.nbc_seconds (3600 samples), giving complete quarters.
         nbc = device_metrics.nbc
-        self.assertIsNotNone(nbc.get("QH1"))
-        self.assertIsNotNone(nbc.get("QH2"))
-        self.assertIsNotNone(nbc.get("QH3"))
-        self.assertIsNotNone(nbc.get("QH4"))
+        self.assertIsNotNone(nbc.qh1)
+        self.assertIsNotNone(nbc.qh2)
+        self.assertIsNotNone(nbc.qh3)
+        self.assertIsNotNone(nbc.qh4)
 
     def test_nbc_ignores_empty_cache_samples(self):
         """When energy_cache.samples is None/empty, fall back to pop_result."""
@@ -2609,22 +2296,22 @@ class TestNBCUsesFullCache(unittest.TestCase):
         # Only 60 samples in pop_result — would normally give only QH1
         pop_result = _PopulationResult(
             per_second_data=[0.001] * 60,
-            scales={},
+
             chart_data=[],
             nbc_seconds=[0.001] * 60,
             nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
             nbc_sample_count=60,
         )
 
-        pred_result = {
-            "lag": timedelta(seconds=5),
-            "minute_predicted": 1.0,
-            "prediction": 60.0,
-            "prediction_min": 55.0,
-            "prediction_max": 65.0,
-            "seconds_remaining": 900.0,
-            "smoothing": {"1MIN": 1.0},
-        }
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+
+        )
 
         mock_vdi = MagicMock()
         mock_vdi.device_gid = 1234
@@ -2635,9 +2322,188 @@ class TestNBCUsesFullCache(unittest.TestCase):
 
         # Empty cache → fallback: only QH1 present (60 samples)
         nbc = device_metrics.nbc
-        self.assertIsNotNone(nbc.get("QH1"))
-        self.assertIsNone(nbc.get("QH2"))
-        self.assertIsNone(nbc.get("QH3"))
+        self.assertIsNotNone(nbc.qh1)
+        self.assertIsNone(nbc.qh2)
+        self.assertIsNone(nbc.qh3)
+
+
+class TestPerSecondDataMergesCache(unittest.TestCase):
+    """Tests verifying per_second_data carries raw API samples (not merged cache).
+
+    Fix: _compute_device_metrics must store the raw API delta in per_second_data
+    so that the EnergyCache re-ingestion step attributes the correct sample count
+    and data_start to the new samples.  Merging the full cache into per_second_data
+    and then re-extracting it with the incremental data_start inflates
+    merged_last_sample_at into the future, which causes the next API call to
+    send start > end and receive a 400 (see bugs/2026-05-30-api-httperror.log).
+
+    NBC accuracy is preserved via nbc_seconds, which still uses the merged cache.
+    """
+
+    def setUp(self):
+        self._p1 = patch.object(MetricsBase, "vue_init")
+        self._p2 = patch.object(MetricsBase, "get_device_info")
+        self._p1.start()
+        self._p2.start()
+
+    def tearDown(self):
+        self._p1.stop()
+        self._p2.stop()
+
+    def test_per_second_data_is_raw_api_delta_not_merged_cache(self):
+        """per_second_data must be the raw API delta, not the merged cache.
+
+        Pre-populate the cache with 3600 samples (full hour), then simulate
+        an incremental fetch returning 60 new samples that start right after
+        the cache end.  The resulting DeviceMetrics.per_second_data must equal
+        the raw 60-sample delta — NOT the merged 3600-sample cache — so that
+        EnergyCache.get_or_fetch re-ingests only the genuinely new points.
+
+        Merging the full cache into per_second_data causes last_sample_at to
+        overshoot the actual latest data point, producing a future timestamp
+        that the Emporia API rejects with a 400 Client Error.
+        """
+        import metrics
+
+        now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+
+        # Pre-populate EnergyCache with a full hour of data.
+        full_hour_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        full_samples = [0.01] * 3600
+        cache = metrics.EnergyCache()
+        cache._samples = list(full_samples)
+        cache._data_start = full_hour_start
+        cache._sample_count = 3600
+        cache._last_sample_at = full_hour_start + timedelta(seconds=3599)
+
+        hp = HourlyProjection(
+            instant=now,
+            logger_next=logging.getLogger("test"),
+            energy_cache=cache,
+        )
+
+        # Simulate an incremental fetch: 60 new samples starting right after
+        # the cache ends (15:00:00).
+        incremental_start = full_hour_start + timedelta(seconds=3600)  # 15:00:00
+        incremental_samples = [0.02] * 60
+        pop_result = _PopulationResult(
+            per_second_data=incremental_samples,
+
+            chart_data=incremental_samples[-300:],
+            nbc_seconds=incremental_samples,
+            nbc_data_start=incremental_start,
+            nbc_sample_count=60,
+        )
+
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+
+        # per_second_data must be the raw 60-sample delta.
+        # Storing the merged 3600-sample cache here caused the EnergyCache to
+        # re-merge those samples with the incremental data_start (15:00:00),
+        # computing new_end = 15:00:00 + 3599s ≈ 16:00:00 — far in the future —
+        # and setting last_sample_at to a future timestamp that became chart_start
+        # on the next cycle, triggering a 400 from the Emporia API.
+        self.assertEqual(
+            len(device_metrics.per_second_data),
+            60,
+            "per_second_data must be the raw API delta (60), not the merged cache",
+        )
+        self.assertEqual(device_metrics.per_second_data, incremental_samples)
+
+    def test_per_second_data_unchanged_when_no_cache(self):
+        """When energy_cache is None, per_second_data uses pop_result as-is."""
+        hp = HourlyProjection(
+            instant=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            logger_next=logging.getLogger("test"),
+            energy_cache=None,
+        )
+
+        raw_data = [0.005] * 60
+        pop_result = _PopulationResult(
+            per_second_data=raw_data,
+
+            chart_data=[],
+            nbc_seconds=raw_data,
+            nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+            nbc_sample_count=60,
+        )
+
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+
+        # Without a cache, per_second_data should equal the raw pop_result data.
+        self.assertEqual(len(device_metrics.per_second_data), 60)
+        self.assertEqual(device_metrics.per_second_data, raw_data)
+
+    def test_per_second_data_unchanged_when_cache_empty(self):
+        """When cache has no samples, per_second_data uses pop_result as-is."""
+        import metrics
+
+        hp = HourlyProjection(
+            instant=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            logger_next=logging.getLogger("test"),
+            energy_cache=metrics.EnergyCache(),  # fresh, no samples
+        )
+
+        raw_data = [0.007] * 60
+        pop_result = _PopulationResult(
+            per_second_data=raw_data,
+
+            chart_data=[],
+            nbc_seconds=raw_data,
+            nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+            nbc_sample_count=60,
+        )
+
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+
+        # Empty cache → no merge → raw data preserved.
+        self.assertEqual(len(device_metrics.per_second_data), 60)
+        self.assertEqual(device_metrics.per_second_data, raw_data)
 
 
 class TestCreateMetricsPassesCache(unittest.TestCase):
@@ -2679,6 +2545,151 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
                     "Third arg (energy_cache) must be the module-level _energy_cache",
                 )
                 self.assertEqual(call_args[1], {}, "No keyword args expected")
+
+
+class TestQuantizationAwarePrediction(unittest.TestCase):
+    """Integration tests for quantization-aware NBC prediction window.
+
+    Verifies that _compute_device_metrics correctly threads quantization
+    data from EnergyCache into the NBC prediction window.
+    """
+
+    def setUp(self):
+        self._p1 = patch.object(MetricsBase, "vue_init")
+        self._p2 = patch.object(MetricsBase, "get_device_info")
+        self._p1.start()
+        self._p2.start()
+
+    def tearDown(self):
+        self._p1.stop()
+        self._p2.stop()
+
+    def _make_cache_with_quantization(
+        self,
+        samples: list[float],
+        data_start: datetime,
+        qs: int | None,
+        qc: float | None,
+    ) -> EnergyCache:
+        """Create an EnergyCache with pre-set quantization data."""
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=data_start,
+            last_fetch_at=data_start,
+            sample_count=len(samples),
+            quantization_seconds=qs,
+            quantization_offset=0,
+            quantization_confidence=qc,
+        )
+        return cache
+
+    def _run_compute_device_metrics(
+        self, cache: EnergyCache | None, nbc_seconds: list[float]
+    ):
+        """Run _compute_device_metrics with given cache and NBC data.
+
+        Returns the DeviceMetrics nbc field.
+        """
+        hp = HourlyProjection(
+            instant=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            logger_next=logging.getLogger("test"),
+            energy_cache=cache,
+        )
+        pop_result = _PopulationResult(
+            per_second_data=nbc_seconds,
+
+            chart_data=[],
+            nbc_seconds=nbc_seconds,
+            nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+            nbc_sample_count=len(nbc_seconds),
+        )
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+
+        )
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+        return device_metrics.nbc
+
+    def test_quantization_30s_window_used(self):
+        """QH1 uses 30s prediction window when quantization (N=30, confidence=1.0).
+
+        Data: 70 samples of 0.001 + 30 samples of 0.003 = 100.
+        With 30s window: prediction_w = 3.0 W → predicted_wh = 2560.
+        With 60s window: prediction_w = 2.0 W → predicted_wh = 1760.
+        """
+        data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 70 + [0.003] * 30
+        cache = self._make_cache_with_quantization(
+            samples, data_start, qs=30, qc=1.0
+        )
+        nbc = self._run_compute_device_metrics(cache, samples)
+
+        self.assertIsNotNone(nbc.qh1)
+        self.assertFalse(nbc.qh1.complete)
+        # 30s window → predicted_wh = 2560
+        self.assertAlmostEqual(
+            nbc.qh1.predicted_wh, 2560.0, places=6,
+            msg="Expected 2560 (30s window)",
+        )
+
+    def test_fallback_60s_when_no_quantization(self):
+        """QH1 falls back to 60s prediction window when no quantization data."""
+        data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 70 + [0.003] * 30
+        cache = self._make_cache_with_quantization(
+            samples, data_start, qs=None, qc=None
+        )
+        nbc = self._run_compute_device_metrics(cache, samples)
+
+        self.assertIsNotNone(nbc.qh1)
+        self.assertFalse(nbc.qh1.complete)
+        # 60s window → predicted_wh = 1760
+        self.assertAlmostEqual(
+            nbc.qh1.predicted_wh, 1760.0, places=6,
+            msg="Expected 1760 (60s fallback)",
+        )
+
+    def test_fallback_60s_when_confidence_below_threshold(self):
+        """QH1 falls back to 60s when quantization confidence < 0.9."""
+        data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 70 + [0.003] * 30
+        cache = self._make_cache_with_quantization(
+            samples, data_start, qs=30, qc=0.5
+        )
+        nbc = self._run_compute_device_metrics(cache, samples)
+
+        self.assertIsNotNone(nbc.qh1)
+        self.assertFalse(nbc.qh1.complete)
+        # 60s window → predicted_wh = 1760
+        self.assertAlmostEqual(
+            nbc.qh1.predicted_wh, 1760.0, places=6,
+            msg="Expected 1760 (60s fallback due to low confidence)",
+        )
+
+    def test_fallback_60s_when_no_cache(self):
+        """QH1 falls back to 60s when energy_cache is None."""
+        samples = [0.001] * 70 + [0.003] * 30
+        nbc = self._run_compute_device_metrics(None, samples)
+
+        self.assertIsNotNone(nbc.qh1)
+        self.assertFalse(nbc.qh1.complete)
+        # 60s window → predicted_wh = 1760
+        self.assertAlmostEqual(
+            nbc.qh1.predicted_wh, 1760.0, places=6,
+            msg="Expected 1760 (60s fallback, no cache)",
+        )
 
 
 

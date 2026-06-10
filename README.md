@@ -184,75 +184,6 @@ Sample output:
       "prediction": -27.6879148912382,
       "predictionMin": -27.6879148912382,
       "predictionMax": -22.758956398742814,
-      "scales": {
-        "1H": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 2950,
-          "usage": -19.45249794323761
-        },
-        "1MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 60,
-          "usage": -0.8375000286102295
-        },
-        "2MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 120,
-          "usage": -0.7937500305308247
-        },
-        "3MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 180,
-          "usage": -0.787500029890627
-        },
-        "4MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 240,
-          "usage": -0.7140625274926442
-        },
-        "5MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 300,
-          "usage": -0.6456250248617615
-        },
-        "6MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 360,
-          "usage": -0.5750000218164057
-        },
-        "7MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 420,
-          "usage": -0.5196428765190988
-        },
-        "8MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 480,
-          "usage": -0.4531250170204389
-        },
-        "9MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 540,
-          "usage": -0.3958333481829856
-        },
-        "10MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 600,
-          "usage": -0.33625001242425817
-        }
-      },
-      "smoothing": {
-        "1MIN": -27.6879148912382,
-        "2MIN": -27.25770657679072,
-        "3MIN": -27.19624823716211,
-        "4MIN": -26.47411279691528,
-        "5MIN": -25.801144021044934,
-        "6MIN": -25.106664824432265,
-        "7MIN": -24.562319562342083,
-        "8MIN": -23.908227277271926,
-        "9MIN": -23.3448592003703,
-        "10MIN": -22.758956398742814
-      },
       "timezone": "America/Los_Angeles"
     }
   ],
@@ -261,10 +192,7 @@ Sample output:
 ```
 
 As you can see, the JSON data includes information that isn't
-available in the HTML view. For example you can see projections based
-on the past minute (`1MIN`), but also based on the past 2, 3, 4, 5, 6,
-7, 8, 9, and 10 minutes.  This data may be useful for custom
-integrations.
+available in the HTML view.
 
 ## Load Management
 

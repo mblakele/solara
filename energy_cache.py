@@ -11,6 +11,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 
+from clock import Clock, RealClock
+from constants import MIN_SLEEP_SECS
 from quantization import detect_quantization
 from util import ceil_to_qh, compute_nbc_quarters, qh_seconds_remaining
 
@@ -34,6 +36,8 @@ class EnergyCacheData:
         quantization_seconds: Detected quantization interval in seconds.
         quantization_offset: Offset within the quantization period (seconds).
         quantization_confidence: Confidence in the quantization detection (0–1).
+        full_metrics_dict: Optional full metrics dict (e.g. with "devices" key)
+            returned on cache hits, preserved from the original fetch.
     """
 
     samples: list[float] | None
@@ -44,6 +48,7 @@ class EnergyCacheData:
     quantization_seconds: int | None
     quantization_offset: int | None
     quantization_confidence: float | None
+    full_metrics_dict: dict[str, Any] | None = None
 
 
 class EnergyCache:
@@ -67,9 +72,10 @@ class EnergyCache:
         _lock: Thread-safety lock.
     """
 
-    def __init__(self, ttl_seconds: int = 30) -> None:
+    def __init__(self, ttl_seconds: int = 30, clock: Clock | None = None) -> None:
         self._data: EnergyCacheData | None = None
         self._ttl_seconds: int = ttl_seconds
+        self._clock: Clock = clock if clock is not None else RealClock()
         self._lock: threading.Lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -369,39 +375,55 @@ class EnergyCache:
 
     @staticmethod
     def merge_incremental(
-        data_start: datetime,
-        result_data_start: datetime,
-        old_samples: list[float],
+        existing: EnergyCacheData,
         new_samples: list[float] | None,
+        result_data_start: datetime,
+        now: datetime | None = None,
+        *,
+        preserve_quantization: bool = True,
     ) -> EnergyCacheData | None:
         """Merge new samples into existing cache samples based on time overlap.
 
-        Computes the cache's effective time range from *data_start*, detects
-        overlap with *result_data_start*, and returns a new
+        Computes the cache's effective time range from *existing.data_start*,
+        detects overlap with *result_data_start*, and returns a new
         ``EnergyCacheData`` with the union of both sample lists in
         chronological order.
+
+        Quantization fields from *existing* are preserved by default; set
+        ``preserve_quantization=False`` to clear them. Quantization is not
+        re-detected after merges — it reflects the most recent full-hour
+        fetch. This matches the design of :meth:`_merge_samples` which only
+        calls ``detect_quantization`` on the initial fetch.
 
         New samples arriving before the cache start will raise
         ``AssertionError``.
 
         Args:
-            data_start: Start time of the existing cache samples.
-            result_data_start: Start time of the new samples from the API.
-            old_samples: Existing samples stored in the cache.
+            existing: Current ``EnergyCacheData`` snapshot.
             new_samples: New samples returned from the API (may be ``None``).
+            result_data_start: Start time of the new samples from the API.
+            now: Current time for last_fetch_at. Falls back to ``datetime.now()``
+                when ``None`` (backward compatible).
+            preserve_quantization: If ``True``, carry forward quantization fields
+                from *existing*. Defaults to ``True``.
 
         Returns:
             A new ``EnergyCacheData`` with merged samples, or ``None`` if
             *new_samples* is ``None``.
 
         Raises:
-            AssertionError: If *result_data_start* is before *data_start*.
+            AssertionError: If *result_data_start* is before *existing.data_start*.
         """
         if new_samples is None or len(new_samples) == 0:
             return None
 
-        cache_start_time = data_start
-        cache_end_time = data_start + timedelta(seconds=len(old_samples) - 1)
+        if existing.data_start is None or existing.samples is None:
+            return None
+
+        cache_start_time = existing.data_start
+        cache_end_time = existing.data_start + timedelta(
+            seconds=len(existing.samples) - 1
+        )
 
         # New samples should never arrive before the cache start.
         assert result_data_start >= cache_start_time
@@ -415,24 +437,30 @@ class EnergyCache:
 
         # Build merged samples in time order.
         after_samples = list(new_samples[len(new_samples) - after_count:])
-        merged_samples = list(old_samples) + after_samples
+        merged_samples = list(existing.samples) + after_samples
 
         if len(merged_samples) > 3600:
             merged_samples = merged_samples[-3600:]
 
-        merged_last_sample_at = merged_samples and (
-            data_start + timedelta(seconds=len(merged_samples) - 1)
-        )
+        merged_last_sample_at = (
+            existing.data_start + timedelta(seconds=len(merged_samples) - 1)
+        ) if merged_samples else None
 
         return EnergyCacheData(
             samples=merged_samples,
-            data_start=data_start,
+            data_start=existing.data_start,
             last_sample_at=merged_last_sample_at,
-            last_fetch_at=datetime.now(tz=data_start.tzinfo) if data_start.tzinfo else datetime.now(),
+            last_fetch_at=now if now is not None else datetime.now(tz=existing.data_start.tzinfo if existing.data_start.tzinfo else None),
             sample_count=len(merged_samples),
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            quantization_seconds=(
+                existing.quantization_seconds if preserve_quantization else None
+            ),
+            quantization_offset=(
+                existing.quantization_offset if preserve_quantization else None
+            ),
+            quantization_confidence=(
+                existing.quantization_confidence if preserve_quantization else None
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -453,6 +481,12 @@ class EnergyCache:
         samples older than 3600 s from *now*.  On the initial fetch (no
         existing samples) the new samples are stored directly.
 
+        Quantization is detected **only on the initial fetch** and
+        preserved through subsequent incremental merges by
+        :meth:`merge_incremental` with ``preserve_quantization=True``.
+        Quantization is not re-detected after merges by design — it
+        reflects the characteristics of the most recent full-hour fetch.
+
         Args:
             existing: The current ``EnergyCacheData`` snapshot.
             new_samples: Samples from the latest API response.
@@ -469,12 +503,17 @@ class EnergyCache:
             logger.debug("EnergyCache quantization %s", quant_tuple)
             if quant_tuple is not None:
                 qs, qo, qc = quant_tuple
+                if qc < 0.9:
+                    logger.warning(
+                        "Quantization detected (N=%d, offset=%d) with low confidence %.3f",
+                        qs, qo, qc,
+                    )
             else:
                 qs, qo, qc = None, None, None
 
-            last_sample_at = new_samples and (
+            last_sample_at = (
                 (result_data_start or now) + timedelta(seconds=len(new_samples) - 1)
-            )
+            ) if new_samples else None
 
             return EnergyCacheData(
                 samples=list(new_samples),
@@ -488,11 +527,20 @@ class EnergyCache:
             )
 
         # Incremental merge path.
+        logger.debug(
+            "EnergyCache incremental_merge: %d old + %d new samples, "
+            "quantization_preserved (qs=%s, qo=%s, qc=%.3f)",
+            len(existing.samples),
+            len(new_samples),
+            existing.quantization_seconds,
+            existing.quantization_offset,
+            existing.quantization_confidence if existing.quantization_confidence else 0,
+        )
         merged_data = self.merge_incremental(
-            existing.data_start or now,
-            result_data_start or now,
-            existing.samples,
+            existing,
             new_samples,
+            result_data_start or now,
+            now=now,
         )
 
         if merged_data is None:
@@ -501,22 +549,16 @@ class EnergyCache:
         # Prune old samples.
         merged_data = self._prune_old_samples(merged_data, now)
 
-        # Re-run quantization on the merged set.
-        quant_tuple = detect_quantization(merged_data.samples or [])
-        if quant_tuple is not None:
-            qs, qo, qc = quant_tuple
-        else:
-            qs, qo, qc = None, None, None
-
         return EnergyCacheData(
             samples=merged_data.samples,
             data_start=merged_data.data_start,
             last_sample_at=merged_data.last_sample_at,
             last_fetch_at=now,
             sample_count=merged_data.sample_count,
-            quantization_seconds=qs,
-            quantization_offset=qo,
-            quantization_confidence=qc,
+            quantization_seconds=merged_data.quantization_seconds,
+            quantization_offset=merged_data.quantization_offset,
+            quantization_confidence=merged_data.quantization_confidence,
+            full_metrics_dict=existing.full_metrics_dict,
         )
 
     def _prune_old_samples(
@@ -566,8 +608,8 @@ class EnergyCache:
     def _build_result(self) -> dict[str, Any] | None:
         """Build the result dict from cached data (caller must hold lock).
 
-        Returns the full result dict if available, or builds one from raw
-        samples.
+        Returns the full result dict if available (with "devices", "nbc", etc.),
+        or builds a minimal dict from raw samples.
 
         Returns:
             Cached metrics dict or ``None`` if no cached data exists.
@@ -575,6 +617,14 @@ class EnergyCache:
         if self._data is None:
             return None
 
+        # Return the full metrics dict if it was stored during the original
+        # fetch.  This preserves keys like "devices", "nbc", "instant" that
+        # callers (e.g. the index endpoint) need but which _build_result
+        # previously discarded on cache hits.
+        if self._data.full_metrics_dict is not None:
+            return self._data.full_metrics_dict
+
+        # Fallback: build minimal dict from raw samples.
         result: dict[str, Any] = {}
         if self._data.samples is not None:
             result["per_second_data"] = self._data.samples
@@ -620,7 +670,15 @@ class EnergyCache:
         with self._lock:
             # Check if cache is valid (non-expired data exists).
             if not force and self._is_valid_unlocked(now):
-                return self._build_result(), False
+                result = self._build_result()
+                logger.debug(
+                    "EnergyCache cache_hit: keys=%s, "
+                    "sample_count=%d, data_start=%s",
+                    list(result.keys()) if result else [],
+                    len(result.get("per_second_data", [])) if result else 0,
+                    result.get("data_start") if result else None,
+                )
+                return result, False
 
             # Fetch fresh data.
             result = fetch_func()
@@ -638,6 +696,14 @@ class EnergyCache:
                         for device in result["devices"]
                         for point in device.get("per_second_data", [])
                     ]
+
+                logger.debug(
+                    "EnergyCache merge_input: extracted %d samples from "
+                    "result_keys=%s, existing_samples=%d",
+                    len(new_samples),
+                    list(result.keys()),
+                    len(self._data.samples) if self._data and self._data.samples else 0,
+                )
 
                 result_data_start: datetime | None = result.get("data_start")
 
@@ -670,13 +736,21 @@ class EnergyCache:
                     # No new samples — prune old data in place.
                     self._data = self._prune_old_samples(self._data, now)
 
-                log_samples = self._data.samples if self._data else []
-                if log_samples:
+                # Store the full metrics dict so cache hits return it.
+                # Always update on fetch — ensures cache hits serve fresh
+                # predictions (NBC, device metrics, etc.) rather than stale
+                # values from the initial fetch.
+                if self._data is not None:
+                    self._data = replace(
+                        self._data, full_metrics_dict=result
+                    )
+
+                data = self._data
+                if data and data.samples:
                     logger.debug(
-                        "EnergyCache fetched %d data points (%s: %d samples) at %s",
-                        len(log_samples),
-                        self._data.data_start,
-                        len(log_samples),
+                        "EnergyCache: len %d start %s now %s",
+                        len(data.samples),
+                        data.data_start,
                         now,
                     )
 
@@ -722,20 +796,30 @@ class EnergyCache:
         assert self._data.data_start is not None
         assert self._data.data_start == ceil_to_qh(self._data.data_start)
 
-        nbc = compute_nbc_quarters(samples)
+        # Use quantization-aware prediction window when available.
+        prediction_window_seconds: int | None = None
+        qs = self._data.quantization_seconds
+        qc = self._data.quantization_confidence
+        if qs is not None and qc is not None and qc >= 0.9:
+            prediction_window_seconds = qs
+
+        nbc = compute_nbc_quarters(samples, prediction_window_seconds)
+
+        # Map from attribute names to QH labels for fallback lookup.
+        _qh_attrs = [("qh1", "QH1"), ("qh2", "QH2"), ("qh3", "QH3"), ("qh4", "QH4")]
 
         # Find QH1 (most recent window).
-        qh1_data = nbc.get("QH1")
+        qh1_data = nbc.qh1
 
         if qh1_data is None:
             # No data at all — return the first non-None QH as fallback.
-            for qh in ("QH2", "QH3", "QH4"):
-                if nbc.get(qh) is not None:
-                    qh_data = nbc[qh]
+            for attr, label in _qh_attrs[1:]:
+                qh_data = getattr(nbc, attr)
+                if qh_data is not None:
                     return {
-                        "qh_name": qh,
-                        "predicted_wh": qh_data.get("predicted_wh", 0),
-                        "seconds_remaining": qh_data.get("remaining_seconds", 0),
+                        "qh_name": label,
+                        "predicted_wh": qh_data.predicted_wh or 0,
+                        "seconds_remaining": qh_data.remaining_seconds or 0,
                         "data_start": self._data.data_start,
                     }
             return None
@@ -745,11 +829,11 @@ class EnergyCache:
         # for fresh incomplete data (this triggers the "no_incomplete_qh"
         # path in run_cycle with a short sleep hint instead of making
         # decisions on a completed quarter's Wh value).
-        if qh1_data.get("complete"):
+        if qh1_data.complete:
             return None
 
         seconds_remaining = qh_seconds_remaining(now)
-        predicted_wh = qh1_data.get("predicted_wh", qh1_data.get("wh", 0))
+        predicted_wh = qh1_data.predicted_wh if qh1_data.predicted_wh is not None else qh1_data.wh
         return {
             "qh_name": "QH1",
             "predicted_wh": predicted_wh,
@@ -784,6 +868,15 @@ class EnergyCache:
         if self._data.quantization_confidence is None or self._data.quantization_confidence < 0.9:
             return interval_seconds
 
+        # Early-exit: data older than 2× quantum → sleep minimum.
+        if (
+            self._data.last_sample_at is not None
+            and self._data.quantization_seconds is not None
+        ):
+            data_age = (now - self._data.last_sample_at).total_seconds()
+            if data_age > 2 * self._data.quantization_seconds:
+                return MIN_SLEEP_SECS
+
         # At this point quantization fields are guaranteed to be set.
         assert self._data.data_start is not None
         assert self._data.quantization_seconds is not None
@@ -793,10 +886,8 @@ class EnergyCache:
         offset_start = self._data.data_start + timedelta(seconds=self._data.quantization_offset)
         seconds_from_start = (now - offset_start).total_seconds()
         seconds_in_period = seconds_from_start % self._data.quantization_seconds
-        # Seems to take pyemvue API ~20 sec to settle.
-        # 0-15.67 is unreliable: 17-sec may be optimal.
         seconds_remaining = (
-            self._data.quantization_seconds - seconds_in_period + 17.0
+            self._data.quantization_seconds - seconds_in_period
         ) % self._data.quantization_seconds
         logger.debug(
             "EnergyCache.sleep_interval_adjust: %.1f > %.1f",

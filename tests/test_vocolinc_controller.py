@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from clock import FakeClock
 from decouple import config
 
 from load_manager import (
@@ -262,9 +263,11 @@ def test_composite_turns_on_both_types():
             mock_instance.set_plug.return_value = None
             mock_instance.devices = {}
 
+            fake_clock = FakeClock(fixed=fixed_now)
             mgr = LoadManager(
                 metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -8000.0),
                 energy_cache=EnergyCache(),
+                clock=fake_clock,
                 target_wh=-500,
                 nbc_device="main_panel",
                 enabled=True,
@@ -273,15 +276,10 @@ def test_composite_turns_on_both_types():
 
             assert isinstance(mgr.plug_ctrl, CompositePlugController)
 
-            with patch("load_manager.datetime") as mock_dt:
-                mock_dt.now.return_value = fixed_now
-                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-                mock_dt.timezone = timezone
-                mock_dt.timedelta = timedelta
-                result = mgr.run_cycle()
+            result = mgr.run_cycle()
 
-            assert result["status"] == "ok"
-            action_names = [a["device"] for a in result["actions"]]
+            assert result.status == "ok"
+            action_names = [a.device_name for a in result.actions]
             assert "hk_heater" in action_names
             assert "vc_pump" in action_names
 
@@ -309,9 +307,11 @@ def test_composite_over_target_turns_off_vocolinc():
             mock_instance.set_plug.return_value = None
             mock_instance.devices = {}
 
+            fake_clock = FakeClock(fixed=fixed_now)
             mgr = LoadManager(
                 metrics_fetch=lambda: _make_metrics_with_wh("main_panel", 2000.0),
                 energy_cache=EnergyCache(),
+                clock=fake_clock,
                 target_wh=-500,
                 nbc_device="main_panel",
                 enabled=True,
@@ -319,25 +319,19 @@ def test_composite_over_target_turns_off_vocolinc():
             )
 
             # Set both devices as ON in state tracker — use fixed timestamps
-            with patch("load_manager.datetime") as mock_dt:
-                mock_dt.now.return_value = fixed_now
-                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-                mgr.state.devices["vc_alpha"] = DeviceState(
-                    name="vc_alpha",
-                    last_toggle=fixed_now - timedelta(seconds=120),
-                    desired_state=True,
-                )
-                mgr.state.devices["vc_bravo"] = DeviceState(
-                    name="vc_bravo",
-                    last_toggle=fixed_now - timedelta(seconds=120),
-                    desired_state=True,
-                )
+            mgr.state.devices["vc_alpha"] = DeviceState(
+                name="vc_alpha",
+                last_toggle=fixed_now - timedelta(seconds=120),
+                desired_state=True,
+            )
+            mgr.state.devices["vc_bravo"] = DeviceState(
+                name="vc_bravo",
+                last_toggle=fixed_now - timedelta(seconds=120),
+                desired_state=True,
+            )
 
-            with patch("load_manager.datetime") as mock_dt:
-                mock_dt.now.return_value = fixed_now
-                mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-                result = mgr.run_cycle()
+            result = mgr.run_cycle()
 
-            action_names = [a["device"] for a in result["actions"]]
+            action_names = [a.device_name for a in result.actions]
             assert "vc_alpha" in action_names
             assert "vc_bravo" in action_names

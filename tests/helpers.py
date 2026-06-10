@@ -1,6 +1,39 @@
 """Shared helper functions for load management tests."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+
+class FakeClock:
+    """A deterministic clock that returns a fixed time.
+
+    Usage:
+        clock = FakeClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+        assert clock.now() == expected_time
+    """
+
+    def __init__(self, now: datetime) -> None:
+        """Initialize with a fixed datetime.
+
+        Args:
+            now: The fixed datetime to return from now().
+        """
+        self._now = now
+
+    def now(self) -> datetime:
+        """Return the fixed datetime.
+
+        Returns:
+            The fixed datetime.
+        """
+        return self._now
+
+    def advance(self, delta: timedelta) -> None:
+        """Advance the clock by a timedelta.
+
+        Args:
+            delta: The amount to advance by.
+        """
+        self._now = self._now + delta
 
 
 def _make_qh_data(

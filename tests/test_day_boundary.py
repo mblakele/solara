@@ -40,9 +40,9 @@ def test_48_hour_aggregation():
 
     print(f"Result: {result}")
     print(f"Expected: {expected}")
-    print(f"Match: {result == expected}")
+    print(f"Match: {result.to_dict() == expected}")
 
-    assert result == expected, f"Got {result}, expected {expected}"
+    assert result.to_dict() == expected, f"Got {result}, expected {expected}"
 
 
 if __name__ == "__main__":

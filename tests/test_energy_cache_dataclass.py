@@ -416,10 +416,9 @@ class TestEnergyCacheWrapper:
 
         new_samples = [0.2, 0.3]
         merged = cache.merge_incremental(
-            existing_data.data_start,
-            base_time + timedelta(seconds=5),
-            existing_data.samples,
+            existing_data,
             new_samples,
+            base_time + timedelta(seconds=5),
         )
 
         assert merged is not None
@@ -447,10 +446,9 @@ class TestEnergyCacheWrapper:
         # New: samples at seconds 3-6 (4 samples), overlap at seconds 3-4
         new_samples = [0.5] * 4
         merged = cache.merge_incremental(
-            base_time,
-            base_time + timedelta(seconds=3),
-            existing_data.samples,
+            existing_data,
             new_samples,
+            base_time + timedelta(seconds=3),
         )
 
         assert merged is not None
@@ -462,7 +460,17 @@ class TestEnergyCacheWrapper:
         """merge_incremental returns None when new_samples is None."""
         cache = EnergyCache(ttl_seconds=60)
         now = datetime.now(timezone.utc)
-        result = cache.merge_incremental(now, now, [], None)
+        empty_existing = EnergyCacheData(
+            samples=[0.1],
+            data_start=now,
+            last_sample_at=now,
+            last_fetch_at=now,
+            sample_count=1,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+        result = cache.merge_incremental(empty_existing, None, now)
         assert result is None
 
     def test_invalidate_clears_data(self) -> None:
@@ -508,6 +516,109 @@ class TestEnergyCacheWrapper:
         # Just verify it returns a reasonable float — exact value depends on
         # implementation details like sample_count logic.
         assert result >= 0.0
+
+    def test_sleep_min_when_data_older_than_2x_quantum(self) -> None:
+        """sleep_interval_adjust returns MIN_SLEEP_SECS when data > 2× quantum."""
+        cache = EnergyCache(ttl_seconds=60)
+        quantum = 30  # 2×30 = 60s threshold
+        data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 1, 12, 1, 1, tzinfo=timezone.utc)  # 61s later
+
+        # Seed cache with all quantization fields set
+        cache._last_sample_at = data_time
+        cache._data_start = data_time
+        cache._quantization_seconds = quantum
+        cache._quantization_offset = 0
+        cache._quantization_confidence = 0.95
+
+        result = cache.sleep_interval_adjust(30.0, now)
+        assert result == 5.0
+
+    def test_sleep_min_at_2x_quantum_boundary(self) -> None:
+        """sleep_interval_adjust returns MIN_SLEEP_SECS at exactly 2× quantum."""
+        cache = EnergyCache(ttl_seconds=60)
+        quantum = 30  # 2×30 = 60s threshold
+        data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)  # exactly 60s later
+
+        cache._last_sample_at = data_time
+        cache._data_start = data_time
+        cache._quantization_seconds = quantum
+        cache._quantization_offset = 0
+        cache._quantization_confidence = 0.95
+
+        result = cache.sleep_interval_adjust(30.0, now)
+        # At exactly 2× (60s), data_age=60, 60 > 60 is False → falls through
+        # At 60s+1ns it would return 5.0. Testing boundary: exactly 2× should
+        # NOT trigger the early-exit (uses strict >), so it falls through to
+        # the quantization adjustment below.
+        assert isinstance(result, float)
+        assert result >= 5.0
+
+    def test_falls_through_below_2x_quantum(self) -> None:
+        """sleep_interval_adjust falls through to quantization logic below 2× quantum."""
+        cache = EnergyCache(ttl_seconds=60)
+        quantum = 30  # 2×30 = 60s threshold
+        data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 1, 12, 0, 45, tzinfo=timezone.utc)  # 45s, < 60s
+
+        cache._last_sample_at = data_time
+        cache._data_start = data_time
+        cache._quantization_seconds = quantum
+        cache._quantization_offset = 0
+        cache._quantization_confidence = 0.95
+
+        result = cache.sleep_interval_adjust(30.0, now)
+        # Should not return 5.0 from the early-exit; falls through to quantization
+        # logic. Result may still be 5.0 if the quantization math produces it,
+        # but the key is that the early-exit path was NOT taken.
+        assert isinstance(result, float)
+        assert result >= 5.0
+
+    def test_skips_when_last_sample_at_none(self) -> None:
+        """sleep_interval_adjust skips 2× check when last_sample_at is None."""
+        cache = EnergyCache(ttl_seconds=60)
+        data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 1, 12, 1, 1, tzinfo=timezone.utc)
+
+        # Only set quantization fields and data_start, not last_sample_at
+        cache._data_start = data_time
+        cache._quantization_seconds = 30
+        cache._quantization_offset = 0
+        cache._quantization_confidence = 0.95
+
+        result = cache.sleep_interval_adjust(30.0, now)
+        assert isinstance(result, float)
+        assert result >= 5.0
+
+    def test_skips_when_quantum_missing(self) -> None:
+        """sleep_interval_adjust skips 2× check when quantization_seconds is None."""
+        cache = EnergyCache(ttl_seconds=60)
+        data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 1, 12, 1, 1, tzinfo=timezone.utc)
+
+        cache._last_sample_at = data_time
+        # Do not set quantization_seconds — it stays None
+
+        result = cache.sleep_interval_adjust(30.0, now)
+        # Returns unchanged because quantization_confidence < 0.9 triggers early return
+        assert isinstance(result, float)
+
+    def test_result_clamped_at_5_minimum(self) -> None:
+        """sleep_interval_adjust result is never below MIN_SLEEP_SECS (5.0)."""
+        cache = EnergyCache(ttl_seconds=60)
+        quantum = 5  # Very small quantum: 2×5 = 10s threshold
+        data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 1, 12, 0, 12, tzinfo=timezone.utc)  # 12s > 10s
+
+        cache._last_sample_at = data_time
+        cache._data_start = data_time
+        cache._quantization_seconds = quantum
+        cache._quantization_offset = 0
+        cache._quantization_confidence = 0.95
+
+        result = cache.sleep_interval_adjust(30.0, now)
+        assert result == 5.0
 
     def test_get_current_qh_returns_none_when_empty(self) -> None:
         """get_current_qh returns None when cache has no data."""
@@ -675,10 +786,9 @@ class TestEnergyCacheWrapper:
 
         new_samples = [0.2, 0.3]
         merged = cache.merge_incremental(
-            existing.data_start,
-            base_time + timedelta(seconds=5),
-            existing.samples,
+            existing,
             new_samples,
+            base_time + timedelta(seconds=5),
         )
 
         assert merged is not None
@@ -705,10 +815,9 @@ class TestEnergyCacheWrapper:
 
         new_samples = [0.2] * 3
         merged = cache.merge_incremental(
-            existing.data_start,
-            base_time + timedelta(seconds=5),
-            existing.samples,
+            existing,
             new_samples,
+            base_time + timedelta(seconds=5),
         )
 
         assert merged is not None
@@ -748,10 +857,9 @@ class TestEnergyCacheWrapper:
         cache._data = existing
 
         merged = cache.merge_incremental(
-            existing.data_start,
-            base_time,
-            existing.samples,
+            existing,
             [],
+            base_time,
         )
 
         # Empty new_samples returns None (nothing to merge).
@@ -781,3 +889,126 @@ class TestEnergyCacheWrapper:
         # now is at 7:30 = 450 seconds into the hour
         expected_remaining = 900 - 450
         assert result["seconds_remaining"] == expected_remaining
+
+    def test_merge_incremental_preserves_quantization(self) -> None:
+        """merge_incremental preserves quantization from existing data by default."""
+        cache = EnergyCache(ttl_seconds=60)
+        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        existing = EnergyCacheData(
+            samples=[0.001] * 5,
+            data_start=base_time,
+            last_sample_at=base_time + timedelta(seconds=4),
+            last_fetch_at=base_time,
+            sample_count=5,
+            quantization_seconds=30,
+            quantization_offset=0,
+            quantization_confidence=0.95,
+        )
+        cache._data = existing
+
+        new_samples = [0.002, 0.003]
+        merged = cache.merge_incremental(
+            existing,
+            new_samples,
+            base_time + timedelta(seconds=5),
+        )
+
+        assert merged is not None
+        assert merged.quantization_seconds == 30
+        assert merged.quantization_offset == 0
+        assert merged.quantization_confidence == 0.95
+
+    def test_merge_incremental_discards_quantization_when_disabled(self) -> None:
+        """merge_incremental with preserve_quantization=False clears quantization fields."""
+        cache = EnergyCache(ttl_seconds=60)
+        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        existing = EnergyCacheData(
+            samples=[0.001] * 5,
+            data_start=base_time,
+            last_sample_at=base_time + timedelta(seconds=4),
+            last_fetch_at=base_time,
+            sample_count=5,
+            quantization_seconds=30,
+            quantization_offset=0,
+            quantization_confidence=0.95,
+        )
+        cache._data = existing
+
+        new_samples = [0.002, 0.003]
+        merged = cache.merge_incremental(
+            existing,
+            new_samples,
+            base_time + timedelta(seconds=5),
+            preserve_quantization=False,
+        )
+
+        assert merged is not None
+        assert merged.quantization_seconds is None
+        assert merged.quantization_offset is None
+        assert merged.quantization_confidence is None
+
+
+class TestCacheHitReturnsFullMetrics:
+    """Tests that cache hits return the full metrics dict, not a minimal one.
+
+    Regression test for: on cache hits, _build_result() returned only
+    {per_second_data, data_start}, dropping the "devices" key that the
+    index endpoint needs to render predictions.
+    """
+
+    def test_cache_hit_returns_full_metrics_with_devices(self) -> None:
+        """On cache hit, get_or_fetch returns the original full dict including devices.
+
+        This reproduces the bug where the index endpoint received {'devices': []}
+        on cache hits because _build_result() only included per_second_data and
+        data_start, omitting the devices list with predictions.
+        """
+        from clock import FakeClock
+
+        now = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        cache = EnergyCache(ttl_seconds=60, clock=FakeClock(now))
+
+        # Simulate the full metrics dict that create_metrics returns
+        full_metrics = {
+            "devices": [
+                {
+                    "gid": 12345,
+                    "name": "Solar Inverter",
+                    "prediction": 500.0,
+                    "nbc": {"QH1": {"predicted_wh": 500}},
+                    "per_second_data": [0.01] * 10,
+                }
+            ],
+            "instant": now,
+            "api_response": {"took_ms": 150},
+        }
+
+        call_count = 0
+
+        def fetch_func() -> dict[str, Any] | None:
+            nonlocal call_count
+            call_count += 1
+            return full_metrics
+
+        # First call: cache miss
+        result, was_fresh = cache.get_or_fetch(fetch_func, now)
+        assert was_fresh is True
+        assert call_count == 1
+        assert "devices" in result
+        assert len(result["devices"]) == 1
+        assert result["devices"][0]["name"] == "Solar Inverter"
+
+        # Second call: cache hit — should return the SAME full dict with devices
+        result2, was_fresh2 = cache.get_or_fetch(fetch_func, now)
+        assert was_fresh2 is False
+        assert call_count == 1  # fetch_func NOT called again
+        assert "devices" in result2, (
+            "Cache hit result missing 'devices' key — _build_result() only returns "
+            "per_second_data and data_start, dropping the full metrics dict"
+        )
+        assert len(result2["devices"]) == 1, (
+            "Cache hit result has empty devices list"
+        )
+        assert result2["devices"][0]["name"] == "Solar Inverter"

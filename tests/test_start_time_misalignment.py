@@ -52,7 +52,7 @@ def test_cross_midnight_aggregation():
 
     print(f"Result: {result}")
     print(f"Expected: {expected}")
-    assert result == expected
+    assert result.to_dict() == expected
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from config import get_timezone
 
+from energy_aggregator import TOUBuckets
 from util import compute_nbc_quarters
 
 
@@ -53,7 +54,7 @@ class MetricsMock:
     """
 
     metrics: Dict[str, Any]
-    tou_result: Dict[str, float]
+    tou_result: TOUBuckets
     nbc_result: float
 
     def __init__(self, instant_minute: int = 42) -> None:
@@ -97,12 +98,12 @@ class MetricsMock:
             ),
         }
 
-        self.tou_result: Dict[str, float] = {
-            "total": 12847.3,
-            "peak": 3200.5,
-            "part_peak": 4100.2,
-            "off_peak": 5546.6,
-        }
+        self.tou_result: TOUBuckets = TOUBuckets(
+            total=12847.3,
+            peak=3200.5,
+            part_peak=4100.2,
+            off_peak=5546.6,
+        )
 
         self.nbc_result: float = -2756.5
 
@@ -115,10 +116,6 @@ class MetricsMock:
         sign: float = -1.0,
     ) -> Dict[str, Any]:
         """Build a single device dict with all fields for backward-compatible testing.
-
-        Produces dynamic scale data derived from the actual per-second values.
-        The scales' data arrays remain truncated (3 sample floats each); full
-        per-second data is stored separately in the 'per_second_data' field for NBC use.
 
         Args:
             per_second_data: Full array of kWh/second values observed so far.
@@ -135,35 +132,13 @@ class MetricsMock:
         n = len(per_second_data)
         hour_usage = 1000.0 * sum(per_second_data)
 
-        scales: Dict[str, Any] = {
-            "1H": self._make_scale_entry(
-                per_second_data,
-                self.instant.replace(second=0, microsecond=0),
-                n,
-                hour_usage,
-            )
-        }
-
-        smoothing: Dict[str, float] = {}
-        for usm in range(1, 11):
-            uss = 60 * usm
-            if uss > n:
-                continue
-            offset_data = per_second_data[-uss:]
-            offset_start = self.instant.replace(second=0, microsecond=0) + timedelta(
-                minutes=minute_of_hour - usm
-            )
-            scale_usage = 1000.0 * sum(offset_data) * 60.0 / len(offset_data)
-            scales[str(usm) + "MIN"] = self._make_scale_entry(
-                offset_data, offset_start, len(offset_data), scale_usage
-            )
-            smoothing[str(usm) + "MIN"] = hour_usage + (
-                (3600 - minute_of_hour * 60) * scale_usage / 60.0
-            )
-
-        one_min_usage = scales.get("1MIN", {}).get("usage", 0) if "1MIN" in scales else 0
         seconds_remaining_hour = 3600 - minute_of_hour * 60
-        minute_predicted = seconds_remaining_hour * one_min_usage / 60.0
+
+        one_min_scale_usage = 0.0
+        if n >= 60:
+            tail = per_second_data[-60:]
+            one_min_scale_usage = 1000.0 * sum(tail) * 60.0 / len(tail)
+        minute_predicted = seconds_remaining_hour * one_min_scale_usage / 60.0
         prediction = hour_usage + minute_predicted
 
         return {
@@ -176,32 +151,6 @@ class MetricsMock:
             "prediction": round(prediction, 14),
             "prediction_min": round(prediction, 14),
             "prediction_max": round(prediction * 0.9 if sign < 0 else prediction * 1.1, 14),
-            "scales": scales,
-            "smoothing": {k: round(v, 14) for k, v in smoothing.items()},
             "timezone": timezone_str,
-            "nbc": compute_nbc_quarters(per_second_data,),
-        }
-
-    @staticmethod
-    def _make_scale_entry(
-        data: List[float], data_start: datetime, data_len: int, usage: float
-    ) -> Dict[str, Any]:
-        """Create a scale entry dict from raw per-second slice data.
-
-        Args:
-            data: kWh/second values for this scale window.
-            data_start: Start time of the first data point.
-            data_len: Number of seconds in this scale window.
-            usage: Pre-computed Wh usage value for display.
-
-        Returns:
-            Scale entry dict with data (truncated to 3 samples), metadata, and usage.
-        """
-        return {
-            "data": data[:3] if len(data) >= 3 else list(data),
-            "data_len": data_len,
-            "data_start": data_start,
-            "instant": data_start + timedelta(seconds=data_len),
-            "seconds": data_len,
-            "usage": usage,
+            "nbc": compute_nbc_quarters(per_second_data).to_dict(),
         }

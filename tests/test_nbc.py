@@ -69,11 +69,12 @@ class TestComputeNBCUnit(unittest.TestCase):
         result = fixture._compute_nbc(data)
 
         for qh in QH_NAMES:
-            self.assertIsNotNone(result[qh])
-            self.assertTrue(result[qh]["complete"])
+            qh_obj = getattr(result, qh.lower())
+            self.assertIsNotNone(qh_obj)
+            self.assertTrue(qh_obj.complete)
             # 900 seconds * 0.001 kWh/s * 1000 = 900 Wh per quarter
-            self.assertAlmostEqual(result[qh]["wh"], 900.0, places=1)
-            self.assertGreater(result[qh]["raw_wh"], 0)
+            self.assertAlmostEqual(qh_obj.wh, 900.0, places=1)
+            self.assertGreater(qh_obj.raw_wh, 0)
 
     def test_all_quarters_complete_negative(self):
         """All quarters complete with negative consumption → wh clamped to 0."""
@@ -86,11 +87,12 @@ class TestComputeNBCUnit(unittest.TestCase):
         result = fixture._compute_nbc(data)
 
         for qh in QH_NAMES:
-            self.assertIsNotNone(result[qh])
-            self.assertTrue(result[qh]["complete"])
+            qh_obj = getattr(result, qh.lower())
+            self.assertIsNotNone(qh_obj)
+            self.assertTrue(qh_obj.complete)
             # raw_wh is negative but wh is clamped to 0
-            self.assertEqual(result[qh]["wh"], 0)
-            self.assertLess(result[qh]["raw_wh"], 0)
+            self.assertEqual(qh_obj.wh, 0)
+            self.assertLess(qh_obj.raw_wh, 0)
 
     def test_mixed_complete_incomplete(self):
         """minute=22 → QH1 complete; QH2 incomplete; QH3, QH4 not started."""
@@ -104,19 +106,19 @@ class TestComputeNBCUnit(unittest.TestCase):
         result = fixture._compute_nbc(data)
 
         # QH1: incomplete (n=1320, end_idx=1799 → not all seconds observed)
-        self.assertIsNotNone(result["QH1"])
-        self.assertFalse(result["QH1"]["complete"])
+        self.assertIsNotNone(result.qh1)
+        self.assertFalse(result.qh1.complete)
 
         # QH2: complete (indices 0-899 all observed)
-        self.assertIsNotNone(result["QH2"])
-        self.assertTrue(result["QH2"]["complete"])
-        self.assertGreater(result["QH2"]["wh"], 0)
+        self.assertIsNotNone(result.qh2)
+        self.assertTrue(result.qh2.complete)
+        self.assertGreater(result.qh2.wh, 0)
 
         # QH3: not started (starts at index 1800, n=1320 < 1800)
-        self.assertIsNone(result["QH3"])
+        self.assertIsNone(result.qh3)
 
         # QH4: not started
-        self.assertIsNone(result["QH4"])
+        self.assertIsNone(result.qh4)
 
     def test_quarter_not_started(self):
         """minute=5 → only QH1 partially observed, QH2-QH4 are None."""
@@ -128,11 +130,11 @@ class TestComputeNBCUnit(unittest.TestCase):
 
         result = fixture._compute_nbc(data)
 
-        self.assertIsNotNone(result["QH1"])
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertIsNone(result["QH2"])
-        self.assertIsNone(result["QH3"])
-        self.assertIsNone(result["QH4"])
+        self.assertIsNotNone(result.qh1)
+        self.assertFalse(result.qh1.complete)
+        self.assertIsNone(result.qh2)
+        self.assertIsNone(result.qh3)
+        self.assertIsNone(result.qh4)
 
     def test_prediction_accuracy_incomplete(self):
         """Incomplete quarter: predicted_wh = rate * 900 should be consistent."""
@@ -147,13 +149,13 @@ class TestComputeNBCUnit(unittest.TestCase):
 
         result = fixture._compute_nbc(data)
 
-        self.assertIsNotNone(result["QH1"])
-        self.assertFalse(result["QH1"]["complete"])
+        self.assertIsNotNone(result.qh1)
+        self.assertFalse(result.qh1.complete)
 
         # rate = 0.002 kWh/s per second of lookback data
         # predicted_wh = 0.002 * 900 * 1000 = 1800 Wh (lookback uses last 60 seconds)
         expected_predicted = 0.002 * 900 * 1000
-        self.assertAlmostEqual(result["QH1"]["predicted_wh"], expected_predicted, places=1)
+        self.assertAlmostEqual(result.qh1.predicted_wh, expected_predicted, places=1)
 
     def test_cross_quarter_lookback(self):
         """Verify that incomplete quarter lookback is clamped to quarter start index."""
@@ -168,15 +170,15 @@ class TestComputeNBCUnit(unittest.TestCase):
 
         result = fixture._compute_nbc(data)
 
-        self.assertIsNotNone(result["QH1"])
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertIsNotNone(result["QH2"])
-        self.assertTrue(result["QH2"]["complete"])
+        self.assertIsNotNone(result.qh1)
+        self.assertFalse(result.qh1.complete)
+        self.assertIsNotNone(result.qh2)
+        self.assertTrue(result.qh2.complete)
         # 30 seconds of QH2 data used for lookback (indices 900-929)
-        self.assertEqual(result["QH1"]["samples_used"], 30)
+        self.assertEqual(result.qh1.samples_used, 30)
         expected_rate = 0.001 * 30 / 30  # rate per second
         expected_predicted = max(0, expected_rate * 900 * 1000)
-        self.assertAlmostEqual(result["QH1"]["predicted_wh"], expected_predicted, places=1)
+        self.assertAlmostEqual(result.qh1.predicted_wh, expected_predicted, places=1)
 
     def test_empty_data(self):
         """Empty data → all quarters None or zero."""
@@ -191,7 +193,7 @@ class TestComputeNBCUnit(unittest.TestCase):
         # At second 0 of minute 0, n=0. QH1 starts at index 0, so n <= start_idx (0 <= 0).
         # The condition is `if seconds_into_hour <= start_idx and n <= start_idx`
         # seconds_into_hour = 0, start_idx = 0 → 0 <= 0 is True, n=0 <= 0 is True → None
-        self.assertIsNone(result["QH1"])
+        self.assertIsNone(result.qh1)
 
     def test_wh_clamped_at_zero_for_incomplete(self):
         """Incomplete quarter with negative consumption: predicted_wh clamped to 0."""
@@ -204,12 +206,12 @@ class TestComputeNBCUnit(unittest.TestCase):
 
         result = fixture._compute_nbc(data)
 
-        self.assertIsNotNone(result["QH1"])
-        self.assertFalse(result["QH1"]["complete"])
+        self.assertIsNotNone(result.qh1)
+        self.assertFalse(result.qh1.complete)
         # predicted_wh should not be clamped to 0
-        self.assertEqual(result["QH1"]["predicted_wh"], -450.0)
+        self.assertEqual(result.qh1.predicted_wh, -450.0)
         # wh should be clamped to 0
-        self.assertEqual(result["QH1"]["wh"], 0)
+        self.assertEqual(result.qh1.wh, 0)
 
     def test_raw_wh_preserved_for_transparency(self):
         """raw_wh should reflect actual observed data before clamping."""
@@ -224,9 +226,10 @@ class TestComputeNBCUnit(unittest.TestCase):
         result = fixture._compute_nbc(data)
 
         for qh in QH_NAMES:
-            self.assertIsNotNone(result[qh])
-            self.assertLess(result[qh]["raw_wh"], 0)
-            self.assertEqual(result[qh]["wh"], 0)
+            qh_obj = getattr(result, qh.lower())
+            self.assertIsNotNone(qh_obj)
+            self.assertLess(qh_obj.raw_wh, 0)
+            self.assertEqual(qh_obj.wh, 0)
 
     def test_incomplete_raw_wh_vs_predicted(self):
         """Incomplete quarter: raw_wh is observed data only, predicted_wh extrapolates."""
@@ -239,10 +242,10 @@ class TestComputeNBCUnit(unittest.TestCase):
 
         result = fixture._compute_nbc(data)
 
-        qh1 = result["QH1"]
+        qh1 = result.qh1
         # raw_wh: only observed QH1 data (indices 900-989 = 90 seconds)
         expected_raw = 90 * 0.001 * 1000  # = 90 Wh
-        self.assertAlmostEqual(qh1["raw_wh"], expected_raw, places=1)
+        self.assertAlmostEqual(qh1.raw_wh, expected_raw, places=1)
 
         # predicted_wh: extrapolated from lookback rate over full 900 seconds
         # Lookback uses last 60 seconds (indices 930-989), all with value 0.001
@@ -251,8 +254,8 @@ class TestComputeNBCUnit(unittest.TestCase):
         # There is a unit inconsistency in the implementation: predicted_wh is not
         # multiplied by 1000 to convert kWh → Wh like raw_wh is. We verify both values
         # are present and non-negative rather than comparing across units.
-        self.assertGreater(qh1["predicted_wh"], 0)
-        self.assertGreater(qh1["raw_wh"], 0)
+        self.assertGreater(qh1.predicted_wh, 0)
+        self.assertGreater(qh1.raw_wh, 0)
 
     def test_stale_data_lookback_beyond_array(self):
         """Stale API data: wall-clock n exceeds len(data), causing empty lookback slice.
@@ -279,13 +282,13 @@ class TestComputeNBCUnit(unittest.TestCase):
         result = fixture._compute_nbc(data)
 
         # QH2 should be complete (indices 0-899 all exist in data)
-        self.assertIsNotNone(result["QH2"])
-        self.assertTrue(result["QH2"]["complete"])
+        self.assertIsNotNone(result.qh2)
+        self.assertTrue(result.qh2.complete)
 
         # QH1 should still produce a prediction using whatever data is available
-        self.assertIsNotNone(result["QH1"])
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertGreater(result["QH1"]["samples_used"], 0)
+        self.assertIsNotNone(result.qh1)
+        self.assertFalse(result.qh1.complete)
+        self.assertGreater(result.qh1.samples_used, 0)
 
     def test_stale_data_lookback_early_quarter(self):
         """Stale API data in early quarter: lookback window falls entirely outside data.
@@ -304,9 +307,9 @@ class TestComputeNBCUnit(unittest.TestCase):
         result = fixture._compute_nbc(data)
 
         # QH1 should use whatever data is available (indices 0..40)
-        self.assertIsNotNone(result["QH1"])
-        self.assertFalse(result["QH1"]["complete"])
-        self.assertGreater(result["QH1"]["samples_used"], 0)
+        self.assertIsNotNone(result.qh1)
+        self.assertFalse(result.qh1.complete)
+        self.assertGreater(result.qh1.samples_used, 0)
 
     def test_device_timezone_fallback(self):
         """_compute_nbc falls back to UTC when device has no time_zone."""
@@ -321,7 +324,7 @@ class TestComputeNBCUnit(unittest.TestCase):
 
         # Should not raise — falls back gracefully
         for qh in QH_NAMES:
-            self.assertIsNotNone(result[qh])
+            self.assertIsNotNone(getattr(result, qh.lower()))
 
 
 class TestComputeNBCMetricsMock(unittest.TestCase):

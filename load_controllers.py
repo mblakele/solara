@@ -10,6 +10,8 @@ import json
 import logging
 import math
 import os
+import time as _time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast, Literal
 
@@ -20,11 +22,13 @@ import aiohttp
 from aiohomekit.controller.abstract import AbstractPairing
 
 import config as _cfg_mod
+from config import Config
 
 
 from load_models import (
     AbstractPlugController,
     AbstractTeslaController,
+    FleetTelemetryProvisionConfig,
     PlugAction,
     PlugConfig,
     TeslaAuthError,
@@ -35,9 +39,29 @@ from load_models import (
 
 logger = logging.getLogger(__name__)
 
+# Exponential backoff for Tesla init when vehicle is offline/asleep.
+CAR_OFFLINE_BACKOFF_SECS: float = 30.0
+"""Initial backoff in seconds after a Tesla init failure (e.g. VehicleOffline)."""
+CAR_OFFLINE_BACKOFF_MAX: float = 900.0
+"""Maximum backoff in seconds (15 minutes) before retrying Tesla init."""
+
 
 # Default path for pairing persistence
 PAIRINGS_FILE = Path(".homekit-pairings.json")
+
+
+def _is_auth_error(exc: BaseException) -> bool:
+    """Check if an exception indicates a Tesla auth/credential problem.
+
+    Args:
+        exc: The exception to check.
+
+    Returns:
+        True if the error message contains auth-related keywords.
+    """
+    error_str = str(exc).lower()
+    keywords = ["login_required", "refresh_token", "unauthorized", "authentication failed"]
+    return any(kw in error_str for kw in keywords)
 
 # Default path for Tesla OAuth token persistence
 TESLA_TOKENS_FILE = Path(".tesla-tokens.json")
@@ -69,7 +93,7 @@ class PlugController(AbstractPlugController):
             return False
         logger.info("PlugController.set_state(%s, %s)", name, on)
         self._state[name] = on
-        self.action_log.append(PlugAction(name=name, on=on))
+        self.action_log.append(PlugAction(name=name, on=on, timestamp=datetime.now(timezone.utc)))
         return True
 
 
@@ -86,10 +110,8 @@ class TeslaController(AbstractTeslaController):
         self._state = TeslaState(
             is_charging=False,
             current_amps=None,
-            soc_percent=50.0,
             plugged_in=False,
-            at_home=True,
-            at_charge_limit=False,
+            at_home=False,
         )
 
     def set_mock_state(self, state: TeslaState) -> None:
@@ -107,16 +129,6 @@ class TeslaController(AbstractTeslaController):
     async def is_plugged_in(self) -> bool:
         """Return stored plugged_in flag."""
         return self._state.plugged_in
-
-    async def get_charge_limit_pct(self) -> float | None:
-        """Return stored SOC percentage."""
-        if self._state.at_charge_limit:
-            return None
-        return self._state.soc_percent
-
-    async def is_at_charge_limit(self) -> bool:
-        """Return stored at_charge_limit flag."""
-        return self._state.at_charge_limit
 
     async def start_charging(self) -> bool:
         """Set charging state to True and log the action."""
@@ -138,6 +150,9 @@ class TeslaController(AbstractTeslaController):
         clamped = max(
             self.config.charge_amps_min, min(self.config.charge_amps_max, amps)
         )
+        # Belt-and-suspenders: hard absolute max regardless of config.
+        HARD_MAX_AMPS = 48
+        clamped = min(clamped, HARD_MAX_AMPS)
         logger.info("TeslaController.set_charge_amps(%d) [stub]", clamped)
         self._state.current_amps = clamped
         if not self._state.is_charging:
@@ -149,10 +164,8 @@ class TeslaController(AbstractTeslaController):
         return TeslaState(
             is_charging=self._state.is_charging,
             current_amps=self._state.current_amps,
-            soc_percent=self._state.soc_percent,
             plugged_in=self._state.plugged_in,
             at_home=self._state.at_home,
-            at_charge_limit=self._state.at_charge_limit,
         )
 
 
@@ -261,17 +274,36 @@ class RealTeslaController(AbstractTeslaController):
     All API calls are wrapped in try/except for resilience.
     """
 
-    def __init__(self, tesla_config: TeslaConfig) -> None:
+    def __init__(self, tesla_config: TeslaConfig, config: Config | None = None) -> None:
         self.config = tesla_config
+        self._cfg = config if config is not None else _cfg_mod._config
         self.last_error: str | None = None
         self._session: aiohttp.ClientSession | None = None
         self._api: Any | None = None  # TeslaFleetOAuth instance
         self._vin: str = ""
+        self._init_state: TeslaState | None = None
+        self._last_init_attempt: float = 0.0
+        """Monotonic time of the last Tesla init attempt (0 = never attempted)."""
+        self._backoff_secs: float = 0.0
+        """Current exponential backoff duration in seconds."""
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create the aiohttp session."""
+    async def _get_session(self, ssl: bool = True) -> aiohttp.ClientSession:
+        """Get or create the aiohttp session.
+
+        Args:
+            ssl: Whether to verify SSL certificates. Set to ``False`` when
+                using a vehicle-command proxy with a hostname-mismatched
+                certificate.
+
+        NOTE: A cached ClientSession binds to the event loop active at creation
+        time.  When ``asyncio.run()`` creates a fresh loop and closes it, the
+        cached session becomes unusable even though ``session.closed`` is still
+        ``False``.  This is why ``reset_session()`` must be called before each
+        ``asyncio.run()`` invocation.
+        """
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(ssl=ssl)
+            self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
     async def _ensure_api(self) -> None:
@@ -282,8 +314,10 @@ class RealTeslaController(AbstractTeslaController):
         """
         from tesla_fleet_api import TeslaFleetOAuth
 
-        session = await self._get_session()
-        region = cast(Literal["na", "eu", "cn"], _cfg_mod.cfg.tesla_region)
+        session = await self._get_session(
+            ssl=not bool(self.config.vehicle_command_proxy_url),
+        )
+        region = cast(Literal["na", "eu", "cn"], self._cfg.tesla_region)
 
         tokens = load_tesla_tokens()
         if tokens is not None:
@@ -314,6 +348,16 @@ class RealTeslaController(AbstractTeslaController):
             else:
                 await self._api.get_private_key(self.config.private_key_path)
                 logger.debug("Loaded Tesla private key from %s", self.config.private_key_path)
+
+            # Override Tesla API server URL if a vehicle-command proxy is
+            # configured.  Setting ``self._api.server`` after construction
+            # overrides the region-based URL for all subsequent API calls.
+            if self.config.vehicle_command_proxy_url:
+                self._api.server = self.config.vehicle_command_proxy_url
+                logger.info(
+                    "Using vehicle-command proxy for Tesla API: %s",
+                    self.config.vehicle_command_proxy_url,
+                )
         else:
             # API already exists — update the session in case the previous one
             # was closed between calls, then refresh tokens from disk.
@@ -377,7 +421,7 @@ class RealTeslaController(AbstractTeslaController):
         """
         from tesla_fleet_api.const import Scope
 
-        region = _cfg_mod.cfg.tesla_region
+        region = self._cfg.tesla_region
         domain = "auth.tesla.cn" if region == "cn" else "auth.tesla.com"
         scope_str = "+".join(
             [
@@ -460,117 +504,76 @@ class RealTeslaController(AbstractTeslaController):
         return await vehicle.vehicle_data(endpoints=endpoints)
 
     async def is_at_home(self) -> bool:
-        """Check vehicle GPS against home lat/lon using haversine distance."""
-        try:
-            data = await self._fetch_vehicle_data(["drive_state", "location_data"])
-            response = data.get("response", {})
-            drive_state = response.get("drive_state", {})
-            location_data = response.get("location_data", {})
-            lat = location_data.get("latitude") or drive_state.get("latitude") or drive_state.get("native_latitude")
-            lon = location_data.get("longitude") or drive_state.get("longitude") or drive_state.get("native_longitude")
+        """Check vehicle GPS against home lat/lon (deprecated).
 
-
-            if lat is None or lon is None:
-                logger.warning(
-                    "Tesla location unavailable (lat=%s, lon=%s)", lat, lon
-                )
-                return False
-
-            distance = _haversine_distance(
-                self.config.home_lat,
-                self.config.home_lon,
-                lat,
-                lon,
-            )
-            is_home = distance <= self.config.home_radius_m
-            logger.debug(
-                "Tesla vehicle %s at home (distance=%.1fm)",
-                "is" if is_home else "is not",
-                distance,
-            )
-            return is_home
-        except BaseException as e:
-            if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                raise
-            logger.error("Failed to check Tesla location: %s", e)
-            return False
-
-    async def is_plugged_in(self) -> bool:
-        """Check chargeState indicates plugged in (not Disconnected)."""
-        try:
-            data = await self._fetch_vehicle_data(["charge_state"])
-            charge_state = data.get("response", {}).get("charge_state", {})
-            charging_state = charge_state.get("charging_state", "")
-            return charging_state not in ("Disconnected", "")
-        except BaseException as e:
-            if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                raise
-            logger.error("Failed to check Tesla plugged-in status: %s", e)
-            return False
-
-    async def get_charge_limit_pct(self) -> float | None:
-        """Get target SOC percentage.
+        Deprecated: REST-based status polling is no longer used.
+        The load manager does not require GPS proximity checks.
+        This method always returns False.
 
         Returns:
-            Target SOC as 0-100, or None if at limit or error.
+            Always False.
         """
-        try:
-            data = await self._fetch_vehicle_data(["charge_state"])
-            charge_state = data.get("response", {}).get("charge_state", {})
-            soc = charge_state.get("battery_level")
-            charge_limit_soc = charge_state.get("charge_limit_soc")
+        logger.warning(
+            "is_at_home() is deprecated; returning False. "
+            "Use MQTT telemetry for GPS proximity."
+        )
+        return False
 
-            if soc is not None and charge_limit_soc is not None:
-                if soc >= charge_limit_soc:
-                    return None  # At limit
-            return float(charge_limit_soc) if charge_limit_soc is not None else None
-        except BaseException as e:
-            if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                raise
-            logger.error("Failed to get Tesla charge limit: %s", e)
-            return None
+    async def is_plugged_in(self) -> bool:
+        """Check if vehicle is plugged in (deprecated).
 
-    async def is_at_charge_limit(self) -> bool:
-        """Check if vehicle has reached its charge limit (saturated load)."""
-        try:
-            data = await self._fetch_vehicle_data(["charge_state"])
-            charge_state = data.get("response", {}).get("charge_state", {})
-            soc = charge_state.get("battery_level")
-            charge_limit_soc = charge_state.get("charge_limit_soc")
+        Deprecated: REST-based status polling is no longer used.
+        The load manager relies on MQTT telemetry for vehicle state.
+        This method always returns False.
 
-            if soc is not None and charge_limit_soc is not None:
-                return soc >= charge_limit_soc
-            return False
-        except BaseException as e:
-            if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                raise
-            logger.error("Failed to check Tesla charge limit: %s", e)
-            return False
+        Returns:
+            Always False.
+        """
+        logger.warning(
+            "is_plugged_in() is deprecated; returning False. "
+            "Use MQTT telemetry for plugged-in state."
+        )
+        return False
+
+    async def get_charge_limit_pct(self) -> float | None:
+        """Get target SOC percentage (deprecated).
+
+        Deprecated: REST-based status polling is no longer used.
+        The load manager does not read charge limits via REST.
+        This method always returns None.
+
+        Returns:
+            Always None.
+        """
+        logger.warning(
+            "get_charge_limit_pct() is deprecated; returning None. "
+            "The load manager does not use charge limits."
+        )
+        return None
 
     async def start_charging(self) -> bool:
-        """Send charge_start command."""
-        if self._api is None or not self._api.has_private_key:
-            logger.error(
-                "Cannot start Tesla charging: private key not loaded. "
-                "Set TESLA_PRIVATE_KEY_PATH to a valid key file."
-            )
-            return False
-        try:
-            vehicle = await self._get_vehicle()
-            await vehicle.charge_start()
-            logger.info("Tesla charge_start sent successfully")
-            return True
-        except BaseException as e:
-            if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                raise
-            logger.error("Failed to start Tesla charging: %s", e)
-            return False
-        finally:
-            await self.close()
+        """Start charging (deprecated — no-op).
+
+        Deprecated: The load manager must not start charging vehicles.
+        This method is a no-op that returns False and logs a warning.
+        Charging must be initiated manually or via separate automation.
+        """
+        logger.warning(
+            "start_charging() is disabled: the load manager must not "
+            "start charging. Please start the car manually or via "
+            "separate automation."
+        )
+        return False
 
     async def stop_charging(self) -> bool:
         """Send charge_stop command."""
-        if self._api is None or not self._api.has_private_key:
+        await self._ensure_api()
+        if self._api is None:
+            logger.error(
+                "Cannot stop Tesla charging: API unavailable. "
+            )
+            return False
+        if not self._api.has_private_key:
             logger.error(
                 "Cannot stop Tesla charging: private key not loaded. "
                 "Set TESLA_PRIVATE_KEY_PATH to a valid key file."
@@ -584,6 +587,8 @@ class RealTeslaController(AbstractTeslaController):
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
+            if _is_auth_error(e):
+                raise TeslaAuthError(str(e)) from e
             logger.error("Failed to stop Tesla charging: %s", e)
             return False
         finally:
@@ -591,7 +596,13 @@ class RealTeslaController(AbstractTeslaController):
 
     async def set_charge_amps(self, amps: int) -> bool:
         """Set charging amps within [min, max] range."""
-        if self._api is None or not self._api.has_private_key:
+        await self._ensure_api()
+        if self._api is None:
+            logger.error(
+                "Cannot set Tesla charge amps: API unavailable. "
+            )
+            return False
+        if not self._api.has_private_key:
             logger.error(
                 "Cannot set Tesla charge amps: private key not loaded. "
                 "Set TESLA_PRIVATE_KEY_PATH to a valid key file."
@@ -600,6 +611,9 @@ class RealTeslaController(AbstractTeslaController):
         clamped = max(
             self.config.charge_amps_min, min(self.config.charge_amps_max, amps)
         )
+        # Belt-and-suspenders: hard absolute max regardless of config.
+        HARD_MAX_AMPS = 48
+        clamped = min(clamped, HARD_MAX_AMPS)
         try:
             vehicle = await self._get_vehicle()
             await vehicle.set_charging_amps(clamped)
@@ -608,107 +622,227 @@ class RealTeslaController(AbstractTeslaController):
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
+            if _is_auth_error(e):
+                raise TeslaAuthError(str(e)) from e
             logger.error("Failed to set Tesla charge amps: %s", e)
             return False
         finally:
             await self.close()
 
     async def get_charging_state(self) -> TeslaState | None:
-        """Return full state: charging_bool, current_amps, soc_pct, plugged_in."""
+        """Return full state from MQTT telemetry (deprecated).
+
+        Deprecated: REST-based status polling is no longer used.
+        The load manager relies solely on Tesla fleet-telemetry MQTT
+        for vehicle state. This method always returns None.
+
+        Returns:
+            Always None.
+        """
+        logger.warning(
+            "get_charging_state() is deprecated; returning None. "
+            "Use MQTT telemetry for Tesla state."
+        )
+        return None
+
+    async def init_tesla_state(self, timeout: int = 60) -> TeslaState | None:
+        """Initialize Tesla state from telemetry or REST API fallback.
+
+        Waits up to ``timeout`` seconds for MQTT telemetry to arrive.
+        If telemetry provides the required fields (DetailedChargeState),
+        converts the snapshot to a TeslaState and returns it immediately.
+
+        If telemetry times out, falls back to the REST API:
+        1. Use ChargeAmps from telemetry (if available) to determine
+           is_charging and current_amps, skipping the charge_state REST call.
+        2. If charging and home_lat/home_lon are configured, fetch drive_state
+           to compute at_home via haversine distance.
+        3. Build and return a TeslaState.
+
+        The result is cached so this method only performs the init once.
+        Subsequent calls return the cached state immediately.
+
+        When ``_init_from_rest()`` fails (e.g. vehicle is offline), exponential
+        backoff is applied: 30s, 60s, 120s, ..., capped at 900s (15 min). The
+        telemetry fast path remains unaffected by backoff.
+
+        Args:
+            timeout: Maximum seconds to wait for telemetry before falling back to REST.
+
+        Returns:
+            TeslaState if available, or None if both telemetry and REST fail.
+        """
+        # Return cached result immediately
+        if self._init_state is not None:
+            return self._init_state
+
+        # Backoff: skip REST fallback if we recently failed.
+        # Telemetry (Phase 1) is always attempted — it is local and free.
+        if self._last_init_attempt > 0:
+            elapsed = _time.monotonic() - self._last_init_attempt
+            if elapsed < self._backoff_secs:
+                logger.debug(
+                    "init_tesla_state: in backoff — skipping REST fallback, "
+                    "%.1fs remaining of %.1fs backoff",
+                    self._backoff_secs - elapsed, self._backoff_secs,
+                )
+                return None
+
+        # Phase 1: Wait for telemetry
+        from mqtt_telemetry import get_telemetry_snapshot, has_telemetry, tesla_state_from_snapshot
+
+        waited = 0
+        while waited < timeout:
+            if has_telemetry():
+                snapshot = get_telemetry_snapshot()
+
+                state = tesla_state_from_snapshot(snapshot)
+                if state is not None:
+                    self._init_state = state
+                    self._backoff_secs = 0.0
+                    logger.info(
+                        "init_tesla_state: telemetry arrived after %.1fs — is_charging=%s",
+                        waited, state.is_charging,
+                    )
+                    return state
+            await asyncio.sleep(1)
+            waited += 1
+
+        # Phase 2: Telemetry timed out — fall back to REST API
+        # Pass the partial snapshot so _init_from_rest can use ChargeAmps
+        # (if present) instead of making an unnecessary charge_state REST call.
+        partial_snapshot = get_telemetry_snapshot() if has_telemetry() else {}
+        logger.info(
+            "init_tesla_state: telemetry not available after %ds, "
+            "falling back to REST (snapshot keys: %s)",
+            timeout, sorted(partial_snapshot.keys()),
+        )
+        self._last_init_attempt = _time.monotonic()
+        state = await self._init_from_rest(snapshot=partial_snapshot)
+        if state is not None:
+            self._init_state = state
+            self._backoff_secs = 0.0
+        else:
+            # Increase backoff: double, floor at CAR_OFFLINE_BACKOFF_SECS,
+            # cap at CAR_OFFLINE_BACKOFF_MAX.
+            self._backoff_secs = min(
+                max(self._backoff_secs * 2, CAR_OFFLINE_BACKOFF_SECS),
+                CAR_OFFLINE_BACKOFF_MAX,
+            )
+        return state
+
+    async def _init_from_rest(
+        self, snapshot: dict[str, Any] | None = None,
+    ) -> TeslaState | None:
+        """Fetch Tesla state from REST API as telemetry fallback.
+
+        When ``snapshot`` contains ``ChargeAmps``, uses it to derive
+        ``is_charging`` (amps > 0) and ``current_amps`` directly, skipping
+        the ``charge_state`` REST call entirely — only ``drive_state`` is
+        fetched (if home coords are configured).  This avoids an unnecessary
+        API round-trip when telemetry already tells us the vehicle is charging.
+
+        When ``snapshot`` is absent or empty, falls back to the original
+        two-call strategy: ``charge_state`` for charging status and amps,
+        then optionally ``drive_state`` for location.
+
+        The Tesla Fleet API wraps endpoint data in a ``response`` key.
+        Both wrapped (``{"response": {"charge_state": ...}}``) and
+        unwrapped (``{"charge_state": ...}``) formats are accepted for
+        backward compatibility.
+
+        Returns:
+            TeslaState built from REST data, or None on failure.
+        """
         try:
-            data = await self._fetch_vehicle_data(
-                ["charge_state", "drive_state", "location_data"]
-            )
-            response = data.get("response", {})
-            charge_state = response.get("charge_state", {})
-            drive_state = response.get("drive_state", {})
-            location_data = response.get("location_data", {})   # add this
-            lat = (location_data.get("latitude")
-                   or drive_state.get("latitude")
-                   or drive_state.get("native_latitude"))
-            lon = (location_data.get("longitude")
-                   or drive_state.get("longitude")
-                   or drive_state.get("native_longitude"))
-
-            charging_state = charge_state.get("charging_state", "")
-            is_charging = charging_state == "Charging"
-
-            charge_amps = charge_state.get("charge_current_request")
-            if charge_amps is None:
-                charge_amps = charge_state.get("charger_pilot_current")
-            current_amps: int | None = (
-                int(charge_amps) if charge_amps is not None else None
-            )
-
-            soc_percent: float | None = (
-                float(charge_state["battery_level"])
-                if charge_state.get("battery_level") is not None
-                else None
-            )
-
-            plugged_in = charging_state not in ("Disconnected", "")
-
-            if lat is not None and lon is not None:
-                distance = _haversine_distance(
-                    self.config.home_lat,
-                    self.config.home_lon,
-                    lat,
-                    lon,
+            # ── Derive is_charging, current_amps, plugged_in ────────────────
+            if snapshot and snapshot.get("ChargeAmps") is not None:
+                # Telemetry snapshot has ChargeAmps — we already know the
+                # vehicle is charging.  Skip the charge_state REST call.
+                charge_amps_raw = snapshot["ChargeAmps"]
+                raw_val = (
+                    charge_amps_raw.get("value", charge_amps_raw)
+                    if isinstance(charge_amps_raw, dict)
+                    else charge_amps_raw
                 )
-                at_home = distance <= self.config.home_radius_m
+                if raw_val is not None:
+                    current_amps = round(float(raw_val))
+                else:
+                    current_amps = None
+                is_charging = current_amps is not None and current_amps > 0
+                plugged_in = is_charging
                 logger.debug(
-                    "Tesla location: lat=%.6f lon=%.6f distance=%.1fm radius=%.1fm at_home=%s",
-                    lat,
-                    lon,
-                    distance,
-                    self.config.home_radius_m,
-                    at_home,
+                    "_init_from_rest: using ChargeAmps=%s from snapshot — "
+                    "skipping charge_state REST call",
+                    current_amps,
                 )
             else:
-                # GPS unavailable (missing vehicle_location scope or privacy mode).
-                # If the car is plugged in it must be at the home charger.
-                at_home = plugged_in
+                # No ChargeAmps snapshot — fall back to full REST fetch.
+                charge_data = await self._fetch_vehicle_data(endpoints=["charge_state"])
+                cs = (
+                    charge_data.get("response", {}).get("charge_state")
+                    or charge_data.get("charge_state")
+                )
+                if cs is None:
+                    logger.warning(
+                        "_init_from_rest: no charge_state in tesla API response",
+                    )
+                    return None
+
+                cs_str = cs.get("charging_state", "")
+                is_charging = cs_str == "Charging"
+                plugged_in = cs_str in ("Charging", "Complete", "PluggedIn")
+                current_amps = cs.get("charge_amps")
+                if current_amps is not None:
+                    current_amps = int(current_amps)
+
+            # ── Location from location_data (only if charging + home coords) ──
+            at_home = False  # Assume not home until proven otherwise
+            if is_charging and self.config.home_lat is not None and self.config.home_lon is not None:
                 logger.debug(
-                    "Tesla location unavailable: drive_state keys=%s, "
-                    "falling back to plugged_in=%s for at_home",
-                    list(drive_state.keys()),
-                    plugged_in,
+                    "_init_from_rest: fetching location_data "
+                    "(home_lat=%s, home_lon=%s)",
+                    self.config.home_lat, self.config.home_lon,
+                )
+                try:
+                    loc_data = await self._fetch_vehicle_data(endpoints=["location_data"])
+                    loc = (
+                        loc_data.get("response", {}).get("drive_state")
+                        or loc_data.get("drive_state")
+                    )
+                    if loc is not None:
+                        drv_lat = loc.get("latitude")
+                        drv_lon = loc.get("longitude")
+                        if drv_lat is not None and drv_lon is not None:
+                            dist_m = _haversine_distance(
+                                float(drv_lat), float(drv_lon),
+                                float(self.config.home_lat), float(self.config.home_lon),
+                            )
+                            at_home = dist_m <= self.config.home_radius_m
+                except Exception as e:
+                    logger.warning("_init_from_rest: tesla API location_data fetch failed: %s", e)
+            else:
+                logger.debug(
+                    "_init_from_rest: skipping location_data fetch "
+                    "(is_charging=%s, home_lat=%s, home_lon=%s)",
+                    is_charging, self.config.home_lat, self.config.home_lon,
                 )
 
-            charge_limit_soc = charge_state.get("charge_limit_soc")
-            if soc_percent is not None and charge_limit_soc is not None:
-                at_charge_limit = soc_percent >= float(charge_limit_soc)
-            else:
-                at_charge_limit = False
-
-            self.last_error = None  # Clear any previous error on success
+            # ── Build TeslaState ────────────────────────────────────────────
             return TeslaState(
                 is_charging=is_charging,
                 current_amps=current_amps,
-                soc_percent=soc_percent,
                 plugged_in=plugged_in,
                 at_home=at_home,
-                at_charge_limit=at_charge_limit,
             )
+
         except BaseException as e:
-            # TeslaFleetError inherits from BaseException, not Exception.
-            # Re-raise system-exiting exceptions, log and suppress others.
+            # TeslaFleetError subclasses (e.g. VehicleOffline) inherit from
+            # BaseException, NOT Exception, so ``except Exception`` misses them.
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
-            if "login_required" in str(e) or "refresh_token" in str(e) or "not authorized" in str(e):
-                raise TeslaAuthError(str(e)) from e
-            try:
-                from tesla_fleet_api.exceptions import VehicleOffline
-                if isinstance(e, VehicleOffline):
-                    logger.info(
-                        "Tesla vehicle is offline (asleep or unplugged); skipping state fetch"
-                    )
-                    return None
-            except ImportError:
-                pass
-            raise
-        finally:
-            await self.close()
+            logger.warning("_init_from_rest: tesla REST API failed: %s", e)
+            return None
 
     async def close(self) -> None:
         """Close the aiohttp session."""
@@ -730,15 +864,20 @@ class RealTeslaController(AbstractTeslaController):
         self.last_error = None
 
 
-async def tesla_auth_cli() -> bool:
+async def tesla_auth_cli(config: Config | None = None) -> bool:
     """CLI helper for initial Tesla OAuth authentication.
 
     Prints the authorization URL and prompts for the callback code.
     Returns True on success, False on failure.
+
+    Args:
+        config: Optional Config instance. Falls back to module-level
+            singleton when None.
     """
     from tesla_fleet_api import TeslaFleetOAuth
 
-    client_id = _cfg_mod.cfg.tesla_client_id or ""
+    cfg = config if config is not None else _cfg_mod._config
+    client_id = cfg.tesla_client_id or ""
     if not client_id:
         print(
             "Error: TESLA_CLIENT_ID not set in environment. "
@@ -747,13 +886,13 @@ async def tesla_auth_cli() -> bool:
         return False
 
     session = aiohttp.ClientSession()
-    region = cast(Literal["na", "eu", "cn"], _cfg_mod.cfg.tesla_region)
+    region = cast(Literal["na", "eu", "cn"], cfg.tesla_region)
     api = TeslaFleetOAuth(
         session=session,
         region=region,
         client_id=client_id,
-        client_secret=_cfg_mod.cfg.tesla_client_secret or "",
-        redirect_uri=_cfg_mod.cfg.tesla_redirect_uri,
+        client_secret=cfg.tesla_client_secret or "",
+        redirect_uri=cfg.tesla_redirect_uri,
     )
 
     try:
@@ -1031,6 +1170,7 @@ class VocolincPlugController(AbstractPlugController):
         plugs: dict[str, PlugConfig],
         username: str | None = None,
         password: str | None = None,
+        config: Config | None = None,
     ) -> None:
         """Initialize controller with plug configs and VOCOlinc credentials.
 
@@ -1040,10 +1180,13 @@ class VocolincPlugController(AbstractPlugController):
                 VOCOLINC_USERNAME env var.
             password: VOCOlinc account password. If None, read from
                 VOCOLINC_PASSWORD env var.
+            config: Optional Config instance. Falls back to module-level
+                singleton when None.
         """
         self.plugs = plugs
         self._username = username
         self._password = password
+        self._cfg = config if config is not None else _cfg_mod._config
         self._client: Any | None = None
         self._initialized = False
 
@@ -1052,8 +1195,8 @@ class VocolincPlugController(AbstractPlugController):
         if self._initialized:
             return
 
-        username = self._username or _cfg_mod.cfg.vocolinc_username
-        password = self._password or _cfg_mod.cfg.vocolinc_password
+        username = self._username or self._cfg.vocolinc_username
+        password = self._password or self._cfg.vocolinc_password
 
         if not username or not password:
             raise RuntimeError(
@@ -1296,3 +1439,45 @@ def pair_homekit_accessory(
             await azc.async_close()
 
     return asyncio.run(_do_pair())
+
+
+async def fleet_telemetry_config_create(
+    ctrl: "RealTeslaController",
+    config: FleetTelemetryProvisionConfig,
+) -> None:
+    """Call the Tesla Fleet API fleet_telemetry_config_create endpoint.
+
+    Args:
+        ctrl: An authenticated RealTeslaController instance.
+        config: Provisioning parameters (hostname, CA cert, intervals).
+
+    Raises:
+        RuntimeError: If the API is not authenticated.
+        Exception: On API or file-I/O failure.
+    """
+    await ctrl._ensure_api()
+    await ctrl.authenticate()
+    assert ctrl._api is not None
+    assert ctrl._vin is not None
+    assert ctrl._vin != ""
+    ca_cert = config.ca_file_path.read_text()
+    body = {
+        "vins": [ctrl._vin],
+        "config": {
+            "hostname": config.server_hostname,
+            "port": config.server_port,
+            "ca": ca_cert,
+            "fields": {
+                "DetailedChargeState": {"interval_seconds": config.detailedchargestate_interval_sec},
+                "ChargeAmps": {"interval_seconds": config.chargeamps_interval_sec},
+                "ChargeState": {"interval_seconds": config.chargestate_interval_sec},
+                "Location": {"interval_seconds": config.location_interval_sec},
+            },
+            "alert_types": ["service"]
+        }
+    }
+    fleet = ctrl._api.vehicles.Fleet(ctrl._api, ctrl._vin)  # type: ignore[union-attr]
+    await fleet.fleet_telemetry_config_create(body)
+    logger.info(
+        "fleet_telemetry_config_create: registered hostname=%s", config.server_hostname
+    )

@@ -5,15 +5,16 @@ variables (via decouple) and devices.json in a unified interface. Callers
 never need to know which source a setting comes from.
 
 Usage:
-    cfg = Config()
-    timezone_str = cfg.timezone              # env or devices.json fallback
-    target_wh = cfg.load_target_wh           # env overrides devices.json
-    is_mock = cfg.is_mock_mode               # derived property
+    _config = Config()
+    timezone_str = _config.timezone              # env or devices.json fallback
+    target_wh = _config.load_target_wh           # env overrides devices.json
+    is_mock = _config.is_mock_mode               # derived property
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 from decouple import UndefinedValueError, config as _decouple_config
@@ -29,24 +30,50 @@ class Config:
     Reads from environment variables first, falls back to devices.json
     where applicable. Derived properties combine multiple sources.
 
-
+    Args:
+        overrides: Optional dict of key→value pairs that take precedence
+            over env vars and devices.json. Used by tests to inject config
+            without patching ``_decouple_config`` or ``_cfg``.
     """
 
+    def __init__(self, overrides: dict[str, str] | None = None) -> None:
+        self._overrides = overrides or {}
+
+    def _get(self, key: str, default: str | None = None) -> str | None:
+        """Check overrides first, then fall back to decouple."""
+        if key in self._overrides:
+            return self._overrides[key]
+        return _decouple_config(key, default=default)  # type: ignore[return-value]
+
+    def _get_bool(self, key: str, default: str = "False") -> bool:
+        """Return boolean config value, checking overrides first."""
+        if key in self._overrides:
+            raw = self._overrides[key]
+            return raw.lower() in ("true", "yes", "1", "t")
+        return _decouple_config(key, default=default, cast=bool)  # type: ignore[return-value]
+
+    def _get_int(self, key: str, default: int = 0) -> int:
+        """Return integer config value, checking overrides first."""
+        if key in self._overrides:
+            return int(self._overrides[key])
+        return _decouple_config(key, default=default, cast=int)  # type: ignore[return-value]
 
     @property
     def timezone(self) -> str:
         """Return device timezone, evaluated lazily for testability."""
-        return _decouple_config("TIMEZONE", default="America/Los_Angeles")
+        val = self._get("TIMEZONE", default="America/Los_Angeles")
+        assert val is not None
+        return val
 
     @property
     def is_mock_mode(self) -> bool:
         """Return True when running in mock/test mode."""
-        return _decouple_config("MOCK", default="False", cast=bool)
+        return self._get_bool("MOCK")
 
     @property
     def is_mock_error(self) -> bool:
         """Return True when mock error mode is enabled."""
-        return _decouple_config("MOCK_ERROR", default="False", cast=bool)
+        return self._get_bool("MOCK_ERROR")
 
     @property
     def load_manage_enabled(self) -> bool | str:
@@ -58,7 +85,10 @@ class Config:
         Time-range strings are returned as-is so _parse_load_manage_enabled
         can extract the start/end times. Boolean strings are converted to bools.
         """
-        raw = _decouple_config("LOAD_MANAGE_ENABLED", default=None)  # type: ignore[assignment]
+        if "LOAD_MANAGE_ENABLED" in self._overrides:
+            raw = self._overrides["LOAD_MANAGE_ENABLED"]
+        else:
+            raw = _decouple_config("LOAD_MANAGE_ENABLED", default=None)  # type: ignore[assignment]
         if raw is not None and isinstance(raw, str):
             lower = raw.lower()
             # Time-range strings (e.g. "06:45-15:00") are returned as-is
@@ -76,6 +106,8 @@ class Config:
     @property
     def load_target_wh(self) -> int:
         """Return target Wh per quarter-hour for load decisions."""
+        if "LOAD_TARGET_WH" in self._overrides:
+            return int(self._overrides["LOAD_TARGET_WH"])
         env_val = _decouple_config("LOAD_TARGET_WH", default=None)
         if env_val is not None:
             return int(env_val)
@@ -84,18 +116,20 @@ class Config:
     @property
     def load_manage_interval_secs(self) -> int:
         """Return seconds between load management cycles."""
-        return _decouple_config(
-            "LOAD_MANAGE_INTERVAL_SECS", default=30, cast=int
-        )
+        return self._get_int("LOAD_MANAGE_INTERVAL_SECS", default=30)
 
     @property
     def load_manage_api_key(self) -> str:
         """Return API key for manual load management endpoint."""
+        if "LOAD_MANAGE_API_KEY" in self._overrides:
+            return self._overrides["LOAD_MANAGE_API_KEY"]
         return _decouple_config("LOAD_MANAGE_API_KEY", default="", cast=str)  # type: ignore[return-value]
 
     @property
     def load_nbc_device(self) -> str:
         """Return NBC device name for load management."""
+        if "LOAD_NBC_DEVICE" in self._overrides:
+            return self._overrides["LOAD_NBC_DEVICE"]
         env_val = _decouple_config("LOAD_NBC_DEVICE", default=None)
         if env_val:
             return env_val
@@ -104,26 +138,34 @@ class Config:
     @property
     def debug(self) -> bool:
         """Return True when DEBUG mode is enabled."""
-        return _decouple_config("DEBUG", default="False", cast=bool)
+        return self._get_bool("DEBUG")
 
     @property
     def dry_run(self) -> bool:
         """Return True when load management is in dry-run mode."""
-        return _decouple_config("LOAD_MANAGE_DRY_RUN", default=False, cast=bool)
+        return self._get_bool("LOAD_MANAGE_DRY_RUN")
 
     @property
     def vue_username(self) -> Optional[str]:
         """Return Emporia VUE username, or None if not configured."""
+        if "VUE_USERNAME" in self._overrides:
+            val = self._overrides["VUE_USERNAME"]
+            return val if val else None
         return _decouple_config("VUE_USERNAME", default=None)
 
     @property
     def vue_password(self) -> Optional[str]:
         """Return Emporia VUE password, or None if not configured."""
+        if "VUE_PASSWORD" in self._overrides:
+            val = self._overrides["VUE_PASSWORD"]
+            return val if val else None
         return _decouple_config("VUE_PASSWORD", default=None)
 
     @property
     def tesla_client_id(self) -> Optional[str]:
         """Return Tesla Fleet API client ID, or None if not configured."""
+        if "TESLA_CLIENT_ID" in self._overrides:
+            return self._overrides["TESLA_CLIENT_ID"] or None
         try:
             return _decouple_config("TESLA_CLIENT_ID", default=None)  # type: ignore[return-value]
         except UndefinedValueError:
@@ -132,6 +174,8 @@ class Config:
     @property
     def tesla_client_secret(self) -> Optional[str]:
         """Return Tesla Fleet API client secret, or None if not configured."""
+        if "TESLA_CLIENT_SECRET" in self._overrides:
+            return self._overrides["TESLA_CLIENT_SECRET"] or None
         try:
             return _decouple_config("TESLA_CLIENT_SECRET", default=None)  # type: ignore[return-value]
         except UndefinedValueError:
@@ -140,36 +184,184 @@ class Config:
     @property
     def tesla_private_key_path(self) -> Optional[str]:
         """Return Tesla private key file path, or None."""
+        if "TESLA_PRIVATE_KEY_PATH" in self._overrides:
+            return self._overrides["TESLA_PRIVATE_KEY_PATH"] or None
         return _decouple_config("TESLA_PRIVATE_KEY_PATH", default=None)
 
     @property
     def tesla_redirect_uri(self) -> str:
         """Return Tesla OAuth redirect URI."""
+        if "TESLA_REDIRECT_URI" in self._overrides:
+            return self._overrides["TESLA_REDIRECT_URI"]
         return _decouple_config("TESLA_REDIRECT_URI", default="", cast=str)  # type: ignore[return-value]
 
     @property
     def tesla_region(self) -> str:
         """Return Tesla API region."""
+        if "TESLA_REGION" in self._overrides:
+            return self._overrides["TESLA_REGION"]
         return _decouple_config("TESLA_REGION", default="na", cast=str)  # type: ignore[return-value]
+
+    @property
+    def tesla_vehicle_command_proxy_url(self) -> str | None:
+        """Return the vehicle-command proxy URL, or None if not configured."""
+        if "TESLA_VEHICLE_COMMAND_PROXY_URL" in self._overrides:
+            return self._overrides["TESLA_VEHICLE_COMMAND_PROXY_URL"] or None
+        try:
+            return _decouple_config("TESLA_VEHICLE_COMMAND_PROXY_URL", default=None)
+        except UndefinedValueError:
+            return None
+
+    @property
+    def tesla_vehicle_id(self) -> Optional[str]:
+        """Return Tesla vehicle ID, or None if not configured."""
+        if "TESLA_VEHICLE_ID" in self._overrides:
+            return self._overrides["TESLA_VEHICLE_ID"] or None
+        try:
+            return _decouple_config("TESLA_VEHICLE_ID", default=None)
+        except UndefinedValueError:
+            return None
+
+    @property
+    def tesla_home_lat(self) -> Optional[float]:
+        """Return Tesla home latitude, or None if not configured."""
+        if "TESLA_HOME_LAT" in self._overrides:
+            val = self._overrides["TESLA_HOME_LAT"]
+            if not val:
+                return None
+            try:
+                return float(val)
+            except ValueError:
+                return None
+        try:
+            val = _decouple_config("TESLA_HOME_LAT", default=None)
+            if val is None:
+                return None
+            return float(val)
+        except (UndefinedValueError, ValueError):
+            return None
+
+    @property
+    def tesla_home_lon(self) -> Optional[float]:
+        """Return Tesla home longitude, or None if not configured."""
+        if "TESLA_HOME_LON" in self._overrides:
+            val = self._overrides["TESLA_HOME_LON"]
+            if not val:
+                return None
+            try:
+                return float(val)
+            except ValueError:
+                return None
+        try:
+            val = _decouple_config("TESLA_HOME_LON", default=None)
+            if val is None:
+                return None
+            return float(val)
+        except (UndefinedValueError, ValueError):
+            return None
+
+    @property
+    def mqtt_host(self) -> str:
+        """Return MQTT broker hostname (default: localhost)."""
+        if "MQTT_HOST" in self._overrides:
+            return self._overrides["MQTT_HOST"]
+        return _decouple_config("MQTT_HOST", default="localhost", cast=str)  # type: ignore[return-value]
+
+    @property
+    def mqtt_port(self) -> int:
+        """Return MQTT broker TCP port (default: 1883)."""
+        return self._get_int("MQTT_PORT", default=1883)
+
+    @property
+    def mqtt_topic_base(self) -> str:
+        """Return base MQTT topic prefix for fleet-telemetry messages.
+
+        Returns:
+            Topic base string (e.g. ``"tesla/telemetry"``).
+        """
+        if "MQTT_TOPIC_BASE" in self._overrides:
+            return self._overrides["MQTT_TOPIC_BASE"]
+        return _decouple_config("MQTT_TOPIC_BASE", default="tesla/telemetry", cast=str)  # type: ignore[return-value]
+
+    @property
+    def tesla_telemetry_ca_file(self) -> str | None:
+        """Return path to CA PEM file for fleet-telemetry TLS, or None."""
+        if "TESLA_TELEMETRY_CA_FILE" in self._overrides:
+            val = self._overrides["TESLA_TELEMETRY_CA_FILE"]
+            return val if val else None
+        return _decouple_config("TESLA_TELEMETRY_CA_FILE", default=None)
+
+    @property
+    def tesla_telemetry_chargestate_interval(self) -> int:
+        """Return min interval for ChargeState telemetry (seconds, default 15)."""
+        if "TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC" in self._overrides:
+            return int(self._overrides["TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC"])
+        raw = _decouple_config("TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC", default=None)
+        if raw is not None:
+            return int(raw)
+        return 15
+
+    @property
+    def tesla_telemetry_location_interval(self) -> int:
+        """Return min interval for Location telemetry (seconds, default 120)."""
+        if "TESLA_TELEMETRY_LOCATION_INTERVAL_SEC" in self._overrides:
+            return int(self._overrides["TESLA_TELEMETRY_LOCATION_INTERVAL_SEC"])
+        raw = _decouple_config("TESLA_TELEMETRY_LOCATION_INTERVAL_SEC", default=None)
+        if raw is not None:
+            return int(raw)
+        return 120
+
+    @property
+    def tesla_telemetry_chargeamps_interval(self) -> int:
+        """Return min interval for ChargeAmps telemetry (seconds, default 15)."""
+        if "TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC" in self._overrides:
+            return int(self._overrides["TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC"])
+        raw = _decouple_config("TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC", default=None)
+        if raw is not None:
+            return int(raw)
+        return 15
+
+    @property
+    def tesla_telemetry_detailedchargestate_interval(self) -> int:
+        """Return min interval for DetailedChargeState telemetry (seconds, default 15)."""
+        if "TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC" in self._overrides:
+            return int(self._overrides["TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC"])
+        raw = _decouple_config("TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC", default=None)
+        if raw is not None:
+            return int(raw)
+        return 15
+
+    @property
+    def public_url(self) -> str:
+        """Return the public URL the app is served on, or a sensible default."""
+        return _decouple_config("PUBLIC_URL", default="http://localhost:8000", cast=str)  # type: ignore[return-value]
 
     @property
     def load_plug_controller(self) -> str:
         """Return plug controller type (real or stub)."""
+        if "LOAD_PLUG_CONTROLLER" in self._overrides:
+            return self._overrides["LOAD_PLUG_CONTROLLER"].lower()
         return _decouple_config("LOAD_PLUG_CONTROLLER", default="stub", cast=str).lower()
 
     @property
     def load_tesla_controller(self) -> str:
         """Return Tesla controller type (real or stub)."""
+        if "LOAD_TESLA_CONTROLLER" in self._overrides:
+            return self._overrides["LOAD_TESLA_CONTROLLER"].lower()
         return _decouple_config("LOAD_TESLA_CONTROLLER", default="stub", cast=str).lower()
 
     @property
     def vocolinc_username(self) -> str:
         """Return VOCOlinc username, or empty string."""
+        if "VOCOLINC_USERNAME" in self._overrides:
+            return self._overrides["VOCOLINC_USERNAME"].strip()
         return _decouple_config("VOCOLINC_USERNAME", default="", cast=str).strip()  # type: ignore[return-value]
 
     @property
     def vocolinc_password(self) -> str:
         """Return VOCOlinc password, or empty string."""
+        if "VOCOLINC_PASSWORD" in self._overrides:
+            return self._overrides["VOCOLINC_PASSWORD"].strip()
         return _decouple_config("VOCOLINC_PASSWORD", default="", cast=str).strip()  # type: ignore[return-value]
 
     def get_homekit_plugs(self) -> list[dict[str, Any]]:
@@ -198,14 +390,14 @@ class Config:
 
 
 # Module-level singleton for convenience (backward compatible)
-cfg = Config()
+_config = Config()
 
 
 def get_timezone() -> str:
     """Return configured timezone — backward compatible alias."""
-    return cfg.timezone
+    return _config.timezone
 
 
 def reload() -> None:
     """Reload configuration — backward compatible alias."""
-    cfg.reload()
+    _config.reload()

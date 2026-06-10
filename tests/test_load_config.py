@@ -8,6 +8,8 @@ import pytz
 import pytest
 from decouple import UndefinedValueError, config
 
+from clock import FakeClock
+
 from load_manager import (
     AbstractPlugController,
     DeviceState,
@@ -20,7 +22,7 @@ from load_manager import (
     load_plugs_from_file,
     load_tesla_config,
 )
-from load_models import TeslaAuthError
+from load_models import CycleResult, TeslaAuthError
 import device_config
 from energy_cache import EnergyCache
 from tests.helpers import _make_metrics_with_wh
@@ -80,16 +82,19 @@ def test_load_plugs_invalid_format():
 
 
 def test_load_tesla_config_all_vars():
-    """Loads Tesla config when all vars present."""
+    """Loads Tesla config when all env vars present."""
     config.set("TESLA_CLIENT_ID", "client-id")
     config.set("TESLA_CLIENT_SECRET", "client-secret")
+    config.set("TESLA_VEHICLE_ID", "7SAYGDED7TF555555")
+    config.set("TESLA_HOME_LAT", "37.7749")
+    config.set("TESLA_HOME_LON", "-122.4194")
+    config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
 
     with patch("device_config._load", return_value={
         "tesla": {
-            "vehicle_id": "vehicle-123",
-            "redirect_uri": "http://localhost/callback",
-            "home_lat": 37.7749,
-            "home_lon": -122.4194,
+            "home_radius_m": 800,
+            "charge_amps_min": 8,
+            "charge_amps_max": 32,
         }
     }):
         device_config.reload()
@@ -97,7 +102,52 @@ def test_load_tesla_config_all_vars():
 
     assert tesla_config is not None
     assert tesla_config.client_id == "client-id"
+    assert tesla_config.vehicle_id == "7SAYGDED7TF555555"
     assert tesla_config.home_lat == 37.7749
+    assert tesla_config.home_lon == -122.4194
+    assert tesla_config.redirect_uri == "http://localhost/callback"
+
+
+def test_load_tesla_config_missing_vehicle_id():
+    """Returns None when TESLA_VEHICLE_ID is not set."""
+    config.set("TESLA_CLIENT_ID", "client-id")
+    config.set("TESLA_CLIENT_SECRET", "client-secret")
+
+    def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+        if key == "TESLA_VEHICLE_ID":
+            return ""
+        if key == "TESLA_HOME_LAT":
+            return ""
+        if key == "TESLA_HOME_LON":
+            return ""
+        if default is not None:
+            return default
+        raise UndefinedValueError(key)
+
+    with patch("config._decouple_config", side_effect=mock_decouple):
+        config_result = load_tesla_config()
+
+    assert config_result is None
+
+
+def test_load_tesla_config_missing_home_lat():
+    """Returns None when TESLA_HOME_LAT is not set."""
+    config.set("TESLA_CLIENT_ID", "client-id")
+    config.set("TESLA_CLIENT_SECRET", "client-secret")
+    config.set("TESLA_VEHICLE_ID", "7SAYGDED7TF555555")
+    config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
+
+    def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+        if key == "TESLA_HOME_LAT":
+            return ""
+        if default is not None:
+            return default
+        raise UndefinedValueError(key)
+
+    with patch("config._decouple_config", side_effect=mock_decouple):
+        config_result = load_tesla_config()
+
+    assert config_result is None
 
 
 def test_load_tesla_config_missing_vars():
@@ -120,13 +170,14 @@ def test_load_tesla_config_optionals():
     """Loads optional vars with defaults."""
     config.set("TESLA_CLIENT_ID", "client-id")
     config.set("TESLA_CLIENT_SECRET", "client-secret")
+    config.set("TESLA_VEHICLE_ID", "vehicle-123")
+    config.set("TESLA_HOME_LAT", "37.7749")
+    config.set("TESLA_HOME_LON", "-122.4194")
+    config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
 
     with patch("device_config._load", return_value={
         "tesla": {
             "vehicle_id": "vehicle-123",
-            "redirect_uri": "http://localhost/callback",
-            "home_lat": 37.7749,
-            "home_lon": -122.4194,
             "charge_amps_min": 8,
             "charge_amps_max": 32,
         }
@@ -136,6 +187,43 @@ def test_load_tesla_config_optionals():
 
     assert tesla_config.charge_amps_min == 8
     assert tesla_config.charge_amps_max == 32
+    # Defaults when devices.json omits them
+    assert tesla_config.home_radius_m == 500.0
+
+
+def test_load_tesla_config_vehicle_command_proxy_url():
+    """Loads vehicle_command_proxy_url when env var is set."""
+    config.set("TESLA_CLIENT_ID", "client-id")
+    config.set("TESLA_CLIENT_SECRET", "client-secret")
+    config.set("TESLA_VEHICLE_ID", "vehicle-123")
+    config.set("TESLA_HOME_LAT", "37.7749")
+    config.set("TESLA_HOME_LON", "-122.4194")
+    config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
+    config.set("TESLA_VEHICLE_COMMAND_PROXY_URL", "https://localhost:4444")
+
+    with patch("device_config._load", return_value={}):
+        device_config.reload()
+        tesla_config = load_tesla_config()
+
+    assert tesla_config is not None
+    assert tesla_config.vehicle_command_proxy_url == "https://localhost:4444"
+
+
+def test_load_tesla_config_vehicle_command_proxy_url_none_when_unset():
+    """vehicle_command_proxy_url is None when env var is not set."""
+    config.set("TESLA_CLIENT_ID", "client-id")
+    config.set("TESLA_CLIENT_SECRET", "client-secret")
+    config.set("TESLA_VEHICLE_ID", "vehicle-123")
+    config.set("TESLA_HOME_LAT", "37.7749")
+    config.set("TESLA_HOME_LON", "-122.4194")
+    config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
+
+    with patch("device_config._load", return_value={}):
+        device_config.reload()
+        tesla_config = load_tesla_config()
+
+    assert tesla_config is not None
+    assert tesla_config.vehicle_command_proxy_url is None
 
 
 # --- Parse load manage enabled tests ---
@@ -221,7 +309,7 @@ def test_parse_bool_false():
 
 
 def _make_manager_with_enabled(
-    enabled, predicted_wh: float = -2000.0
+    enabled, predicted_wh: float = -2000.0, clock=None
 ) -> LoadManager:
     """Create a LoadManager with the given enabled value and predicted Wh."""
     plugs: dict[str, PlugConfig] = {}
@@ -238,6 +326,7 @@ def _make_manager_with_enabled(
         nbc_device="main_panel",
         enabled=enabled,
         dry_run=False,
+        clock=clock,
     )
 
 
@@ -309,35 +398,31 @@ def test_is_enabled_at_exclusive_end(mock_config):
 def test_run_cycle_disabled_outside_range(mock_config):
     """run_cycle returns disabled when outside time range."""
     mock_config.return_value = "America/Los_Angeles"
-    mgr = _make_manager_with_enabled((time(6, 0), time(18, 0)))
 
     tz = pytz.timezone("America/Los_Angeles")
     fake_now = tz.localize(datetime(2025, 6, 15, 3, 0, 0)).astimezone(timezone.utc)
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.timedelta = timedelta
-        result = mgr.run_cycle()
+    mgr = _make_manager_with_enabled((time(6, 0), time(18, 0)))
+    mgr._clock = FakeClock(fake_now)
 
-    assert result["status"] == "disabled"
-    assert "outside_time_range" in result["diagnostics"]["reason"]
+    result = mgr.run_cycle()
+
+    assert result.status == "disabled"
+    assert "outside_time_range" in result.diagnostics.reason
 
 
 @patch("config._decouple_config")
 def test_run_cycle_enabled_in_range(mock_config):
     """run_cycle proceeds when inside time range."""
     mock_config.return_value = "America/Los_Angeles"
-    mgr = _make_manager_with_enabled(
-        (time(6, 0), time(18, 0)), predicted_wh=-2000.0
-    )
-
     tz = pytz.timezone("America/Los_Angeles")
     fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fake_now
-        mock_dt.timedelta = timedelta
-        result = mgr.run_cycle()
+    mgr = _make_manager_with_enabled(
+        (time(6, 0), time(18, 0)), predicted_wh=-2000.0, clock=FakeClock(fake_now)
+    )
 
-    assert result["status"] != "disabled"
+    result = mgr.run_cycle()
+
+    assert result.status != "disabled"
 
 
 # --- Sync plug states tests ---
@@ -621,17 +706,18 @@ def test_load_vocolinc_plug_time_range_parsed():
     assert lamp.time_range[1] == time(23, 0)
 
 
-def test_load_tesla_time_range_parsed():
-    """Tesla config with time_range parses correctly."""
+def test_tesla_config_time_range_parsed():
+    """Tesla config with time_range from devices.json parses correctly."""
     config.set("TESLA_CLIENT_ID", "client-id")
     config.set("TESLA_CLIENT_SECRET", "client-secret")
+    config.set("TESLA_VEHICLE_ID", "vehicle-123")
+    config.set("TESLA_HOME_LAT", "37.7749")
+    config.set("TESLA_HOME_LON", "-122.4194")
+    config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
 
     with patch("device_config._load", return_value={
         "tesla": {
             "vehicle_id": "vehicle-123",
-            "redirect_uri": "http://localhost/callback",
-            "home_lat": 37.7749,
-            "home_lon": -122.4194,
             "time_range": "08:00-20:00",
         }
     }):
@@ -736,8 +822,8 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
             tesla_configured=False,
         )
 
-    heater_detail = next(d for d in details if d["name"] == "heater")
-    assert heater_detail.get("reason") == "outside_time_range"
+    heater_detail = next(d for d in details if d.name == "heater")
+    assert heater_detail.reason == "outside_time_range"
 
 
 @patch("config._decouple_config")
@@ -782,8 +868,8 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
             tesla_configured=False,
         )
 
-    heater_detail = next(d for d in details if d["name"] == "heater")
-    assert "reason" not in heater_detail
+    heater_detail = next(d for d in details if d.name == "heater")
+    assert heater_detail.reason is None
 
 
 @patch("config._decouple_config")
@@ -931,8 +1017,8 @@ def test_cycle_filters_outside_range_tesla(mock_config):
             mgr, "_fetch_tesla_state_async",
             return_value=(
                 TeslaState(
-                    is_charging=True, current_amps=32, soc_percent=50.0,
-                    plugged_in=True, at_home=True, at_charge_limit=False,
+                    is_charging=True, current_amps=32,
+                    plugged_in=True, at_home=True,
                 ),
                 None,
                 None,
@@ -1057,54 +1143,6 @@ def test_authenticate_calls_access_token_not_check_access_token(tmp_path):
         mock_api_obj.access_token.assert_called_once()
         # check_access_token() MUST NOT be called (it's a no-op local check)
         mock_api_obj.check_access_token.assert_not_called()
-
-    finally:
-        lc.TESLA_TOKENS_FILE = original
-
-
-def test_get_charging_state_converts_forbidden_to_tesla_auth_error(tmp_path):
-    """When the Tesla API returns 403 Forbidden, get_charging_state() raises
-    TeslaAuthError instead of letting the raw exception propagate."""
-    from load_controllers import RealTeslaController, TESLA_TOKENS_FILE
-    from tesla_fleet_api.exceptions import Forbidden
-
-    tokens_path = tmp_path / "tesla-tokens.json"
-    import load_controllers as lc
-
-    original = lc.TESLA_TOKENS_FILE
-    lc.TESLA_TOKENS_FILE = tokens_path
-
-    try:
-        from load_manager import save_tesla_tokens
-
-        future_expires = 9999999999
-        save_tesla_tokens(
-            refresh_token="refresh-abc",
-            access_token="access-def",
-            expires=future_expires,
-            tokens_path=tokens_path,
-        )
-
-        tesla_config = TeslaConfig(
-            client_id="client-id",
-            client_secret="client-secret",
-            redirect_uri="http://localhost/callback",
-            vehicle_id="12345",
-            home_lat=37.0,
-            home_lon=-122.0,
-            home_radius_m=500,
-        )
-
-        controller = RealTeslaController(tesla_config)
-
-        # Mock _fetch_vehicle_data to raise Forbidden (403)
-        with patch.object(
-            controller, "_fetch_vehicle_data", side_effect=Forbidden({"message": "not authorized"})
-        ):
-            with pytest.raises(TeslaAuthError) as exc_info:
-                asyncio.run(controller.get_charging_state())
-
-            assert "not authorized" in str(exc_info.value).lower()
 
     finally:
         lc.TESLA_TOKENS_FILE = original
@@ -1545,12 +1583,12 @@ def test_diagnostics_include_sentinel_info(mock_config):
         mock_dt.timedelta = timedelta
         result = mgr.run_cycle()
 
-    diag = result["diagnostics"]
-    assert "sentinel_names" in diag
-    assert "sentinel_on" in diag
-    assert diag["sentinel_names"] == ["home_presence"]
+    diag = result.diagnostics
+    assert diag.sentinel_names is not None
+    assert diag.sentinel_on is not None
+    assert diag.sentinel_names == ["home_presence"]
     # Sentinel is off by default in the stub controller, so sentinel_on is False
-    assert diag["sentinel_on"] is False
+    assert diag.sentinel_on is False
 
 
 # --- Sentinel disabled status tests ---
@@ -1573,6 +1611,10 @@ def test_run_cycle_disabled_when_sentinel_on(mock_config):
     # Set the sentinel to on
     plug_ctrl._state["home_presence"] = True
 
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 5, 0)).astimezone(timezone.utc)
+    data_point_at = fake_now - timedelta(seconds=30)
+
     mgr = LoadManager(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
@@ -1581,17 +1623,10 @@ def test_run_cycle_disabled_when_sentinel_on(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
+        clock=FakeClock(fake_now),
     )
 
-    tz = pytz.timezone("America/Los_Angeles")
-    fake_now = tz.localize(datetime(2025, 6, 15, 12, 5, 0)).astimezone(timezone.utc)
-    data_point_at = fake_now - timedelta(seconds=30)
-
-    with patch("load_manager.datetime") as mock_dt, \
-         patch.object(mgr.nbc_reader, "get_current_qh") as mock_qh:
-        mock_dt.now.return_value = fake_now
-        mock_dt.timezone = timezone
-        mock_dt.timedelta = timedelta
+    with patch.object(mgr.nbc_reader, "get_current_qh") as mock_qh:
         mock_qh.return_value = (
             "QH1",
             -5.0,
@@ -1600,7 +1635,112 @@ def test_run_cycle_disabled_when_sentinel_on(mock_config):
         )
         result = mgr.run_cycle()
 
-    assert result["status"] == "disabled"
-    assert result["diagnostics"]["reason"] == "sentinel_on"
-    assert result["diagnostics"]["sentinel_names"] == ["home_presence"]
-    assert result["diagnostics"]["sentinel_on"] is True
+    assert result.status == "disabled"
+    assert result.diagnostics.reason == "sentinel_on"
+    assert result.diagnostics.sentinel_names == ["home_presence"]
+    assert result.diagnostics.sentinel_on is True
+
+
+# =============================================================================
+# _fetch_tesla_state_async — telemetry fallthrough & timeout
+# =============================================================================
+
+
+@patch("config._decouple_config")
+def test_fetch_tesla_state_async_passes_timeout_zero(mock_config):
+    """When telemetry is unavailable, init_tesla_state is called with
+    timeout=0 because the fast path already checked telemetry moments ago."""
+    from load_controllers import RealTeslaController
+
+    tesla_cfg = TeslaConfig(
+        client_id="test-id",
+        client_secret="test-secret",
+        redirect_uri="http://localhost/callback",
+        vehicle_id="vehicle-123",
+        home_lat=37.0,
+        home_lon=-122.0,
+        home_radius_m=500,
+    )
+    ctrl = RealTeslaController(tesla_cfg)
+    expected_state = TeslaState(
+        is_charging=True, current_amps=12, plugged_in=True, at_home=True,
+    )
+
+    mgr = LoadManager(
+        tesla_ctrl=ctrl,
+        plug_ctrl=PlugController({}),
+        dry_run=True,
+        enabled=False,
+    )
+
+    with patch("load_manager.has_telemetry", return_value=False):
+        with patch.object(
+            ctrl, "init_tesla_state",
+            return_value=expected_state,
+        ) as mock_init:
+            result = asyncio.run(mgr._fetch_tesla_state_async())
+
+    assert mock_init.called, (
+        "init_tesla_state should be called when telemetry is unavailable"
+    )
+    assert mock_init.call_args.kwargs.get("timeout") == 0, (
+        "timeout=0 should be passed since fast path checked telemetry"
+    )
+    result_state, result_err, result_url = result
+    assert result_state is expected_state
+    assert result_err is None
+    assert result_url is None
+
+
+@patch("config._decouple_config")
+def test_fetch_tesla_state_async_falls_through_on_incomplete_telemetry(
+    mock_config,
+):
+    """When telemetry has ChargeAmps but no DetailedChargeState, the fast
+    path returns None and we fall through to init_tesla_state() instead
+    of returning (None, None, None) immediately."""
+    from load_controllers import RealTeslaController
+
+    tesla_cfg = TeslaConfig(
+        client_id="test-id",
+        client_secret="test-secret",
+        redirect_uri="http://localhost/callback",
+        vehicle_id="vehicle-123",
+        home_lat=37.0,
+        home_lon=-122.0,
+        home_radius_m=500,
+    )
+    ctrl = RealTeslaController(tesla_cfg)
+    expected_state = TeslaState(
+        is_charging=True, current_amps=12, plugged_in=True, at_home=True,
+    )
+
+    mgr = LoadManager(
+        tesla_ctrl=ctrl,
+        plug_ctrl=PlugController({}),
+        dry_run=True,
+        enabled=False,
+    )
+
+    with patch("load_manager.has_telemetry", return_value=True):
+        with patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 12},
+        ):
+            with patch(
+                "load_manager.tesla_state_from_snapshot",
+                return_value=None,
+            ):
+                with patch.object(
+                    ctrl, "init_tesla_state",
+                    return_value=expected_state,
+                ) as mock_init:
+                    result = asyncio.run(mgr._fetch_tesla_state_async())
+
+    assert mock_init.called, (
+        "init_tesla_state should be called when telemetry is incomplete"
+    )
+    result_state, result_err, result_url = result
+    assert result_state is expected_state
+    assert result_err is None
+    assert result_url is None

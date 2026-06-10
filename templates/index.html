@@ -114,23 +114,27 @@
     </tr>
     {% endif %}
     {% endfor %}
-    {% endif %}
+    {% set qh = vd.nbc.get("QH1") %}
+    {% if qh is not none and qh.prediction_w is not none %}
+    {% set w = 60 * qh.prediction_w %}
     <tr>
       <td class="op"></td>
       <td class="num">
-        {{ "%.0f" % (60 * vd.scales["1MIN"].usage) }}</td>
+        {{ "%.0f" % (60 * w) }}</td>
       <td class="note">W, latest minute</td>
     </tr>
     <tr>
       <td class="op"></td>
       <td class="num">
-        {% if vd.scales["1MIN"].usage < 10 %}
-        {{ "%.1f" % (vd.scales["1MIN"].usage) }}</td>
+        {% if w < 10 %}
+        {{ "%.1f" % w }}</td>
         {% else %}
-        {{ "%.0f" % (vd.scales["1MIN"].usage) }}</td>
+        {{ "%.0f" % w }}</td>
         {% endif %}
       <td class="note">Wh, latest minute</td>
     </tr>
+    {% endif %}
+    {% endif %}
     <tr>
       <td colspan="3" class="note">
         response time:
@@ -230,7 +234,7 @@
         {{ load_management.last_cycle_result.status }}
       </td>
     </tr>
-    {% if load_management.last_cycle_result.predicted_wh is defined %}
+    {% if load_management.last_cycle_result.predicted_wh is not none %}
     <tr>
       <td>Predicted Wh</td>
       <td class="num">{{ "%.0f" % load_management.last_cycle_result.predicted_wh }}</td>
@@ -308,7 +312,6 @@
       <td class="num">
         {% if diag.tesla_state.is_charging %}charging{% else %}not charging{% endif %}
         {% if diag.tesla_state.current_amps is not none %}({{ diag.tesla_state.current_amps }}A){% endif %}
-        {% if diag.tesla_state.soc_percent is not none %}{{ "%.0f" % diag.tesla_state.soc_percent }}%{% endif %}
         {% if diag.tesla_state.plugged_in %}plugged{% else %}unplugged{% endif %}
         {% if diag.tesla_state.at_home %}at home{% else %}away{% endif %}
       </td>
