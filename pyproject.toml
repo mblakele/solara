@@ -11,6 +11,7 @@ dependencies = [
     "idna>=3.15",
     "isodate>=0.6.0",
     "pyemvue>=0.18.8",
+    "pyjwt>=2.13.0",
     "pytz>=2022.0",
     "requests>=2.32.4",
     "urllib3>=2.7.0",
