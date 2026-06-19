@@ -380,7 +380,7 @@ uv run pytest                          # 3. Full test suite
 | Lint | `uv run pylint *.py` |
 | Type check | `uv run mypy` |
 | Dev server | `uv run python app.py` |
-| Production-like server | `gunicorn --reload --bind 0.0.0.0:8000 app:app` |
+| Production-like server | `gunicorn --reload --worker-class=gthread --threads=4 --timeout=0 --bind 127.0.0.1:8000 app:app` |
 
 The dev server reads credentials from `.env` (`VUE_USERNAME`, `VUE_PASSWORD`).
 Ensure that file is present and sourced before running.

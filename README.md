@@ -121,6 +121,7 @@ For development work you may prefer this:
 gunicorn --reload \
     --reload-extra-file .env \
     --reload-extra-file templates \
+    --worker-class=gthread --threads=4 --timeout=0 \
     app:app
 ```
 
