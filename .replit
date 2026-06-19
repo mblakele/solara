@@ -35,6 +35,18 @@ author = "agent"
 task = "workflow.run"
 args = "Run Flask App"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "pytest"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "pylint"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "mypy"
+
 [[workflows.workflow]]
 name = "Run Flask App"
 author = "agent"
@@ -46,6 +58,39 @@ outputType = "webview"
 task = "shell.exec"
 args = "uv run gunicorn app:app --bind 0.0.0.0:5000"
 waitForPort = 5000
+
+[[workflows.workflow]]
+name = "pytest"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pytest"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "pylint"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pylint *.py"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "mypy"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "mypy *.py"
+
+[workflows.workflow.metadata]
+isValidation = true
 
 [userenv]
 
