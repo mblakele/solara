@@ -71,6 +71,10 @@ variables:
 After setting these credentials, deploy the web service again.
 You should now see live data from your VUE Utility Connect.
 
+For load management features (smart plug and Tesla charging control),
+you'll also need additional environment variables. See [env.example](env.example)
+and [docs/LOADMANAGER.md](docs/LOADMANAGER.md) for the full configuration reference.
+
 ## Local Setup
 
 You can also run this project locally, or adapt these instructions
@@ -94,20 +98,16 @@ Next, install dependencies:
 uv sync
 ```
 
-Next, the local server will need your Emporia account credentials.
-Configure these by creating a `.env` file in your local copy of the
-source code.
+Next, copy `env.example` to `.env` and configure your credentials:
 
-**Never check the `.env` file into source control.**
+```bash
+cp env.example .env
+```
 
-```
-# Never check this file into source control!
-#
-# Enable debug for local development, if desired.
-#DEBUG=True
-VUE_USERNAME=yourEmporiaUsername
-VUE_PASSWORD=yourEmporiaPassword
-```
+Edit `.env` with your Emporia username/password and any optional load management
+settings. See [env.example](env.example) for all available options.
+
+**Never check the `.env` file into source control.** It is listed in `.gitignore`.
 
 Finally, start a local server with:
 
@@ -121,6 +121,7 @@ For development work you may prefer this:
 gunicorn --reload \
     --reload-extra-file .env \
     --reload-extra-file templates \
+    --worker-class=gthread --threads=4 --timeout=0 \
     app:app
 ```
 
@@ -184,75 +185,6 @@ Sample output:
       "prediction": -27.6879148912382,
       "predictionMin": -27.6879148912382,
       "predictionMax": -22.758956398742814,
-      "scales": {
-        "1H": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 2950,
-          "usage": -19.45249794323761
-        },
-        "1MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 60,
-          "usage": -0.8375000286102295
-        },
-        "2MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 120,
-          "usage": -0.7937500305308247
-        },
-        "3MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 180,
-          "usage": -0.787500029890627
-        },
-        "4MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 240,
-          "usage": -0.7140625274926442
-        },
-        "5MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 300,
-          "usage": -0.6456250248617615
-        },
-        "6MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 360,
-          "usage": -0.5750000218164057
-        },
-        "7MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 420,
-          "usage": -0.5196428765190988
-        },
-        "8MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 480,
-          "usage": -0.4531250170204389
-        },
-        "9MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 540,
-          "usage": -0.3958333481829856
-        },
-        "10MIN": {
-          "instant": "2022-03-08T20:50:10Z",
-          "seconds": 600,
-          "usage": -0.33625001242425817
-        }
-      },
-      "smoothing": {
-        "1MIN": -27.6879148912382,
-        "2MIN": -27.25770657679072,
-        "3MIN": -27.19624823716211,
-        "4MIN": -26.47411279691528,
-        "5MIN": -25.801144021044934,
-        "6MIN": -25.106664824432265,
-        "7MIN": -24.562319562342083,
-        "8MIN": -23.908227277271926,
-        "9MIN": -23.3448592003703,
-        "10MIN": -22.758956398742814
-      },
       "timezone": "America/Los_Angeles"
     }
   ],
@@ -261,10 +193,25 @@ Sample output:
 ```
 
 As you can see, the JSON data includes information that isn't
-available in the HTML view. For example you can see projections based
-on the past minute (`1MIN`), but also based on the past 2, 3, 4, 5, 6,
-7, 8, 9, and 10 minutes.  This data may be useful for custom
-integrations.
+available in the HTML view.
+
+## Load Management
+
+Solara can automatically control smart plugs and Tesla vehicle charging to
+absorb excess solar energy. The load management engine uses NBC predictions
+to decide when to turn flexible loads on or off, aiming to keep your
+quarter-hour net usage near a configurable target (default: -50 Wh).
+
+Supported devices include HomeKit smart plugs, VOCOlinc smart plugs, and Tesla
+vehicle charging. See [docs/LOADMANAGER.md](docs/LOADMANAGER.md) for full
+configuration details, including Tesla Fleet API OAuth setup.
+
+### Getting Started with Load Management
+
+1. Copy `env.example` to `.env` and configure your devices
+2. Start with `LOAD_MANAGE_DRY_RUN=True` to test without executing actions
+3. Review logs to verify decisions match expectations
+4. Set `LOAD_MANAGE_DRY_RUN=False` when ready for real control
 
 ## Accuracy
 

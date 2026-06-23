@@ -1,0 +1,53 @@
+{
+  "timezone": "America/Los_Angeles",
+  "smartmeter": {
+    "device": "",
+    "target_wh": -50
+  },
+  "plugs": {
+    "homekit": [
+      {
+        "name": "water_heater",
+        "accessory_id": "192.168.1.50",
+        "power_watts": 4500,
+        "priority": 10,
+        "time_range": "06:00-22:00"
+      },
+      {
+        "name": "home_presence",
+        "accessory_id": "192.168.1.51",
+        "power_watts": 5,
+        "sentinel": true,
+        "description": "Low-power night-light or indicator used to detect home occupancy. When ON, load management is paused to avoid turning off lights the resident needs."
+      }
+    ],
+    "vocolinc": [
+      {
+        "name": "floor_lamp",
+        "device_name": "LivingRoomLamp",
+        "power_watts": 60,
+        "priority": 5
+      }
+    ]
+  },
+  "telegram": {
+    "enabled": false,
+    "alert_on_auth_error": true,
+    "bot_token": "",
+    "chat_id": "",
+    "devices": {
+      "water_heater": ["turn_on", "turn_off"],
+      "floor_lamp": ["turn_on"]
+    }
+  },
+  "tesla": {
+    "vehicle_id": "",
+    "redirect_uri": "http://localhost:8000/callback",
+    "home_lat": 37.7749,
+    "home_lon": -122.4194,
+    "home_radius_m": 500,
+    "charge_amps_min": 5,
+    "charge_amps_max": 48,
+    "time_range": "08:00-20:00"
+  }
+}

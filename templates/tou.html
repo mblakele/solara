@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TOU Energy Report</title>
+</head>
+<body>
+    <h1>Time-of-Use Energy Report</h1>
+    <p><strong>Start Date:</strong> {{ start_date }}</p>
+    <p><strong>End Date:</strong> {{ end_date }}</p>
+    <h2>Energy Buckets (Wh)</h2>
+    <ul>
+        <li><strong>Total:</strong> {{ buckets.total }}</li>
+        <li><strong>Peak:</strong> {{ buckets.peak }}</li>
+        <li><strong>Part-Peak:</strong> {{ buckets.part_peak }}</li>
+        <li><strong>Off-Peak:</strong> {{ buckets.off_peak }}</li>
+    </ul>
+    {% if nbc is not none %}
+    <h2>NBC Total (Wh)</h2>
+    <p><strong>{{ nbc }}</strong></p>
+    {% endif %}
+</body>
+</html>

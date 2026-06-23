@@ -1,0 +1,24 @@
+{
+    "host": "0.0.0.0",
+    "port": 4443,
+    "log_level": "debug",
+    "json_log_enable": true,
+    "namespace": "Solara",
+    "reliable_ack": true,
+    "transmit_decoded_records": false,
+    "records": {
+      "V": ["mqtt"],
+      "alerts": ["logger"],
+      "errors": ["logger"],
+      "connectivity": ["logger"]
+    },
+    "mqtt": {
+        "broker": "mosquitto:1883",
+        "client_id": "fleet-telemetry",
+        "topic_base": "telemetry"
+    },
+    "tls": {
+      "server_cert": "/certs/fullchain.pem",
+      "server_key": "/certs/privkey.pem"
+    }
+}

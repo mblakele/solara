@@ -1,0 +1,39 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - 127.0.0.1:1883:1883
+    volumes:
+      - /home/USERNAME/solara-prod/fleet-telemetry/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+  fleet-telemetry:
+    image: tesla/fleet-telemetry:v0.9.0
+    command:
+      - /fleet-telemetry
+      - -config=/etc/fleet-telemetry/config.json
+    ports:
+      - 4443:4443
+    volumes:
+      - /home/USERNAME/solara-prod/fleet-telemetry/config.json:/etc/fleet-telemetry/config.json:ro
+      - /home/USERNAME/tesla-certs/fullchain.pem:/certs/fullchain.pem:ro
+      - /home/USERNAME/tesla-certs/privkey.pem:/certs/privkey.pem:ro
+    restart: unless-stopped
+  tesla_http_proxy:
+    image: tesla/vehicle-command:0.4.1
+    command:
+      - /tesla-http-proxy
+    ports:
+      - 4444:4444
+    environment:
+      - TESLA_HTTP_PROXY_TLS_CERT=/certs/fullchain.pem
+      - TESLA_HTTP_PROXY_TLS_KEY=/certs/privkey.pem
+      - TESLA_HTTP_PROXY_HOST=0.0.0.0
+      - TESLA_HTTP_PROXY_PORT=4444
+      - TESLA_HTTP_PROXY_TIMEOUT=10s
+      - TESLA_KEY_FILE=/config/fleet-key.pem
+      - TESLA_VERBOSE=true
+    volumes:
+      - /home/USERNAME/tesla-certs/fullchain.pem:/certs/fullchain.pem:ro
+      - /home/USERNAME/tesla-certs/privkey.pem:/certs/privkey.pem:ro
+      - /etc/tesla/private-key.pem:/config/fleet-key.pem:ro
+    restart: unless-stopped
