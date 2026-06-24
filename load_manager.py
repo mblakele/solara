@@ -26,7 +26,7 @@ import pytz
 import device_config
 
 from clock import Clock, RealClock
-from config import Config, _config
+from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
     DEFAULT_SLEEP_HINT_SECS,
     STALE_DATA_THRESHOLD_SECS,
@@ -261,6 +261,7 @@ class LoadManager:
         self._clock: Clock = clock if clock is not None else RealClock()
 
         self._lock = threading.Lock()
+        self._config_watcher = ConfigWatcher()
         self.plug_ctrl: AbstractPlugController
         self.tesla_ctrl: AbstractTeslaController | None
         self.plugs: dict[str, PlugConfig]
@@ -1961,6 +1962,95 @@ class LoadManager:
             if c.name != "tesla"
         }
 
+    def reload_config(self) -> list[str]:
+        """Hot-reload settings from devices.json.
+
+        Must be called under self._lock (from run_cycle).
+        Returns list of human-readable change descriptions.
+        """
+        device_config.reload()
+        changes: list[str] = []
+
+        new_target = device_config.get_target_wh()
+        if new_target != self.target_wh:
+            changes.append(f"target_wh: {self.target_wh} -> {new_target}")
+            self.target_wh = new_target
+
+        new_nbc = device_config.get_smartmeter_device()
+        if new_nbc != self.nbc_device:
+            changes.append(f"nbc_device: {self.nbc_device} -> {new_nbc}")
+            self.nbc_device = new_nbc
+
+        new_homekit = load_plugs_from_file()
+        new_vocolinc = load_vocolinc_plugs_from_file()
+        new_all: dict[str, Any] = {**new_homekit, **new_vocolinc}
+        if set(new_all.keys()) != set(self.plugs.keys()) or any(
+            new_all[k] != self.plugs[k] for k in new_all if k in self.plugs
+        ):
+            changes.append(f"plugs updated: {sorted(new_all.keys())}")
+            self.plugs = new_all
+            self.plug_ctrl.plugs = new_all  # type: ignore[attr-defined]
+            self.sentinel_names = frozenset(
+                name for name, plug in new_all.items() if plug.sentinel
+            )
+
+        new_tesla = load_tesla_config(config=self._cfg)
+        if new_tesla != self.tesla_config:
+            changes.append("tesla_config updated")
+            self.tesla_config = new_tesla
+            if new_tesla:
+                self.engine = GapMinder(
+                    hysteresis_wh=self.engine.HYSTERESIS_WH,
+                    charge_amps_min=new_tesla.charge_amps_min,
+                    charge_amps_max=new_tesla.charge_amps_max,
+                )
+
+        tg_config = device_config.get_telegram_config()
+        new_devices = None
+        new_alert_on_auth = True
+        if tg_config:
+            new_alert_on_auth = tg_config.get("alert_on_auth_error", True)
+            devices = tg_config.get("devices")
+            if devices:
+                new_devices = {
+                    name.lower(): set(actions)
+                    for name, actions in devices.items()
+                }
+        if new_devices != self._telegram_devices:
+            changes.append("telegram devices whitelist updated")
+            self._telegram_devices = new_devices
+        if new_alert_on_auth != self._telegram_alert_on_auth_error:
+            self._telegram_alert_on_auth_error = new_alert_on_auth
+
+        return changes
+
+    def _check_config_changes(self) -> None:
+        """Check .env and devices.json for changes; reload and log results.
+
+        Called at the top of run_cycle() under self._lock.
+        """
+        config_changes = self._config_watcher.check()
+        if config_changes.devices_changed:
+            reload_changes = self.reload_config()
+            if reload_changes:
+                logger.info(
+                    "config_reloaded devices.json changes=%s",
+                    reload_changes,
+                    extra={"event": "config_reloaded", "changes": reload_changes},
+                )
+        if config_changes.env_changed:
+            restart_required = check_restart_required(config_changes.env_changed)
+            if restart_required:
+                logger.warning(
+                    "config_env_changed requires_restart=%s changed_keys=%s",
+                    restart_required, config_changes.env_changed,
+                )
+            else:
+                logger.info(
+                    "config_reloaded .env changed_keys=%s",
+                    config_changes.env_changed,
+                )
+
     def run_cycle(self, force: bool = False) -> CycleResult:
         """Execute one load management cycle. Returns a CycleResult.
 
@@ -1968,6 +2058,7 @@ class LoadManager:
         with concurrent endpoint calls.
 
         The cycle runs as a seven-stage pipeline:
+            0. Config check — detect .env / devices.json changes.
             1. Enabled check — bail early if disabled or outside time window.
             2. NBC fetch — obtain the current quarter-hour prediction.
             3. Pending-state check — skip if data is stale or pending effects
@@ -1987,6 +2078,8 @@ class LoadManager:
             CycleResult with status, diagnostics, and sleep_hint.
         """
         with self._lock:
+            self._check_config_changes()
+
             ctx = CycleContext(now=self._clock.now(), force=force)
             logger.info("cycle_start force=%s",
                         force,
