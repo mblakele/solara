@@ -102,6 +102,11 @@ def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
     candidates = sorted(n for n, c in length_counts.items() if c == max_count)
     n = candidates[0]
 
+    # If N/2 appears in ≥30% of runs, it's likely the true period
+    # (adjacent windows with identical values create 2× runs).
+    if n > 2 and n % 2 == 0 and length_counts.get(n // 2, 0) >= len(runs) * 0.3:
+        n = n // 2
+
     # Cap at 60; must be at least 2.
     if n > 60 or n < 2:
         return None

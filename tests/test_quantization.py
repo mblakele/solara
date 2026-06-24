@@ -323,3 +323,42 @@ class TestDetectQuantization:
         assert sample_size == 2
         assert offset == 0
         assert confidence == 1.0
+
+    def test_30s_quantization_with_60s_runs(self):
+        """30s-quantized data where adjacent windows sometimes match.
+
+        8 runs of 60s (adjacent 30s windows with identical values) and
+        4 runs of 30s.  Mode picks 60, but divisor check should prefer 30
+        because 30s runs appear in 4/12 = 33% of runs (≥30%).
+        """
+        data: list[float] = []
+        # 8 runs of 60s (paired 30s windows with same value)
+        for i in range(8):
+            data.extend([float(i)] * 60)
+        # 4 runs of 30s (single 30s windows)
+        for i in range(8, 12):
+            data.extend([float(i)] * 30)
+        # Total: 480 + 120 = 600
+
+        result = detect_quantization(data)
+
+        assert result is not None
+        sample_size, offset, confidence = result
+        # Divisor check prefers 30 over 60
+        assert sample_size == 30
+        assert offset == 0
+
+    def test_genuine_60s_quantization_preserved(self):
+        """Genuine 60s quantization — no 30s runs, divisor check should not fire."""
+        data: list[float] = []
+        for i in range(10):
+            data.extend([float(i)] * 60)
+        # Total: 600, 10 runs of 60, 0 runs of 30
+
+        result = detect_quantization(data)
+
+        assert result is not None
+        sample_size, offset, confidence = result
+        assert sample_size == 60
+        assert offset == 0
+        assert confidence == 1.0
