@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from decouple import UndefinedValueError, config as _decouple_config
@@ -401,3 +403,136 @@ def get_timezone() -> str:
 def reload() -> None:
     """Reload configuration — backward compatible alias."""
     _config.reload()
+
+
+# === Config file hot-reload support ===
+
+
+@dataclass
+class ConfigChanges:
+    """Summary of detected config file changes."""
+
+    env_changed: list[str] | None = None
+    devices_changed: bool = False
+
+
+RESTART_REQUIRED_KEYS = frozenset({
+    "TESLA_CLIENT_ID", "TESLA_CLIENT_SECRET", "TESLA_VEHICLE_ID",
+    "TESLA_PRIVATE_KEY_PATH", "MQTT_HOST", "MQTT_PORT", "MQTT_TOPIC_BASE",
+    "LOAD_PLUG_CONTROLLER", "LOAD_TESLA_CONTROLLER",
+    "VOCOLINC_USERNAME", "VOCOLINC_PASSWORD",
+    "VUE_USERNAME", "VUE_PASSWORD",
+    "LOAD_MANAGE_INTERVAL_SECS",
+})
+
+
+def check_restart_required(changed_keys: list[str]) -> list[str]:
+    """Return subset of changed_keys that require a restart."""
+    return [k for k in changed_keys if k in RESTART_REQUIRED_KEYS]
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a .env file into a dict of key=value pairs."""
+    data: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return data
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if len(v) >= 2 and ((v[0] == "'" and v[-1] == "'") or (v[0] == '"' and v[-1] == '"')):
+            v = v[1:-1]
+        data[k] = v
+    return data
+
+
+def _update_decouple_repository(new_data: dict[str, str]) -> None:
+    """Push updated values into decouple's RepositoryEnv.data dict."""
+    _decouple_config._ensure_loaded()  # type: ignore[attr-defined]
+    repo = _decouple_config.config.repository  # type: ignore[attr-defined]
+    if hasattr(repo, "data"):
+        repo.data.update(new_data)
+
+
+def reload_dotenv(path: Path | None = None) -> list[str]:
+    """Re-read .env file into os.environ and decouple cache.
+
+    Returns list of keys that changed (new or modified).
+    Does NOT remove keys that were deleted from the file.
+    """
+    if path is None:
+        path = Path(".env")
+    new_data = _parse_env_file(path)
+    if not new_data:
+        return []
+
+    changed: list[str] = []
+    for key, value in new_data.items():
+        old = os.environ.get(key)
+        if old != value:
+            changed.append(key)
+            os.environ[key] = value
+
+    if changed:
+        _update_decouple_repository(new_data)
+
+    return changed
+
+
+class ConfigWatcher:
+    """Tracks file mtimes and triggers reload when files change.
+
+    Designed to be called from run_cycle() — no separate thread.
+    On construction, records current mtimes so the first check() does not
+    report changes for files that already exist.
+    """
+
+    def __init__(
+        self,
+        env_path: Path | None = None,
+        devices_path: Path | None = None,
+    ) -> None:
+        self._env_path = env_path or Path(".env")
+        self._devices_path = devices_path or Path("devices.json")
+        self._env_mtime = self._safe_mtime(self._env_path)
+        self._devices_mtime = self._safe_mtime(self._devices_path)
+
+    @staticmethod
+    def _safe_mtime(path: Path) -> float:
+        """Return file mtime, or 0.0 if file doesn't exist."""
+        try:
+            return path.stat().st_mtime if path.exists() else 0.0
+        except OSError:
+            return 0.0
+
+    def check(self) -> ConfigChanges:
+        """Check both files for changes. Returns summary of what changed."""
+        changes = ConfigChanges()
+
+        if self._env_path.exists():
+            try:
+                new_mtime = self._env_path.stat().st_mtime
+                if new_mtime > self._env_mtime:
+                    changed_keys = reload_dotenv(self._env_path)
+                    self._env_mtime = new_mtime
+                    if changed_keys:
+                        changes.env_changed = changed_keys
+            except OSError:
+                pass
+
+        if self._devices_path.exists():
+            try:
+                new_mtime = self._devices_path.stat().st_mtime
+                if new_mtime > self._devices_mtime:
+                    device_config.reload()
+                    self._devices_mtime = new_mtime
+                    changes.devices_changed = True
+            except OSError:
+                pass
+
+        return changes

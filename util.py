@@ -104,6 +104,7 @@ class NBCQuarter:
     complete: bool
     raw_wh: float
     wh: float
+    prediction_values: int | None = None
     prediction_w: float | None = None
     predicted_wh: float | None = None
     remaining_seconds: int | None = None
@@ -115,6 +116,7 @@ class NBCQuarter:
             "complete": self.complete,
             "raw_wh": self.raw_wh,
             "wh": self.wh,
+            "prediction_values": self.prediction_values,
             "prediction_w": self.prediction_w,
             "predicted_wh": self.predicted_wh,
             "remaining_seconds": self.remaining_seconds,
@@ -184,12 +186,14 @@ def compute_nbc_quarter(
     if not is_complete:
         window = min(prediction_window_seconds or 60, values_len)
         prediction_values = values[-window:]
-        prediction_w = 1000 * sum(prediction_values) / len(prediction_values)
+        prediction_values_len = len(prediction_values)
+        prediction_w = 1000 * sum(prediction_values) / prediction_values_len
         remaining_seconds = QH_PERIOD_SECONDS - values_len
         return NBCQuarter(
             complete=False,
             raw_wh=raw_wh,
             wh=wh,
+            prediction_values=prediction_values_len,
             prediction_w=prediction_w,
             predicted_wh=raw_wh + remaining_seconds * prediction_w,
             remaining_seconds=remaining_seconds,
