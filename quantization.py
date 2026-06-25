@@ -102,21 +102,36 @@ def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
     candidates = sorted(n for n, c in length_counts.items() if c == max_count)
     n = candidates[0]
 
-    # If N/2 fits the run-length distribution better than N, prefer it.
+    # If N/2 achieves strictly higher window-purity than N, prefer it.
     # Adjacent quantized windows with identical values inflate the
-    # run-length mode; the finer period explains all run lengths as
-    # near-multiples while the inflated mode does not.
+    # run-length mode; the finer period explains the data better.
     if n > 2 and n % 2 == 0:
         n2 = n // 2
-        tol = 1
-        def _fit(d: int) -> float:
-            hits = 0
-            for _, _, rl in runs:
-                rem = rl % d
-                if rem <= tol or rem >= d - tol:
-                    hits += 1
-            return hits / len(runs)
-        if _fit(n2) - _fit(n) > 0.05:
+        # Score N: total data points in pure N-second windows.
+        best_s = 0
+        for off in range(n):
+            s = 0
+            nw = (data_len - off) // n
+            for k in range(nw):
+                ws = off + k * n
+                v = data[ws]
+                if all(_equal(data[j], v) for j in range(ws + 1, ws + n)):
+                    s += n
+            if s > best_s:
+                best_s = s
+        # Score N/2.
+        best_s2 = 0
+        for off in range(n2):
+            s = 0
+            nw = (data_len - off) // n2
+            for k in range(nw):
+                ws = off + k * n2
+                v = data[ws]
+                if all(_equal(data[j], v) for j in range(ws + 1, ws + n2)):
+                    s += n2
+            if s > best_s2:
+                best_s2 = s
+        if best_s > 0 and best_s2 > best_s * 1.02:
             n = n2
 
     # Cap at 60; must be at least 2.
