@@ -19,6 +19,188 @@ from mockdata import MetricsMock
 from test_app import mock_config
 from clock import FakeClock
 
+
+class TestCreateMetricsIncrementalChartStart(unittest.TestCase):
+    """Tests for create_metrics using QH boundary on incremental fetches.
+
+    After the initial full-hour fetch, subsequent calls to create_metrics
+    should fetch from the current QH boundary (not last_sample_at) so that
+    _compute_nbc sees the full incomplete QH.
+    """
+
+    def setUp(self):
+        self._p1 = patch.object(MetricsBase, "vue_init")
+        self._p2 = patch.object(MetricsBase, "get_device_info")
+        self._p1.start()
+        self._p2.start()
+
+    def tearDown(self):
+        self._p1.stop()
+        self._p2.stop()
+
+    def test_incremental_fetch_uses_qh_boundary_not_last_sample(self):
+        """When cache has last_sample_at, chart_start is the QH boundary."""
+        from metrics import create_metrics
+
+        cache = EnergyCache()
+        # Simulate a prior fetch that set last_sample_at to 14:54:59
+        # (inside QH1 = 14:45:00–15:00:00).
+        fake_data_start = datetime(2025, 6, 15, 14, 45, 0, tzinfo=timezone.utc)
+        cache._data = EnergyCacheData(
+            samples=[0.001] * 599,
+            data_start=fake_data_start,
+            last_sample_at=datetime(2025, 6, 15, 14, 54, 59, tzinfo=timezone.utc),
+            last_fetch_at=datetime(2025, 6, 15, 14, 55, 0, tzinfo=timezone.utc),
+            sample_count=599,
+        )
+
+        now = datetime(2025, 6, 15, 14, 56, 30, tzinfo=timezone.utc)
+
+        with patch("metrics.HourlyProjection") as MockHP:
+            mock_instance = MockHP.return_value
+            mock_instance.metrics = {
+                "devices": [], "api_response": {},
+                "data_start": fake_data_start, "_data_lag_secs": 0,
+            }
+            create_metrics(cache, now, logging.getLogger("test"))
+
+            # populate() should be called with the QH boundary (14:45:00),
+            # NOT cap_chart_start(14:54:59, now) which would be 14:54:59.
+            call_args = MockHP.return_value.populate.call_args
+            chart_start = call_args[0][0]
+            expected_qh_start = datetime(2025, 6, 15, 14, 45, 0, tzinfo=timezone.utc)
+            self.assertEqual(
+                chart_start, expected_qh_start,
+                f"Expected chart_start at QH boundary {expected_qh_start}, "
+                f"got {chart_start} (was it using last_sample_at?)",
+            )
+
+    def test_first_fetch_still_uses_full_hour(self):
+        """When cache has no last_sample_at, chart_start is full hour ago."""
+        from metrics import create_metrics
+
+        cache = EnergyCache()  # fresh cache, last_sample_at is None
+
+        now = datetime(2025, 6, 15, 14, 56, 30, tzinfo=timezone.utc)
+
+        with patch("metrics.HourlyProjection") as MockHP:
+            mock_instance = MockHP.return_value
+            mock_instance.metrics = {
+                "devices": [], "api_response": {},
+                "data_start": None, "_data_lag_secs": 0,
+            }
+            create_metrics(cache, now, logging.getLogger("test"))
+
+            call_args = MockHP.return_value.populate.call_args
+            chart_start = call_args[0][0]
+            expected = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+            self.assertEqual(
+                chart_start, expected,
+                f"First fetch should start at {expected}, got {chart_start}",
+            )
+
+    def test_incremental_fetch_covers_full_current_qh(self):
+        """_compute_nbc receives full QH data, not just the incremental delta.
+
+        Simulates: cache has 599 samples (14:45:00–14:54:59), then an
+        incremental fetch from the QH boundary returns 660 samples covering
+        the full QH. _compute_nbc should see all 660, not just the 61 new ones.
+        """
+        hp = HourlyProjection(
+            instant=datetime(2025, 6, 15, 14, 56, 0, tzinfo=timezone.utc),
+            logger_next=logging.getLogger("test"),
+            energy_cache=None,
+        )
+
+        # 660 samples = 11 minutes into QH1 (14:45:00–14:56:00).
+        full_qh_samples = [0.001] * 660
+        pop_result = _PopulationResult(
+            per_second_data=full_qh_samples,
+            chart_data=full_qh_samples[-300:],
+            nbc_seconds=full_qh_samples,
+            nbc_data_start=datetime(2025, 6, 15, 14, 45, 0, tzinfo=timezone.utc),
+            nbc_sample_count=660,
+        )
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+
+        nbc = device_metrics.nbc
+        self.assertIsNotNone(nbc.qh1)
+        self.assertFalse(nbc.qh1.complete)
+        # 660 samples in QH1 → remaining_seconds should be 900 - 660 = 240
+        self.assertEqual(
+            nbc.qh1.remaining_seconds, 240,
+            f"Expected 240s remaining (900-660), got {nbc.qh1.remaining_seconds}. "
+            "Was the full QH data used?",
+        )
+        self.assertEqual(
+            nbc.qh1.samples_used, 660,
+            f"Expected 660 samples, got {nbc.qh1.samples_used}",
+        )
+
+    def test_nbc_prediction_correct_after_incremental_fetch(self):
+        """End-to-end: incremental fetch → predicted_wh based on full QH data.
+
+        With 660 samples of 0.001 Wh/s, raw_wh = 660 Wh. The trailing 60
+        samples give prediction_w = 1.0 W. predicted_wh = 660 + 240 * 1.0 = 900.
+        If only 60 samples were used (the bug), predicted_wh would be ~60.
+        """
+        hp = HourlyProjection(
+            instant=datetime(2025, 6, 15, 14, 56, 0, tzinfo=timezone.utc),
+            logger_next=logging.getLogger("test"),
+            energy_cache=None,
+        )
+
+        full_qh_samples = [0.001] * 660
+        pop_result = _PopulationResult(
+            per_second_data=full_qh_samples,
+            chart_data=full_qh_samples[-300:],
+            nbc_seconds=full_qh_samples,
+            nbc_data_start=datetime(2025, 6, 15, 14, 45, 0, tzinfo=timezone.utc),
+            nbc_sample_count=660,
+        )
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
+
+        nbc = device_metrics.nbc
+        self.assertIsNotNone(nbc.qh1)
+        # With 660 samples at 0.001 Wh/s:
+        # raw_wh = 660 * 0.001 * 1000 = 660 Wh
+        # prediction_w = last 60 samples: 60 * 0.001 * 1000 / 60 = 1.0 W
+        # remaining = 240s
+        # predicted_wh = 660 + 240 * 1.0 = 900.0
+        self.assertAlmostEqual(
+            nbc.qh1.predicted_wh, 900.0, places=6,
+            msg="predicted_wh should be based on full 660-sample QH, not 60-sample delta",
+        )
+
+
 class TestTOUReporterAggregate(unittest.TestCase):
     """Test that TOUReporter.aggregate_tou correctly uses EnergyDataAggregator."""
 

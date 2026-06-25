@@ -18,6 +18,7 @@ from pyemvue.enums import Scale, Unit
 from clock import Clock, RealClock
 from energy_cache import EnergyCache
 from energy_aggregator import EnergyDataAggregator, TOUBuckets
+from load_nbc import NBCPeriod
 from util import (
     CustomJSONProvider,
     NBCQuarterSet,
@@ -125,11 +126,14 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         energy_cache.last_sample_at
     )
     try:
-        chart_start = (
-            ceil_to_qh(now - MAX_FETCH_WINDOW)
-            if energy_cache.last_sample_at is None
-            else cap_chart_start(energy_cache.last_sample_at, now)
-        )
+        if energy_cache.last_sample_at is None:
+            # First call: fetch up to four QH periods.
+            chart_start = ceil_to_qh(now - MAX_FETCH_WINDOW)
+        else:
+            # Subsequent calls: fetch from current QH boundary so
+            # _compute_nbc() sees the full incomplete QH, not just the
+            # delta since last_sample_at.
+            chart_start, _ = NBCPeriod.current_qh_window(now)
         hp = HourlyProjection(now, logger, energy_cache)
         hp.populate(chart_start)
         logger.debug(
