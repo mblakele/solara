@@ -230,6 +230,68 @@ class TestQHUpdateLogic:
         assert cache._data is not None
         assert cache._data.current_qh is not None
 
+    def test_update_qh_straddle_completes_and_overflows(self) -> None:
+        """Samples straddling a boundary complete a QH with overflow into the next.
+
+        current_qh has 691 samples (incomplete). New batch of 300 samples
+        starts at 20:56:29 — 211 fill QH1 to 902, freeze with 900, carry
+        2 overflow into QH2 which then receives 89 more = 91 total.
+        """
+        cache = EnergyCache(ttl_seconds=30)
+        qh1_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        qh2_start = datetime(2025, 6, 15, 12, 30, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 35, 0, tzinfo=timezone.utc)
+
+        # 691 samples in QH1 (incomplete)
+        cache._update_qh([0.001] * 691, qh1_start, now)
+
+        # 300 samples starting at 12:26:29 — 211s to boundary at 13:00, 89s after
+        data_start = datetime(2025, 6, 15, 12, 26, 29, tzinfo=timezone.utc)
+        cache._update_qh([0.002] * 300, data_start, now)
+
+        assert cache._data is not None
+        # QH1 frozen (691 + 211 = 902, frozen at 900)
+        assert cache._data.frozen_qhs is not None
+        qh1_frozen = [fq for fq in cache._data.frozen_qhs if fq.data_start == qh1_start]
+        assert len(qh1_frozen) == 1, f"Expected exactly one frozen QH at {qh1_start}"
+        assert qh1_frozen[0].nbc_result.complete is True
+        # QH2 current with overflow + remaining (2 + 89 = 91)
+        assert cache._data.current_qh is not None
+        assert cache._data.current_qh.data_start == qh2_start
+        assert len(cache._data.current_qh.samples) == 91
+        """Partial QH frozen at boundary crossing produces corrupt NBC.
+
+        When the current QH has fewer than 900 samples and a boundary is
+        crossed, the old code froze it with compute_nbc_quarter(partial),
+        producing complete=False with extrapolated raw_wh.  This test
+        verifies the partial QH is discarded, not frozen.
+        """
+        cache = EnergyCache(ttl_seconds=30)
+        qh1_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        qh2_start = datetime(2025, 6, 15, 12, 30, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 35, 0, tzinfo=timezone.utc)
+
+        # Accumulate 691 samples in QH1 (incomplete — only 900 would be full)
+        cache._update_qh([0.001] * 691, qh1_start, now)
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
+        assert len(cache._data.current_qh.samples) == 691
+
+        # Now send data starting in QH2 — triggers boundary crossing
+        cache._update_qh([0.002] * 100, qh2_start, now)
+
+        assert cache._data is not None
+        # The partial 691-sample QH must NOT be in frozen_qhs
+        frozen_starts = [fq.data_start for fq in (cache._data.frozen_qhs or [])]
+        assert qh1_start not in frozen_starts, (
+            f"Partial QH at {qh1_start} was frozen — should be discarded. "
+            f"frozen_qhs starts: {frozen_starts}"
+        )
+        # Current QH should be QH2 with 100 samples
+        assert cache._data.current_qh is not None
+        assert cache._data.current_qh.data_start == qh2_start
+        assert len(cache._data.current_qh.samples) == 100
+
 
 class TestEnergyCacheWrapper:
     """Tests for the EnergyCache wrapper class with new public interface."""
