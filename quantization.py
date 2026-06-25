@@ -102,10 +102,22 @@ def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
     candidates = sorted(n for n, c in length_counts.items() if c == max_count)
     n = candidates[0]
 
-    # If N/2 appears in ≥30% of runs, it's likely the true period
-    # (adjacent windows with identical values create 2× runs).
-    if n > 2 and n % 2 == 0 and length_counts.get(n // 2, 0) >= len(runs) * 0.3:
-        n = n // 2
+    # If N/2 fits the run-length distribution better than N, prefer it.
+    # Adjacent quantized windows with identical values inflate the
+    # run-length mode; the finer period explains all run lengths as
+    # near-multiples while the inflated mode does not.
+    if n > 2 and n % 2 == 0:
+        n2 = n // 2
+        tol = 1
+        def _fit(d: int) -> float:
+            hits = 0
+            for _, _, rl in runs:
+                rem = rl % d
+                if rem <= tol or rem >= d - tol:
+                    hits += 1
+            return hits / len(runs)
+        if _fit(n2) - _fit(n) > 0.05:
+            n = n2
 
     # Cap at 60; must be at least 2.
     if n > 60 or n < 2:
