@@ -98,14 +98,16 @@ class TestQHUpdateLogic:
         assert cache._data.frozen_qhs is None or len(cache._data.frozen_qhs) == 0
 
     def test_update_qh_appends_to_current_qh(self) -> None:
-        """Subsequent fetch in same QH appends samples to current_qh."""
+        """Subsequent fetch with new data appends to current_qh."""
         from energy_cache import EnergyCache
         cache = EnergyCache(ttl_seconds=30)
         now = datetime(2025, 6, 15, 12, 20, 0, tzinfo=timezone.utc)
         qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
 
         cache._update_qh([0.001] * 300, qh_start, now)
-        cache._update_qh([0.002] * 60, qh_start, now)
+        # New data starts at 12:20:00 (300s after qh_start), no overlap
+        new_start = datetime(2025, 6, 15, 12, 20, 0, tzinfo=timezone.utc)
+        cache._update_qh([0.002] * 60, new_start, now)
 
         assert cache._data is not None
         assert cache._data.current_qh is not None
@@ -119,7 +121,9 @@ class TestQHUpdateLogic:
         qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
 
         cache._update_qh([0.001] * 800, qh_start, now)
-        cache._update_qh([0.001] * 100, qh_start, now)
+        # New data starts at 12:28:20 (800s after qh_start), no overlap
+        new_start = datetime(2025, 6, 15, 12, 28, 20, tzinfo=timezone.utc)
+        cache._update_qh([0.001] * 100, new_start, now)
 
         assert cache._data is not None
         assert cache._data.frozen_qhs is not None
@@ -234,8 +238,8 @@ class TestQHUpdateLogic:
         """Samples straddling a boundary complete a QH with overflow into the next.
 
         current_qh has 691 samples (incomplete). New batch of 300 samples
-        starts at 20:56:29 — 211 fill QH1 to 902, freeze with 900, carry
-        2 overflow into QH2 which then receives 89 more = 91 total.
+        starts at 12:26:31 — 209 fill QH1 to 900, freeze, carry
+        0 overflow into QH2 which then receives 91 more = 91 total.
         """
         cache = EnergyCache(ttl_seconds=30)
         qh1_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
@@ -245,17 +249,17 @@ class TestQHUpdateLogic:
         # 691 samples in QH1 (incomplete)
         cache._update_qh([0.001] * 691, qh1_start, now)
 
-        # 300 samples starting at 12:26:29 — 211s to boundary at 13:00, 89s after
-        data_start = datetime(2025, 6, 15, 12, 26, 29, tzinfo=timezone.utc)
+        # 300 samples starting at 12:26:31 — 209s to boundary at 12:30:00, 91s after
+        data_start = datetime(2025, 6, 15, 12, 26, 31, tzinfo=timezone.utc)
         cache._update_qh([0.002] * 300, data_start, now)
 
         assert cache._data is not None
-        # QH1 frozen (691 + 211 = 902, frozen at 900)
+        # QH1 frozen (691 + 209 = 900, frozen at 900)
         assert cache._data.frozen_qhs is not None
         qh1_frozen = [fq for fq in cache._data.frozen_qhs if fq.data_start == qh1_start]
         assert len(qh1_frozen) == 1, f"Expected exactly one frozen QH at {qh1_start}"
         assert qh1_frozen[0].nbc_result.complete is True
-        # QH2 current with overflow + remaining (2 + 89 = 91)
+        # QH2 current with remaining 91 samples
         assert cache._data.current_qh is not None
         assert cache._data.current_qh.data_start == qh2_start
         assert len(cache._data.current_qh.samples) == 91
@@ -721,6 +725,91 @@ class TestEnergyCacheWrapper:
             t.join(timeout=5)
 
         assert errors == [], f"Thread errors: {errors}"
+
+
+class TestUpdateQhOverlapDetection:
+    """Tests that _update_qh skips overlapping samples from re-fetches.
+
+    When the API re-fetches from the same QH boundary, the new samples overlap
+    with existing current_qh samples. _update_qh must detect this and only
+    append the genuinely new tail.
+    """
+
+    def test_identical_re_fetch_no_duplication(self) -> None:
+        """Re-fetching the same 630 samples doesn't create 1260."""
+        cache = EnergyCache(ttl_seconds=30)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 25, 30, tzinfo=timezone.utc)
+
+        cache._update_qh([0.001] * 630, qh_start, now)
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
+        assert len(cache._data.current_qh.samples) == 630
+
+        # Same fetch again — should NOT duplicate
+        cache._update_qh([0.001] * 630, qh_start, now)
+        assert len(cache._data.current_qh.samples) == 630
+
+    def test_superset_fetch_appends_only_new_tail(self) -> None:
+        """Fetching 690 when 630 exist appends only 60 new samples."""
+        cache = EnergyCache(ttl_seconds=30)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 26, 30, tzinfo=timezone.utc)
+
+        cache._update_qh([0.001] * 630, qh_start, now)
+        cache._update_qh([0.002] * 690, qh_start, now)
+
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
+        assert len(cache._data.current_qh.samples) == 690
+
+    def test_partial_overlap_appends_only_new_portion(self) -> None:
+        """New data starts 10s before end of existing — only new tail appended."""
+        cache = EnergyCache(ttl_seconds=30)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 25, 0, tzinfo=timezone.utc)
+
+        cache._update_qh([0.001] * 600, qh_start, now)
+        # 600 samples cover 12:15:00–12:24:59. New batch starts at 12:24:50,
+        # so 10s overlap (12:24:50–12:24:59) and 50 new samples appended.
+        data_start = datetime(2025, 6, 15, 12, 24, 50, tzinfo=timezone.utc)
+        cache._update_qh([0.002] * 60, data_start, now)
+
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
+        assert len(cache._data.current_qh.samples) == 650
+
+    def test_overlap_does_not_freeze_garbage_qh(self) -> None:
+        """Overlapping re-fetch must not trigger premature freeze with mixed data."""
+        cache = EnergyCache(ttl_seconds=30)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 25, 0, tzinfo=timezone.utc)
+
+        # 630 samples in current QH
+        cache._update_qh([0.001] * 630, qh_start, now)
+        # Re-fetch same 630 — must NOT cause freeze
+        cache._update_qh([0.001] * 630, qh_start, now)
+
+        assert cache._data is not None
+        # No frozen QHs should be created from the duplicate
+        assert cache._data.frozen_qhs is None or len(cache._data.frozen_qhs) == 0
+        assert cache._data.current_qh is not None
+        assert cache._data.current_qh.data_start == qh_start
+
+    def test_current_qh_data_start_unchanged_after_overlap(self) -> None:
+        """data_start stays at QH boundary, not pushed to next QH."""
+        cache = EnergyCache(ttl_seconds=30)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        next_qh = datetime(2025, 6, 15, 12, 30, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 25, 0, tzinfo=timezone.utc)
+
+        cache._update_qh([0.001] * 630, qh_start, now)
+        cache._update_qh([0.001] * 630, qh_start, now)
+
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
+        assert cache._data.current_qh.data_start == qh_start
+        assert cache._data.current_qh.data_start != next_qh
 
 
 class TestCacheHitReturnsFullMetrics:

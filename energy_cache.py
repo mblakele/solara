@@ -308,7 +308,14 @@ class EnergyCache:
             if current is None:
                 current = CurrentQH(data_start=qh_start, samples=list(chunk))
             elif current.data_start == qh_start:
-                current.samples.extend(chunk)
+                # Skip samples that overlap with existing data.
+                # This happens when the API re-fetches from the same QH boundary.
+                # remaining_start was already advanced by `take`, so chunk start is -take.
+                skip = max(0, len(current.samples) - int(((remaining_start - timedelta(seconds=take)) - current.data_start).total_seconds()))
+                if skip > 0:
+                    chunk = chunk[skip:]
+                if chunk:
+                    current.samples.extend(chunk)
             else:
                 current = CurrentQH(data_start=qh_start, samples=list(chunk))
 
