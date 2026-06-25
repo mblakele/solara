@@ -769,13 +769,21 @@ def _start_load_manager_thread():
 
 def _shutdown_load_manager():
     """Clean up LoadManager resources on process exit."""
-    with _load_manager_lock:
+    try:
+        acquired = _load_manager_lock.acquire(timeout=5)  # pylint: disable=consider-using-with
+    except Exception:
+        return
+    if not acquired:
+        return
+    try:
         if _load_manager is not None:
             try:
                 _load_manager.close()
                 logger.info("LoadManager shut down cleanly")
             except Exception as e:
                 logger.warning("Error during LoadManager shutdown: %s", e)
+    finally:
+        _load_manager_lock.release()
 
 
 atexit.register(_shutdown_load_manager)

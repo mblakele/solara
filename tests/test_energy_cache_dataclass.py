@@ -10,152 +10,225 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from energy_cache import EnergyCache, EnergyCacheData
+from energy_cache import EnergyCache, EnergyCacheData, CurrentQH, FrozenQH
+from util import NBCQuarter
 
 
-class TestEnergyCacheData:
-    """Tests for the EnergyCacheData frozen dataclass."""
+class TestFrozenQH:
+    """Tests for the FrozenQH dataclass (completed QH with cached NBC result)."""
 
-    def test_dataclass_exists(self) -> None:
-        """EnergyCacheData must be importable from energy_cache."""
-        from energy_cache import EnergyCacheData  # noqa: F401
+    def test_frozen_qh_exists(self) -> None:
+        """FrozenQH must be importable from energy_cache."""
+        from energy_cache import FrozenQH  # noqa: F401
 
-    def test_dataclass_is_frozen(self) -> None:
-        """EnergyCacheData must be immutable — setattr raises AttributeError."""
-        now = datetime.now(timezone.utc)
-        data = EnergyCacheData(
-            samples=[0.001, 0.002, 0.003],
-            data_start=now,
-            last_sample_at=now,
-            last_fetch_at=now,
-            sample_count=3,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
+    def test_frozen_qh_is_frozen(self) -> None:
+        """FrozenQH must be immutable — setattr raises AttributeError."""
+        now = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        nbc = NBCQuarter(complete=True, raw_wh=150.0, wh=150.0)
+        fqh = FrozenQH(data_start=now, nbc_result=nbc)
         with pytest.raises(AttributeError):
-            data.samples = [0.999]  # type: ignore[assignment]
+            fqh.data_start = datetime(2025, 1, 1, tzinfo=timezone.utc)
 
-    def test_dataclass_equality(self) -> None:
-        """Two EnergyCacheData instances with identical fields are equal."""
-        now = datetime.now(timezone.utc)
-        a = EnergyCacheData(
-            samples=[0.1],
-            data_start=now,
-            last_sample_at=now,
-            last_fetch_at=now,
-            sample_count=1,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        b = EnergyCacheData(
-            samples=[0.1],
-            data_start=now,
-            last_sample_at=now,
-            last_fetch_at=now,
-            sample_count=1,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        assert a == b
+    def test_frozen_qh_fields(self) -> None:
+        """FrozenQH has data_start and nbc_result fields."""
+        now = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        nbc = NBCQuarter(complete=True, raw_wh=200.0, wh=200.0)
+        fqh = FrozenQH(data_start=now, nbc_result=nbc)
+        assert fqh.data_start == now
+        assert fqh.nbc_result == nbc
+        assert fqh.nbc_result.complete is True
+        assert fqh.nbc_result.wh == 200.0
 
-    def test_dataclass_inequality_different_samples(self) -> None:
-        """Different sample values produce inequality."""
-        now = datetime.now(timezone.utc)
-        a = EnergyCacheData(
-            samples=[0.1],
-            data_start=now,
-            last_sample_at=now,
-            last_fetch_at=now,
-            sample_count=1,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+    def test_frozen_qh_is_not_complete_qh(self) -> None:
+        """FrozenQH stores a completed NBCQuarter (complete=True)."""
+        nbc = NBCQuarter(complete=True, raw_wh=100.0, wh=100.0)
+        fqh = FrozenQH(
+            data_start=datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc),
+            nbc_result=nbc,
         )
-        b = EnergyCacheData(
-            samples=[0.2],
-            data_start=now,
-            last_sample_at=now,
-            last_fetch_at=now,
-            sample_count=1,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        assert a != b
+        assert fqh.nbc_result.complete is True
 
-    def test_dataclass_all_fields_present(self) -> None:
-        """All fields described in the plan must be present."""
-        now = datetime.now(timezone.utc)
-        data = EnergyCacheData(
-            samples=[0.001],
-            data_start=now,
-            last_sample_at=now,
+
+class TestCurrentQH:
+    """Tests for the CurrentQH dataclass (in-progress QH with raw samples)."""
+
+    def test_current_qh_exists(self) -> None:
+        """CurrentQH must be importable from energy_cache."""
+        from energy_cache import CurrentQH  # noqa: F401
+
+    def test_current_qh_is_mutable(self) -> None:
+        """CurrentQH must be mutable — samples can be appended."""
+        now = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        cqh = CurrentQH(data_start=now, samples=[0.001, 0.002])
+        cqh.samples.append(0.003)
+        assert len(cqh.samples) == 3
+
+    def test_current_qh_fields(self) -> None:
+        """CurrentQH has data_start and samples fields."""
+        now = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        samples = [0.001, 0.002, 0.003]
+        cqh = CurrentQH(data_start=now, samples=samples)
+        assert cqh.data_start == now
+        assert cqh.samples == samples
+
+    def test_current_qh_empty_samples(self) -> None:
+        """CurrentQH can start with empty samples."""
+        now = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        cqh = CurrentQH(data_start=now, samples=[])
+        assert len(cqh.samples) == 0
+
+
+class TestQHUpdateLogic:
+    """Tests for the QH-aware update logic in EnergyCache."""
+
+    def test_update_qh_initial_fetch_creates_current_qh(self) -> None:
+        """First fetch creates a current_qh with the returned samples."""
+        from energy_cache import EnergyCache
+        cache = EnergyCache(ttl_seconds=30)
+        now = datetime(2025, 6, 15, 12, 20, 0, tzinfo=timezone.utc)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 300  # 5 minutes of data
+
+        cache._update_qh(samples, qh_start, now)
+
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
+        assert cache._data.current_qh.data_start == qh_start
+        assert len(cache._data.current_qh.samples) == 300
+        assert cache._data.frozen_qhs is None or len(cache._data.frozen_qhs) == 0
+
+    def test_update_qh_appends_to_current_qh(self) -> None:
+        """Subsequent fetch in same QH appends samples to current_qh."""
+        from energy_cache import EnergyCache
+        cache = EnergyCache(ttl_seconds=30)
+        now = datetime(2025, 6, 15, 12, 20, 0, tzinfo=timezone.utc)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+
+        cache._update_qh([0.001] * 300, qh_start, now)
+        cache._update_qh([0.002] * 60, qh_start, now)
+
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
+        assert len(cache._data.current_qh.samples) == 360
+
+    def test_update_qh_freezes_on_completion(self) -> None:
+        """When current_qh reaches 900 samples, it is frozen."""
+        from energy_cache import EnergyCache
+        cache = EnergyCache(ttl_seconds=30)
+        now = datetime(2025, 6, 15, 12, 29, 59, tzinfo=timezone.utc)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+
+        cache._update_qh([0.001] * 800, qh_start, now)
+        cache._update_qh([0.001] * 100, qh_start, now)
+
+        assert cache._data is not None
+        assert cache._data.frozen_qhs is not None
+        assert len(cache._data.frozen_qhs) == 1
+        assert cache._data.frozen_qhs[0].data_start == qh_start
+        assert cache._data.frozen_qhs[0].nbc_result.complete is True
+        # Current QH should be empty or None after freeze
+        assert cache._data.current_qh is None or len(cache._data.current_qh.samples) == 0
+
+    def test_update_qh_splits_at_boundary(self) -> None:
+        """Samples spanning a QH boundary are split correctly."""
+        from energy_cache import EnergyCache
+        cache = EnergyCache(ttl_seconds=30)
+        # Start in QH 12:15-12:30, but fetch data that crosses into 12:30-12:45
+        qh1_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        qh2_start = datetime(2025, 6, 15, 12, 30, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 35, 0, tzinfo=timezone.utc)
+
+        # 800 samples from 12:15:00 to 12:28:20 (within QH1)
+        cache._update_qh([0.001] * 800, qh1_start, now)
+
+        # 200 samples starting at 12:28:20 — crosses QH boundary at 12:30:00
+        # 100 samples in QH1 (12:28:20 to 12:30:00), 100 in QH2 (12:30:00 to 12:31:40)
+        samples = [0.002] * 200
+        data_start = datetime(2025, 6, 15, 12, 28, 20, tzinfo=timezone.utc)
+        cache._update_qh(samples, data_start, now)
+
+        assert cache._data is not None
+        # QH1 should be frozen (had 800 + 100 = 900 samples)
+        assert cache._data.frozen_qhs is not None
+        assert len(cache._data.frozen_qhs) >= 1
+        # Current QH should be QH2 with 100 samples
+        assert cache._data.current_qh is not None
+        assert cache._data.current_qh.data_start == qh2_start
+        assert len(cache._data.current_qh.samples) == 100
+
+    def test_prune_frozen_qhs_keeps_max_3(self) -> None:
+        """Pruning drops the oldest frozen QH when count exceeds 3."""
+        from energy_cache import EnergyCache
+        from util import NBCQuarter
+        cache = EnergyCache(ttl_seconds=30)
+        now = datetime(2025, 6, 15, 13, 0, 0, tzinfo=timezone.utc)
+
+        # Manually create 4 frozen QHs
+        frozen = []
+        for i in range(4):
+            qh_start = datetime(2025, 6, 15, 11, i * 15, 0, tzinfo=timezone.utc)
+            nbc = NBCQuarter(complete=True, raw_wh=float(i * 100), wh=float(i * 100))
+            frozen.append(FrozenQH(data_start=qh_start, nbc_result=nbc))
+
+        from energy_cache import EnergyCacheData
+        cache._data = EnergyCacheData(
+            frozen_qhs=frozen,
+            current_qh=CurrentQH(
+                data_start=datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
+                samples=[0.001] * 100,
+            ),
             last_fetch_at=now,
-            sample_count=1,
-            quantization_seconds=5,
-            quantization_offset=0,
-            quantization_confidence=0.99,
         )
-        assert hasattr(data, "samples")
-        assert hasattr(data, "data_start")
-        assert hasattr(data, "last_sample_at")
-        assert hasattr(data, "last_fetch_at")
-        assert hasattr(data, "sample_count")
-        assert hasattr(data, "quantization_seconds")
-        assert hasattr(data, "quantization_offset")
-        assert hasattr(data, "quantization_confidence")
-        assert data.samples == [0.001]
-        assert data.quantization_seconds == 5
-        assert data.quantization_confidence == 0.99
 
-    def test_dataclass_none_fields(self) -> None:
-        """Fields may be None when no data has been fetched."""
-        data = EnergyCacheData(
-            samples=None,
-            data_start=None,
-            last_sample_at=None,
-            last_fetch_at=None,
-            sample_count=None,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        assert data.samples is None
-        assert data.data_start is None
-        assert data.sample_count is None
+        cache._prune_frozen_qhs()
 
-    def test_dataclass_sample_count_matches_samples_length(self) -> None:
-        """When samples is a list, sample_count should equal len(samples)."""
-        now = datetime.now(timezone.utc)
-        samples = [0.1, 0.2, 0.3, 0.4, 0.5]
-        data = EnergyCacheData(
-            samples=samples,
-            data_start=now,
-            last_sample_at=now,
+        assert cache._data is not None
+        assert cache._data.frozen_qhs is not None
+        assert len(cache._data.frozen_qhs) == 3
+        # Oldest (index 0) should be dropped
+        assert cache._data.frozen_qhs[0].data_start.minute == 15
+
+    def test_update_qh_preserves_full_metrics_dict(self) -> None:
+        """_update_qh preserves full_metrics_dict from existing data."""
+        from energy_cache import EnergyCache, EnergyCacheData
+        cache = EnergyCache(ttl_seconds=30)
+        now = datetime(2025, 6, 15, 12, 20, 0, tzinfo=timezone.utc)
+        qh_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+
+        cache._data = EnergyCacheData(
             last_fetch_at=now,
-            sample_count=5,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            full_metrics_dict={"devices": [{"name": "test"}]},
         )
-        assert data.sample_count == len(data.samples)
 
-    def test_dataclass_sample_count_none_when_samples_none(self) -> None:
-        """sample_count is None when samples is None."""
-        data = EnergyCacheData(
-            samples=None,
-            data_start=None,
-            last_sample_at=None,
-            last_fetch_at=None,
-            sample_count=None,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        assert data.sample_count is None
+        cache._update_qh([0.001] * 100, qh_start, now)
+
+        assert cache._data is not None
+        assert cache._data.full_metrics_dict == {"devices": [{"name": "test"}]}
+
+    def test_update_qh_handles_subsecond_timestamps_at_boundary(self) -> None:
+        """_update_qh must not hang when data_start has a sub-second fraction
+        and the sample window crosses a QH boundary."""
+        import threading
+        from energy_cache import EnergyCache
+
+        cache = EnergyCache(ttl_seconds=30)
+        data_start = datetime(2025, 6, 15, 12, 14, 55, 400000, tzinfo=timezone.utc)
+        samples = [0.001] * 10
+        now = data_start + timedelta(seconds=10)
+
+        done = threading.Event()
+
+        def run() -> None:
+            cache._update_qh(samples, data_start, now)
+            done.set()
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(timeout=2.0)
+
+        assert done.is_set(), "_update_qh hung — infinite loop in QH boundary splitting"
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
 
 
 class TestEnergyCacheWrapper:
@@ -309,22 +382,6 @@ class TestEnergyCacheWrapper:
         assert cache.data is None
         assert cache.is_valid(now) is False
 
-    def test_get_or_fetch_populates_data_start(self) -> None:
-        """data.data_start is set from the fetch result."""
-        cache = EnergyCache(ttl_seconds=60)
-        fixed_start = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-
-        def fetch_func() -> dict[str, Any] | None:
-            return {
-                "per_second_data": [0.001] * 10,
-                "data_start": fixed_start,
-            }
-
-        cache.get_or_fetch(fetch_func, now)
-        assert cache.data is not None
-        assert cache.data.data_start == fixed_start
-
     def test_get_or_fetch_populates_last_fetch_at(self) -> None:
         """data.last_fetch_at is set on API call but not on cache hit."""
         cache = EnergyCache(ttl_seconds=60)
@@ -343,21 +400,6 @@ class TestEnergyCacheWrapper:
         time.sleep(0.02)
         cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         assert cache.data.last_fetch_at == first_fetch_at
-
-    def test_get_or_fetch_populates_sample_count(self) -> None:
-        """data.sample_count is set to len(samples) after fetch."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc)
-
-        def fetch_func() -> dict[str, Any] | None:
-            return {
-                "per_second_data": [0.001] * 7,
-                "data_start": now,
-            }
-
-        cache.get_or_fetch(fetch_func, now)
-        assert cache.data is not None
-        assert cache.data.sample_count == 7
 
     def test_get_or_fetch_nested_device_data(self) -> None:
         """get_or_fetch populates samples from nested devices list."""
@@ -378,102 +420,8 @@ class TestEnergyCacheWrapper:
 
         cache.get_or_fetch(fetch_func, now)
         assert cache.data is not None
-        assert cache.data.samples is not None
-        assert len(cache.data.samples) == 150
-
-    def test_get_or_fetch_samples_field_access(self) -> None:
-        """samples can be accessed via cache.data.samples."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc)
-        expected = [0.5] * 20
-
-        def fetch_func() -> dict[str, Any] | None:
-            return {
-                "per_second_data": expected,
-                "data_start": now,
-            }
-
-        cache.get_or_fetch(fetch_func, now)
-        assert cache.data is not None
-        assert cache.data.samples == expected
-
-    def test_merge_incremental_appends_new_samples(self) -> None:
-        """merge_incremental appends new samples after existing ones."""
-        cache = EnergyCache(ttl_seconds=60)
-        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-        # Pre-populate with 5 samples
-        existing_data = EnergyCacheData(
-            samples=[0.1] * 5,
-            data_start=base_time,
-            last_sample_at=base_time + timedelta(seconds=4),
-            last_fetch_at=base_time,
-            sample_count=5,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        cache._data = existing_data
-
-        new_samples = [0.2, 0.3]
-        merged = cache.merge_incremental(
-            existing_data,
-            new_samples,
-            base_time + timedelta(seconds=5),
-        )
-
-        assert merged is not None
-        assert merged.samples is not None
-        assert merged.samples == [0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.3]
-
-    def test_merge_incremental_deduplicates_overlap(self) -> None:
-        """merge_incremental skips samples that overlap with existing data."""
-        cache = EnergyCache(ttl_seconds=60)
-        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-        # Existing: samples at seconds 0-4 (5 samples)
-        existing_data = EnergyCacheData(
-            samples=[0.1] * 5,
-            data_start=base_time,
-            last_sample_at=base_time + timedelta(seconds=4),
-            last_fetch_at=base_time,
-            sample_count=5,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        cache._data = existing_data
-
-        # New: samples at seconds 3-6 (4 samples), overlap at seconds 3-4
-        # Overlapping values must match existing (0.1) for verification to pass
-        new_samples = [0.1, 0.1, 0.5, 0.5]
-        merged = cache.merge_incremental(
-            existing_data,
-            new_samples,
-            base_time + timedelta(seconds=3),
-        )
-
-        assert merged is not None
-        assert merged.samples is not None
-        # Existing 0-4 + new 5-6 = 7 samples
-        assert len(merged.samples) == 7
-
-    def test_merge_incremental_returns_none_on_none_input(self) -> None:
-        """merge_incremental returns None when new_samples is None."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc)
-        empty_existing = EnergyCacheData(
-            samples=[0.1],
-            data_start=now,
-            last_sample_at=now,
-            last_fetch_at=now,
-            sample_count=1,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        result = cache.merge_incremental(empty_existing, None, now)
-        assert result is None
+        assert cache.data.current_qh is not None
+        assert len(cache.data.current_qh.samples) == 150
 
     def test_invalidate_clears_data(self) -> None:
         """invalidate() sets data to None."""
@@ -526,12 +474,14 @@ class TestEnergyCacheWrapper:
         data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         now = datetime(2025, 6, 1, 12, 1, 1, tzinfo=timezone.utc)  # 61s later
 
-        # Seed cache with all quantization fields set
-        cache._last_sample_at = data_time
-        cache._data_start = data_time
-        cache._quantization_seconds = quantum
-        cache._quantization_offset = 0
-        cache._quantization_confidence = 0.95
+        cache._data = EnergyCacheData(
+            last_sample_at=data_time,
+            data_start=data_time,
+            last_fetch_at=now,
+            quantization_seconds=quantum,
+            quantization_offset=0,
+            quantization_confidence=0.95,
+        )
 
         result = cache.sleep_interval_adjust(30.0, now)
         assert result == 5.0
@@ -543,17 +493,16 @@ class TestEnergyCacheWrapper:
         data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)  # exactly 60s later
 
-        cache._last_sample_at = data_time
-        cache._data_start = data_time
-        cache._quantization_seconds = quantum
-        cache._quantization_offset = 0
-        cache._quantization_confidence = 0.95
+        cache._data = EnergyCacheData(
+            last_sample_at=data_time,
+            data_start=data_time,
+            last_fetch_at=now,
+            quantization_seconds=quantum,
+            quantization_offset=0,
+            quantization_confidence=0.95,
+        )
 
         result = cache.sleep_interval_adjust(30.0, now)
-        # At exactly 2× (60s), data_age=60, 60 > 60 is False → falls through
-        # At 60s+1ns it would return 5.0. Testing boundary: exactly 2× should
-        # NOT trigger the early-exit (uses strict >), so it falls through to
-        # the quantization adjustment below.
         assert isinstance(result, float)
         assert result >= 5.0
 
@@ -564,16 +513,16 @@ class TestEnergyCacheWrapper:
         data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         now = datetime(2025, 6, 1, 12, 0, 45, tzinfo=timezone.utc)  # 45s, < 60s
 
-        cache._last_sample_at = data_time
-        cache._data_start = data_time
-        cache._quantization_seconds = quantum
-        cache._quantization_offset = 0
-        cache._quantization_confidence = 0.95
+        cache._data = EnergyCacheData(
+            last_sample_at=data_time,
+            data_start=data_time,
+            last_fetch_at=now,
+            quantization_seconds=quantum,
+            quantization_offset=0,
+            quantization_confidence=0.95,
+        )
 
         result = cache.sleep_interval_adjust(30.0, now)
-        # Should not return 5.0 from the early-exit; falls through to quantization
-        # logic. Result may still be 5.0 if the quantization math produces it,
-        # but the key is that the early-exit path was NOT taken.
         assert isinstance(result, float)
         assert result >= 5.0
 
@@ -583,11 +532,13 @@ class TestEnergyCacheWrapper:
         data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         now = datetime(2025, 6, 1, 12, 1, 1, tzinfo=timezone.utc)
 
-        # Only set quantization fields and data_start, not last_sample_at
-        cache._data_start = data_time
-        cache._quantization_seconds = 30
-        cache._quantization_offset = 0
-        cache._quantization_confidence = 0.95
+        cache._data = EnergyCacheData(
+            data_start=data_time,
+            last_fetch_at=now,
+            quantization_seconds=30,
+            quantization_offset=0,
+            quantization_confidence=0.95,
+        )
 
         result = cache.sleep_interval_adjust(30.0, now)
         assert isinstance(result, float)
@@ -599,11 +550,12 @@ class TestEnergyCacheWrapper:
         data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         now = datetime(2025, 6, 1, 12, 1, 1, tzinfo=timezone.utc)
 
-        cache._last_sample_at = data_time
-        # Do not set quantization_seconds — it stays None
+        cache._data = EnergyCacheData(
+            last_sample_at=data_time,
+            last_fetch_at=now,
+        )
 
         result = cache.sleep_interval_adjust(30.0, now)
-        # Returns unchanged because quantization_confidence < 0.9 triggers early return
         assert isinstance(result, float)
 
     def test_result_clamped_at_5_minimum(self) -> None:
@@ -613,11 +565,14 @@ class TestEnergyCacheWrapper:
         data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         now = datetime(2025, 6, 1, 12, 0, 12, tzinfo=timezone.utc)  # 12s > 10s
 
-        cache._last_sample_at = data_time
-        cache._data_start = data_time
-        cache._quantization_seconds = quantum
-        cache._quantization_offset = 0
-        cache._quantization_confidence = 0.95
+        cache._data = EnergyCacheData(
+            last_sample_at=data_time,
+            data_start=data_time,
+            last_fetch_at=now,
+            quantization_seconds=quantum,
+            quantization_offset=0,
+            quantization_confidence=0.95,
+        )
 
         result = cache.sleep_interval_adjust(30.0, now)
         assert result == 5.0
@@ -701,255 +656,6 @@ class TestEnergyCacheWrapper:
             t.join(timeout=5)
 
         assert errors == [], f"Thread errors: {errors}"
-
-    def test_pruning_keeps_samples_within_3600s(self) -> None:
-        """Samples older than 3600 seconds from now are pruned."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-
-        # Pre-populate with 3601 samples (oldest is >3600s ago)
-        old_start = now - timedelta(seconds=3621)
-        existing = EnergyCacheData(
-            samples=[0.1] * 3601,
-            data_start=old_start,
-            last_sample_at=now - timedelta(seconds=20),
-            last_fetch_at=old_start,
-            sample_count=3601,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        cache._data = existing
-
-        with patch("energy_cache.datetime") as mock_dt:
-            mock_dt.now.return_value = now
-
-            def fetch_func() -> dict[str, Any] | None:
-                return {
-                    "per_second_data": [0.2] * 10,
-                    "data_start": now - timedelta(seconds=10),
-                }
-
-            cache.get_or_fetch(fetch_func, now, force=True)
-
-        # After merge + pruning, should be at most ~3600 samples
-        assert cache.data is not None
-        assert cache.data.samples is not None
-        assert len(cache.data.samples) <= 3600
-
-    def test_last_fetch_at_property(self) -> None:
-        """DataCache.last_fetch_at property works correctly."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc)
-
-        def fetch_func() -> dict[str, Any] | None:
-            return {
-                "per_second_data": [0.001] * 5,
-                "data_start": now,
-            }
-
-        assert cache.last_fetch_at is None
-        cache.get_or_fetch(fetch_func, now)
-        assert cache.last_fetch_at is not None
-        assert cache.last_fetch_at == cache.data.last_fetch_at
-
-    def test_data_start_property(self) -> None:
-        """DataCache.data_start property works correctly."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc)
-        fixed_start = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-
-        def fetch_func() -> dict[str, Any] | None:
-            return {
-                "per_second_data": [0.001] * 5,
-                "data_start": fixed_start,
-            }
-
-        assert cache.data_start is None
-        cache.get_or_fetch(fetch_func, now)
-        assert cache.data_start == fixed_start
-
-    def test_merge_incremental_updates_last_fetch_at(self) -> None:
-        """merge_incremental returns new data with updated last_fetch_at."""
-        cache = EnergyCache(ttl_seconds=60)
-        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-        existing = EnergyCacheData(
-            samples=[0.1] * 5,
-            data_start=base_time,
-            last_sample_at=base_time + timedelta(seconds=4),
-            last_fetch_at=base_time,
-            sample_count=5,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        cache._data = existing
-
-        new_samples = [0.2, 0.3]
-        merged = cache.merge_incremental(
-            existing,
-            new_samples,
-            base_time + timedelta(seconds=5),
-        )
-
-        assert merged is not None
-        # last_fetch_at should be updated to current time (or close to it)
-        assert merged.last_fetch_at is not None
-        assert merged.last_fetch_at >= base_time
-
-    def test_merge_incremental_updates_sample_count(self) -> None:
-        """merge_incremental updates sample_count to match total samples."""
-        cache = EnergyCache(ttl_seconds=60)
-        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-        existing = EnergyCacheData(
-            samples=[0.1] * 5,
-            data_start=base_time,
-            last_sample_at=base_time + timedelta(seconds=4),
-            last_fetch_at=base_time,
-            sample_count=5,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        cache._data = existing
-
-        new_samples = [0.2] * 3
-        merged = cache.merge_incremental(
-            existing,
-            new_samples,
-            base_time + timedelta(seconds=5),
-        )
-
-        assert merged is not None
-        assert merged.sample_count == 8  # 5 + 3
-
-    def test_samples_is_list_type(self) -> None:
-        """cache.data.samples is a list of floats when data exists."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc)
-
-        def fetch_func() -> dict[str, Any] | None:
-            return {
-                "per_second_data": [0.001, 0.002, 0.003],
-                "data_start": now,
-            }
-
-        cache.get_or_fetch(fetch_func, now)
-        assert cache.data is not None
-        assert isinstance(cache.data.samples, list)
-        assert all(isinstance(v, float) for v in cache.data.samples)
-
-    def test_merge_incremental_with_empty_new_samples(self) -> None:
-        """merge_incremental with empty new_samples list returns existing data unchanged."""
-        cache = EnergyCache(ttl_seconds=60)
-        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-        existing = EnergyCacheData(
-            samples=[0.1, 0.2],
-            data_start=base_time,
-            last_sample_at=base_time + timedelta(seconds=1),
-            last_fetch_at=base_time,
-            sample_count=2,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        cache._data = existing
-
-        merged = cache.merge_incremental(
-            existing,
-            [],
-            base_time,
-        )
-
-        # Empty new_samples returns None (nothing to merge).
-        assert merged is None
-
-    def test_get_current_qh_with_incremental_data(self) -> None:
-        """get_current_qh works correctly with incrementally merged data."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
-
-        # Initial fetch: 400 samples (first ~6.5 min of QH1)
-        data_start = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        samples = [0.001] * 400
-
-        def fetch_func() -> dict[str, Any] | None:
-            return {
-                "per_second_data": samples,
-                "data_start": data_start,
-            }
-
-        cache.get_or_fetch(fetch_func, now)
-        result = cache.get_current_qh(now)
-
-        assert result is not None
-        assert result["qh_name"] == "QH1"
-        # seconds_remaining should be based on wall-clock, not sample count
-        # now is at 7:30 = 450 seconds into the hour
-        expected_remaining = 900 - 450
-        assert result["seconds_remaining"] == expected_remaining
-
-    def test_merge_incremental_preserves_quantization(self) -> None:
-        """merge_incremental preserves quantization from existing data by default."""
-        cache = EnergyCache(ttl_seconds=60)
-        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-        existing = EnergyCacheData(
-            samples=[0.001] * 5,
-            data_start=base_time,
-            last_sample_at=base_time + timedelta(seconds=4),
-            last_fetch_at=base_time,
-            sample_count=5,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=0.95,
-        )
-        cache._data = existing
-
-        new_samples = [0.002, 0.003]
-        merged = cache.merge_incremental(
-            existing,
-            new_samples,
-            base_time + timedelta(seconds=5),
-        )
-
-        assert merged is not None
-        assert merged.quantization_seconds == 30
-        assert merged.quantization_offset == 0
-        assert merged.quantization_confidence == 0.95
-
-    def test_merge_incremental_discards_quantization_when_disabled(self) -> None:
-        """merge_incremental with preserve_quantization=False clears quantization fields."""
-        cache = EnergyCache(ttl_seconds=60)
-        base_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-        existing = EnergyCacheData(
-            samples=[0.001] * 5,
-            data_start=base_time,
-            last_sample_at=base_time + timedelta(seconds=4),
-            last_fetch_at=base_time,
-            sample_count=5,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=0.95,
-        )
-        cache._data = existing
-
-        new_samples = [0.002, 0.003]
-        merged = cache.merge_incremental(
-            existing,
-            new_samples,
-            base_time + timedelta(seconds=5),
-            preserve_quantization=False,
-        )
-
-        assert merged is not None
-        assert merged.quantization_seconds is None
-        assert merged.quantization_offset is None
-        assert merged.quantization_confidence is None
 
 
 class TestCacheHitReturnsFullMetrics:

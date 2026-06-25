@@ -19,6 +19,15 @@ Write tests first, then diagnose and fix bugs.
 
 Always invoke tools using structured function-calling JSON (not inline XML or markdown text).
 
+**`actor` tool:** The `operation` parameter must be a JSON object, not a JSON string.
+```json
+// ✅ Correct — operation is a nested object
+{"operation": {"action": "run", "subagent_type": "explore", "description": "...", "prompt": "..."}}
+
+// ❌ Wrong — operation is a serialized string (causes "Invalid input: expected object, received string")
+{"operation": "{\"action\": \"run\", \"subagent_type\": \"explore\"}"}
+```
+
 Never try to work around permission errors.
 
 ### Editing
@@ -147,7 +156,7 @@ project-root
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
-├── energy_cache.py        # EnergyCache with per-second sample storage, incremental
+├── energy_cache.py        # EnergyCache with QH-block storage, frozen/completed QH tracking
                            # fetch merging, and pruning
  ├── load_controllers.py   # Load manager controllers: PlugController/RealPlugController,
                             # TeslaController/RealTeslaController, VocolincController/RealVocolincController,
@@ -280,32 +289,26 @@ project-root
 - `load_telegram_devices()` (telegram.py) — loads device whitelist dict from `LOAD_TELEGRAM_DEVICES` env var or devices.json
 - `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`
 - Whitelist gate: Telegram notifications are only sent when a telegram.devices whitelist is explicitly configured AND at least one action matches it. Without a whitelist, notifications are blocked to prevent unintended messages to unconfigured devices.
-- Plug notifications use emoji format: `🔵 device → ON` / `🔴 device → OFF`
+- Plug notifications use emoji format: `🟢 device → ON` / `🔘 device → OFF`
 
-### EnergyCache & Incremental Fetch
-- `EnergyCache` (energy_cache.py) stores per-second energy samples with metadata in a
-  frozen `EnergyCacheData` dataclass:
-  - `samples`: list[float] — per-second Wh values
-  - `data_start`: datetime — start time of the sample window
-  - `sample_count`, `last_sample_at`: metadata for diagnostics
-  - `full_metrics_dict`: dict[str, Any] | None — metrics dict refreshed on every fetch (not just the first),
-    returned on cache hits to preserve keys like `devices`, `nbc`, `instant`
-- `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that returns
-  only new samples since the last data point. Returns `None` on API error.
-- `_merge_samples(existing, new_data)`: merges new samples into existing cache, updating
-  metadata. Handles overlapping and non-overlapping data ranges.
-- `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent
-  unbounded memory growth. Called automatically by `get_or_fetch()`.
+### EnergyCache & QH-Block Storage
+- `EnergyCache` (energy_cache.py) stores energy data in QH-block format:
+  - `FrozenQH`: completed QH with pre-computed `NBCQuarter` result (~100 bytes each)
+  - `CurrentQH`: in-progress QH with raw per-second samples (0–899 values)
+  - `EnergyCacheData`: frozen dataclass holding `frozen_qhs` (max 3), `current_qh`,
+    `last_fetch_at`, `full_metrics_dict`, and quantization fields
+- `_update_qh(samples, data_start, now)`: splits samples at QH boundaries, freezes
+  completed QHs, prunes to max 3 frozen QHs. No merge needed — fresh fetch per QH.
 - `get_or_fetch(fetcher, force=False)`: returns cached data if valid (within TTL), otherwise
-  calls the fetcher. When an incremental fetcher is available, it merges new samples into
-  existing cache instead of replacing them entirely. On cache hits, returns the full metrics
-  dict (including `devices`) if stored from a prior fetch. Always updates `full_metrics_dict`
-  on every fetch to keep predictions current.
+  calls the fetcher. On cache hits, returns the full metrics dict. Always updates
+  `full_metrics_dict` on every fetch.
+- `get_current_qh(now)`: reads from `current_qh` directly, computes NBC only for the
+  incomplete QH. Frozen QHs are never recomputed.
 
 ### Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
   The optional `force=True` parameter bypasses the stale-data check and always fetches fresh NBC data from API.
-- EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`
+- EnergyCache stores data in QH-block format; NBCReader reads QH predictions from it with `get_current_qh(force=False)`
 - Controllers: PlugController (stub) / RealPlugController (aiohomekit), TeslaController (stub) / RealTeslaController (tesla-fleet-api)
 - Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>[:<priority>] env vars
 

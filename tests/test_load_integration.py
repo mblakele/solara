@@ -23,7 +23,7 @@ from load_manager import (
 from load_models import CandidateDetailPlug, CycleDiagnostics, CycleResult
 from load_nbc import DecideContext
 from tests.helpers import _make_metrics_with_wh
-from energy_cache import EnergyCache
+from energy_cache import CurrentQH, EnergyCache, EnergyCacheData
 from tests.helpers import FakeClock
 
 
@@ -51,25 +51,26 @@ def _make_energy_cache_with_prediction(
             (fresh). Pass a positive value to simulate older fetch time.
 
     Returns:
-        EnergyCache with ~2800 samples backfilled from ``now``.
+        EnergyCache with current_qh backfilled to produce the target prediction.
     """
+    from energy_cache import CurrentQH
+
     sample_value = predicted_wh / 900_000.0
 
-    # Align data_start to the previous QH boundary so ceil_to_qh(data_start) == data_start.
-    # qh_minute floors to 0, 15, 30, or 45 — the start of the current QH window.
-    # Subtract 15 minutes to land on the previous boundary (also QH-aligned).
+    # Align data_start to the current QH boundary.
     qh_minute = (now.minute // 15) * 15
-    data_start = now.replace(minute=qh_minute, second=0, microsecond=0) - timedelta(minutes=15)
+    data_start = now.replace(minute=qh_minute, second=0, microsecond=0)
     sample_count = int((now - data_start).total_seconds())
+    # Cap at 899 — current_qh holds only the incomplete QH.
+    sample_count = min(sample_count, 899)
 
     cache = EnergyCache(ttl_seconds=30)
     samples = [sample_value] * sample_count
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = data_start
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = sample_count
-        cache._last_fetch_at = now - timedelta(seconds=fetch_offset_secs)
+        cache._data = EnergyCacheData(
+            current_qh=CurrentQH(data_start=data_start, samples=samples),
+            last_fetch_at=now - timedelta(seconds=fetch_offset_secs),
+        )
     # Store _data_lag_secs on the cache so NBCReader picks it up.
     cache._data_lag_secs = data_lag_secs  # type: ignore[attr-defined]
     return cache
@@ -254,8 +255,9 @@ class TestLoadIntegration(unittest.TestCase):
       # p200 pool pump turns on
       # p100 water heater would fit gap without pool pump, but stays off
       mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-1000.0)
-      samples = mgr.nbc_reader.energy_cache._samples
-      assert len(samples) == 900 + 8 * 60
+      current_qh = mgr.nbc_reader.energy_cache._data.current_qh
+      assert current_qh is not None
+      assert len(current_qh.samples) == 480  # 07:00:00 to 07:08:00 = 480 seconds
       asyncio.run(plug_ctrl.set_state("pool_pump", False))
       asyncio.run(plug_ctrl.set_state("water_heater", False))
 

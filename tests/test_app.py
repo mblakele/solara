@@ -1064,8 +1064,7 @@ class TestIndexEndpointPerSecondData(unittest.TestCase):
             "First sample should be 230 (last 300 of the merged 530)")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestLagRecalculation(unittest.TestCase):
     """Tests that lag is recalculated per request, not frozen by cache."""
 
     def setUp(self):

@@ -2251,13 +2251,13 @@ class LoadManager:
         """
         if self.tesla_ctrl is not None:
             try:
-                asyncio.run(self.tesla_ctrl.close())
+                asyncio.run(asyncio.wait_for(self.tesla_ctrl.close(), timeout=10))
             except Exception as e:
                 logger.warning("Failed to close Tesla controller: %s", e)
 
         if self.telegram_sender is not None:
             try:
-                asyncio.run(self.telegram_sender.close())
+                asyncio.run(asyncio.wait_for(self.telegram_sender.close(), timeout=10))
             except Exception as e:
                 logger.warning("Failed to close TelegramSender: %s", e)
 

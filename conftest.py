@@ -9,16 +9,14 @@ import device_config
 
 def _close_all_aiohttp_sessions():
     """Find and close all lingering aiohttp ClientSessions."""
+    import asyncio
     import aiohttp.client
 
     for obj in gc.get_objects():
         try:
             if isinstance(obj, aiohttp.client.ClientSession) and not obj.closed:
-                # Close synchronously by running the async close in a new event loop
-                import asyncio
-
                 loop = asyncio.new_event_loop()
-                loop.run_until_complete(obj.close())
+                loop.run_until_complete(asyncio.wait_for(obj.close(), timeout=5))
                 loop.close()
         except Exception:
             pass

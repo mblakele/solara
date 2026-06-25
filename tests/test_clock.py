@@ -138,33 +138,23 @@ class TestEnergyCacheClockInjection:
         cache = EnergyCache()
         assert isinstance(cache._clock, RealClock)
 
-    def test_clock_used_through_merge(self):
-        """EnergyCache must use the injected clock for merge timing."""
-        from energy_cache import EnergyCache, EnergyCacheData
+    def test_clock_used_through_update(self):
+        """EnergyCache must use the injected clock for update timing."""
+        from energy_cache import EnergyCache
 
         clock = FakeClock(self.FIXED)
         cache = EnergyCache(clock=clock)
 
-        # Populate with initial samples via _merge_samples (full-fetch path)
-        existing = EnergyCacheData(
-            samples=[],
-            data_start=None,
-            last_sample_at=None,
-            last_fetch_at=None,
-            sample_count=None,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        data = cache._merge_samples(
-            existing=existing,
+        # Populate with initial samples via _update_qh
+        data_start = self.FIXED.replace(minute=0, second=0, microsecond=0)
+        cache._update_qh(
             new_samples=[0.001] * 100,
-            result_data_start=self.FIXED - timedelta(seconds=100),
+            result_data_start=data_start,
             now=clock.now(),
         )
-        assert data is not None
+        assert cache._data is not None
         # last_fetch_at should be the clock's now
-        assert data.last_fetch_at == self.FIXED
+        assert cache._data.last_fetch_at == self.FIXED
 
 
 class TestMetricsClockInjection:

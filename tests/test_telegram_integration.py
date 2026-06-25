@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from energy_cache import EnergyCache
+from energy_cache import EnergyCache, EnergyCacheData
 from load_controllers import PlugConfig, PlugController, TeslaController
 from load_manager import LoadManager, LoadManagerConfig
 from load_models import PendingEffect, TeslaConfig
@@ -41,11 +41,13 @@ def _make_energy_cache(predicted_wh: float = -2000.0, now: datetime | None = Non
     cache = EnergyCache(ttl_seconds=30)
     samples = [sample_value] * sample_count
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = data_start
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = sample_count
-        cache._last_fetch_at = now - timedelta(seconds=0)
+        cache._data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=now - timedelta(seconds=1),
+            last_fetch_at=now,
+            sample_count=sample_count,
+        )
     return cache
 
 

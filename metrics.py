@@ -121,8 +121,7 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
     # First call: fetch up to four QH periods.
     # Subsequent calls: fetch incremental data from the last sample timestamp.
     logger.debug(
-        "create_metrics: len %d, last_sample_at %s",
-        len(energy_cache._samples or []),
+        "create_metrics: last_sample_at %s",
         energy_cache.last_sample_at
     )
     try:
@@ -804,45 +803,27 @@ class HourlyProjection(MetricsBase):
         Returns:
             DeviceMetrics instance with all derived fields.
         """
-        pop_data_start = pop_result.nbc_data_start
         energy_cache = self.energy_cache
 
         def _maybe_merge_with_cache(raw_data: list[float] | None) -> list[float]:
-            """Merge raw incremental data with cached samples when available.
+            """Return raw API data unchanged.
 
-            When the cache holds a previous fetch (e.g. a full hour) and the
-            API returns only an incremental delta (~60 samples), this produces
-            a complete, gapless time series by appending the delta to the
-            cached data.
+            Previously this merged incremental data with cached samples, but
+            the QH-block storage model makes that unnecessary — the full
+            chart window is fetched fresh each time by create_metrics().
 
             Args:
-                raw_data: Per-second data from the API (incremental delta).
+                raw_data: Per-second data from the API.
 
             Returns:
-                Merged data list, or the original input when no cache is
-                available or merge yields nothing.
+                The original input, or empty list if None.
             """
             if raw_data is None:
-                return raw_data or []
-            if energy_cache is None or energy_cache._data is None:
-                return raw_data
-            merged = energy_cache.merge_incremental(
-                energy_cache._data,
-                raw_data,
-                pop_data_start,
-            )
-            if merged is not None and merged.samples is not None:
-                return merged.samples
+                return []
             return raw_data
 
         nbc_seconds = _maybe_merge_with_cache(pop_result.nbc_seconds)
-        # Use raw API samples for per_second_data so that the EnergyCache
-        # re-ingests only genuinely new points.  _maybe_merge_with_cache
-        # returns the full merged cache (old + new), which EnergyCache then
-        # re-extracts and mis-labels with the incremental data_start.  That
-        # mismatch inflates merged_last_sample_at into the future, which
-        # causes the next call to send start > end to the Emporia API (400).
-        # NBC still uses nbc_seconds (merged) for prediction accuracy.
+        # Use raw API samples for per_second_data.
         per_second_data = list(pop_result.per_second_data) if pop_result.per_second_data is not None else []
 
         # Determine the prediction window from quantization data, if available.
