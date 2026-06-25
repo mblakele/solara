@@ -840,6 +840,22 @@ class HourlyProjection(MetricsBase):
 
         nbc_result = self._compute_nbc(nbc_seconds, prediction_window_seconds)
 
+        # Backfill missing QH2-QH4 from frozen QH blocks in the EnergyCache.
+        # When only the current QH is fetched (incremental mode), _compute_nbc
+        # produces QH1 only.  Frozen blocks hold pre-computed NBC for completed
+        # quarters, so we graft them in to restore the full NBCQuarterSet.
+        if energy_cache is not None and energy_cache.data is not None:
+            frozen = energy_cache.data.frozen_qhs
+            if frozen:
+                sorted_frozen = sorted(frozen, key=lambda fq: fq.data_start, reverse=True)
+                qh2 = nbc_result.qh2 or (sorted_frozen[0].nbc_result if len(sorted_frozen) > 0 else None)
+                qh3 = nbc_result.qh3 or (sorted_frozen[1].nbc_result if len(sorted_frozen) > 1 else None)
+                qh4 = nbc_result.qh4 or (sorted_frozen[2].nbc_result if len(sorted_frozen) > 2 else None)
+                if qh2 is not nbc_result.qh2 or qh3 is not nbc_result.qh3 or qh4 is not nbc_result.qh4:
+                    nbc_result = NBCQuarterSet(
+                        qh1=nbc_result.qh1, qh2=qh2, qh3=qh3, qh4=qh4,
+                    )
+
         return DeviceMetrics(
             gid=vdi.device_gid,
             name=vdi.device_name,

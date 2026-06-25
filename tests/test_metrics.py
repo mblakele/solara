@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import requests
-from energy_cache import EnergyCache, EnergyCacheData
+from energy_cache import CurrentQH, EnergyCache, EnergyCacheData, FrozenQH
 from metrics import (
     DevicePrediction,
     HourlyProjection,
@@ -1908,5 +1908,213 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
         )
 
 
+class TestFrozenQHBackfill(unittest.TestCase):
+    """Tests for backfilling QH2-QH4 from frozen QH blocks in EnergyCache."""
+
+    def setUp(self):
+        self._p1 = patch.object(MetricsBase, "vue_init")
+        self._p2 = patch.object(MetricsBase, "get_device_info")
+        self._p1.start()
+        self._p2.start()
+
+    def tearDown(self):
+        self._p1.stop()
+        self._p2.stop()
+
+    def _make_cache_with_frozen(
+        self,
+        current_samples: list[float],
+        current_data_start: datetime,
+        frozen_qhs: list[FrozenQH],
+    ) -> EnergyCache:
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            current_qh=CurrentQH(data_start=current_data_start, samples=current_samples),
+            frozen_qhs=frozen_qhs,
+            last_fetch_at=current_data_start,
+            quantization_seconds=None,
+            quantization_confidence=None,
+        )
+        return cache
+
+    def test_frozen_qhs_backfill_missing_qh2_qh4(self):
+        """QH2-QH4 should be populated from frozen blocks when _compute_nbc only has QH1 data."""
+        from util import NBCQuarter
+
+        now = datetime(2025, 6, 15, 14, 50, 0, tzinfo=timezone.utc)
+        # Only 300 samples in current QH (5 minutes) → _compute_nbc gives only QH1
+        current_samples = [0.001] * 300
+        qh1_start = datetime(2025, 6, 15, 14, 45, 0, tzinfo=timezone.utc)
+
+        frozen = [
+            FrozenQH(
+                data_start=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+                nbc_result=NBCQuarter(complete=True, raw_wh=-100.0, wh=0),
+            ),
+            FrozenQH(
+                data_start=datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc),
+                nbc_result=NBCQuarter(complete=True, raw_wh=-200.0, wh=0),
+            ),
+            FrozenQH(
+                data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+                nbc_result=NBCQuarter(complete=True, raw_wh=-300.0, wh=0),
+            ),
+        ]
+
+        cache = self._make_cache_with_frozen(current_samples, qh1_start, frozen)
+
+        hp = HourlyProjection(
+            instant=now,
+            logger_next=logging.getLogger("test"),
+            energy_cache=cache,
+        )
+
+        pop_result = _PopulationResult(
+            per_second_data=current_samples,
+            chart_data=[],
+            nbc_seconds=current_samples,
+            nbc_data_start=qh1_start,
+            nbc_sample_count=300,
+        )
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        nbc = hp._compute_device_metrics(mock_vdi, pop_result, pred_result).nbc
+
+        # QH1 from _compute_nbc (incomplete, 300 samples)
+        self.assertIsNotNone(nbc.qh1)
+        self.assertFalse(nbc.qh1.complete)
+        self.assertEqual(nbc.qh1.samples_used, 300)
+
+        # QH2-QH4 backfilled from frozen blocks (most recent frozen = QH2)
+        self.assertIsNotNone(nbc.qh2)
+        self.assertTrue(nbc.qh2.complete)
+        self.assertEqual(nbc.qh2.raw_wh, -100.0)
+
+        self.assertIsNotNone(nbc.qh3)
+        self.assertTrue(nbc.qh3.complete)
+        self.assertEqual(nbc.qh3.raw_wh, -200.0)
+
+        self.assertIsNotNone(nbc.qh4)
+        self.assertTrue(nbc.qh4.complete)
+        self.assertEqual(nbc.qh4.raw_wh, -300.0)
+
+    def test_no_frozen_qhs_leaves_qh2_qh4_none(self):
+        """Without frozen blocks, QH2-QH4 should remain None."""
+        now = datetime(2025, 6, 15, 14, 50, 0, tzinfo=timezone.utc)
+        current_samples = [0.001] * 300
+        qh1_start = datetime(2025, 6, 15, 14, 45, 0, tzinfo=timezone.utc)
+
+        cache = self._make_cache_with_frozen(current_samples, qh1_start, frozen_qhs=[])
+
+        hp = HourlyProjection(
+            instant=now,
+            logger_next=logging.getLogger("test"),
+            energy_cache=cache,
+        )
+
+        pop_result = _PopulationResult(
+            per_second_data=current_samples,
+            chart_data=[],
+            nbc_seconds=current_samples,
+            nbc_data_start=qh1_start,
+            nbc_sample_count=300,
+        )
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        nbc = hp._compute_device_metrics(mock_vdi, pop_result, pred_result).nbc
+
+        self.assertIsNotNone(nbc.qh1)
+        self.assertIsNone(nbc.qh2)
+        self.assertIsNone(nbc.qh3)
+        self.assertIsNone(nbc.qh4)
+
+    def test_incremental_fetch_preserves_completed_qh_periods(self):
+        """First fetch gets all QHs; incremental fetch should preserve QH2-QH4 via frozen blocks."""
+        from util import NBCQuarter
+
+        # Simulate: first fetch populated all QHs and froze QH2-QH4.
+        # Now an incremental fetch only has QH1 data (300 samples).
+        qh1_start = datetime(2025, 6, 15, 14, 45, 0, tzinfo=timezone.utc)
+        current_samples = [0.001] * 300
+        frozen = [
+            FrozenQH(
+                data_start=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+                nbc_result=NBCQuarter(complete=True, raw_wh=-50.0, wh=0),
+            ),
+            FrozenQH(
+                data_start=datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc),
+                nbc_result=NBCQuarter(complete=True, raw_wh=-75.0, wh=0),
+            ),
+            FrozenQH(
+                data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+                nbc_result=NBCQuarter(complete=True, raw_wh=-125.0, wh=0),
+            ),
+        ]
+
+        cache = self._make_cache_with_frozen(current_samples, qh1_start, frozen)
+
+        hp = HourlyProjection(
+            instant=datetime(2025, 6, 15, 14, 50, 0, tzinfo=timezone.utc),
+            logger_next=logging.getLogger("test"),
+            energy_cache=cache,
+        )
+
+        pop_result = _PopulationResult(
+            per_second_data=current_samples,
+            chart_data=[],
+            nbc_seconds=current_samples,
+            nbc_data_start=qh1_start,
+            nbc_sample_count=300,
+        )
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        nbc = hp._compute_device_metrics(mock_vdi, pop_result, pred_result).nbc
+
+        # All four QHs should be populated
+        self.assertIsNotNone(nbc.qh1, "QH1 should be present (from _compute_nbc)")
+        self.assertIsNotNone(nbc.qh2, "QH2 should be backfilled from frozen block")
+        self.assertIsNotNone(nbc.qh3, "QH3 should be backfilled from frozen block")
+        self.assertIsNotNone(nbc.qh4, "QH4 should be backfilled from frozen block")
+
+        # Verify the frozen data was used (not recomputed)
+        self.assertEqual(nbc.qh2.raw_wh, -50.0)
+        self.assertEqual(nbc.qh3.raw_wh, -75.0)
+        self.assertEqual(nbc.qh4.raw_wh, -125.0)
 
 
