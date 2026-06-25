@@ -848,9 +848,12 @@ class HourlyProjection(MetricsBase):
             frozen = energy_cache.data.frozen_qhs
             if frozen:
                 sorted_frozen = sorted(frozen, key=lambda fq: fq.data_start, reverse=True)
-                qh2 = nbc_result.qh2 or (sorted_frozen[0].nbc_result if len(sorted_frozen) > 0 else None)
-                qh3 = nbc_result.qh3 or (sorted_frozen[1].nbc_result if len(sorted_frozen) > 1 else None)
-                qh4 = nbc_result.qh4 or (sorted_frozen[2].nbc_result if len(sorted_frozen) > 2 else None)
+                # Always use frozen blocks for QH2-QH4 — _compute_nbc may
+                # produce incorrect or incomplete results for these quarters
+                # when the fetched data spans a QH boundary.
+                qh2 = sorted_frozen[0].nbc_result if len(sorted_frozen) > 0 else nbc_result.qh2
+                qh3 = sorted_frozen[1].nbc_result if len(sorted_frozen) > 1 else nbc_result.qh3
+                qh4 = sorted_frozen[2].nbc_result if len(sorted_frozen) > 2 else nbc_result.qh4
                 if qh2 is not nbc_result.qh2 or qh3 is not nbc_result.qh3 or qh4 is not nbc_result.qh4:
                     nbc_result = NBCQuarterSet(
                         qh1=nbc_result.qh1, qh2=qh2, qh3=qh3, qh4=qh4,

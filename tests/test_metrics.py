@@ -2117,4 +2117,71 @@ class TestFrozenQHBackfill(unittest.TestCase):
         self.assertEqual(nbc.qh3.raw_wh, -75.0)
         self.assertEqual(nbc.qh4.raw_wh, -125.0)
 
+    def test_incomplete_qh2_from_compute_nbc_replaced_by_frozen(self):
+        """When _compute_nbc produces an incomplete QH2, frozen block must override.
+
+        This reproduces the production bug where data spanning a QH boundary
+        causes _compute_nbc to produce an incomplete QH2 (complete=False,
+        samples_used=572).  The frozen block (complete=True) must replace it.
+        """
+        from util import NBCQuarter
+
+        now = datetime(2025, 6, 15, 14, 58, 0, tzinfo=timezone.utc)
+        # Simulate: 1382 samples spanning two QHs → _compute_nbc gives
+        # QH1(482 samples, incomplete) and QH2(900 samples, complete).
+        # But we simulate the buggy case: data_start is misaligned so
+        # _compute_nbc produces QH1(810) and QH2(572, incomplete).
+        # Use 1382 samples to trigger the split:
+        current_samples = [0.001] * 1382
+        qh1_start = datetime(2025, 6, 15, 14, 45, 0, tzinfo=timezone.utc)
+
+        frozen = [
+            FrozenQH(
+                data_start=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+                nbc_result=NBCQuarter(complete=True, raw_wh=-100.0, wh=0),
+            ),
+        ]
+
+        cache = self._make_cache_with_frozen(current_samples, qh1_start, frozen)
+
+        hp = HourlyProjection(
+            instant=now,
+            logger_next=logging.getLogger("test"),
+            energy_cache=cache,
+        )
+
+        pop_result = _PopulationResult(
+            per_second_data=current_samples,
+            chart_data=[],
+            nbc_seconds=current_samples,
+            nbc_data_start=qh1_start,
+            nbc_sample_count=1382,
+        )
+        pred_result = DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+        )
+
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+
+        nbc = hp._compute_device_metrics(mock_vdi, pop_result, pred_result).nbc
+
+        # QH1 from _compute_nbc (the only quarter it should control)
+        self.assertIsNotNone(nbc.qh1)
+        self.assertFalse(nbc.qh1.complete)
+
+        # QH2 must come from the frozen block, NOT from _compute_nbc.
+        # The frozen block has complete=True, raw_wh=-100.0.
+        # If the bug exists, nbc.qh2 would be the incomplete result from
+        # _compute_nbc (complete=False, different raw_wh).
+        self.assertIsNotNone(nbc.qh2)
+        self.assertTrue(nbc.qh2.complete, "QH2 must be complete (from frozen block)")
+        self.assertEqual(nbc.qh2.raw_wh, -100.0, "QH2 must use frozen block data")
 
