@@ -280,14 +280,16 @@ class EnergyCache:
         current = self._data.current_qh
 
         # If current QH is from a different window, finalize it first.
-        # Only freeze when the QH has a full 900 samples — partial QHs
-        # at boundary crossings are discarded (the next fetch will
-        # re-request from the QH boundary and rebuild correctly).
+        # Freeze whatever samples we have — partial QHs get complete=False
+        # so callers know the data is incomplete.  The next fetch starts
+        # from the NEW QH boundary, so discarding would lose this data.
         if current is not None and current.data_start != self._qh_boundaries(data_start)[0]:
             if len(current.samples) >= 900:
                 nbc = compute_nbc_quarter(current.samples[:900])
-                if nbc is not None:
-                    frozen.append(FrozenQH(data_start=current.data_start, nbc_result=nbc))
+            else:
+                nbc = compute_nbc_quarter(current.samples)
+            if nbc is not None:
+                frozen.append(FrozenQH(data_start=current.data_start, nbc_result=nbc))
             current = None
 
         # Process all new samples, splitting at QH boundaries.

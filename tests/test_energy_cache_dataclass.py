@@ -266,9 +266,9 @@ class TestQHUpdateLogic:
         """Partial QH frozen at boundary crossing produces corrupt NBC.
 
         When the current QH has fewer than 900 samples and a boundary is
-        crossed, the old code froze it with compute_nbc_quarter(partial),
-        producing complete=False with extrapolated raw_wh.  This test
-        verifies the partial QH is discarded, not frozen.
+        crossed, the partial QH is frozen with complete=False.  This
+        prevents data loss since the next fetch starts from the new QH
+        boundary and never re-requests the old one.
         """
         cache = EnergyCache(ttl_seconds=30)
         qh1_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
@@ -285,12 +285,14 @@ class TestQHUpdateLogic:
         cache._update_qh([0.002] * 100, qh2_start, now)
 
         assert cache._data is not None
-        # The partial 691-sample QH must NOT be in frozen_qhs
+        # The partial 691-sample QH IS frozen (complete=False)
         frozen_starts = [fq.data_start for fq in (cache._data.frozen_qhs or [])]
-        assert qh1_start not in frozen_starts, (
-            f"Partial QH at {qh1_start} was frozen — should be discarded. "
+        assert qh1_start in frozen_starts, (
+            f"Partial QH at {qh1_start} was discarded — should be frozen. "
             f"frozen_qhs starts: {frozen_starts}"
         )
+        qh1_frozen = [fq for fq in cache._data.frozen_qhs if fq.data_start == qh1_start]
+        assert qh1_frozen[0].nbc_result.complete is False
         # Current QH should be QH2 with 100 samples
         assert cache._data.current_qh is not None
         assert cache._data.current_qh.data_start == qh2_start
@@ -810,6 +812,62 @@ class TestUpdateQhOverlapDetection:
         assert cache._data.current_qh is not None
         assert cache._data.current_qh.data_start == qh_start
         assert cache._data.current_qh.data_start != next_qh
+
+
+class TestPartialQhFreezeAtBoundary:
+    """Partial QHs must be frozen at boundary crossings, not discarded.
+
+    When a boundary crossing is detected and the departing QH has < 900
+    samples, it should still be frozen. The next fetch starts from the NEW
+    QH boundary, so the old partial data would be lost forever otherwise.
+    """
+
+    def test_partial_qh_frozen_at_boundary(self) -> None:
+        """841-sample QH is frozen (complete=False) when boundary is crossed."""
+        cache = EnergyCache(ttl_seconds=30)
+        qh1_start = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        qh2_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 15, 10, tzinfo=timezone.utc)
+
+        # 841 samples in QH1 (partial — only 900 would be full)
+        cache._update_qh([0.001] * 841, qh1_start, now)
+        assert cache._data is not None
+        assert cache._data.current_qh is not None
+        assert len(cache._data.current_qh.samples) == 841
+
+        # New data in QH2 — triggers boundary crossing
+        cache._update_qh([0.002] * 30, qh2_start, now)
+
+        assert cache._data is not None
+        # The partial 841-sample QH MUST be in frozen_qhs
+        frozen_starts = [fq.data_start for fq in (cache._data.frozen_qhs or [])]
+        assert qh1_start in frozen_starts, (
+            f"Partial QH at {qh1_start} was discarded — should be frozen. "
+            f"frozen_qhs starts: {frozen_starts}"
+        )
+        # The frozen QH should have complete=False
+        qh1_frozen = [fq for fq in cache._data.frozen_qhs if fq.data_start == qh1_start]
+        assert len(qh1_frozen) == 1
+        assert qh1_frozen[0].nbc_result.complete is False
+        # Current QH should be QH2 with 30 samples
+        assert cache._data.current_qh is not None
+        assert cache._data.current_qh.data_start == qh2_start
+        assert len(cache._data.current_qh.samples) == 30
+
+    def test_full_qh_still_frozen_at_boundary(self) -> None:
+        """900-sample QH is still frozen (complete=True) at boundary."""
+        cache = EnergyCache(ttl_seconds=30)
+        qh1_start = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        qh2_start = datetime(2025, 6, 15, 12, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 15, 10, tzinfo=timezone.utc)
+
+        cache._update_qh([0.001] * 900, qh1_start, now)
+        cache._update_qh([0.002] * 30, qh2_start, now)
+
+        assert cache._data is not None
+        qh1_frozen = [fq for fq in cache._data.frozen_qhs if fq.data_start == qh1_start]
+        assert len(qh1_frozen) == 1
+        assert qh1_frozen[0].nbc_result.complete is True
 
 
 class TestCacheHitReturnsFullMetrics:
