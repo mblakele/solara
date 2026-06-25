@@ -403,8 +403,11 @@ class TestEnergyCacheWrapper:
 
     def test_get_or_fetch_nested_device_data(self) -> None:
         """get_or_fetch populates samples from nested devices list."""
-        cache = EnergyCache(ttl_seconds=60)
-        now = datetime.now(timezone.utc)
+        from clock import FakeClock
+
+        # 600s into QH1 — 150 samples stay within the same QH
+        fixed_now = datetime(2026, 1, 1, 0, 10, 0, tzinfo=timezone.utc)
+        cache = EnergyCache(ttl_seconds=60, clock=FakeClock(fixed=fixed_now))
 
         def fetch_func() -> dict[str, Any] | None:
             return {
@@ -418,7 +421,7 @@ class TestEnergyCacheWrapper:
                 ],
             }
 
-        cache.get_or_fetch(fetch_func, now)
+        cache.get_or_fetch(fetch_func, fixed_now)
         assert cache.data is not None
         assert cache.data.current_qh is not None
         assert len(cache.data.current_qh.samples) == 150

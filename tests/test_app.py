@@ -992,14 +992,19 @@ class TestIndexEndpointPerSecondData(unittest.TestCase):
     def test_full_fetch_trims_to_300_samples(self):
         """After a full fetch with >300 samples, perSecondData is the last 300."""
         import app as app_mod
+        from clock import FakeClock
         from energy_cache import EnergyCache
 
-        now = datetime.now(timezone.utc)
-        data_start = now - timedelta(seconds=500)
-        samples_500 = list(range(500))
-        metrics_dict = self._make_metrics(samples_500, data_start, now)
+        # 600s into QH1 (0:00-0:15) — data_start = 100s into same QH
+        fixed_now = datetime(2026, 1, 1, 0, 10, 0, tzinfo=timezone.utc)
+        clock = FakeClock(fixed=fixed_now)
+        app_mod.set_clock(clock)
 
-        fresh_cache = EnergyCache(ttl_seconds=0)
+        data_start = fixed_now - timedelta(seconds=500)
+        samples_500 = list(range(500))
+        metrics_dict = self._make_metrics(samples_500, data_start, fixed_now)
+
+        fresh_cache = EnergyCache(ttl_seconds=0, clock=FakeClock(fixed_now))
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod, "_energy_cache", fresh_cache):
@@ -1022,17 +1027,22 @@ class TestIndexEndpointPerSecondData(unittest.TestCase):
         perSecondData contains 300 samples from the merged cache — not just
         the 30-sample delta."""
         import app as app_mod
+        from clock import FakeClock
         from energy_cache import EnergyCache
 
-        now = datetime.now(timezone.utc)
-        full_start = now - timedelta(seconds=500)
+        # 600s into QH1 (0:00-0:15) — all 530 samples stay within one QH
+        fixed_now = datetime(2026, 1, 1, 0, 10, 0, tzinfo=timezone.utc)
+        clock = FakeClock(fixed=fixed_now)
+        app_mod.set_clock(clock)
+
+        full_start = fixed_now - timedelta(seconds=500)
 
         full_samples = list(range(500))
-        full_metrics = self._make_metrics(full_samples, full_start, now)
+        full_metrics = self._make_metrics(full_samples, full_start, fixed_now)
 
         incr_start = full_start + timedelta(seconds=500)
         incr_samples = list(range(500, 530))
-        incr_metrics = self._make_metrics(incr_samples, incr_start, now)
+        incr_metrics = self._make_metrics(incr_samples, incr_start, fixed_now)
 
         fetch_count = 0
 
@@ -1041,7 +1051,7 @@ class TestIndexEndpointPerSecondData(unittest.TestCase):
             fetch_count += 1
             return full_metrics if fetch_count == 1 else incr_metrics
 
-        fresh_cache = EnergyCache(ttl_seconds=0)
+        fresh_cache = EnergyCache(ttl_seconds=0, clock=FakeClock(fixed_now))
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod, "_energy_cache", fresh_cache):

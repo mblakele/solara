@@ -31,6 +31,7 @@ from flask import (
 )
 from flask.typing import ResponseReturnValue
 
+from clock import Clock, RealClock
 from config import Config, _config, get_timezone
 
 from energy_cache import EnergyCache
@@ -57,6 +58,15 @@ app.register_blueprint(bp)
 
 # Application-level configuration injected into all consumers.
 _config = Config()
+
+# Module-level clock for deterministic time in tests.
+_clock: Clock = RealClock()
+
+
+def set_clock(clock: Clock) -> None:
+    """Set the module clock (for testing)."""
+    global _clock
+    _clock = clock
 
 
 def camelize(obj: object) -> object:
@@ -114,7 +124,7 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
         The enriched metrics dict (same object, modified in place).
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = _clock.now()
     fetched_at = metrics_data.get("_fetched_at")
     if fetched_at is not None:
         elapsed = (now - fetched_at).total_seconds()
@@ -287,7 +297,7 @@ def index() -> ResponseReturnValue:
     # Determine whether to use mock or real data
     is_mock = _config.is_mock_mode
 
-    now = datetime.now(timezone.utc)
+    now = _clock.now()
 
     if is_mock:
         # Mock mode: use MetricsMock for deterministic test data
