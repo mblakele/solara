@@ -127,11 +127,19 @@ def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
     best_s = _score(n)
 
     # Check N/2 (handles inflated mode).
+    # Only switch if N/2 has some representation in the run distribution —
+    # otherwise its higher purity is just an artifact of smaller windows
+    # dodging value changes rather than a genuine quantization period.
     if n > 2 and n % 2 == 0:
         n_half = n // 2
-        s_half = _score(n_half)
-        if best_s > 0 and s_half > best_s * 1.02:
-            best_n, best_s = n_half, s_half
+        n_half_runs = sum(
+            1 for _, _, rl in runs
+            if abs(rl - n_half) <= 1
+        )
+        if n_half_runs >= 1:
+            s_half = _score(n_half)
+            if best_s > 0 and s_half > best_s * 1.02:
+                best_n, best_s = n_half, s_half
 
     # Check multiples 2N, 3N, … up to 60 (handles shrunk mode).
     mult = 2
