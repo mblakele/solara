@@ -38,6 +38,6 @@ MIN_SLEEP_SECS: float = 5.0
 
 # ── Quantization ────────────────────────────────────────────────────
 
-QUANTIZATION_CONFIDENCE_THRESHOLD: float = 0.7
+QUANTIZATION_CONFIDENCE_THRESHOLD: float = 0.55
 """Minimum window-purity confidence to accept a detected quantization
 period for prediction-window selection and sleep alignment."""

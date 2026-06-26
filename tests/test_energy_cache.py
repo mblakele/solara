@@ -38,7 +38,7 @@ class TestEnergyCacheLowConfidenceLog:
         new_samples = [0.0] * 7 + [1.0] * 20 + [2.0] * 20 + [3.0] * 20
 
         from unittest.mock import patch
-        with patch("energy_cache.detect_quantization", return_value=(20, 0, 0.60)):
+        with patch("energy_cache.detect_quantization", return_value=(20, 0, 0.50)):
             with caplog.at_level("WARNING", logger="energy_cache"):
                 cache._merge_samples(empty, new_samples, data_start, now)
 
