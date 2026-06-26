@@ -15,10 +15,10 @@ class TestEnergyCacheLowConfidenceLog:
     """Tests for low-confidence quantization warning log."""
 
     def test_low_confidence_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """When detect_quantization returns confidence < 0.9, a warning is emitted.
+        """When detect_quantization returns confidence below the threshold, a warning is emitted.
 
-        Data: 7 preamble + 3 samples of 20 values each = 67 total.
-        Confidence = 60/67 ≈ 0.8955 < 0.9.
+        Mocks detect_quantization to return N=20, offset=0, confidence=0.60
+        which is below QUANTIZATION_CONFIDENCE_THRESHOLD (0.7).
         """
         cache = EnergyCache()
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
@@ -35,11 +35,12 @@ class TestEnergyCacheLowConfidenceLog:
             quantization_confidence=None,
         )
 
-        # Data that gives 60/67 ≈ 0.8955 confidence
         new_samples = [0.0] * 7 + [1.0] * 20 + [2.0] * 20 + [3.0] * 20
 
-        with caplog.at_level("WARNING", logger="energy_cache"):
-            cache._merge_samples(empty, new_samples, data_start, now)
+        from unittest.mock import patch
+        with patch("energy_cache.detect_quantization", return_value=(20, 0, 0.60)):
+            with caplog.at_level("WARNING", logger="energy_cache"):
+                cache._merge_samples(empty, new_samples, data_start, now)
 
         assert len(caplog.records) > 0
         assert any(
@@ -156,7 +157,7 @@ class TestGetCurrentQhQuantization:
         )
 
     def test_get_current_qh_falls_back_when_confidence_below_threshold(self):
-        """get_current_qh falls back to 60s window when confidence < 0.9.
+        """get_current_qh falls back to 60s window when confidence below threshold.
 
         Same samples as above, with quantization_seconds=30 but confidence=0.5.
         """

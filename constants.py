@@ -35,3 +35,9 @@ DEFAULT_SLEEP_HINT_SECS: float = 5.0
 
 MIN_SLEEP_SECS: float = 5.0
 """Minimum sleep duration (clamped in _calculate_adaptive_sleep)."""
+
+# ── Quantization ────────────────────────────────────────────────────
+
+QUANTIZATION_CONFIDENCE_THRESHOLD: float = 0.7
+"""Minimum window-purity confidence to accept a detected quantization
+period for prediction-window selection and sleep alignment."""

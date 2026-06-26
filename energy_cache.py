@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from clock import Clock, RealClock
-from constants import MIN_SLEEP_SECS
+from constants import MIN_SLEEP_SECS, QUANTIZATION_CONFIDENCE_THRESHOLD
 from quantization import detect_quantization
 from util import ceil_to_qh, compute_nbc_quarters, qh_seconds_remaining
 
@@ -561,7 +561,7 @@ class EnergyCache:
             logger.debug("EnergyCache quantization %s", quant_tuple)
             if quant_tuple is not None:
                 qs, qo, qc = quant_tuple
-                if qc < 0.9:
+                if qc < QUANTIZATION_CONFIDENCE_THRESHOLD:
                     logger.warning(
                         "Quantization detected (N=%d, offset=%d) with low confidence %.3f",
                         qs, qo, qc,
@@ -921,7 +921,7 @@ class EnergyCache:
         prediction_window_seconds: int | None = None
         qs = self._data.quantization_seconds
         qc = self._data.quantization_confidence
-        if qs is not None and qc is not None and qc >= 0.9:
+        if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
             prediction_window_seconds = qs
 
         nbc = compute_nbc_quarters(samples, prediction_window_seconds)
@@ -986,7 +986,7 @@ class EnergyCache:
         """
         if self._data is None:
             return interval_seconds
-        if self._data.quantization_confidence is None or self._data.quantization_confidence < 0.9:
+        if self._data.quantization_confidence is None or self._data.quantization_confidence < QUANTIZATION_CONFIDENCE_THRESHOLD:
             return interval_seconds
 
         # Early-exit: data older than 2× quantum → sleep minimum.

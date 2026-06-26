@@ -29,6 +29,7 @@ from clock import Clock, RealClock
 from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
     DEFAULT_SLEEP_HINT_SECS,
+    QUANTIZATION_CONFIDENCE_THRESHOLD,
     STALE_DATA_THRESHOLD_SECS,
 )
 
@@ -441,8 +442,9 @@ class LoadManager:
     def _resolve_prediction_window(self) -> int:
         """Return the prediction window in seconds, derived from EnergyCache quantization.
 
-        When the energy cache has high-confidence quantization data (>= 0.9),
-        returns ``quantization_seconds``. Otherwise falls back to 60 seconds
+        When the energy cache has quantization data with confidence at or
+        above ``QUANTIZATION_CONFIDENCE_THRESHOLD``, returns
+        ``quantization_seconds``.  Otherwise falls back to 60 seconds
         (the classic default pre-quantization prediction window).
 
         Safe to call before ``nbc_reader`` is initialized (returns 60), and
@@ -459,7 +461,7 @@ class LoadManager:
         if ec is not None and ec.data is not None:
             qs = ec.quantization_seconds
             qc = ec.quantization_confidence
-            if qs is not None and qc is not None and qc >= 0.9:
+            if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
                 return qs
         return 60
 

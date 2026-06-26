@@ -2682,7 +2682,7 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
         )
 
     def test_fallback_60s_when_confidence_below_threshold(self):
-        """QH1 falls back to 60s when quantization confidence < 0.9."""
+        """QH1 falls back to 60s when quantization confidence is below threshold."""
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         samples = [0.001] * 70 + [0.003] * 30
         cache = self._make_cache_with_quantization(

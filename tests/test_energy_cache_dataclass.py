@@ -603,7 +603,7 @@ class TestEnergyCacheWrapper:
         # Do not set quantization_seconds — it stays None
 
         result = cache.sleep_interval_adjust(30.0, now)
-        # Returns unchanged because quantization_confidence < 0.9 triggers early return
+        # Returns unchanged because quantization_confidence is None (below threshold)
         assert isinstance(result, float)
 
     def test_result_clamped_at_5_minimum(self) -> None:
