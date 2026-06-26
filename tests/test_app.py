@@ -1325,6 +1325,69 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         app_mod._last_error_type = None
         app_mod._telegram_sender = None
 
+    def test_disabled_cycle_skips_sleep_interval_adjust(self):
+        """When cycle is disabled, sleep_interval_adjust is skipped.
+
+        The loop should use result.sleep_hint directly (30s) instead of
+        calling sleep_interval_adjust which would clamp to 5s when cache
+        data is stale relative to the quantization period.
+        """
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+        from load_models import CycleResult, CycleDiagnostics
+
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        # Set up cache with stale data: last_sample_at is old enough that
+        # sleep_interval_adjust would return MIN_SLEEP_SECS (5.0).
+        app_mod._energy_cache._data = EnergyCacheData(
+            samples=[0.1] * 100,
+            data_start=base - timedelta(minutes=55),
+            last_sample_at=base - timedelta(minutes=50),
+            last_fetch_at=base - timedelta(minutes=50),
+            sample_count=100,
+            quantization_seconds=30,
+            quantization_offset=0,
+            quantization_confidence=0.9,
+        )
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.run_cycle.return_value = CycleResult(
+            status="disabled",
+            sleep_hint=30.0,
+            sleep_hint_at=base.isoformat(),
+            diagnostics=CycleDiagnostics(
+                gap_wh=None,
+                hysteresis_wh=3.0,
+                seconds_remaining=None,
+                data_point_at=None,
+                reason="[run_cycle] outside_time_range(06:30-20:30)",
+            ),
+        )
+        mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
+
+        app_mod._consecutive_error_count = 0
+        app_mod._last_error_type = None
+        app_mod._telegram_sender = None
+
+        captured_sleep_values: list[float] = []
+
+        def capture_sleep(secs: float) -> None:
+            captured_sleep_values.append(secs)
+            if len(captured_sleep_values) >= 2:
+                raise InterruptedError("stop")
+
+        with patch("app._get_load_manager", return_value=mock_lm):
+            with patch("app.time.sleep", side_effect=capture_sleep):
+                with self.assertRaises(InterruptedError):
+                    app_mod._load_management_loop()
+
+        assert captured_sleep_values[0] == 30.0, (
+            f"Expected 30.0 for disabled cycle, got {captured_sleep_values[0]}"
+        )
+
+        app_mod._consecutive_error_count = 0
+        app_mod._last_error_type = None
+
 
 if __name__ == "__main__":
     unittest.main()

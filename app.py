@@ -556,6 +556,7 @@ def _load_management_loop() -> None:
         _config.dry_run, _config.is_mock_mode, interval_secs_config
     )
     while True:
+        result = None
         try:
             lm = _get_load_manager()
             if lm is not None:
@@ -593,12 +594,16 @@ def _load_management_loop() -> None:
             if _consecutive_error_count == 1 or _consecutive_error_count % 10 == 0:
                 _send_error_alert(e)
         else:
-            interval_secs = result.sleep_hint
+            if result is not None:
+                interval_secs = result.sleep_hint
             _consecutive_error_count = 0
             _last_error_type = None
 
-        interval_secs_adjusted = _energy_cache.sleep_interval_adjust(
-            interval_secs, datetime.now(pytz.timezone(_config.timezone)))
+        if result is not None and result.status == "disabled":
+            interval_secs_adjusted: float = interval_secs
+        else:
+            interval_secs_adjusted = _energy_cache.sleep_interval_adjust(
+                interval_secs, datetime.now(pytz.timezone(_config.timezone)))
         logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
         time.sleep(interval_secs_adjusted)
 

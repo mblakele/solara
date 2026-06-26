@@ -34,7 +34,7 @@ DEFAULT_SLEEP_HINT_SECS: float = 5.0
 (e.g., stale_data, no_incomplete_qh)."""
 
 MIN_SLEEP_SECS: float = 5.0
-"""Minimum sleep duration (clamped in _calculate_adaptive_sleep)."""
+"""Minimum sleep duration used by EnergyCache.sleep_interval_adjust."""
 
 # ── Quantization ────────────────────────────────────────────────────
 
