@@ -28,6 +28,7 @@ import device_config
 from clock import Clock, RealClock
 from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
+    DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
     QUANTIZATION_CONFIDENCE_THRESHOLD,
     STALE_DATA_THRESHOLD_SECS,
@@ -447,7 +448,7 @@ class LoadManager:
         ``quantization_seconds``.  Otherwise falls back to 60 seconds
         (the classic default pre-quantization prediction window).
 
-        Safe to call before ``nbc_reader`` is initialized (returns 60), and
+        Safe to call before ``nbc_reader`` is initialized (returns default), and
         when ``nbc_reader`` is replaced with a mock that doesn't expose
         ``energy_cache``.
 
@@ -456,14 +457,14 @@ class LoadManager:
         """
         nbc = getattr(self, 'nbc_reader', None)
         if nbc is None:
-            return 60
+            return DEFAULT_PREDICTION_WINDOW_SECS
         ec = getattr(nbc, 'energy_cache', None)
         if ec is not None and ec.data is not None:
             qs = ec.quantization_seconds
             qc = ec.quantization_confidence
             if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
                 return qs
-        return 60
+        return DEFAULT_PREDICTION_WINDOW_SECS
 
     def is_enabled_at(self, now: datetime) -> bool:
         """Check if load management is enabled at the given moment.

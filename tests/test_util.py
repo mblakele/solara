@@ -65,7 +65,7 @@ class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
         and predicted_wh would be 120 + 840 * 3.0 = 2640 Wh — clearly wrong.
         """
         values = [0.001] * 30 + [0.003] * 30
-        result = compute_nbc_quarter(values)
+        result = compute_nbc_quarter(values, prediction_window_seconds=60)
 
         self.assertIsNotNone(result)
         self.assertFalse(result.complete)
@@ -141,11 +141,11 @@ class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
         self.assertAlmostEqual(result.prediction_w, expected_prediction_w, places=6)
         self.assertAlmostEqual(result.predicted_wh, expected_predicted_wh, places=6)
 
-    def test_default_prediction_window_60_when_none(self):
-        """With prediction_window_seconds=None, fall back to 60-second window.
+    def test_default_prediction_window_when_none(self):
+        """With prediction_window_seconds=None, fall back to the default window.
 
         Same data as test_prediction_capped_at_60_samples_when_more_available,
-        verifying the None default matches the existing hardcoded 60.
+        verifying the None default matches DEFAULT_PREDICTION_WINDOW_SECS.
         """
         values = [0.001] * 300 + [0.003] * 60
         result = compute_nbc_quarter(values, prediction_window_seconds=None)

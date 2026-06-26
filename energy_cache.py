@@ -586,13 +586,9 @@ class EnergyCache:
 
         # Incremental merge path.
         logger.debug(
-            "EnergyCache incremental_merge: %d old + %d new samples, "
-            "quantization_preserved (qs=%s, qo=%s, qc=%.3f)",
+            "EnergyCache incremental_merge: %d old + %d new samples",
             len(existing.samples),
             len(new_samples),
-            existing.quantization_seconds,
-            existing.quantization_offset,
-            existing.quantization_confidence if existing.quantization_confidence else 0,
         )
         merged_data = self.merge_incremental(
             existing,
@@ -603,6 +599,28 @@ class EnergyCache:
 
         if merged_data is None:
             return existing
+
+        # Re-detect quantization when enough new samples arrived.
+        # A single detection can be noisy; re-running each cycle lets the
+        # correct period emerge over time.
+        if len(new_samples) > 1:
+            quant_tuple = detect_quantization(merged_data.samples)
+            if quant_tuple is not None:
+                qs, qo, qc = quant_tuple
+                if qc < QUANTIZATION_CONFIDENCE_THRESHOLD:
+                    logger.warning(
+                        "Quantization re-detected (N=%d, offset=%d) "
+                        "with low confidence %.3f",
+                        qs, qo, qc,
+                    )
+                merged_data = replace(
+                    merged_data,
+                    quantization_seconds=qs,
+                    quantization_offset=qo,
+                    quantization_confidence=qc,
+                )
+            # If detect_quantization returns None, keep the preserved
+            # values from the previous cycle.
 
         # Prune old samples.
         merged_data = self._prune_old_samples(merged_data, now)

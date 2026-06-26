@@ -41,3 +41,7 @@ MIN_SLEEP_SECS: float = 5.0
 QUANTIZATION_CONFIDENCE_THRESHOLD: float = 0.55
 """Minimum window-purity confidence to accept a detected quantization
 period for prediction-window selection and sleep alignment."""
+
+DEFAULT_PREDICTION_WINDOW_SECS: int = 30
+"""Fallback prediction window in seconds when no quantization data is
+available (previously hardcoded as 60)."""

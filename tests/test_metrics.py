@@ -2664,8 +2664,8 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
             msg="Expected 2560 (30s window)",
         )
 
-    def test_fallback_60s_when_no_quantization(self):
-        """QH1 falls back to 60s prediction window when no quantization data."""
+    def test_fallback_30s_when_no_quantization(self):
+        """QH1 falls back to default prediction window when no quantization data."""
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         samples = [0.001] * 70 + [0.003] * 30
         cache = self._make_cache_with_quantization(
@@ -2675,14 +2675,14 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
 
         self.assertIsNotNone(nbc.qh1)
         self.assertFalse(nbc.qh1.complete)
-        # 60s window → predicted_wh = 1760
+        # 30s window → predicted_wh = 2560
         self.assertAlmostEqual(
-            nbc.qh1.predicted_wh, 1760.0, places=6,
-            msg="Expected 1760 (60s fallback)",
+            nbc.qh1.predicted_wh, 2560.0, places=6,
+            msg="Expected 2560 (30s fallback)",
         )
 
-    def test_fallback_60s_when_confidence_below_threshold(self):
-        """QH1 falls back to 60s when quantization confidence is below threshold."""
+    def test_fallback_when_confidence_below_threshold(self):
+        """QH1 falls back to default window when quantization confidence is below threshold."""
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         samples = [0.001] * 70 + [0.003] * 30
         cache = self._make_cache_with_quantization(
@@ -2692,23 +2692,23 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
 
         self.assertIsNotNone(nbc.qh1)
         self.assertFalse(nbc.qh1.complete)
-        # 60s window → predicted_wh = 1760
+        # 30s window → predicted_wh = 2560
         self.assertAlmostEqual(
-            nbc.qh1.predicted_wh, 1760.0, places=6,
-            msg="Expected 1760 (60s fallback due to low confidence)",
+            nbc.qh1.predicted_wh, 2560.0, places=6,
+            msg="Expected 2560 (30s fallback due to low confidence)",
         )
 
-    def test_fallback_60s_when_no_cache(self):
-        """QH1 falls back to 60s when energy_cache is None."""
+    def test_fallback_when_no_cache(self):
+        """QH1 falls back to default window when energy_cache is None."""
         samples = [0.001] * 70 + [0.003] * 30
         nbc = self._run_compute_device_metrics(None, samples)
 
         self.assertIsNotNone(nbc.qh1)
         self.assertFalse(nbc.qh1.complete)
-        # 60s window → predicted_wh = 1760
+        # 30s window → predicted_wh = 2560
         self.assertAlmostEqual(
-            nbc.qh1.predicted_wh, 1760.0, places=6,
-            msg="Expected 1760 (60s fallback, no cache)",
+            nbc.qh1.predicted_wh, 2560.0, places=6,
+            msg="Expected 2560 (30s fallback, no cache)",
         )
 
 

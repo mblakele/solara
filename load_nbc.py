@@ -16,6 +16,8 @@ from typing import Any
 
 from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
 
+from constants import DEFAULT_PREDICTION_WINDOW_SECS
+
 # Deferred import to avoid circular dependency with metrics module.
 _energy_cache_type: Any = None
 
@@ -399,7 +401,7 @@ class StateTracker:
         """
         return energy_wh * 3600.0 / (StateTracker.VOLTAGE * seconds)
 
-    def __init__(self, prediction_window_seconds: int = 60) -> None:
+    def __init__(self, prediction_window_seconds: int = DEFAULT_PREDICTION_WINDOW_SECS) -> None:
         self._pending_effect_min_secs = prediction_window_seconds
         self.devices: dict[str, DeviceState] = {}
         self.pending_effects: list[PendingEffect] = []

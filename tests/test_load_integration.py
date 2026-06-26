@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from constants import DEFAULT_PREDICTION_WINDOW_SECS
 from load_manager import (
     DeviceState,
     LoadManager,
@@ -853,18 +854,18 @@ def test_prune_old_effects_respects_minimum_age():
 
 def test_pending_since_count_uses_prediction_window():
     """pending_since_count uses prediction_window_seconds as the buffer."""
-    tracker = StateTracker(prediction_window_seconds=30)
+    tracker = StateTracker(prediction_window_seconds=DEFAULT_PREDICTION_WINDOW_SECS)
     base = datetime(2025, 1, 1, tzinfo=timezone.utc)
-    buf30 = timedelta(seconds=30)
+    buf = timedelta(seconds=DEFAULT_PREDICTION_WINDOW_SECS)
     tracker.pending_effects.extend([
-        # Exactly at the boundary (older than 30 s) → excluded by strict > check
+        # Exactly at the boundary (older than buffer) → excluded by strict > check
         PendingEffect(
             device_name="old", action="turn_on",
-            timestamp=base - buf30,
+            timestamp=base - buf,
             data_point_at=base - timedelta(seconds=40),
             power_watts=1000.0,
         ),
-        # Well within 30 s buffer → counted
+        # Well within buffer → counted
         PendingEffect(
             device_name="recent", action="turn_off",
             timestamp=base + timedelta(seconds=10),
@@ -877,9 +878,9 @@ def test_pending_since_count_uses_prediction_window():
 
 def test_prune_old_effects_uses_prediction_window():
     """prune_old_effects uses prediction_window_seconds as the age threshold."""
-    tracker = StateTracker(prediction_window_seconds=30)
+    tracker = StateTracker(prediction_window_seconds=DEFAULT_PREDICTION_WINDOW_SECS)
     base = datetime(2025, 1, 1, tzinfo=timezone.utc)
-    oldness = 31  # just past 30 s threshold
+    oldness = DEFAULT_PREDICTION_WINDOW_SECS + 1  # just past threshold
     tracker.pending_effects.extend([
         # Exceeds both age thresholds → pruned
         PendingEffect(
@@ -1604,13 +1605,13 @@ class TestAdaptiveSleep:
         assert hint == 20.0
 
     def test_waiting_for_fresh_data_clamped_to_prediction_window(self):
-        """When seconds_remaining exceeds prediction_window, sleep_hint is clamped to fallback 60."""
+        """When seconds_remaining exceeds prediction_window, sleep_hint is clamped to the default."""
         lm = self._make_manager(interval=30)
         result = self._make_cycle_result(
             status="waiting_for_fresh_data", seconds_remaining=120.0
         )
         hint = lm._calculate_adaptive_sleep(result)
-        assert hint == 60.0  # fallback prediction_window
+        assert hint == 30.0  # fallback prediction_window
 
     # --- Scenario 5: No deficit (predicted >= target) → longer sleep early in QH ---
 

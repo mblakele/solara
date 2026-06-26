@@ -166,7 +166,6 @@ def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
         for k in range(num_windows):
             window_start = offset + k * n
             window_end = window_start + n
-            # Check if the window is pure (all values equal, NaN==NaN).
             window_value = data[window_start]
             is_pure = True
             for j in range(window_start + 1, window_end):

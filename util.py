@@ -11,6 +11,8 @@ from flask.json.provider import DefaultJSONProvider
 
 from config import Config, _config
 
+from constants import DEFAULT_PREDICTION_WINDOW_SECS
+
 
 def get_timezone(config: Config | None = None) -> str:
     """Return the configured timezone, evaluated lazily for testability.
@@ -167,8 +169,8 @@ def compute_nbc_quarter(
         values: Up to 900 per-second kWh values for a single QH period.
         prediction_window_seconds: Number of trailing seconds to use for
             rate extrapolation when the quarter is incomplete. Defaults to
-            60 when ``None``. Caps at ``len(values)``. A value of 0 also
-            falls back to 60.
+            ``DEFAULT_PREDICTION_WINDOW_SECS`` when ``None``. Caps at
+            ``len(values)``. A value of 0 also falls back to the default.
     """
     if values is None:
         return None
@@ -184,7 +186,7 @@ def compute_nbc_quarter(
     wh = max(0, raw_wh)
 
     if not is_complete:
-        window = min(prediction_window_seconds or 60, values_len)
+        window = min(prediction_window_seconds or DEFAULT_PREDICTION_WINDOW_SECS, values_len)
         prediction_values = values[-window:]
         prediction_values_len = len(prediction_values)
         prediction_w = 1000 * sum(prediction_values) / prediction_values_len

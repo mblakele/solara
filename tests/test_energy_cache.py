@@ -135,8 +135,8 @@ class TestGetCurrentQhQuantization:
             f"Expected 2560 (30s window) but got {result['predicted_wh']}"
         )
 
-    def test_get_current_qh_falls_back_to_60_when_no_quantization(self):
-        """get_current_qh falls back to 60s window when no quantization data.
+    def test_get_current_qh_falls_back_when_no_quantization(self):
+        """get_current_qh falls back to default window when no quantization data.
 
         Same samples as test_get_current_qh_uses_quantization_window.
         """
@@ -151,13 +151,13 @@ class TestGetCurrentQhQuantization:
 
         assert result is not None
         assert result["qh_name"] == "QH1"
-        # 1760 from 60s window
-        assert result["predicted_wh"] == pytest.approx(1760.0, abs=0.01), (
+        # 2560 from 30s window
+        assert result["predicted_wh"] == pytest.approx(2560.0, abs=0.01), (
             f"Expected 1760 (60s window) but got {result['predicted_wh']}"
         )
 
     def test_get_current_qh_falls_back_when_confidence_below_threshold(self):
-        """get_current_qh falls back to 60s window when confidence below threshold.
+        """get_current_qh falls back to default window when confidence below threshold.
 
         Same samples as above, with quantization_seconds=30 but confidence=0.5.
         """
@@ -172,9 +172,9 @@ class TestGetCurrentQhQuantization:
 
         assert result is not None
         assert result["qh_name"] == "QH1"
-        # 1760 from 60s fallback (not 2560 from 30s window)
-        assert result["predicted_wh"] == pytest.approx(1760.0, abs=0.01), (
-            f"Expected 1760 (60s fallback) but got {result['predicted_wh']}"
+        # 2560 from 30s default (not 1760 from old 60s default)
+        assert result["predicted_wh"] == pytest.approx(2560.0, abs=0.01), (
+            f"Expected 2560 (30s default) but got {result['predicted_wh']}"
         )
 
     def test_get_current_qh_returns_none_when_no_data(self):

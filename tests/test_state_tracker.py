@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from constants import DEFAULT_PREDICTION_WINDOW_SECS
 from load_manager import (
     PlugConfig,
     DeviceState,
@@ -99,16 +100,16 @@ def test_has_pending_effect_since():
 
 
 def test_has_pending_effect_since_uses_buffer():
-    """has_pending_effect_since includes effects within the 60-second buffer
+    """has_pending_effect_since includes effects within the prediction-window buffer
     before the NBC timestamp."""
     tracker = StateTracker()
     nbc_ts = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-    # Effect timestamp is 30s before NBC timestamp — inside the 60s buffer.
+    # Effect timestamp is 15s before NBC timestamp — inside the 30s buffer.
     tracker.pending_effects.append(
         PendingEffect(
             device_name="plug",
             action="turn_on",
-            timestamp=nbc_ts - timedelta(seconds=30),
+            timestamp=nbc_ts - timedelta(seconds=15),
             data_point_at=nbc_ts - timedelta(seconds=60),
             power_watts=500.0,
         )
@@ -283,15 +284,15 @@ def test_prune_old_effects_boundary_not_pruned_early():
 
 
 def test_pending_since_count_uses_buffer():
-    """pending_since_count applies the 60-second buffer (no longer strict)."""
+    """pending_since_count applies the prediction-window buffer (no longer strict)."""
     tracker = StateTracker()
     nbc_ts = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-    # Effect timestamp is 30s before NBC timestamp — inside the 60s buffer.
+    # Effect timestamp is 15s before NBC timestamp — inside the 30s buffer.
     tracker.pending_effects.append(
         PendingEffect(
             device_name="plug",
             action="turn_on",
-            timestamp=nbc_ts - timedelta(seconds=30),
+            timestamp=nbc_ts - timedelta(seconds=15),
             data_point_at=nbc_ts - timedelta(seconds=60),
             power_watts=500.0,
         )
@@ -325,7 +326,7 @@ def test_has_pending_effect_since_checks_data_point_at():
             device_name="plug",
             action="turn_on",
             timestamp=nbc_ts - timedelta(seconds=90),
-            data_point_at=nbc_ts - timedelta(seconds=30),
+            data_point_at=nbc_ts - timedelta(seconds=15),
             power_watts=500.0,
         )
     )
@@ -349,7 +350,7 @@ def test_misleading_count_has_pending_but_count_is_zero():
         PendingEffect(
             device_name="jackery",
             action="turn_on",
-            timestamp=nbc_ts - timedelta(seconds=30),
+            timestamp=nbc_ts - timedelta(seconds=15),
             data_point_at=nbc_ts - timedelta(seconds=60),
             power_watts=270.0,
         )
@@ -555,9 +556,9 @@ class TestEffectiveSettleSecs:
     """Tests for StateTracker.effective_settle_secs."""
 
     def test_default_prediction_window(self) -> None:
-        """With default prediction_window_seconds=60, settle is 60."""
+        """With default prediction_window_seconds, settle matches the default."""
         tracker = StateTracker()
-        assert tracker.effective_settle_secs == 60
+        assert tracker.effective_settle_secs == DEFAULT_PREDICTION_WINDOW_SECS
 
     def test_custom_prediction_window_30(self) -> None:
         """With prediction_window_seconds=30, settle is 30."""
