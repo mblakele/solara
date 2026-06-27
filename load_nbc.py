@@ -1088,20 +1088,6 @@ class GapMinder:
                         name=name, last_toggle=ctx.now, desired_state=True
                     )
 
-            elif self._tesla_supports_amps(plug, ctx.tesla, ctx.requires_home_check) and ctx.tesla is not None and ctx.tesla.is_charging:
-                logger.debug(
-                    "[_decide_turn_on] %s: Tesla amps"
-                    "(capacity=%.1f Wh > gap %.1f Wh)",
-                    "tesla",
-                    capacity,
-                    remaining_gap,
-                )
-                tesla_action = self._decide_tesla_amps(ctx, remaining_gap)
-                if tesla_action:
-                    actions.append(tesla_action)
-                remaining_gap = 0
-                break
-
             else:
                 logger.debug(
                     "[_decide_turn_on] %s: too large "
@@ -1111,15 +1097,13 @@ class GapMinder:
                     remaining_gap,
                 )
 
-        if ctx.tesla and ctx.tesla.is_charging and remaining_gap > 0:
+        if remaining_gap > 0 and ctx.tesla is not None and ctx.tesla.is_charging:
             logger.debug(
                 "[_decide_turn_on] trying Tesla amps increase "
                 "for remaining %.1f Wh",
                 remaining_gap,
             )
-            tesla_action = self._decide_tesla_amps(
-                ctx, remaining_gap,
-            )
+            tesla_action = self._decide_tesla_amps(ctx, remaining_gap)
             if tesla_action:
                 actions.append(tesla_action)
 

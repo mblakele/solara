@@ -1623,3 +1623,110 @@ def test_decide_tesla_reduce_rounds_up_to_min_amps():
     assert actions[0].device_name == "tesla"
     assert actions[0].action == "set_amps"
     assert actions[0].target_amps == 5
+
+
+# --- _decide_turn_on Tesla fallback bug tests ---
+
+
+def test_tesla_eligible_but_no_action_loop_continues():
+    """When Tesla returns None (amps too low), remaining plugs are still tried.
+
+    Regression: previously remaining_gap was zeroed and loop broken even when
+    _decide_tesla_amps returned None, discarding the gap silently.
+    """
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "large": PlugConfig(
+            name="large",
+            accessory_id="a",
+            power_watts=8000.0,  # capacity = 666.7 Wh > 500 Wh gap → too large
+            priority=20,
+        ),
+        "small": PlugConfig(
+            name="small",
+            accessory_id="b",
+            power_watts=200.0,  # capacity = 16.7 Wh → fits in remaining gap
+            priority=10,
+        ),
+    }
+    # current_amps=1 < charge_amps_min=5 → _decide_tesla_amps returns None
+    tesla = TeslaState(
+        is_charging=True,
+        current_amps=1,
+        plugged_in=True,
+        at_home=True,
+    )
+
+    # gap = 500 Wh; large (666.7 Wh) doesn't fit, Tesla can't act, small (16.7 Wh) fits
+    actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
+        predicted_wh=-1000.0,
+        target_wh=-500.0,
+    )
+
+    # small plug should be turned on; tesla should produce no action
+    assert any(a.device_name == "small" for a in actions)
+    assert not any(a.device_name == "tesla" for a in actions)
+
+
+def test_tesla_clamps_to_max_residual_filled_by_smaller_plug():
+    """When Tesla can only absorb part of the gap, smaller plugs fill the rest.
+
+    Regression: previously remaining_gap was unconditionally zeroed even when
+    Tesla was clamped to charge_amps_max, discarding the residual.
+    """
+    engine = GapMinder(
+        hysteresis_wh=3,
+        charge_amps_max=24,
+    )
+    state = StateTracker()
+    plugs = {
+        "large": PlugConfig(
+            name="large",
+            accessory_id="a",
+            power_watts=8000.0,  # capacity = 666.7 Wh > 497 Wh gap → too large
+            priority=20,
+        ),
+        "small": PlugConfig(
+            name="small",
+            accessory_id="b",
+            power_watts=200.0,  # capacity = 16.7 Wh → fits in residual after Tesla
+            priority=10,
+        ),
+    }
+    # Tesla at 23A, max is 24 → can only increase by 1A
+    tesla = TeslaState(
+        is_charging=True,
+        current_amps=23,
+        plugged_in=True,
+        at_home=True,
+    )
+
+    # gap = 500 Wh; Tesla absorbs ~20 Wh (1A * 120V * 300s / 3600),
+    # small plug (16.7 Wh) fills some of the residual
+    actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=tesla,
+        ),
+        predicted_wh=-1000.0,
+        target_wh=-500.0,
+    )
+
+    # Both Tesla set_amps and small plug turn_on should be present
+    assert any(
+        a.device_name == "tesla" and a.action == "set_amps" for a in actions
+    )
+    assert any(
+        a.device_name == "small" and a.action == "turn_on" for a in actions
+    )
