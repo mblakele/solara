@@ -1485,14 +1485,6 @@ class GapMinder:
                 power_watts=-StateTracker.amps_to_watts(current_amps),
             )
 
-        if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
-            logger.debug(
-                "[_decide_tesla_reduce] skipped: too little time (%d s < %d s)",
-                ctx.seconds_remaining, self.MIN_SECONDS_TO_ACT,
-            )
-            return None
-
-        # TODO test for 3-4A threshold for stop?
         if abs(new_amps - current_amps) < self.TESLA_AMP_CHANGE_THRESHOLD:
             logger.debug(
                 "[_decide_tesla_reduce] skipped: change too small (%d - %d < %d)",
