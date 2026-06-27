@@ -431,8 +431,10 @@ def _build_load_management_payload() -> dict:
 
     Returns a dict with enabled flag, device states, pending effects,
     and the last cycle result. Returns an empty dict if LoadManager
-    is not initialized.
+    is not initialized or load management is disabled.
     """
+    if _config.load_manage_enabled is False:
+        return {}
     lm = _get_load_manager()
     if lm is None:
         return {}
@@ -786,7 +788,8 @@ atexit.register(_shutdown_load_manager)
 if "pytest" not in sys.modules:
     if _config.load_tesla_controller == "real":
         _start_mqtt_subscriber()
-    _start_load_manager_thread()
+    if _config.load_manage_enabled is not False:
+        _start_load_manager_thread()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
