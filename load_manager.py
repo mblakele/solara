@@ -621,49 +621,43 @@ class LoadManager:
             )
 
         # Commit succeeded effects to state
-        for effect in ctx.succeeded_effects:
-            self.state.pending_effects.append(effect)
-
-        # Track Tesla amp state and settle-window
         now_postfetch = ctx.now_postfetch
         assert now_postfetch is not None
         for effect in ctx.succeeded_effects:
-            if effect.device_name == "tesla":
-                if effect.action == "set_amps":
-                    prev_amps = self.state.last_commanded_amps
-                    new_amps = effect.target_amps
-                    self.state.last_commanded_amps = new_amps
-                    if new_amps is not None and (
-                        prev_amps is None or new_amps > prev_amps
-                    ):
-                        self.state.record_tesla_amp_increase(
-                            effect.timestamp, qh_name=ctx.qh_name,
-                            data_point_at=effect.data_point_at,
-                        )
-                        logger.debug(
-                            "Tesla amp increase recorded: %s → %d A "
-                            "(settle window starts)",
-                            prev_amps,
-                            new_amps,
-                        )
-                    elif (
-                        new_amps is not None
-                        and prev_amps is not None
-                        and new_amps < prev_amps
-                    ):
-                        self.state.record_tesla_amp_decrease(
-                            effect.timestamp, qh_name=ctx.qh_name,
-                            data_point_at=effect.data_point_at,
-                        )
-                        logger.debug(
-                            "Tesla amp decrease recorded: %s → %d A "
-                            "(post-decrease settle window starts)",
-                            prev_amps,
-                            new_amps,
-                        )
-                elif effect.action in ("turn_off", "turn_on"):
-                    self.state.last_commanded_amps = None
-                    self.state.clear_tesla_settle()
+            if effect.device_name == "tesla" and effect.action == "set_amps":
+                prev_amps = self.state.last_commanded_amps
+                new_amps = effect.target_amps
+                self.state.last_commanded_amps = new_amps
+                if new_amps is not None and (
+                    prev_amps is None or new_amps > prev_amps
+                ):
+                    effect.direction = "increase"
+                    effect.suppress_action = "turn_off"
+                    effect.qh_name = ctx.qh_name
+                    logger.debug(
+                        "Tesla amp increase recorded: %s → %d A "
+                        "(settle window starts)",
+                        prev_amps,
+                        new_amps,
+                    )
+                elif (
+                    new_amps is not None
+                    and prev_amps is not None
+                    and new_amps < prev_amps
+                ):
+                    effect.direction = "decrease"
+                    effect.suppress_action = "turn_on"
+                    effect.qh_name = ctx.qh_name
+                    logger.debug(
+                        "Tesla amp decrease recorded: %s → %d A "
+                        "(post-decrease settle window starts)",
+                        prev_amps,
+                        new_amps,
+                    )
+            elif effect.device_name == "tesla" and effect.action in ("turn_off", "turn_on"):
+                self.state.last_commanded_amps = None
+                self.state.clear_tesla_settle_effects()
+            self.state.pending_effects.append(effect)
 
         # Sync Tesla entry in devices from live vehicle state
         self.state.sync_tesla_device_state(ctx.tesla_state)
@@ -1733,14 +1727,18 @@ class LoadManager:
         # the window on a QH transition.
         settle_now = now
         # ── Post-increase: suppress turn-off ──
+        increase_eff = self.state.get_active_tesla_settle(
+            settle_now, current_qh=qh_name, data_point_at=data_point_at,
+            direction="increase",
+        )
         if (
             corrected_gap_wh < 0
             and abs(corrected_gap_wh) < self.engine.TESLA_SETTLE_SUPPRESS_WH
-            and self.state.is_settling_after_amp_increase(settle_now, current_qh=qh_name, data_point_at=data_point_at)
+            and increase_eff is not None
         ):
             settle_remaining = (
                 self.state.effective_settle_secs
-                - (settle_now - self.state.last_tesla_increase_at).total_seconds()  # type: ignore[operator]
+                - (settle_now - increase_eff.timestamp).total_seconds()
             )
             logger.info(
                 "[_cycle_async_phase] suppressing turn-off: settling after Tesla "
@@ -1759,14 +1757,18 @@ class LoadManager:
                 False,
             )
         # ── Post-decrease: suppress turn-on ──
+        decrease_eff = self.state.get_active_tesla_settle(
+            settle_now, current_qh=qh_name, data_point_at=data_point_at,
+            direction="decrease",
+        )
         if (
             corrected_gap_wh > 0
             and corrected_gap_wh < self.engine.TESLA_SETTLE_SUPPRESS_WH
-            and self.state.is_settling_after_amp_decrease(settle_now, current_qh=qh_name, data_point_at=data_point_at)
+            and decrease_eff is not None
         ):
             settle_remaining = (
                 self.state.effective_settle_secs
-                - (settle_now - self.state.last_tesla_decrease_at).total_seconds()  # type: ignore[operator]
+                - (settle_now - decrease_eff.timestamp).total_seconds()
             )
             logger.info(
                 "[_cycle_async_phase] suppressing turn-on: settling after Tesla "

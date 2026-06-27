@@ -408,25 +408,6 @@ class StateTracker:
         self.last_data_point_at: datetime | None = None
         self.last_nbc_predicted_wh: float | None = None
         self.last_commanded_amps: int | None = None
-        # Settle-window state: set when Tesla amps are increased so that the
-        # next few cycles don't over-react before the NBC prediction absorbs
-        # the new load.
-        self.last_tesla_increase_at: datetime | None = None
-        self.last_tesla_increase_qh: str | None = None
-        # Timestamp of the most recent Tesla command (turn_on/set_amps/turn_off).
-        # Used by tesla_inflight_wh to distinguish ramp-up (recent command)
-        # from stale state (old command) when the car reports 1A.
-        self.last_tesla_command_at: datetime | None = None
-        # Settle-window state for post-decrease: symmetric to increase settle,
-        # suppresses turn-ON decisions while the NBC prediction catches up to
-        # the reduced load.
-        self.last_tesla_decrease_at: datetime | None = None
-        self.last_tesla_decrease_qh: str | None = None
-        # data_point_at timestamps stored alongside wall-clock timestamps
-        # so that settle expiry considers API data staleness.
-        self.last_tesla_increase_data_point_at: datetime | None = None
-        self.last_tesla_decrease_data_point_at: datetime | None = None
-        self.last_tesla_command_data_point_at: datetime | None = None
         # Fleet-telemetry push callbacks replace REST reads of Tesla state.
         self.tesla_telemetry_state: TeslaVehicleTelemetry | None = None
         self.has_fresh_telemetry: bool = False
@@ -501,21 +482,22 @@ class StateTracker:
         if reported_amps == 0:
             self.last_commanded_amps = None
             return 0.0
+        latest_cmd = self._latest_tesla_command()
         # Car is at 1 A: gate the stale-clearing behind a recency check.
         # During ramp-up the car briefly reports 1A — treat as stale only
         # when the command was issued long enough ago that the car should
         # have reached a higher level by now.
         if reported_amps == 1:
-            if self.last_tesla_command_at is not None:
-                elapsed_wall = (resolve_now - self.last_tesla_command_at).total_seconds()
+            if latest_cmd is not None:
+                elapsed_wall = (resolve_now - latest_cmd.timestamp).total_seconds()
                 if elapsed_wall < self.effective_settle_secs:
                     # Recent command — car is ramping up, don't clear.
                     return 0.0
                 # Wall clock expired — check data-point-at age.
                 if (data_point_at is not None
-                        and self.last_tesla_command_data_point_at is not None):
+                        and latest_cmd.data_point_at is not None):
                     elapsed_data = (
-                        data_point_at - self.last_tesla_command_data_point_at
+                        data_point_at - latest_cmd.data_point_at
                     ).total_seconds()
                     if elapsed_data < self.effective_settle_secs:
                         return 0.0
@@ -529,14 +511,17 @@ class StateTracker:
         # After both settle windows expire, if the car still hasn't reached
         # the commanded level, treat the command as unsuccessful and clear
         # the stale state so it doesn't distort the gap forever.
-        # Only fires when at least one settle window was ever started — tests
-        # that set last_commanded_amps directly without record_tesla_amp_*
+        # Only fires when at least one settle effect was ever recorded — tests
+        # that set last_commanded_amps directly without pending effects
         # still compute the delta as expected.
-        has_settle = (self.last_tesla_increase_at is not None
-                      or self.last_tesla_decrease_at is not None)
+        has_settle = any(
+            eff.device_name == "tesla" and eff.action == "set_amps"
+            and eff.direction is not None
+            for eff in self.pending_effects
+        )
         if (has_settle
-                and not self.is_settling_after_amp_increase(resolve_now, data_point_at=data_point_at)
-                and not self.is_settling_after_amp_decrease(resolve_now, data_point_at=data_point_at)):
+                and not self.is_settling(resolve_now, data_point_at=data_point_at, direction="increase")
+                and not self.is_settling(resolve_now, data_point_at=data_point_at, direction="decrease")):
             logger.debug(
                 "[tesla_inflight_wh] settle expired — clearing stale last_commanded_amps=%d "
                 "(reported=%d)",
@@ -545,50 +530,6 @@ class StateTracker:
             self.last_commanded_amps = None
             return 0.0
         return StateTracker.delta_amps_to_wh(delta, seconds_remaining)
-
-    def record_tesla_amp_increase(
-        self, now: datetime, qh_name: str | None = None,
-        data_point_at: datetime | None = None,
-    ) -> None:
-        """Record that Tesla charge amps were just increased.
-
-        Called by LoadManager when a set_amps effect that raised amps succeeds.
-        Starts the settle window that suppresses premature turn-off reactions.
-
-        Args:
-            now: Timestamp of the amp increase command.
-            qh_name: Current QH name (e.g. "QH1").  Stored so that a QH
-                transition automatically invalidates the settle state — a
-                deficit at the start of a new quarter is a genuine signal.
-            data_point_at: The NBC data-point-at timestamp when the command
-                was recorded.  Stored alongside wall-clock ``now`` so that
-                settle expiry considers API data staleness.  ``None`` falls
-                back to wall-clock-only behaviour.
-        """
-        # Recording an increase clears any prior decrease settle state.
-        self.last_tesla_decrease_at = None
-        self.last_tesla_decrease_qh = None
-        self.last_tesla_decrease_data_point_at = None
-        self.last_tesla_increase_at = now
-        self.last_tesla_increase_qh = qh_name
-        self.last_tesla_increase_data_point_at = data_point_at
-        self.last_tesla_command_at = now
-        self.last_tesla_command_data_point_at = data_point_at
-
-    def clear_tesla_settle(self) -> None:
-        """Clear all settle state (both increase and decrease).
-
-        Called when Tesla charging is stopped via turn_off, which means the
-        system is already correcting; both settle windows are no longer
-        relevant.  Also called when a decrease occurs, since the increase
-        settle is cleared by ``record_tesla_amp_decrease`` directly.
-        """
-        self.last_tesla_increase_at = None
-        self.last_tesla_increase_qh = None
-        self.last_tesla_increase_data_point_at = None
-        self.last_tesla_decrease_at = None
-        self.last_tesla_decrease_qh = None
-        self.last_tesla_decrease_data_point_at = None
 
     def sync_tesla_device_state(
         self, tesla_state: TeslaState | None,
@@ -603,131 +544,123 @@ class StateTracker:
             tesla_state: Current Tesla vehicle state, or None if unavailable.
         """
         if tesla_state is not None:
+            latest_cmd = self._latest_tesla_command()
             self.devices["tesla"] = DeviceState(
                 name="tesla",
                 actual_state=tesla_state.is_charging,
                 current_amps=tesla_state.current_amps,
                 desired_state=self.last_commanded_amps is not None,
-                last_toggle=self.last_tesla_command_at,
+                last_toggle=latest_cmd.timestamp if latest_cmd else None,
             )
         else:
             self.devices.pop("tesla", None)
 
-    def is_settling_after_amp_increase(
+    def _latest_tesla_command(self) -> PendingEffect | None:
+        """Return the most recent Tesla effect (set_amps, turn_on, or turn_off).
+
+        Searches ``pending_effects`` in reverse order to find the newest
+        effect targeting the Tesla device. Used by ``tesla_inflight_wh()``
+        for 1A ramp-up detection and stale-command clearing.
+
+        Returns:
+            The most recent Tesla effect, or None if none exist.
+        """
+        for eff in reversed(self.pending_effects):
+            if eff.device_name == "tesla":
+                return eff
+        return None
+
+    def get_active_tesla_settle(
         self, now: datetime, current_qh: str | None = None,
         data_point_at: datetime | None = None,
+        direction: str = "increase",
+    ) -> PendingEffect | None:
+        """Return the active settle effect for the given direction, or None.
+
+        Like ``is_settling()`` but returns the effect itself so callers can
+        access its timestamp for logging or diagnostics.
+
+        Args:
+            now: Current wall-clock timestamp.
+            current_qh: Current QH name for QH-boundary expiry.
+            data_point_at: Current NBC data-point-at timestamp.
+            direction: "increase" or "decrease".
+
+        Returns:
+            The active settle effect, or None if no active settle exists.
+        """
+        for eff in reversed(self.pending_effects):
+            if (eff.device_name == "tesla" and eff.action == "set_amps"
+                    and eff.direction == direction):
+                if current_qh is not None and eff.qh_name != current_qh:
+                    return None
+                elapsed_wall = (now - eff.timestamp).total_seconds()
+                if elapsed_wall < self.effective_settle_secs:
+                    return eff
+                if (data_point_at is not None
+                        and eff.data_point_at is not None):
+                    elapsed_data = (
+                        data_point_at - eff.data_point_at
+                    ).total_seconds()
+                    if elapsed_data < self.effective_settle_secs:
+                        return eff
+                return None
+        return None
+
+    def is_settling(
+        self, now: datetime, current_qh: str | None = None,
+        data_point_at: datetime | None = None,
+        direction: str = "increase",
     ) -> bool:
-        """Return True if we are still in the post-amp-increase settle window.
+        """Return True if we are in the settle window for the given direction.
 
-        The settle window suppresses turn-off decisions for
-        ``effective_settle_secs`` after a Tesla amp increase so that the first
-        few post-confirmation cycles don't react to apparent deficits that are
-        mostly NBC prediction lag or solar variability rather than genuine
-        overshoot.
-
-        The window is automatically expired when the QH name changes, because
-        a new quarter-hour represents a fresh accounting period where even a
-        modest deficit is a real signal.
-
-        The window expires only when **both** the wall-clock elapsed time and
-        the data-point-at elapsed time exceed ``effective_settle_secs``.
-        This mirrors the dual-age pattern in ``has_pending_effect_since`` and
-        ``prune_old_effects`` — if either measure is still within the window,
-        the settle remains active.
+        Unified settle-window check that queries ``pending_effects`` instead
+        of dedicated attributes. Finds the most recent Tesla "set_amps" effect
+        with the matching ``direction`` and checks whether it is still active
+        using dual-age expiry (wall clock + data-point-at) and QH-boundary
+        expiry.
 
         Args:
             now: Current wall-clock timestamp.
             current_qh: Current QH name; if different from the QH in which the
-                increase was recorded, the window is treated as expired.
-            data_point_at: Current NBC data-point-at timestamp.  When provided,
+                effect was recorded, the window is treated as expired.
+            data_point_at: Current NBC data-point-at timestamp. When provided,
                 the data-point-at age is checked alongside wall-clock age.
-                ``None`` falls back to wall-clock-only behaviour.
+            direction: "increase" or "decrease" — which settle window to check.
 
         Returns:
-            True if turn-off decisions should be suppressed.
+            True if turn-off (increase) or turn-on (decrease) decisions should
+            be suppressed.
         """
-        if self.last_tesla_increase_at is None:
-            return False
-        if current_qh is not None and self.last_tesla_increase_qh != current_qh:
-            return False
-        elapsed_wall = (now - self.last_tesla_increase_at).total_seconds()
-        if elapsed_wall < self.effective_settle_secs:
-            return True
-        # Wall clock expired — check data-point-at age.
-        if data_point_at is not None and self.last_tesla_increase_data_point_at is not None:
-            elapsed_data = (data_point_at - self.last_tesla_increase_data_point_at).total_seconds()
-            if elapsed_data < self.effective_settle_secs:
-                return True
+        for eff in reversed(self.pending_effects):
+            if (eff.device_name == "tesla" and eff.action == "set_amps"
+                    and eff.direction == direction):
+                if current_qh is not None and eff.qh_name != current_qh:
+                    return False
+                elapsed_wall = (now - eff.timestamp).total_seconds()
+                if elapsed_wall < self.effective_settle_secs:
+                    return True
+                if (data_point_at is not None
+                        and eff.data_point_at is not None):
+                    elapsed_data = (
+                        data_point_at - eff.data_point_at
+                    ).total_seconds()
+                    if elapsed_data < self.effective_settle_secs:
+                        return True
+                return False
         return False
 
-    def record_tesla_amp_decrease(
-        self, now: datetime, qh_name: str | None = None,
-        data_point_at: datetime | None = None,
-    ) -> None:
-        """Record that Tesla charge amps were just decreased.
+    def clear_tesla_settle_effects(self) -> None:
+        """Remove Tesla set_amps effects from pending_effects.
 
-        Called by LoadManager when a set_amps effect that lowered amps succeeds.
-        Starts the settle window that suppresses premature turn-on reactions
-        while the NBC prediction catches up to the reduced load.
-
-        Args:
-            now: Timestamp of the amp decrease command.
-            qh_name: Current QH name.  Stored so that a QH transition
-                automatically expires the settle state.
-            data_point_at: The NBC data-point-at timestamp when the command
-                was recorded.  ``None`` falls back to wall-clock-only.
+        Called when Tesla charging is stopped or started via turn_on/turn_off,
+        which supersedes any prior amp-change effects. Only removes "set_amps"
+        effects — turn_on/turn_off effects are preserved.
         """
-        # Recording a decrease clears any prior increase settle state.
-        self.last_tesla_increase_at = None
-        self.last_tesla_increase_qh = None
-        self.last_tesla_increase_data_point_at = None
-        self.last_tesla_decrease_at = now
-        self.last_tesla_decrease_qh = qh_name
-        self.last_tesla_decrease_data_point_at = data_point_at
-        self.last_tesla_command_at = now
-        self.last_tesla_command_data_point_at = data_point_at
-
-    def is_settling_after_amp_decrease(
-        self, now: datetime, current_qh: str | None = None,
-        data_point_at: datetime | None = None,
-    ) -> bool:
-        """Return True if we are still in the post-amp-decrease settle window.
-
-        The settle window suppresses turn-on decisions for
-        ``effective_settle_secs`` after a Tesla amp decrease so that the first
-        few post-confirmation cycles don't react to apparent surpluses that
-        are mostly NBC prediction lag rather than genuine oversupply.
-
-        The window is automatically expired when the QH name changes, because
-        a new quarter-hour represents a fresh accounting period where even a
-        modest surplus is a real signal.
-
-        The window expires only when **both** the wall-clock elapsed time and
-        the data-point-at elapsed time exceed ``effective_settle_secs``.
-
-        Args:
-            now: Current wall-clock timestamp.
-            current_qh: Current QH name; if different from the QH in which the
-                decrease was recorded, the window is treated as expired.
-            data_point_at: Current NBC data-point-at timestamp.  ``None``
-                falls back to wall-clock-only behaviour.
-
-        Returns:
-            True if turn-on decisions should be suppressed.
-        """
-        if self.last_tesla_decrease_at is None:
-            return False
-        if current_qh is not None and self.last_tesla_decrease_qh != current_qh:
-            return False
-        elapsed_wall = (now - self.last_tesla_decrease_at).total_seconds()
-        if elapsed_wall < self.effective_settle_secs:
-            return True
-        # Wall clock expired — check data-point-at age.
-        if data_point_at is not None and self.last_tesla_decrease_data_point_at is not None:
-            elapsed_data = (data_point_at - self.last_tesla_decrease_data_point_at).total_seconds()
-            if elapsed_data < self.effective_settle_secs:
-                return True
-        return False
+        self.pending_effects = [
+            eff for eff in self.pending_effects
+            if not (eff.device_name == "tesla" and eff.action == "set_amps")
+        ]
 
     def has_pending_effect_since(self, nbc_timestamp: datetime) -> bool:
         """Return True if we took an action after the NBC timestamp by either measure.
@@ -869,11 +802,6 @@ class StateTracker:
             "last_data_point_at": (self.last_data_point_at.isoformat()
                                    if self.last_data_point_at else None),
             "last_commanded_amps": self.last_commanded_amps,
-            "last_tesla_increase_at": (
-                self.last_tesla_increase_at.isoformat()
-                if self.last_tesla_increase_at else None
-            ),
-            "last_tesla_increase_qh": self.last_tesla_increase_qh,
             "has_fresh_telemetry": self.has_fresh_telemetry,
             "tesla_telemetry_state": ts_dict,
         }
