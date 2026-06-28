@@ -45,3 +45,9 @@ period for prediction-window selection and sleep alignment."""
 DEFAULT_PREDICTION_WINDOW_SECS: int = 30
 """Fallback prediction window in seconds when no quantization data is
 available (previously hardcoded as 60)."""
+
+MIN_SAMPLES_FOR_PREDICTION: int = 5
+"""Minimum per-second samples in the current QH required to produce a
+reliable NBC prediction.  Below this threshold the pipeline returns
+``no_incomplete_qh`` with a short sleep hint instead of acting on a
+wildly extrapolated single-sample prediction."""

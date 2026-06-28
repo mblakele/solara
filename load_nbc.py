@@ -35,6 +35,20 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class NBCFetchResult:
+    """Return value from ``NBCReader.get_current_qh()``.
+
+    Replaces the previous 4-tuple with a typed, extensible structure.
+    """
+
+    qh_name: str
+    predicted_wh: float
+    seconds_remaining: int
+    data_point_at: datetime
+    samples_used: int | None = None
+
+
+@dataclass(frozen=True)
 class ParsedMetricsQH:
     """Parsed quarter-hour prediction from _parse_metrics.
 
@@ -44,6 +58,7 @@ class ParsedMetricsQH:
     predicted_wh: float
     seconds_remaining: int
     data_lag_secs: float
+    samples_used: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for backward compat."""
@@ -141,8 +156,8 @@ class NBCReader:
 
     def get_current_qh(
         self, now: datetime, force: bool = False
-    ) -> tuple[str, float, int, datetime] | None:
-        """Return (qh_name, predicted_wh, seconds_remaining, data_point_at).
+    ) -> NBCFetchResult | None:
+        """Return NBCFetchResult with QH prediction, or None.
 
         Uses EnergyCache.get_current_qh() to extract QH prediction from cached
         per-second samples. When force=True, bypasses cache and triggers a fresh
@@ -153,8 +168,7 @@ class NBCReader:
             now: Current time for TTL check. Required.
 
         Returns:
-            Tuple of (qh_name, predicted_wh in Wh, seconds remaining in QH,
-            data_point_at), or None if no incomplete QH available.
+            NBCFetchResult or None if no incomplete QH available.
         """
         # Fast path: cache is valid — read directly from it.
         if not force and self.energy_cache.is_valid(now=now):
@@ -168,11 +182,12 @@ class NBCReader:
                     self.energy_cache, "_data_lag_secs", 0.0
                 )
                 data_point_at = fetched_at - timedelta(seconds=lag_secs)
-                return (  # type: ignore[return-value]
-                    qh_data["qh_name"],
-                    qh_data.get("predicted_wh", 0),
-                    qh_data.get("seconds_remaining", 0),
-                    data_point_at,
+                return NBCFetchResult(
+                    qh_name=qh_data["qh_name"],
+                    predicted_wh=qh_data.get("predicted_wh", 0),
+                    seconds_remaining=qh_data.get("seconds_remaining", 0),
+                    data_point_at=data_point_at,
+                    samples_used=qh_data.get("samples_used"),
                 )
             # Cache is valid but no incomplete QH (QH1 is complete) — fall
             # through to the fetch path below so we can check for a newer
@@ -194,11 +209,12 @@ class NBCReader:
                 return None
             fetched_at = metrics_data.get("_fetched_at", now)
             data_point_at = fetched_at - timedelta(seconds=parsed.data_lag_secs)
-            return (  # type: ignore[return-value]
-                parsed.qh_name,
-                parsed.predicted_wh,
-                parsed.seconds_remaining,
-                data_point_at,
+            return NBCFetchResult(
+                qh_name=parsed.qh_name,
+                predicted_wh=parsed.predicted_wh,
+                seconds_remaining=parsed.seconds_remaining,
+                data_point_at=data_point_at,
+                samples_used=parsed.samples_used,
             )
 
         # force=True but no fetch callable: fall back to reading from cache.
@@ -213,11 +229,12 @@ class NBCReader:
                 self.energy_cache, "_data_lag_secs", 0.0
             )
             data_point_at = fetched_at - timedelta(seconds=lag_secs)
-            return (  # type: ignore[return-value]
-                qh_data["qh_name"],
-                qh_data.get("predicted_wh", 0),
-                qh_data.get("seconds_remaining", 0),
-                data_point_at,
+            return NBCFetchResult(
+                qh_name=qh_data["qh_name"],
+                predicted_wh=qh_data.get("predicted_wh", 0),
+                seconds_remaining=qh_data.get("seconds_remaining", 0),
+                data_point_at=data_point_at,
+                samples_used=qh_data.get("samples_used"),
             )
 
         return None
@@ -305,6 +322,7 @@ class NBCReader:
                     predicted_wh=predicted_wh,
                     seconds_remaining=remaining_seconds,
                     data_lag_secs=metrics_data.get("_data_lag_secs", 0.0),
+                    samples_used=qh_data.get("samples_used"),
                 )
                 # Don't break — keep scanning for the last complete QH fallback.
             else:

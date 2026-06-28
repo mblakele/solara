@@ -7,9 +7,11 @@ from unittest.mock import patch
 
 import pytest
 
+from constants import MIN_SAMPLES_FOR_PREDICTION
 from load_controllers import RealTeslaController, TeslaController
 from load_manager import LoadManager
 from load_models import CycleContext, PendingEffect, TeslaAuthError
+from load_nbc import NBCFetchResult
 
 
 @pytest.fixture
@@ -44,9 +46,12 @@ class TestStageNBCFetch:
     def test_fetch_returns_tuple_populates_ctx(
         self, lm: LoadManager, ctx: CycleContext
     ):
-        """When get_current_qh returns a tuple, ctx fields are populated."""
+        """When get_current_qh returns a result, ctx fields are populated."""
         data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        qh_result = ("QH2", 750.0, 450, data_point)
+        qh_result = NBCFetchResult(
+            qh_name="QH2", predicted_wh=750.0, seconds_remaining=450,
+            data_point_at=data_point, samples_used=300,
+        )
         with patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result):
             result = lm._stage_nbc_fetch(ctx)
         assert result is None
@@ -61,11 +66,43 @@ class TestStageNBCFetch:
         """The force flag from ctx is passed to get_current_qh."""
         ctx.force = True
         data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        qh_result = ("QH1", 500.0, 900, data_point)
+        qh_result = NBCFetchResult(
+            qh_name="QH1", predicted_wh=500.0, seconds_remaining=900,
+            data_point_at=data_point, samples_used=100,
+        )
         with patch.object(lm.nbc_reader, "get_current_qh") as mock_fetch:
             mock_fetch.return_value = qh_result
             lm._stage_nbc_fetch(ctx)
         mock_fetch.assert_called_once_with(force=True, now=ctx.now)
+
+    def test_fetch_insufficient_samples_returns_early(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """When samples_used < MIN_SAMPLES_FOR_PREDICTION, returns early."""
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        qh_result = NBCFetchResult(
+            qh_name="QH1", predicted_wh=359.83, seconds_remaining=899,
+            data_point_at=data_point, samples_used=1,
+        )
+        with patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result):
+            result = lm._stage_nbc_fetch(ctx)
+        assert result is not None
+        assert result.status == "no_incomplete_qh"
+        assert result.diagnostics.reason == "insufficient_samples"
+
+    def test_fetch_samples_used_none_continues(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """When samples_used is None (unknown), pipeline continues normally."""
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        qh_result = NBCFetchResult(
+            qh_name="QH1", predicted_wh=500.0, seconds_remaining=900,
+            data_point_at=data_point, samples_used=None,
+        )
+        with patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result):
+            result = lm._stage_nbc_fetch(ctx)
+        assert result is None
+        assert ctx.qh_name == "QH1"
 
 
 class TestStagePendingCheck:

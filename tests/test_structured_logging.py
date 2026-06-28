@@ -16,6 +16,7 @@ import pytest
 from clock import FakeClock
 from load_manager import LoadManager
 from load_models import CycleContext, PendingEffect, TeslaState
+from load_nbc import NBCFetchResult
 
 
 @pytest.fixture
@@ -62,7 +63,7 @@ class TestCycleBoundaryLogging:
         caplog.set_level(logging.INFO)
         now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         data_point = now - timedelta(seconds=10)
-        qh_result = ("QH2", 750.0, 450, data_point)
+        qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=750.0, seconds_remaining=450, data_point_at=data_point, samples_used=300)
         lm._clock = FakeClock(now)
         with (
             patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result),
@@ -118,7 +119,7 @@ class TestCycleBoundaryLogging:
         caplog.set_level(logging.INFO)
         now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
         data_point = now
-        qh_result = ("QH2", 750.0, 840, data_point)
+        qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=750.0, seconds_remaining=840, data_point_at=data_point, samples_used=300)
         lm._clock = FakeClock(now)
         with (
             patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result),
@@ -143,7 +144,7 @@ class TestCycleBoundaryLogging:
         caplog.set_level(logging.INFO)
         now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
         data_point = now
-        qh_result = ("QH2", 750.0, 840, data_point)
+        qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=750.0, seconds_remaining=840, data_point_at=data_point, samples_used=300)
         lm._clock = FakeClock(now)
         with (
             patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result),
@@ -178,7 +179,7 @@ class TestGapMinderLogging:
         caplog.set_level(logging.INFO)
         now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
         data_point = now
-        qh_result = ("QH2", 750.0, 840, data_point)
+        qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=750.0, seconds_remaining=840, data_point_at=data_point, samples_used=300)
         lm._clock = FakeClock(now)
         with (
             patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result),
@@ -199,7 +200,7 @@ class TestGapMinderLogging:
         now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
         data_point = now
         # Use a large predicted_wh that should trigger turn_off actions
-        qh_result = ("QH2", -5000.0, 840, data_point)
+        qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=-5000.0, seconds_remaining=840, data_point_at=data_point, samples_used=300)
         lm._clock = FakeClock(now)
         with (
             patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result),
@@ -226,7 +227,7 @@ class TestPendingCheckLogging:
         caplog.set_level(logging.WARNING)
         now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
         stale_point = now - timedelta(seconds=300)
-        qh_result = ("QH2", 750.0, 840, stale_point)
+        qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=750.0, seconds_remaining=840, data_point_at=stale_point, samples_used=300)
         lm._clock = FakeClock(now)
         with (
             patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result),
@@ -252,7 +253,7 @@ class TestPendingCheckLogging:
         # (QH starts at 12:00, so 11:59:30 is previous QH but within stale threshold)
         now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
         previous_qh_point = datetime(2025, 6, 1, 11, 59, 30, tzinfo=timezone.utc)
-        qh_result = ("QH2", 750.0, 840, previous_qh_point)
+        qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=750.0, seconds_remaining=840, data_point_at=previous_qh_point, samples_used=300)
         lm._clock = FakeClock(now)
         with (
             patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result),

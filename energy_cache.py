@@ -978,6 +978,7 @@ class EnergyCache:
             "predicted_wh": predicted_wh,
             "seconds_remaining": seconds_remaining,
             "data_start": self._data.data_start,
+            "samples_used": qh1_data.samples_used,
         }
 
     # ------------------------------------------------------------------

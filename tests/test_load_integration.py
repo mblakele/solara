@@ -22,7 +22,7 @@ from load_manager import (
     GapMinder,
 )
 from load_models import CandidateDetailPlug, CycleDiagnostics, CycleResult
-from load_nbc import DecideContext
+from load_nbc import DecideContext, NBCFetchResult
 from tests.helpers import _make_metrics_with_wh
 from energy_cache import EnergyCache
 from tests.helpers import FakeClock
@@ -326,7 +326,7 @@ def test_excess_solar_qh_boundary_returns_stale_data():
 
     # Patch get_current_qh to return data from the previous QH
     def patched_get(force=False, now=fixed_now):
-        return ("QH2", -6000.0, 899, data_point_at)
+        return NBCFetchResult(qh_name="QH2", predicted_wh=-6000.0, seconds_remaining=899, data_point_at=data_point_at, samples_used=100)
 
     mgr.nbc_reader.get_current_qh = patched_get  # type: ignore[method-assign]
 
@@ -530,9 +530,8 @@ def test_stale_data_from_previous_qh():
 
     # Patch get_current_qh to return our crafted data_point_at.
     def patched_get(force=False, now=fixed_now):
-        # Return a 4-tuple matching the expected signature:
-        # (qh_name, predicted_wh, seconds_remaining, data_point_at)
-        return ("QH2", -2000.0, 600, data_point_at)
+        # Return NBCFetchResult matching the expected signature.
+        return NBCFetchResult(qh_name="QH2", predicted_wh=-2000.0, seconds_remaining=600, data_point_at=data_point_at, samples_used=100)
 
     mgr.nbc_reader.get_current_qh = patched_get  # type: ignore[method-assign]
 
@@ -1551,7 +1550,7 @@ class TestAdaptiveSleep:
             """Mock NBC reader that returns data 200 seconds old."""
 
             def get_current_qh(self, force=False, now=None):
-                return ("QH3", -1000.0, 600, data_point_at)
+                return NBCFetchResult(qh_name="QH3", predicted_wh=-1000.0, seconds_remaining=600, data_point_at=data_point_at, samples_used=100)
 
             def get_data_lag_secs(self) -> int:
                 return 10
@@ -1599,7 +1598,7 @@ class TestAdaptiveSleep:
             """Mock NBC reader that returns a recent data point."""
 
             def get_current_qh(self, force=False, now=None):
-                return ("QH3", -1000.0, 600, data_point_at)
+                return NBCFetchResult(qh_name="QH3", predicted_wh=-1000.0, seconds_remaining=600, data_point_at=data_point_at, samples_used=100)
 
             def get_data_lag_secs(self) -> int:
                 return 10
@@ -1711,7 +1710,7 @@ class TestAdaptiveSleep:
             """Mock NBC reader that returns data 200 seconds old."""
 
             def get_current_qh(self, force=False, now=None):
-                return ("QH3", -1000.0, 600, data_point_at)
+                return NBCFetchResult(qh_name="QH3", predicted_wh=-1000.0, seconds_remaining=600, data_point_at=data_point_at, samples_used=100)
 
             def get_data_lag_secs(self) -> int:
                 return 10
@@ -1768,7 +1767,7 @@ class TestAdaptiveSleep:
             """Mock NBC reader where pending effects exist since the data point."""
 
             def get_current_qh(self, force=False, now=None):
-                return ("QH3", -800.0, 600, data_point_at)
+                return NBCFetchResult(qh_name="QH3", predicted_wh=-800.0, seconds_remaining=600, data_point_at=data_point_at, samples_used=100)
 
             def get_data_lag_secs(self) -> int:
                 return 10

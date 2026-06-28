@@ -30,6 +30,7 @@ from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
+    MIN_SAMPLES_FOR_PREDICTION,
     QUANTIZATION_CONFIDENCE_THRESHOLD,
     STALE_DATA_THRESHOLD_SECS,
 )
@@ -532,8 +533,10 @@ class LoadManager:
 
         Calls get_current_qh on the NBC reader. If the fetch returns None
         (no incomplete quarter-hour), returns CycleResult(status='no_incomplete_qh').
-        Otherwise populates ctx.qh_name, ctx.predicted_wh, ctx.seconds_remaining,
-        ctx.data_point_at, and ctx.now_postfetch, then returns None.
+        If samples_used < MIN_SAMPLES_FOR_PREDICTION, returns early with a short
+        sleep hint instead of acting on unreliable data.  Otherwise populates
+        ctx.qh_name, ctx.predicted_wh, ctx.seconds_remaining, ctx.data_point_at,
+        and ctx.now_postfetch, then returns None.
         """
         fetch_start = _time_mod.perf_counter()
         qh_result = self.nbc_reader.get_current_qh(force=ctx.force, now=ctx.now)
@@ -554,12 +557,28 @@ class LoadManager:
                 sleep_hint=DEFAULT_SLEEP_HINT_SECS,
                 sleep_hint_at=ctx.now.isoformat(),
             )
-        (
-            ctx.qh_name,
-            ctx.predicted_wh,
-            ctx.seconds_remaining,
-            ctx.data_point_at,
-        ) = qh_result
+        if (qh_result.samples_used is not None
+                and qh_result.samples_used < MIN_SAMPLES_FOR_PREDICTION):
+            return CycleResult(
+                status="no_incomplete_qh",
+                diagnostics=CycleDiagnostics(
+                    gap_wh=None,
+                    hysteresis_wh=self.engine.HYSTERESIS_WH,
+                    seconds_remaining=None,
+                    data_point_at=None,
+                    reason="insufficient_samples",
+                    tesla_configured=self.tesla_ctrl is not None,
+                    tesla_state=None,
+                    tesla_error=None,
+                    plugs_configured=list(self.plugs.keys()),
+                ),
+                sleep_hint=DEFAULT_SLEEP_HINT_SECS,
+                sleep_hint_at=ctx.now.isoformat(),
+            )
+        ctx.qh_name = qh_result.qh_name
+        ctx.predicted_wh = qh_result.predicted_wh
+        ctx.seconds_remaining = qh_result.seconds_remaining
+        ctx.data_point_at = qh_result.data_point_at
         fetch_end = _time_mod.perf_counter()
         ctx.now_postfetch = ctx.now + timedelta(seconds=fetch_end - fetch_start)
         return None
