@@ -720,9 +720,10 @@ class HourlyProjection(MetricsBase):
                 usage_data_local, usage_data_start_local, _ = (
                     self._fetch_channel_data(chan, chart_start, self.instant)
                 )
-            except (requests.exceptions.RequestException, IOError):
-                self.logger.exception(
-                    "error fetching device data: skipping %s", vdi.device_name
+            except (requests.exceptions.RequestException, IOError) as exc:
+                self.logger.warning(
+                    "error fetching device data: skipping %s (%s)",
+                    vdi.device_name, exc,
                 )
                 return None
 
