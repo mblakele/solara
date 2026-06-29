@@ -703,6 +703,65 @@ class TestStageAsyncPhase:
         assert len(ctx.actions) == 1
         assert ctx.actions[0].action == "turn_on"
 
+    def test_cycle_async_phase_closes_tesla_session(
+        self, lm: LoadManager
+    ):
+        """_cycle_async_phase closes the Tesla controller's aiohttp session.
+
+        When a RealTeslaController creates an aiohttp session during the
+        async phase, it must be closed before the event loop shuts down
+        to avoid 'Unclosed connector' warnings from aiohttp GC.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from load_controllers import RealTeslaController
+
+        ctrl = RealTeslaController.__new__(RealTeslaController)
+        ctrl.config = MagicMock()
+        ctrl.config.vehicle_command_proxy_url = ""
+        ctrl.config.vehicle_id = "VIN"
+        ctrl.config.client_id = ""
+        ctrl.config.client_secret = ""
+        ctrl.config.redirect_uri = ""
+        ctrl.config.private_key_path = ""
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.tesla_region = "na"
+        ctrl._api = MagicMock()
+        ctrl._api._access_token = None
+        ctrl._api.refresh_token = None
+        ctrl._api.expires = 0
+        ctrl.last_error = None
+        ctrl._backoff_secs = 0.0
+        ctrl._last_init_attempt = 0.0
+        ctrl._last_saved_tokens_at = 0.0
+        ctrl._init_state = None
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.close = AsyncMock()
+        ctrl._session = mock_session
+        ctrl._api.session = mock_session
+
+        lm.tesla_ctrl = ctrl
+        lm.telegram_sender = None
+
+        now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        async def _run():
+            return await lm._cycle_async_phase(
+                gap_wh=500.0,
+                adjusted_wh=-500.0,
+                now=now,
+                seconds_remaining=450,
+                dry_run=True,
+                qh_name="QH2",
+                data_point_at=now,
+            )
+
+        asyncio.run(_run())
+        mock_session.close.assert_awaited_once()
+
 
 class TestStageComputeGap:
     """_stage_compute_gap() — Stage 4 of the pipeline.

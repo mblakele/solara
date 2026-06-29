@@ -1666,6 +1666,34 @@ class LoadManager:
             The final bool is True when any sentinel device was detected on
             during sync, allowing the caller to disable the cycle.
         """
+        try:
+            return await self._cycle_async_phase_body(
+                gap_wh, adjusted_wh, now, seconds_remaining,
+                dry_run, qh_name=qh_name, data_point_at=data_point_at,
+            )
+        finally:
+            await self._cleanup_sessions()
+
+    async def _cycle_async_phase_body(
+        self,
+        gap_wh: float,
+        adjusted_wh: float,
+        now: datetime,
+        seconds_remaining: int,
+        dry_run: bool,
+        qh_name: str | None = None,
+        data_point_at: datetime | None = None,
+    ) -> tuple[
+        TeslaState | None,
+        str | None,
+        str | None,
+        list[PendingEffect],
+        list[PendingEffect],
+        float,
+        float,
+        bool,
+    ]:
+        """Body of _cycle_async_phase, extracted for try/finally cleanup."""
         # Sync actual plug states before making decisions so the engine sees
         # external changes (user toggles, other automations, etc.)
         await self._sync_plug_states()
@@ -1892,6 +1920,32 @@ class LoadManager:
             await self.tesla_ctrl.maybe_refresh_token()
 
         return tesla_state, tesla_error, tesla_login_url, succeeded_effects, results, corrected_gap_wh, corrected_adjusted_wh, False
+
+    async def _cleanup_sessions(self) -> None:
+        """Close aiohttp sessions held by controllers.
+
+        Must be called while the event loop is still alive (inside asyncio.run)
+        so that session.close() can be awaited.  Discards the session reference
+        afterward so reset_session() is a no-op on the next cycle.
+        """
+        if self.tesla_ctrl is not None:
+            session = getattr(self.tesla_ctrl, "_session", None)
+            if session is not None:
+                try:
+                    await session.close()
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+                self.tesla_ctrl._session = None  # type: ignore[attr-defined]
+        if self.telegram_sender is not None:
+            client = getattr(self.telegram_sender, "_telegram_client", None)
+            if client is not None:
+                session = getattr(client, "_session", None)
+                if session is not None:
+                    try:
+                        await session.close()
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        pass
+                    client._session = None
 
     @staticmethod
     def _plug_states_from_candidates(
