@@ -754,7 +754,9 @@ class StateTracker:
         before = len(self.pending_effects)
         self.pending_effects = [
             eff for eff in self.pending_effects
-            if eff.timestamp >= wall_cutoff or eff.data_point_at >= dp_cutoff
+            if eff.timestamp >= wall_cutoff
+            or eff.data_point_at >= dp_cutoff
+            or eff.timestamp > data_point_at
         ]
         return before - len(self.pending_effects)
 

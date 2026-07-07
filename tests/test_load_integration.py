@@ -902,6 +902,34 @@ def test_prune_old_effects_uses_prediction_window():
     assert tracker.pending_effects[0].device_name == "young"
 
 
+def test_prune_old_effects_keeps_unreflected_command():
+    """Effect whose command was sent after the NBC data point must survive pruning.
+
+    Regression guard for the Tesla overshoot bug: the 5→11A command landed
+    at 19:12:04 but the NBC data_point_at was 19:12:00.  The effect's
+    data_point_at (from the prior cycle) fell just below dp_cutoff and was
+    pruned, causing the next cycle to see a stale surplus prediction.
+    """
+    tracker = StateTracker(prediction_window_seconds=30)
+    dp = datetime(2026, 7, 7, 19, 12, 0, 999717, tzinfo=timezone.utc)
+    now = dp + timedelta(seconds=64)
+
+    # Effect: command sent AFTER the NBC data was collected, but its own
+    # data_point_at is old enough that both age checks would prune it.
+    tracker.pending_effects.append(
+        PendingEffect(
+            device_name="tesla", action="set_amps",
+            timestamp=dp + timedelta(seconds=4),       # command landed AFTER data
+            data_point_at=dp - timedelta(seconds=30, microseconds=6),  # 6 µs below dp_cutoff
+            power_watts=1440.0, target_amps=11, direction="increase",
+        )
+    )
+
+    pruned = tracker.prune_old_effects(dp, now)
+    assert pruned == 0, "effect with timestamp > data_point_at must survive pruning"
+    assert len(tracker.pending_effects) == 1
+
+
 # --- Pending effect lifecycle tests ---
 
 

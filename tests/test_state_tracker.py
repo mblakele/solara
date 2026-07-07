@@ -283,6 +283,31 @@ def test_prune_old_effects_boundary_not_pruned_early():
     assert len(tracker.pending_effects) == 1
 
 
+def test_prune_preserves_unreflected_command():
+    """Effect whose command was sent after the NBC data point must survive.
+
+    Regression guard: command timestamp > data_point_at means the NBC
+    prediction doesn't reflect the load change yet.  Pruning it causes
+    the next cycle to act on a stale surplus/deficit.
+    """
+    tracker = StateTracker(prediction_window_seconds=30)
+    dp = datetime(2026, 7, 7, 19, 12, 0, tzinfo=timezone.utc)
+    now = dp + timedelta(seconds=64)
+
+    tracker.pending_effects.append(
+        PendingEffect(
+            device_name="tesla", action="set_amps",
+            timestamp=dp + timedelta(seconds=4),          # command after data
+            data_point_at=dp - timedelta(seconds=30, microseconds=6),  # below dp_cutoff
+            power_watts=1440.0, target_amps=11, direction="increase",
+        )
+    )
+
+    pruned = tracker.prune_old_effects(dp, now)
+    assert pruned == 0, "effect with timestamp > data_point_at must survive"
+    assert len(tracker.pending_effects) == 1
+
+
 def test_pending_since_count_uses_buffer():
     """pending_since_count applies the prediction-window buffer (no longer strict)."""
     tracker = StateTracker()
