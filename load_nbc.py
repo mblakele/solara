@@ -351,16 +351,16 @@ class StateTracker:
     # The settle window duration is now derived dynamically from the
     # quantization-based prediction window via effective_settle_secs.
     # The old TESLA_SETTLE_SECS=60 constant is replaced by
-    # prediction_window_seconds * 2 at init time.
+    # prediction_window_seconds at init time.
 
     @property
     def effective_settle_secs(self) -> int:
-        """Settle window duration in seconds: twice the prediction window.
+        """Settle window duration in seconds: equal to the prediction window.
 
         Derived from the quantization-based prediction window so that the
         settle window scales proportionally to how quickly the NBC prediction
-        absorbs load changes.  With the default 60 s prediction window the
-        settle is 120 s; with a 30 s quantization window it is 60 s.
+        absorbs load changes.  With the default 30 s prediction window the
+        settle is 30 s; with a 60 s quantization window it is 60 s.
         """
         return self._pending_effect_min_secs
 
