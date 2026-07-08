@@ -143,6 +143,21 @@ class Config:
         return self._get_bool("DEBUG")
 
     @property
+    def log_file(self) -> str | None:
+        """Return log file path, or None to disable file logging."""
+        return self._get("LOG_FILE", default=None)
+
+    @property
+    def log_max_bytes(self) -> int:
+        """Return max log file size in bytes before rotation."""
+        return self._get_int("LOG_MAX_BYTES", default=10_485_760)
+
+    @property
+    def log_backup_count(self) -> int:
+        """Return number of rotated log files to keep."""
+        return self._get_int("LOG_BACKUP_COUNT", default=5)
+
+    @property
     def dry_run(self) -> bool:
         """Return True when load management is in dry-run mode."""
         return self._get_bool("LOAD_MANAGE_DRY_RUN")

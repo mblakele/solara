@@ -11,6 +11,7 @@ import atexit
 from collections import deque
 
 import logging
+import logging.handlers
 
 import sys
 import threading
@@ -135,12 +136,37 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
 # relative to the application path. Using the default root structure.
 
 
+def _setup_file_logging(config: Config) -> logging.Handler | None:
+    """Create a RotatingFileHandler if LOG_FILE is configured.
+
+    Returns the handler so callers can attach it to additional loggers
+    (e.g. gunicorn.error), or None if file logging is disabled.
+    """
+    log_file = config.log_file
+    if not log_file:
+        return None
+    handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=config.log_max_bytes,
+        backupCount=config.log_backup_count,
+    )
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S %z",
+    ))
+    return handler
+
+
 logger = app.logger
 if __name__ != "__main__":
     gunicorn_logger = logging.getLogger("gunicorn.error")
     root_logger = logging.getLogger()
     root_logger.handlers = gunicorn_logger.handlers
     root_logger.setLevel(logging.DEBUG if is_debug() else logging.INFO)
+    file_handler = _setup_file_logging(_config)
+    if file_handler:
+        root_logger.addHandler(file_handler)
+        gunicorn_logger.addHandler(file_handler)
 else:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
@@ -149,6 +175,9 @@ else:
     ))
     logging.basicConfig(handlers=[handler],
                         level=logging.DEBUG if is_debug() else logging.INFO)
+    file_handler = _setup_file_logging(_config)
+    if file_handler:
+        logging.getLogger().addHandler(file_handler)
 
 # squelch internal log messages
 for noisy in (

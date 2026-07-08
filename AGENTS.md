@@ -140,7 +140,7 @@ project-root
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback)
 ├── clock.py               # Clock protocol (now()) with FakeClock for tests
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
-                           # load_tesla_config(), load_plug_configs(), etc.
+                           # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
 ├── config_loader.py       # LazyConfig deferred env loading (config.get(), config.set())
 ├── conftest.py            # Pytest shared fixtures & configuration
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS, etc.)
@@ -205,6 +205,7 @@ project-root
   (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
 - Data models in `load_models.py`
 - Routes in `app.py`
+- `_setup_file_logging()` in `app.py` — creates `RotatingFileHandler` when `LOG_FILE` is configured
 - Test data generation in `mockdata.py`
 - Quantization detection in `quantization.py`
 - Timezones in `util.py`
@@ -227,6 +228,7 @@ project-root
 - CycleContext tests in `tests/test_cycle_context.py`
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
+- File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
 
 ### Actions Generation Flow
 - GapMinder.decide() generates actions as a list of PendingEffect objects
