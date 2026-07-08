@@ -516,3 +516,90 @@ class TestGetOrFetchFetchFuncOverlapMismatch:
             cache.get_or_fetch(fetcher, now)
         # Cache should be cleared even if retry also fails
         assert cache._data is None or cache._data.samples is None
+
+
+class TestGetOrFetchTimeout:
+    """Tests for fetch timeout in EnergyCache.get_or_fetch."""
+
+    def test_slow_fetch_returns_none_on_timeout(self) -> None:
+        """When fetch_func exceeds timeout, returns (None, True) without hanging."""
+        import time
+
+        cache = EnergyCache(fetch_timeout_secs=0.5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def slow_fetcher() -> dict[str, Any] | None:
+            time.sleep(5)
+            return {"devices": []}
+
+        result, was_fresh = cache.get_or_fetch(slow_fetcher, now, force=True)
+        assert result is None
+        assert was_fresh is True
+
+    def test_fast_fetch_completes_within_timeout(self) -> None:
+        """When fetch_func completes before timeout, returns normally."""
+        cache = EnergyCache(fetch_timeout_secs=10)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def fast_fetcher() -> dict[str, Any] | None:
+            return {"devices": [], "data_start": now}
+
+        result, was_fresh = cache.get_or_fetch(fast_fetcher, now, force=True)
+        assert was_fresh is True
+        assert result is not None
+
+    def test_timeout_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Timeout emits a warning log message."""
+        import time
+
+        cache = EnergyCache(fetch_timeout_secs=0.5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def slow_fetcher() -> dict[str, Any] | None:
+            time.sleep(5)
+            return {"devices": []}
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            cache.get_or_fetch(slow_fetcher, now, force=True)
+
+        assert any(
+            "fetch timed out" in rec.message.lower()
+            for rec in caplog.records
+        ), f"Expected timeout warning, got: {[r.message for r in caplog.records]}"
+
+    def test_timeout_fetch_exception_returns_none(self) -> None:
+        """When fetch_func raises an exception, returns (None, True)."""
+        cache = EnergyCache(fetch_timeout_secs=5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def failing_fetcher() -> dict[str, Any] | None:
+            raise ConnectionError("API down")
+
+        result, was_fresh = cache.get_or_fetch(failing_fetcher, now, force=True)
+        assert result is None
+        assert was_fresh is True
+
+    def test_default_timeout_is_120(self) -> None:
+        """Default fetch_timeout_secs is 120 seconds."""
+        cache = EnergyCache()
+        assert cache._fetch_timeout_secs == 120
+
+
+class TestGetOrFetchTimingLogs:
+    """Tests for timing/diagnostic logging in EnergyCache.get_or_fetch."""
+
+    def test_fetch_elapsed_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Fetch path logs elapsed time."""
+        cache = EnergyCache()
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def fetcher() -> dict[str, Any] | None:
+            return {"devices": [], "data_start": now}
+
+        with caplog.at_level("DEBUG", logger="energy_cache"):
+            cache.get_or_fetch(fetcher, now, force=True)
+
+        assert any(
+            "fetch_func completed" in rec.message.lower()
+            for rec in caplog.records
+        ), f"Expected fetch timing log, got: {[r.message for r in caplog.records]}"

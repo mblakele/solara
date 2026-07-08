@@ -4,8 +4,10 @@ Data caching and management.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import threading
+import time as _time_mod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -103,11 +105,17 @@ class EnergyCache:
         _lock: Thread-safety lock.
     """
 
-    def __init__(self, ttl_seconds: int = 30, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        ttl_seconds: int = 30,
+        clock: Clock | None = None,
+        fetch_timeout_secs: int = 120,
+    ) -> None:
         self._data: EnergyCacheData | None = None
         self._ttl_seconds: int = ttl_seconds
         self._clock: Clock = clock if clock is not None else RealClock()
         self._lock: threading.Lock = threading.Lock()
+        self._fetch_timeout_secs: int = fetch_timeout_secs
 
     # ------------------------------------------------------------------
     # Public properties (mimic the old direct-attribute interface)
@@ -715,6 +723,40 @@ class EnergyCache:
     # Main API
     # ------------------------------------------------------------------
 
+    def _run_fetch_with_timeout(
+        self,
+        fetch_func: Callable[[], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        """Run *fetch_func* with a timeout, returning ``None`` on expiry.
+
+        Uses a daemon thread so the caller is never blocked indefinitely
+        even if the fetch hangs on network I/O.  Domain exceptions such as
+        ``OverlapMismatchError`` propagate to the caller.
+
+        On timeout the pool is shut down without waiting for the stuck
+        thread — the caller returns immediately.
+        """
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(fetch_func)
+        try:
+            return future.result(timeout=self._fetch_timeout_secs)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "EnergyCache fetch timed out after %ds",
+                self._fetch_timeout_secs,
+            )
+            pool.shutdown(wait=False, cancel_futures=True)
+            return None
+        except OverlapMismatchError:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("EnergyCache fetch_func raised")
+            pool.shutdown(wait=False, cancel_futures=True)
+            return None
+        else:
+            pool.shutdown(wait=False)
+
     def get_or_fetch(
         self,
         fetch_func: Callable[[], dict[str, Any] | None],
@@ -758,9 +800,10 @@ class EnergyCache:
                 )
                 return result, False
 
-            # Fetch fresh data.
+            # Fetch fresh data with timeout protection.
+            fetch_start = _time_mod.monotonic()
             try:
-                result = fetch_func()
+                result = self._run_fetch_with_timeout(fetch_func)
             except OverlapMismatchError as exc:
                 logger.warning(
                     "Overlap mismatch in fetch_func (%s) — "
@@ -777,7 +820,17 @@ class EnergyCache:
                     quantization_offset=None,
                     quantization_confidence=None,
                 )
-                result = fetch_func()
+                result = self._run_fetch_with_timeout(fetch_func)
+            fetch_elapsed = _time_mod.monotonic() - fetch_start
+            logger.debug(
+                "EnergyCache fetch_func completed in %.2fs, result=%s",
+                fetch_elapsed,
+                "ok" if result is not None else "None",
+            )
+
+            if result is None:
+                # Timed out or fetch_func returned None — keep existing cache.
+                return (None, True)
 
             if result is not None:
                 new_samples: list[float] = []
@@ -828,7 +881,7 @@ class EnergyCache:
                             quantization_offset=None,
                             quantization_confidence=None,
                         )
-                        result = fetch_func()
+                        result = self._run_fetch_with_timeout(fetch_func)
                         if result is not None:
                             new_samples = []
                             if "per_second_data" in result:
