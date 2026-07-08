@@ -457,7 +457,9 @@ class EnergyCache:
         )
 
         # New samples should never arrive before the cache start.
-        assert result_data_start >= cache_start_time
+        assert result_data_start >= cache_start_time, (
+            f"data_start {result_data_start} < cache_start {cache_start_time}"
+        )
 
         # Verify overlap samples match cached data.
         if result_data_start <= cache_end_time:
@@ -932,8 +934,10 @@ class EnergyCache:
             return None
 
         # Required: data_start present and aligned to a QH boundary.
-        assert self._data.data_start is not None
-        assert self._data.data_start == ceil_to_qh(self._data.data_start)
+        assert self._data.data_start is not None, "data_start is None in get_current_qh"
+        assert self._data.data_start == ceil_to_qh(self._data.data_start), (
+            f"data_start {self._data.data_start} not aligned to QH boundary"
+        )
 
         # Use quantization-aware prediction window when available.
         prediction_window_seconds: int | None = None

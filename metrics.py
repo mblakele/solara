@@ -147,7 +147,7 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         return hp.metrics
 
     except AssertionError as ae:
-        logger.error(ae)
+        logger.error("AssertionError in create_metrics: %s", ae)
         # force clean cache and full fetch on next cycle
         energy_cache.invalidate()
         raise RetryableMetricsException(ae) from ae
@@ -326,7 +326,7 @@ def _build_incremental_fetch(
             start_time = capped
 
         # pyemvue throws error if start_time is earlier than end_time (now)
-        assert start_time <= now
+        assert start_time <= now, f"start_time {start_time} is after now {now}"
 
         try:
             usage_data, data_start = vue.get_chart_usage(

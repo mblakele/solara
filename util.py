@@ -179,7 +179,9 @@ def compute_nbc_quarter(
     if values_len < 1:
         return None
 
-    assert values_len <= QH_PERIOD_SECONDS
+    assert values_len <= QH_PERIOD_SECONDS, (
+        f"QH slice has {values_len} values, expected <= {QH_PERIOD_SECONDS}"
+    )
 
     is_complete = values_len == QH_PERIOD_SECONDS
     raw_wh = 1000 * sum(values)
@@ -231,7 +233,9 @@ def compute_nbc_quarters(
         ``None`` if the quarter has not yet started.
     """
     values_len = len(values)
-    assert values_len <= 3600
+    assert values_len <= 3600, (
+        f"total values {values_len} exceeds 3600 (one hour of per-second data)"
+    )
 
     incomplete_len = values_len % QH_PERIOD_SECONDS
 
