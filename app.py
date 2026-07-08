@@ -747,9 +747,9 @@ if __name__ == "__main__":
             sys.exit(1)
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--provision-fleet-telemetry":
-        from load_manager import provision_fleet_telemetry
-        from load_models import FleetTelemetryProvisionConfig
         from pathlib import Path
+        from load_manager import provision_fleet_telemetry
+        from load_models import FleetTelemetryProvisionConfig  # pylint: disable=ungrouped-imports
 
         if len(sys.argv) < 4:
             print(

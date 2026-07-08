@@ -85,7 +85,7 @@ def get_field_update_at(field: str) -> datetime | None:
         return _field_update_at.get(field)
 
 
-def on_message(client: Any, userdata: Any, msg: Any) -> None:  # noqa: ARG001
+def on_message(_client: Any, _userdata: Any, msg: Any) -> None:  # noqa: ARG001
     """paho callback: parse incoming MQTT message and update state.
 
     Extracts the field name from the last topic segment and stores a
@@ -138,10 +138,9 @@ def check_fleet_telemetry_dotfile() -> None:
     whether the broker is reachable.
     """
     if _FLEET_TELEMETRY_DOTFILE.exists():
-        import datetime
-        mtime = datetime.datetime.fromtimestamp(
+        mtime = datetime.fromtimestamp(
             _FLEET_TELEMETRY_DOTFILE.stat().st_mtime,
-            tz=datetime.timezone.utc,
+            tz=timezone.utc,
         )
         logger.info(
             "mqtt_telemetry: fleet-telemetry provisioned at %s (%s)",
@@ -177,7 +176,7 @@ def start_mqtt_subscriber(cfg: Any) -> None:
         client = mqtt.Client()
         client.on_message = on_message
 
-        def _on_connect(c: Any, userdata: Any, flags: Any, rc: int) -> None:  # noqa: ARG001
+        def _on_connect(c: Any, _userdata: Any, _flags: Any, rc: int) -> None:  # noqa: ARG001
             if rc == 0:
                 logger.info(
                     "mqtt_telemetry: connected to %s:%d, subscribing to %s/#",

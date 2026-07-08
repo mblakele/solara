@@ -1064,7 +1064,7 @@ class LoadManager:
         now: datetime,
         seconds_remaining: int,
         tesla_state: TeslaState | None,
-        tesla_error: str | None,
+        _tesla_error: str | None,
         tesla_configured: bool,
     ) -> list[CandidateDetail]:
         """Build per-device diagnostics for visibility into decisions.
@@ -1073,7 +1073,7 @@ class LoadManager:
             now: current datetime.
             seconds_remaining: Seconds left in current quarter-hour.
             tesla_state: Tesla state if available.
-            tesla_error: Error message if Tesla state fetch failed.
+            _tesla_error: Error message if Tesla state fetch failed (reserved).
             tesla_configured: Whether a Tesla controller is configured.
 
         Returns:
@@ -1676,7 +1676,7 @@ class LoadManager:
 
     async def _cycle_async_phase_body(
         self,
-        gap_wh: float,
+        _gap_wh: float,
         adjusted_wh: float,
         now: datetime,
         seconds_remaining: int,
@@ -1809,8 +1809,7 @@ class LoadManager:
             direction="decrease",
         )
         if (
-            corrected_gap_wh > 0
-            and corrected_gap_wh < self.engine.TESLA_SETTLE_SUPPRESS_WH
+            0 < corrected_gap_wh < self.engine.TESLA_SETTLE_SUPPRESS_WH
             and decrease_eff is not None
         ):
             settle_remaining = (
@@ -1993,7 +1992,7 @@ class LoadManager:
         new_vocolinc = load_vocolinc_plugs_from_file()
         new_all: dict[str, Any] = {**new_homekit, **new_vocolinc}
         if set(new_all.keys()) != set(self.plugs.keys()) or any(
-            new_all[k] != self.plugs[k] for k in new_all if k in self.plugs
+            new_all[k] != v for k, v in self.plugs.items() if k in new_all
         ):
             changes.append(f"plugs updated: {sorted(new_all.keys())}")
             self.plugs = new_all

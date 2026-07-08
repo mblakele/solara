@@ -605,7 +605,7 @@ class EnergyCache:
         # Re-detect quantization when enough new samples arrived.
         # A single detection can be noisy; re-running each cycle lets the
         # correct period emerge over time.
-        if len(new_samples) > 1:
+        if len(new_samples) > 1 and merged_data.samples is not None:
             quant_tuple = detect_quantization(merged_data.samples)
             if quant_tuple is not None:
                 qs, qo, qc = quant_tuple

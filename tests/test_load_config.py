@@ -819,7 +819,7 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
             fake_now,
             seconds_remaining=600,
             tesla_state=None,
-            tesla_error=None,
+            _tesla_error=None,
             tesla_configured=False,
         )
 
@@ -865,7 +865,7 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
             fake_now,
             seconds_remaining=600,
             tesla_state=None,
-            tesla_error=None,
+            _tesla_error=None,
             tesla_configured=False,
         )
 

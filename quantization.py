@@ -119,8 +119,7 @@ def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
                 v = data[ws]
                 if all(_equal(data[j], v) for j in range(ws + 1, ws + d)):
                     s += d
-            if s > best:
-                best = s
+            best = max(best, s)
         return best
 
     best_n = n

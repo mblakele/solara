@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Literal
 
