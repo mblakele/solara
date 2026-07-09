@@ -829,7 +829,11 @@ class EnergyCache:
             )
 
             if result is None:
-                # Timed out or fetch_func returned None — keep existing cache.
+                # Timed out or fetch_func returned None — return stale cache
+                # if available, so callers get stale-but-valid data instead
+                # of crashing on None.
+                if self._data is not None:
+                    return self._build_result(), False
                 return (None, True)
 
             if result is not None:

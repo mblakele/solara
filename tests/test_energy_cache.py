@@ -579,6 +579,38 @@ class TestGetOrFetchTimeout:
         assert result is None
         assert was_fresh is True
 
+    def test_timeout_returns_stale_cache_if_available(self) -> None:
+        """When fetch times out, returns existing stale cache instead of None."""
+        import time
+        from datetime import timedelta
+
+        cache = EnergyCache(fetch_timeout_secs=1, ttl_seconds=30)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        stale_time = now - timedelta(seconds=60)
+
+        # Pre-populate cache with stale data.
+        cache._data = EnergyCacheData(
+            samples=[1.0] * 60,
+            data_start=stale_time,
+            last_sample_at=stale_time,
+            last_fetch_at=stale_time,
+            sample_count=60,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+            full_metrics_dict={"devices": [{"gid": 1}], "data_start": stale_time},
+        )
+
+        def slow_fetcher() -> dict[str, Any] | None:
+            time.sleep(5)
+            return None
+
+        result, was_fresh = cache.get_or_fetch(slow_fetcher, now, force=True)
+        # Should return stale cache, not None.
+        assert result is not None
+        assert was_fresh is False
+        assert result.get("devices") == [{"gid": 1}]
+
     def test_default_timeout_is_120(self) -> None:
         """Default fetch_timeout_secs is 120 seconds."""
         cache = EnergyCache()
