@@ -193,6 +193,9 @@ project-root
 - `init_tesla_state()` / `_init_from_rest()` in `load_controllers.py` — initializes
   vehicle state from telemetry with REST fallback when initial telemetry is missing
   (waits up to 60 s for telemetry, then falls back to REST API with minimal calls)
+- `_is_vehicle_offline_error()` in `load_controllers.py` — detects VehicleOffline
+  exceptions from Tesla fleet API; used to downgrade ERROR to WARNING and trigger
+  short sleep hint for faster retries
 - OAuth in `load_manager.py`
 - Tesla callback config dotfile: `.tesla-callback-config` (auto-created, auto-updated)
 - Pipeline orchestration in `load_manager.py` (`_stage_enabled_check`, `_stage_nbc_fetch`,
@@ -228,6 +231,7 @@ project-root
 - CycleContext tests in `tests/test_cycle_context.py`
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
+- Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
 - File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
 
 ### Actions Generation Flow

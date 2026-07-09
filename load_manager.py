@@ -325,6 +325,9 @@ class LoadManager:
         # Anti-spam dedup: tracks the last auth error text sent to Telegram so we
         # only send one alert per unique error message (not one per 30 s cycle).
         self._last_auth_error_msg: str | None = None
+        # Set to True when a Tesla command fails with VehicleOffline this cycle.
+        # Used to select a shorter sleep hint so the next cycle retries quickly.
+        self._vehicle_offline_this_cycle: bool = False
 
         logger.debug("LoadManager %s", plug_ctrl)
         if plug_ctrl is not None:
@@ -777,8 +780,13 @@ class LoadManager:
                 ),
                 telemetry_registered=has_telemetry(),
                 active_tesla_telemetry=active_telemetry,
+                tesla_command_offline=self._vehicle_offline_this_cycle,
             ),
-            sleep_hint=self.config_interval_secs,
+            sleep_hint=(
+                DEFAULT_SLEEP_HINT_SECS
+                if self._vehicle_offline_this_cycle
+                else self.config_interval_secs
+            ),
             sleep_hint_at=(
                 ctx.now_postfetch.isoformat()
                 if ctx.now_postfetch else ""
@@ -1694,6 +1702,7 @@ class LoadManager:
         bool,
     ]:
         """Body of _cycle_async_phase, extracted for try/finally cleanup."""
+        self._vehicle_offline_this_cycle = False
         # Sync actual plug states before making decisions so the engine sees
         # external changes (user toggles, other automations, etc.)
         await self._sync_plug_states()
@@ -2219,7 +2228,10 @@ class LoadManager:
 
         if action.action == "turn_off":
             try:
-                return await self.tesla_ctrl.stop_charging()
+                result = await self.tesla_ctrl.stop_charging()
+                if self.tesla_ctrl._last_command_vehicle_offline:
+                    self._vehicle_offline_this_cycle = True
+                return result
             except TeslaAuthError as e:
                 self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
                 return False
@@ -2229,7 +2241,10 @@ class LoadManager:
         if action.action == "set_amps":
             if action.target_amps is None or action.target_amps < 5:
                 try:
-                    return await self.tesla_ctrl.stop_charging()
+                    result = await self.tesla_ctrl.stop_charging()
+                    if self.tesla_ctrl._last_command_vehicle_offline:
+                        self._vehicle_offline_this_cycle = True
+                    return result
                 except TeslaAuthError as e:
                     self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
                     return False
@@ -2239,7 +2254,10 @@ class LoadManager:
             clamped_amps = min(action.target_amps, self.tesla_config.charge_amps_max)
             clamped_amps = min(clamped_amps, GapMinder.HARD_MAX_AMPS)
             try:
-                return await self.tesla_ctrl.set_charge_amps(clamped_amps)
+                result = await self.tesla_ctrl.set_charge_amps(clamped_amps)
+                if self.tesla_ctrl._last_command_vehicle_offline:
+                    self._vehicle_offline_this_cycle = True
+                return result
             except TeslaAuthError as e:
                 self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
                 return False

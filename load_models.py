@@ -110,6 +110,9 @@ class AbstractTeslaController(ABC):
     async def get_charging_state(self) -> TeslaState | None:
         """Return full state: charging_bool, current_amps, soc_pct, plugged_in."""
 
+    _last_command_vehicle_offline: bool = False
+    """True when the last command failed with VehicleOffline."""
+
     def reset_session(self) -> None:
         """Reset cached HTTP session before a new asyncio.run() call.
 
@@ -389,6 +392,7 @@ class CycleDiagnostics:
     sentinel_on: bool = False
     telemetry_registered: bool | None = None
     active_tesla_telemetry: dict[str, Any] | None = None
+    tesla_command_offline: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -422,6 +426,7 @@ class CycleDiagnostics:
             "sentinel_on": self.sentinel_on,
             "telemetry_registered": self.telemetry_registered,
             "active_tesla_telemetry": self.active_tesla_telemetry,
+            "tesla_command_offline": self.tesla_command_offline,
         }
 
 

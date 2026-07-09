@@ -63,6 +63,23 @@ def _is_auth_error(exc: BaseException) -> bool:
     keywords = ["login_required", "refresh_token", "unauthorized", "authentication failed"]
     return any(kw in error_str for kw in keywords)
 
+
+def _is_vehicle_offline_error(exc: BaseException) -> bool:
+    """Check if an exception indicates the Tesla vehicle is offline/sleeping.
+
+    Args:
+        exc: The exception to check.
+
+    Returns:
+        True if the exception is a VehicleOffline instance or the error
+        message matches the vehicle-offline pattern.
+    """
+    from tesla_fleet_api.exceptions import VehicleOffline
+    if isinstance(exc, VehicleOffline):
+        return True
+    error_str = str(exc).lower()
+    return "vehicle is not" in error_str and "online" in error_str
+
 # Default path for Tesla OAuth token persistence
 TESLA_TOKENS_FILE = Path(".tesla-tokens.json")
 
@@ -107,6 +124,7 @@ class TeslaController(AbstractTeslaController):
     def __init__(self, tesla_config: TeslaConfig) -> None:
         self.config = tesla_config
         self.last_error: str | None = None
+        self._last_command_vehicle_offline: bool = False
         self._state = TeslaState(
             is_charging=False,
             current_amps=None,
@@ -288,6 +306,8 @@ class RealTeslaController(AbstractTeslaController):
         """Current exponential backoff duration in seconds."""
         self._last_saved_tokens_at: float = 0.0
         """Monotonic time of the last save_tokens() call (0 = never saved)."""
+        self._last_command_vehicle_offline: bool = False
+        """True when the last command failed with VehicleOffline."""
 
     async def _get_session(self, ssl: bool = True) -> aiohttp.ClientSession:
         """Get or create the aiohttp session.
@@ -587,12 +607,18 @@ class RealTeslaController(AbstractTeslaController):
             await vehicle.charge_stop()
             logger.info("Tesla charge_stop sent successfully")
             self.save_tokens()
+            self._last_command_vehicle_offline = False
             return True
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
             if _is_auth_error(e):
                 raise TeslaAuthError(str(e)) from e
+            if _is_vehicle_offline_error(e):
+                self._last_command_vehicle_offline = True
+                logger.warning("Tesla vehicle not online, command deferred: %s", e)
+                return False
+            self._last_command_vehicle_offline = False
             logger.error("Failed to stop Tesla charging: %s", e)
             return False
         finally:
@@ -623,12 +649,18 @@ class RealTeslaController(AbstractTeslaController):
             await vehicle.set_charging_amps(clamped)
             logger.info("Tesla set_charge_amps(%d) sent successfully", clamped)
             self.save_tokens()
+            self._last_command_vehicle_offline = False
             return True
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
             if _is_auth_error(e):
                 raise TeslaAuthError(str(e)) from e
+            if _is_vehicle_offline_error(e):
+                self._last_command_vehicle_offline = True
+                logger.warning("Tesla vehicle not online, command deferred: %s", e)
+                return False
+            self._last_command_vehicle_offline = False
             logger.error("Failed to set Tesla charge amps: %s", e)
             return False
         finally:
