@@ -635,3 +635,43 @@ class TestGetOrFetchTimingLogs:
             "fetch_func completed" in rec.message.lower()
             for rec in caplog.records
         ), f"Expected fetch timing log, got: {[r.message for r in caplog.records]}"
+
+
+class TestPruneOldSamplesLastSampleAt:
+    """Tests that _prune_old_samples updates last_sample_at."""
+
+    def test_pruning_updates_last_sample_at(self) -> None:
+        """After pruning, last_sample_at must be >= data_start."""
+        from datetime import timedelta
+
+        cache = EnergyCache()
+        # 3241 samples starting at 03:29:00 — ends at 03:29:59.
+        # cutoff = ceil_to_qh(04:23:59 - 3600s) = 03:30:00.
+        # All 60 samples before 03:30:00 are pruned, advancing data_start
+        # to 03:30:00. Without the fix, last_sample_at stays 03:29:59
+        # which is before the new data_start.
+        data_start = datetime(2026, 7, 9, 3, 29, 0, tzinfo=timezone.utc)
+        # last_sample_at is 03:29:59 (60 seconds after data_start).
+        last_sample_at = data_start + timedelta(seconds=59)
+        samples = [0.0] * 60  # only 60 samples: 03:29:00 to 03:29:59
+        now = datetime(2026, 7, 9, 4, 23, 59, tzinfo=timezone.utc)
+
+        data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=last_sample_at,
+            last_fetch_at=now,
+            sample_count=60,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        pruned = cache._prune_old_samples(data, now)
+        # data_start should advance to 03:30:00.
+        expected_data_start = datetime(2026, 7, 9, 3, 30, 0, tzinfo=timezone.utc)
+        assert pruned.data_start == expected_data_start
+        # last_sample_at must be >= data_start (the invariant).
+        assert pruned.last_sample_at >= pruned.data_start, (
+            f"last_sample_at {pruned.last_sample_at} < data_start {pruned.data_start}"
+        )

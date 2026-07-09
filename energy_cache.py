@@ -674,10 +674,13 @@ class EnergyCache:
         if old_count > 0:
             trimmed = data.samples[old_count:]
             new_data_start = data.data_start + timedelta(seconds=old_count)
+            new_last_sample_at = (
+                new_data_start + timedelta(seconds=len(trimmed) - 1)
+            ) if trimmed else new_data_start
             return EnergyCacheData(
                 samples=trimmed,
                 data_start=new_data_start,
-                last_sample_at=data.last_sample_at,
+                last_sample_at=new_last_sample_at,
                 last_fetch_at=data.last_fetch_at,
                 sample_count=len(trimmed),
                 quantization_seconds=data.quantization_seconds,
