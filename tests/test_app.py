@@ -1162,6 +1162,32 @@ class TestBuildLoadManagementPayloadLocked(unittest.TestCase):
         self.assertEqual(result["state"], {"devices": {}})
 
 
+class TestBuildLoadManagementPayloadDisabled(unittest.TestCase):
+    """Tests for _build_load_management_payload() when load management is disabled.
+
+    When LOAD_MANAGE_ENABLED=False, the payload builder must return {}
+    immediately without touching _get_load_manager() or _load_manager_lock.
+    This avoids a lock contention crash where the background thread holds
+    the lock during LoadManager init while the request handler blocks on it.
+    """
+
+    def setUp(self):
+        import app as app_mod
+        app_mod._load_manager = None
+
+    def test_returns_empty_when_disabled(self):
+        """Returns {} without calling _get_load_manager when disabled."""
+        import app as app_mod
+        from app import _build_load_management_payload
+        from decouple import config as dc_config
+
+        dc_config.set("LOAD_MANAGE_ENABLED", "False")
+        with patch("app._get_load_manager", side_effect=Exception("should not be called")):
+            result = _build_load_management_payload()
+
+        self.assertEqual(result, {})
+
+
 class TestSendErrorAlert(unittest.TestCase):
     """Tests for _send_error_alert helper."""
 

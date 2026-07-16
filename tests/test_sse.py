@@ -236,7 +236,9 @@ class TestSSEEndpoint:
     def _setup_mock_load_manager(self) -> MagicMock:
         """Set up a mock LoadManager and inject it into the app module."""
         import app as app_mod
+        from decouple import config as dc_config
 
+        dc_config.set("LOAD_MANAGE_ENABLED", "True")
         mock_lm = MagicMock()
         mock_lm.enabled = True
         mock_lm.dry_run = True
