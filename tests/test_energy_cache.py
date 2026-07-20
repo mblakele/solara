@@ -579,6 +579,32 @@ class TestGetOrFetchTimeout:
         assert result is None
         assert was_fresh is True
 
+    def test_timeout_logs_underlying_exception(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Timeout warning includes the underlying thread exception details."""
+        import time
+
+        cache = EnergyCache(fetch_timeout_secs=0.3)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def slow_failing_fetcher() -> dict[str, Any] | None:
+            time.sleep(1)
+            raise ConnectionError("DNS resolution failed")
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            cache.get_or_fetch(slow_failing_fetcher, now, force=True)
+            # Give the thread time to log its exception after the timeout.
+            time.sleep(1.5)
+
+        all_msgs = [rec.message for rec in caplog.records]
+        assert any(
+            "fetch timed out" in msg.lower() for msg in all_msgs
+        ), f"Expected timeout warning, got: {all_msgs}"
+        assert any(
+            "ConnectionError" in msg for msg in all_msgs
+        ), f"Expected underlying exception in log, got: {all_msgs}"
+
     def test_timeout_returns_stale_cache_if_available(self) -> None:
         """When fetch times out, returns existing stale cache instead of None."""
         import time
@@ -615,6 +641,26 @@ class TestGetOrFetchTimeout:
         """Default fetch_timeout_secs is 30 seconds."""
         cache = EnergyCache()
         assert cache._fetch_timeout_secs == 30
+
+    def test_fetch_failure_no_stale_cache_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When fetch returns None and no stale cache exists, logs WARNING."""
+        cache = EnergyCache(fetch_timeout_secs=5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def failing_fetcher() -> dict[str, Any] | None:
+            raise ConnectionError("network down")
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            result, was_fresh = cache.get_or_fetch(failing_fetcher, now, force=True)
+
+        assert result is None
+        assert was_fresh is True
+        assert any(
+            "no stale cache" in rec.message.lower()
+            for rec in caplog.records
+        ), f"Expected 'no stale cache' warning, got: {[r.message for r in caplog.records]}"
 
 
 class TestGetOrFetchTimingLogs:

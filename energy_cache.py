@@ -21,6 +21,27 @@ from util import ceil_to_qh, compute_nbc_quarters, qh_seconds_remaining
 logger = logging.getLogger(__name__)
 
 
+def _root_cause(exc: BaseException) -> BaseException:
+    """Walk exception chain to find the most informative cause.
+
+    Follows ``__cause__`` then ``__context__`` links, but stops before
+    raw OS-level errors (``OSError`` subclasses like ``gaierror``) that
+    lack contextual details such as hostnames.  Returns the outermost
+    exception if no deeper cause exists.
+    """
+    seen: set[int] = set()
+    current = exc
+    while True:
+        seen.add(id(current))
+        cause = current.__cause__ or current.__context__
+        if cause is None or id(cause) in seen:
+            break
+        if isinstance(cause, OSError) and not isinstance(cause, ConnectionError):
+            break
+        current = cause
+    return current
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EnergyCacheData:
     """Immutable snapshot of cached per-second energy data.
@@ -737,13 +758,33 @@ class EnergyCache:
         ``OverlapMismatchError`` propagate to the caller.
 
         On timeout the pool is shut down without waiting for the stuck
-        thread — the caller returns immediately.
+        thread — the caller returns immediately.  The thread's exception
+        (if any) is logged immediately inside the thread so the error
+        details appear in logs even when the thread is still blocked in
+        a system call (e.g. DNS resolution) at timeout time.
         """
+        timed_out = threading.Event()
+
+        def _wrapped() -> dict[str, Any] | None:
+            try:
+                return fetch_func()
+            except BaseException as exc:
+                if timed_out.is_set():
+                    root = _root_cause(exc)
+                    logger.warning(
+                        "EnergyCache fetch raised after timeout: "
+                        "%s: %s",
+                        type(root).__name__,
+                        root,
+                    )
+                raise
+
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(fetch_func)
+        future = pool.submit(_wrapped)
         try:
             return future.result(timeout=self._fetch_timeout_secs)
         except concurrent.futures.TimeoutError:
+            timed_out.set()
             logger.warning(
                 "EnergyCache fetch timed out after %ds",
                 self._fetch_timeout_secs,
@@ -837,6 +878,9 @@ class EnergyCache:
                 # of crashing on None.
                 if self._data is not None:
                     return self._build_result(), False
+                logger.warning(
+                    "EnergyCache: fetch failed and no stale cache available"
+                )
                 return (None, True)
 
             if result is not None:

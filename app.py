@@ -607,6 +607,13 @@ def _load_management_loop() -> None:
                     })
                     lm_payload = _build_load_management_payload_locked()
                 logger.debug("Load management cycle result: %s", result)
+                if (
+                    result.status == "no_incomplete_qh"
+                    and _energy_cache._data is None
+                ):
+                    logger.warning(
+                        "Load management: no data available (possible network issue)"
+                    )
                 _sse_broadcaster.publish("load_cycle", camelize(lm_payload))
                 cache_data = _energy_cache._data
                 if cache_data is not None and cache_data.full_metrics_dict is not None:
