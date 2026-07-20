@@ -109,7 +109,7 @@ class EnergyCache:
         self,
         ttl_seconds: int = 30,
         clock: Clock | None = None,
-        fetch_timeout_secs: int = 120,
+        fetch_timeout_secs: int = 30,
     ) -> None:
         self._data: EnergyCacheData | None = None
         self._ttl_seconds: int = ttl_seconds

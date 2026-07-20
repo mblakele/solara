@@ -611,10 +611,10 @@ class TestGetOrFetchTimeout:
         assert was_fresh is False
         assert result.get("devices") == [{"gid": 1}]
 
-    def test_default_timeout_is_120(self) -> None:
-        """Default fetch_timeout_secs is 120 seconds."""
+    def test_default_timeout_is_30(self) -> None:
+        """Default fetch_timeout_secs is 30 seconds."""
         cache = EnergyCache()
-        assert cache._fetch_timeout_secs == 120
+        assert cache._fetch_timeout_secs == 30
 
 
 class TestGetOrFetchTimingLogs:

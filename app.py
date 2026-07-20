@@ -114,6 +114,8 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
     Returns:
         The enriched metrics dict (same object, modified in place).
     """
+    if metrics_data is None:
+        metrics_data = {"devices": [], "api_response": {}, "instant": now}
     if now is None:
         now = datetime.now(timezone.utc)
     fetched_at = metrics_data.get("_fetched_at")

@@ -5,7 +5,7 @@ import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import requests
 from app import app
@@ -1062,6 +1062,41 @@ class TestIndexEndpointPerSecondData(unittest.TestCase):
             "Last sample should be 529, the most recent merged sample")
         self.assertEqual(psd[0], 230,
             "First sample should be 230 (last 300 of the merged 530)")
+
+
+class TestNetworkOutageGracefulDegradation(unittest.TestCase):
+    """Tests for graceful handling when network is down and metrics are None."""
+
+    def setUp(self):
+        self.app = app.test_client()
+
+    def test_index_returns_gracefully_when_metrics_none(self):
+        """Index endpoint returns 200 (not 500) when get_or_fetch returns None.
+
+        During a network outage, EnergyCache.get_or_fetch() returns (None, True)
+        and _enrich_metrics_for_sse must not crash on None input.
+        """
+        import app as app_mod
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod, "_energy_cache") as mock_cache:
+                mock_cache.get_or_fetch.return_value = (None, True)
+                mock_cache._data = None
+                mock_cache.merge_incremental = MagicMock(return_value=None)
+                resp = self.app.get("/", headers={"Accept": "application/json"})
+
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertIn("devices", data)
+
+    def test_enrich_metrics_for_sse_none_input(self):
+        """_enrich_metrics_for_sse handles None input without crashing."""
+        import app as app_mod
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        result = app_mod._enrich_metrics_for_sse(None, now=now)
+        self.assertIsInstance(result, dict)
+        self.assertIn("devices", result)
 
 
 if __name__ == "__main__":
