@@ -284,9 +284,10 @@ project-root
 - `NotificationEvent` (telegram.py) — frozen dataclass for structured notifications with `format_message()`
 - `load_telegram_config()` (telegram.py) — loads config from env vars (priority) or devices.json
 - `load_telegram_devices()` (telegram.py) — loads device whitelist dict from `LOAD_TELEGRAM_DEVICES` env var or devices.json
-- `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`
+- `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`; "tesla" is accepted as a special device name for Tesla stop-charging alerts
 - Whitelist gate: Telegram notifications are only sent when a telegram.devices whitelist is explicitly configured AND at least one action matches it. Without a whitelist, notifications are blocked to prevent unintended messages to unconfigured devices.
-- Plug notifications use emoji format: `🔵 device → ON` / `🔴 device → OFF`
+- Plug notifications use emoji format: `🟢 device → ON` / `🔘 device → OFF`
+- Tesla notifications use device-specific format: `🔌 Tesla charging stopped` / `⚡ Tesla charging started` / `🔋 Tesla charge amps → N A`
 
 ### EnergyCache & Incremental Fetch
 - `EnergyCache` (energy_cache.py) stores per-second energy samples with metadata in a

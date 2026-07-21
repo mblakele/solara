@@ -187,6 +187,86 @@ class TestNotificationEvent:
         with pytest.raises(Exception):
             event.event_type = "new"
 
+    def test_format_message_tesla_stop_charging(self):
+        """Tesla turn_off action shows charging-stopped format."""
+        from load_models import PendingEffect
+
+        event = NotificationEvent(
+            event_type=EVENT_TYPE_SURPLUS,
+            timestamp=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            description="Solara",
+            actions=[
+                PendingEffect(
+                    device_name="tesla",
+                    action="turn_off",
+                    timestamp=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+                    data_point_at=datetime(2025, 6, 15, 14, 29, 0, tzinfo=timezone.utc),
+                    power_watts=0,
+                ),
+            ],
+            predicted_wh=-200.0,
+            target_wh=-50.0,
+        )
+        msg = event.format_message()
+        assert "Tesla charging stopped" in msg
+        assert "14:30:00" in msg
+
+    def test_format_message_tesla_set_amps(self):
+        """Tesla set_amps action shows amps-changed format."""
+        from load_models import PendingEffect
+
+        event = NotificationEvent(
+            event_type=EVENT_TYPE_SURPLUS,
+            timestamp=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            description="Solara",
+            actions=[
+                PendingEffect(
+                    device_name="tesla",
+                    action="set_amps",
+                    timestamp=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+                    data_point_at=datetime(2025, 6, 15, 14, 29, 0, tzinfo=timezone.utc),
+                    power_watts=0,
+                    target_amps=12,
+                ),
+            ],
+            predicted_wh=-200.0,
+            target_wh=-50.0,
+        )
+        msg = event.format_message()
+        assert "Tesla charge amps" in msg
+        assert "12 A" in msg
+
+    def test_format_message_mixed_tesla_and_plug(self):
+        """Mixed Tesla and plug actions show appropriate format for each."""
+        from load_models import PendingEffect
+
+        event = NotificationEvent(
+            event_type=EVENT_TYPE_SURPLUS,
+            timestamp=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            description="Solara",
+            actions=[
+                PendingEffect(
+                    device_name="pool_pump",
+                    action="turn_off",
+                    timestamp=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+                    data_point_at=datetime(2025, 6, 15, 14, 29, 0, tzinfo=timezone.utc),
+                    power_watts=1500,
+                ),
+                PendingEffect(
+                    device_name="tesla",
+                    action="turn_off",
+                    timestamp=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+                    data_point_at=datetime(2025, 6, 15, 14, 29, 0, tzinfo=timezone.utc),
+                    power_watts=0,
+                ),
+            ],
+            predicted_wh=-200.0,
+            target_wh=-50.0,
+        )
+        msg = event.format_message()
+        assert "Tesla charging stopped" in msg
+        assert "pool_pump" in msg
+
 
 # =============================================================================
 # 3. TelegramSender

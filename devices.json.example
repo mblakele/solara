@@ -37,7 +37,8 @@
     "chat_id": "",
     "devices": {
       "water_heater": ["turn_on", "turn_off"],
-      "floor_lamp": ["turn_on"]
+      "floor_lamp": ["turn_on"],
+      "tesla": ["turn_off"]
     }
   },
   "tesla": {
