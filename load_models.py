@@ -255,6 +255,22 @@ class TeslaState:
     at_home: bool
 
 
+def build_tesla_state(
+    *,
+    is_charging: bool,
+    current_amps: int | None,
+    plugged_in: bool,
+    at_home: bool,
+) -> TeslaState:
+    """Construct a TeslaState. Centralizes construction to avoid duplication."""
+    return TeslaState(
+        is_charging=is_charging,
+        current_amps=current_amps,
+        plugged_in=plugged_in,
+        at_home=at_home,
+    )
+
+
 @dataclass(frozen=True)
 class TeslaVehicleTelemetry:
     """State received via fleet-telemetry push callbacks.

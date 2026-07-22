@@ -23,8 +23,8 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 
-from load_controllers import _haversine_distance
-from load_models import TeslaState
+from load_models import TeslaState, build_tesla_state
+from util import _haversine_distance
 
 # Deferred import to avoid circular import with config_loader → device_config
 import config
@@ -278,7 +278,7 @@ def tesla_state_from_snapshot(
                     "(DetailedChargeState not yet received)",
                     charge_val,
                 )
-                return TeslaState(
+                return build_tesla_state(
                     is_charging=True,
                     current_amps=charge_val,
                     plugged_in=True,
@@ -307,7 +307,7 @@ def tesla_state_from_snapshot(
                 pass
 
     at_home = _compute_at_home_from_location(snapshot)
-    return TeslaState(
+    return build_tesla_state(
         is_charging=is_charging,
         current_amps=current_amps,
         plugged_in=plugged_in,

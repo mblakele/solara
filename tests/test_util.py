@@ -1,14 +1,36 @@
-"""Tests for util.compute_nbc_quarter prediction window behavior.
+"""Tests for util.py functions.
 
-Verifies that incomplete quarter-hour predictions use exactly the last 60
-per-second samples (or fewer if fewer are available), matching the docstring
-promise in compute_nbc_quarters: "computes a rate from the last 60 seconds of
-data within the current quarter".
+Covers:
+  - _haversine_distance (GPS distance calculation)
+  - compute_nbc_quarter prediction window behavior
 """
 
 import unittest
 
-from util import compute_nbc_quarter
+import pytest
+
+from util import _haversine_distance, compute_nbc_quarter
+
+
+class TestHaversineDistance:
+
+    def test_same_point_returns_zero(self):
+        """Identical coordinates should yield 0 m distance."""
+        assert _haversine_distance(37.0, -122.0, 37.0, -122.0) == pytest.approx(0, abs=0.01)
+
+    def test_known_distance_nyc_to_la(self):
+        """NYC to LA is approximately 3940 km — verify within +/-1%."""
+        # NYC: (40.7128, -74.0060), LA: (34.0522, -118.2437)
+        distance_m = _haversine_distance(40.7128, -74.0060, 34.0522, -118.2437)
+        expected_m = 3_940_000.0
+        assert distance_m == pytest.approx(expected_m, rel=0.01)
+
+    def test_same_lat_different_lon(self):
+        """Moving purely along longitude at equator should give known distance."""
+        # At the equator, 1 degree of longitude ~ 111.3 km
+        distance_m = _haversine_distance(0.0, 0.0, 0.0, 1.0)
+        # Roughly 111 km; allow generous tolerance for spherical approximation
+        assert distance_m == pytest.approx(111_000, rel=0.05)
 
 
 class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):

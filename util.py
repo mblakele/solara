@@ -4,6 +4,7 @@ Utility functions and custom JSON provider for the application.
 
 from dataclasses import dataclass
 from datetime import datetime, time as TimeType, timedelta
+import math
 from typing import Any
 
 import isodate
@@ -294,3 +295,31 @@ def _clock_boundary_windows(now: datetime) -> list[tuple[datetime, datetime]]:
         windows.append((window_start, window_end))
 
     return windows
+
+
+def _haversine_distance(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """Calculate the great-circle distance between two GPS points.
+
+    Args:
+        lat1: Latitude of point 1 in degrees.
+        lon1: Longitude of point 1 in degrees.
+        lat2: Latitude of point 2 in degrees.
+        lon2: Longitude of point 2 in degrees.
+
+    Returns:
+        Distance in meters.
+    """
+    earth_radius_m = 6_371_000  # Earth radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(delta_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return earth_radius_m * c

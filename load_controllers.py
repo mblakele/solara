@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import time as _time
 from datetime import datetime, timezone
@@ -34,7 +33,9 @@ from load_models import (
     TeslaAuthError,
     TeslaConfig,
     TeslaState,
+    build_tesla_state,
 )
+from util import _haversine_distance
 
 
 logger = logging.getLogger(__name__)
@@ -185,35 +186,6 @@ class TeslaController(AbstractTeslaController):
             plugged_in=self._state.plugged_in,
             at_home=self._state.at_home,
         )
-
-
-def _haversine_distance(
-    lat1: float, lon1: float, lat2: float, lon2: float
-) -> float:
-    """Calculate the great-circle distance between two GPS points.
-
-    Args:
-        lat1: Latitude of point 1 in degrees.
-        lon1: Longitude of point 1 in degrees.
-        lat2: Latitude of point 2 in degrees.
-        lon2: Longitude of point 2 in degrees.
-
-    Returns:
-        Distance in meters.
-    """
-    earth_radius_m = 6_371_000  # Earth radius in meters
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(delta_phi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    return earth_radius_m * c
 
 
 def load_tesla_tokens(tokens_path: Path = TESLA_TOKENS_FILE) -> dict[str, Any] | None:
@@ -867,7 +839,7 @@ class RealTeslaController(AbstractTeslaController):
 
             # ── Build TeslaState ────────────────────────────────────────────
             self.save_tokens()
-            return TeslaState(
+            return build_tesla_state(
                 is_charging=is_charging,
                 current_amps=current_amps,
                 plugged_in=plugged_in,
