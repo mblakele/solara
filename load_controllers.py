@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import time as _time
 from datetime import datetime, timezone
@@ -34,7 +33,9 @@ from load_models import (
     TeslaAuthError,
     TeslaConfig,
     TeslaState,
+    build_tesla_state,
 )
+from util import _haversine_distance
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,23 @@ def _is_auth_error(exc: BaseException) -> bool:
     error_str = str(exc).lower()
     keywords = ["login_required", "refresh_token", "unauthorized", "authentication failed"]
     return any(kw in error_str for kw in keywords)
+
+
+def _is_vehicle_offline_error(exc: BaseException) -> bool:
+    """Check if an exception indicates the Tesla vehicle is offline/sleeping.
+
+    Args:
+        exc: The exception to check.
+
+    Returns:
+        True if the exception is a VehicleOffline instance or the error
+        message matches the vehicle-offline pattern.
+    """
+    from tesla_fleet_api.exceptions import VehicleOffline
+    if isinstance(exc, VehicleOffline):
+        return True
+    error_str = str(exc).lower()
+    return "vehicle is not" in error_str and "online" in error_str
 
 # Default path for Tesla OAuth token persistence
 TESLA_TOKENS_FILE = Path(".tesla-tokens.json")
@@ -107,6 +125,7 @@ class TeslaController(AbstractTeslaController):
     def __init__(self, tesla_config: TeslaConfig) -> None:
         self.config = tesla_config
         self.last_error: str | None = None
+        self._last_command_vehicle_offline: bool = False
         self._state = TeslaState(
             is_charging=False,
             current_amps=None,
@@ -167,35 +186,6 @@ class TeslaController(AbstractTeslaController):
             plugged_in=self._state.plugged_in,
             at_home=self._state.at_home,
         )
-
-
-def _haversine_distance(
-    lat1: float, lon1: float, lat2: float, lon2: float
-) -> float:
-    """Calculate the great-circle distance between two GPS points.
-
-    Args:
-        lat1: Latitude of point 1 in degrees.
-        lon1: Longitude of point 1 in degrees.
-        lat2: Latitude of point 2 in degrees.
-        lon2: Longitude of point 2 in degrees.
-
-    Returns:
-        Distance in meters.
-    """
-    earth_radius_m = 6_371_000  # Earth radius in meters
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(delta_phi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    return earth_radius_m * c
 
 
 def load_tesla_tokens(tokens_path: Path = TESLA_TOKENS_FILE) -> dict[str, Any] | None:
@@ -288,6 +278,8 @@ class RealTeslaController(AbstractTeslaController):
         """Current exponential backoff duration in seconds."""
         self._last_saved_tokens_at: float = 0.0
         """Monotonic time of the last save_tokens() call (0 = never saved)."""
+        self._last_command_vehicle_offline: bool = False
+        """True when the last command failed with VehicleOffline."""
 
     async def _get_session(self, ssl: bool = True) -> aiohttp.ClientSession:
         """Get or create the aiohttp session.
@@ -587,12 +579,18 @@ class RealTeslaController(AbstractTeslaController):
             await vehicle.charge_stop()
             logger.info("Tesla charge_stop sent successfully")
             self.save_tokens()
+            self._last_command_vehicle_offline = False
             return True
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
             if _is_auth_error(e):
                 raise TeslaAuthError(str(e)) from e
+            if _is_vehicle_offline_error(e):
+                self._last_command_vehicle_offline = True
+                logger.warning("Tesla vehicle not online, command deferred: %s", e)
+                return False
+            self._last_command_vehicle_offline = False
             logger.error("Failed to stop Tesla charging: %s", e)
             return False
         finally:
@@ -623,12 +621,18 @@ class RealTeslaController(AbstractTeslaController):
             await vehicle.set_charging_amps(clamped)
             logger.info("Tesla set_charge_amps(%d) sent successfully", clamped)
             self.save_tokens()
+            self._last_command_vehicle_offline = False
             return True
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)):
                 raise
             if _is_auth_error(e):
                 raise TeslaAuthError(str(e)) from e
+            if _is_vehicle_offline_error(e):
+                self._last_command_vehicle_offline = True
+                logger.warning("Tesla vehicle not online, command deferred: %s", e)
+                return False
+            self._last_command_vehicle_offline = False
             logger.error("Failed to set Tesla charge amps: %s", e)
             return False
         finally:
@@ -835,7 +839,7 @@ class RealTeslaController(AbstractTeslaController):
 
             # ── Build TeslaState ────────────────────────────────────────────
             self.save_tokens()
-            return TeslaState(
+            return build_tesla_state(
                 is_charging=is_charging,
                 current_amps=current_amps,
                 plugged_in=plugged_in,

@@ -1,15 +1,16 @@
 """Tests for load_controllers.py — standalone functions, stub controllers, and composite controller.
 
 Covers:
-  - _haversine_distance (lines ~158-184)
-  - Tesla token persistence functions (lines ~187-250)
-  - PlugController stub expansion (lines ~46-73)
-  - TeslaController stub expansion (lines ~76-156)
-  - CompositePlugController routing and merging (lines ~1148-1219)
-  - RealTeslaController.reset_session (lines ~719-730)
-  - RealPlugController._load_pairing_data / _save_pairing_data (lines ~817-839)
-  - VOCOlincPlugController._ensure_initialized (lines ~1050-1087)
-  - VOCOlincPlugController error paths (lines ~1089-1145)
+  - Tesla token persistence functions
+  - PlugController stub expansion
+  - TeslaController stub expansion
+  - CompositePlugController routing and merging
+  - RealTeslaController.reset_session
+  - RealPlugController._load_pairing_data / _save_pairing_data
+  - VOCOlincPlugController._ensure_initialized
+  - VOCOlincPlugController error paths
+
+Note: _haversine_distance tests live in tests/test_util.py (function moved to util.py).
 """
 
 from __future__ import annotations
@@ -29,7 +30,6 @@ from load_controllers import (
     RealPlugController,
     TeslaController,
     VocolincPlugController,
-    _haversine_distance,
     load_tesla_tokens,
     remove_tesla_tokens,
     save_tesla_tokens,
@@ -74,33 +74,7 @@ def tesla_config():
 
 
 # =============================================================================
-# 1. _haversine_distance (lines ~158-184)
-# =============================================================================
-
-
-class TestHaversineDistance:
-
-    def test_same_point_returns_zero(self):
-        """Identical coordinates should yield 0 m distance."""
-        assert _haversine_distance(37.0, -122.0, 37.0, -122.0) == pytest.approx(0, abs=0.01)
-
-    def test_known_distance_nyc_to_la(self):
-        """NYC to LA is approximately 3940 km — verify within +/-1%."""
-        # NYC: (40.7128, -74.0060), LA: (34.0522, -118.2437)
-        distance_m = _haversine_distance(40.7128, -74.0060, 34.0522, -118.2437)
-        expected_m = 3_940_000.0
-        assert distance_m == pytest.approx(expected_m, rel=0.01)
-
-    def test_same_lat_different_lon(self):
-        """Moving purely along longitude at equator should give known distance."""
-        # At the equator, 1 degree of longitude ~ 111.3 km
-        distance_m = _haversine_distance(0.0, 0.0, 0.0, 1.0)
-        # Roughly 111 km; allow generous tolerance for spherical approximation
-        assert distance_m == pytest.approx(111_000, rel=0.05)
-
-
-# =============================================================================
-# 2. Tesla token persistence functions (lines ~187-249)
+# Tesla token persistence functions
 # =============================================================================
 
 

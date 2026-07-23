@@ -91,6 +91,9 @@ def validate_telegram_devices(
     ``config["plugs"]["vocolinc"]``.  Comparison is case-insensitive to
     match the convention used by the plug loaders.
 
+    The special device name "tesla" (case-insensitive) is always accepted
+    to enable Tesla stop-charging alerts via the telegram.devices whitelist.
+
     Args:
         config: The full devices.json config dict (contains plugs section).
         telegram_config: The telegram section from devices.json.
@@ -113,13 +116,16 @@ def validate_telegram_devices(
             if name:
                 plug_names.add(name.lower())
 
+    # "tesla" is a valid device name for Tesla stop-charging alerts.
+    plug_names.add("tesla")
+
     unmatched: list[str] = []
     for device_name in devices:
         if device_name.lower() not in plug_names:
             unmatched.append(device_name)
 
     if unmatched:
-        sorted_plugs = sorted(plug_names)
+        sorted_plugs = sorted(plug_names - {"tesla"})
         raise DeviceConfigError(
             f"Invalid telegram.devices: {unmatched} not found in plugs. "
             f"Found plug names: {sorted_plugs}."

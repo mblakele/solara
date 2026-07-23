@@ -102,6 +102,55 @@ def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
     candidates = sorted(n for n, c in length_counts.items() if c == max_count)
     n = candidates[0]
 
+    # The run-length mode can be wrong in two ways:
+    #   1. Adjacent windows with identical values merge, inflating the mode
+    #      (e.g. real period 30, mode becomes 60).  Check N/2.
+    #   2. Frequent value changes within a true window shrink the mode
+    #      (e.g. real period 30, mode becomes 15).  Check multiples of N.
+    # For each candidate, score window-purity and prefer the one that
+    # scores strictly higher (≥ 2 % improvement) over the mode.
+    def _score(d: int) -> int:
+        best = 0
+        for off in range(d):
+            s = 0
+            nw = (data_len - off) // d
+            for k in range(nw):
+                ws = off + k * d
+                v = data[ws]
+                if all(_equal(data[j], v) for j in range(ws + 1, ws + d)):
+                    s += d
+            best = max(best, s)
+        return best
+
+    best_n = n
+    best_s = _score(n)
+
+    # Check N/2 (handles inflated mode).
+    # Only switch if N/2 has some representation in the run distribution —
+    # otherwise its higher purity is just an artifact of smaller windows
+    # dodging value changes rather than a genuine quantization period.
+    if n > 2 and n % 2 == 0:
+        n_half = n // 2
+        n_half_runs = sum(
+            1 for _, _, rl in runs
+            if abs(rl - n_half) <= 1
+        )
+        if n_half_runs >= 1:
+            s_half = _score(n_half)
+            if best_s > 0 and s_half > best_s * 1.02:
+                best_n, best_s = n_half, s_half
+
+    # Check multiples 2N, 3N, … up to 60 (handles shrunk mode).
+    mult = 2
+    while mult * n <= 60:
+        n_mult = mult * n
+        s_mult = _score(n_mult)
+        if best_s > 0 and s_mult > best_s * 1.02:
+            best_n, best_s = n_mult, s_mult
+        mult += 1
+
+    n = best_n
+
     # Cap at 60; must be at least 2.
     if n > 60 or n < 2:
         return None
@@ -116,7 +165,6 @@ def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
         for k in range(num_windows):
             window_start = offset + k * n
             window_end = window_start + n
-            # Check if the window is pure (all values equal, NaN==NaN).
             window_value = data[window_start]
             is_pure = True
             for j in range(window_start + 1, window_end):

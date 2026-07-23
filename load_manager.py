@@ -26,9 +26,12 @@ import pytz
 import device_config
 
 from clock import Clock, RealClock
-from config import Config, _config
+from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
+    DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
+    MIN_SAMPLES_FOR_PREDICTION,
+    QUANTIZATION_CONFIDENCE_THRESHOLD,
     STALE_DATA_THRESHOLD_SECS,
 )
 
@@ -261,6 +264,7 @@ class LoadManager:
         self._clock: Clock = clock if clock is not None else RealClock()
 
         self._lock = threading.Lock()
+        self._config_watcher = ConfigWatcher()
         self.plug_ctrl: AbstractPlugController
         self.tesla_ctrl: AbstractTeslaController | None
         self.plugs: dict[str, PlugConfig]
@@ -321,6 +325,9 @@ class LoadManager:
         # Anti-spam dedup: tracks the last auth error text sent to Telegram so we
         # only send one alert per unique error message (not one per 30 s cycle).
         self._last_auth_error_msg: str | None = None
+        # Set to True when a Tesla command fails with VehicleOffline this cycle.
+        # Used to select a shorter sleep hint so the next cycle retries quickly.
+        self._vehicle_offline_this_cycle: bool = False
 
         logger.debug("LoadManager %s", plug_ctrl)
         if plug_ctrl is not None:
@@ -440,11 +447,12 @@ class LoadManager:
     def _resolve_prediction_window(self) -> int:
         """Return the prediction window in seconds, derived from EnergyCache quantization.
 
-        When the energy cache has high-confidence quantization data (>= 0.9),
-        returns ``quantization_seconds``. Otherwise falls back to 60 seconds
+        When the energy cache has quantization data with confidence at or
+        above ``QUANTIZATION_CONFIDENCE_THRESHOLD``, returns
+        ``quantization_seconds``.  Otherwise falls back to 60 seconds
         (the classic default pre-quantization prediction window).
 
-        Safe to call before ``nbc_reader`` is initialized (returns 60), and
+        Safe to call before ``nbc_reader`` is initialized (returns default), and
         when ``nbc_reader`` is replaced with a mock that doesn't expose
         ``energy_cache``.
 
@@ -453,14 +461,14 @@ class LoadManager:
         """
         nbc = getattr(self, 'nbc_reader', None)
         if nbc is None:
-            return 60
+            return DEFAULT_PREDICTION_WINDOW_SECS
         ec = getattr(nbc, 'energy_cache', None)
         if ec is not None and ec.data is not None:
             qs = ec.quantization_seconds
             qc = ec.quantization_confidence
-            if qs is not None and qc is not None and qc >= 0.9:
+            if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
                 return qs
-        return 60
+        return DEFAULT_PREDICTION_WINDOW_SECS
 
     def is_enabled_at(self, now: datetime) -> bool:
         """Check if load management is enabled at the given moment.
@@ -528,8 +536,10 @@ class LoadManager:
 
         Calls get_current_qh on the NBC reader. If the fetch returns None
         (no incomplete quarter-hour), returns CycleResult(status='no_incomplete_qh').
-        Otherwise populates ctx.qh_name, ctx.predicted_wh, ctx.seconds_remaining,
-        ctx.data_point_at, and ctx.now_postfetch, then returns None.
+        If samples_used < MIN_SAMPLES_FOR_PREDICTION, returns early with a short
+        sleep hint instead of acting on unreliable data.  Otherwise populates
+        ctx.qh_name, ctx.predicted_wh, ctx.seconds_remaining, ctx.data_point_at,
+        and ctx.now_postfetch, then returns None.
         """
         fetch_start = _time_mod.perf_counter()
         qh_result = self.nbc_reader.get_current_qh(force=ctx.force, now=ctx.now)
@@ -550,12 +560,28 @@ class LoadManager:
                 sleep_hint=DEFAULT_SLEEP_HINT_SECS,
                 sleep_hint_at=ctx.now.isoformat(),
             )
-        (
-            ctx.qh_name,
-            ctx.predicted_wh,
-            ctx.seconds_remaining,
-            ctx.data_point_at,
-        ) = qh_result
+        if (qh_result.samples_used is not None
+                and qh_result.samples_used < MIN_SAMPLES_FOR_PREDICTION):
+            return CycleResult(
+                status="no_incomplete_qh",
+                diagnostics=CycleDiagnostics(
+                    gap_wh=None,
+                    hysteresis_wh=self.engine.HYSTERESIS_WH,
+                    seconds_remaining=None,
+                    data_point_at=None,
+                    reason="insufficient_samples",
+                    tesla_configured=self.tesla_ctrl is not None,
+                    tesla_state=None,
+                    tesla_error=None,
+                    plugs_configured=list(self.plugs.keys()),
+                ),
+                sleep_hint=DEFAULT_SLEEP_HINT_SECS,
+                sleep_hint_at=ctx.now.isoformat(),
+            )
+        ctx.qh_name = qh_result.qh_name
+        ctx.predicted_wh = qh_result.predicted_wh
+        ctx.seconds_remaining = qh_result.seconds_remaining
+        ctx.data_point_at = qh_result.data_point_at
         fetch_end = _time_mod.perf_counter()
         ctx.now_postfetch = ctx.now + timedelta(seconds=fetch_end - fetch_start)
         return None
@@ -617,49 +643,43 @@ class LoadManager:
             )
 
         # Commit succeeded effects to state
-        for effect in ctx.succeeded_effects:
-            self.state.pending_effects.append(effect)
-
-        # Track Tesla amp state and settle-window
         now_postfetch = ctx.now_postfetch
         assert now_postfetch is not None
         for effect in ctx.succeeded_effects:
-            if effect.device_name == "tesla":
-                if effect.action == "set_amps":
-                    prev_amps = self.state.last_commanded_amps
-                    new_amps = effect.target_amps
-                    self.state.last_commanded_amps = new_amps
-                    if new_amps is not None and (
-                        prev_amps is None or new_amps > prev_amps
-                    ):
-                        self.state.record_tesla_amp_increase(
-                            effect.timestamp, qh_name=ctx.qh_name,
-                            data_point_at=effect.data_point_at,
-                        )
-                        logger.debug(
-                            "Tesla amp increase recorded: %s → %d A "
-                            "(settle window starts)",
-                            prev_amps,
-                            new_amps,
-                        )
-                    elif (
-                        new_amps is not None
-                        and prev_amps is not None
-                        and new_amps < prev_amps
-                    ):
-                        self.state.record_tesla_amp_decrease(
-                            effect.timestamp, qh_name=ctx.qh_name,
-                            data_point_at=effect.data_point_at,
-                        )
-                        logger.debug(
-                            "Tesla amp decrease recorded: %s → %d A "
-                            "(post-decrease settle window starts)",
-                            prev_amps,
-                            new_amps,
-                        )
-                elif effect.action in ("turn_off", "turn_on"):
-                    self.state.last_commanded_amps = None
-                    self.state.clear_tesla_settle()
+            if effect.device_name == "tesla" and effect.action == "set_amps":
+                prev_amps = self.state.last_commanded_amps
+                new_amps = effect.target_amps
+                self.state.last_commanded_amps = new_amps
+                if new_amps is not None and (
+                    prev_amps is None or new_amps > prev_amps
+                ):
+                    effect.direction = "increase"
+                    effect.suppress_action = "turn_off"
+                    effect.qh_name = ctx.qh_name
+                    logger.debug(
+                        "Tesla amp increase recorded: %s → %d A "
+                        "(settle window starts)",
+                        prev_amps,
+                        new_amps,
+                    )
+                elif (
+                    new_amps is not None
+                    and prev_amps is not None
+                    and new_amps < prev_amps
+                ):
+                    effect.direction = "decrease"
+                    effect.suppress_action = "turn_on"
+                    effect.qh_name = ctx.qh_name
+                    logger.debug(
+                        "Tesla amp decrease recorded: %s → %d A "
+                        "(post-decrease settle window starts)",
+                        prev_amps,
+                        new_amps,
+                    )
+            elif effect.device_name == "tesla" and effect.action in ("turn_off", "turn_on"):
+                self.state.last_commanded_amps = None
+                self.state.clear_tesla_settle_effects()
+            self.state.pending_effects.append(effect)
 
         # Sync Tesla entry in devices from live vehicle state
         self.state.sync_tesla_device_state(ctx.tesla_state)
@@ -760,8 +780,13 @@ class LoadManager:
                 ),
                 telemetry_registered=has_telemetry(),
                 active_tesla_telemetry=active_telemetry,
+                tesla_command_offline=self._vehicle_offline_this_cycle,
             ),
-            sleep_hint=self.config_interval_secs,
+            sleep_hint=(
+                DEFAULT_SLEEP_HINT_SECS
+                if self._vehicle_offline_this_cycle
+                else self.config_interval_secs
+            ),
             sleep_hint_at=(
                 ctx.now_postfetch.isoformat()
                 if ctx.now_postfetch else ""
@@ -850,7 +875,7 @@ class LoadManager:
                 sleep_hint_at=now_postfetch.isoformat(),
             )
 
-        # Stale-data gate: data_point_age > 120 s (accounting for Emporia lag).
+        # Stale-data gate: data_point_age > STALE_DATA_THRESHOLD_SECS (accounting for Emporia lag).
         data_lag = self.nbc_reader.get_data_lag_secs()
         base_diag: dict[str, Any] = {
             "gap_wh": None,
@@ -1047,7 +1072,7 @@ class LoadManager:
         now: datetime,
         seconds_remaining: int,
         tesla_state: TeslaState | None,
-        tesla_error: str | None,
+        _tesla_error: str | None,
         tesla_configured: bool,
     ) -> list[CandidateDetail]:
         """Build per-device diagnostics for visibility into decisions.
@@ -1056,7 +1081,7 @@ class LoadManager:
             now: current datetime.
             seconds_remaining: Seconds left in current quarter-hour.
             tesla_state: Tesla state if available.
-            tesla_error: Error message if Tesla state fetch failed.
+            _tesla_error: Error message if Tesla state fetch failed (reserved).
             tesla_configured: Whether a Tesla controller is configured.
 
         Returns:
@@ -1181,76 +1206,6 @@ class LoadManager:
         if has_too_large:
             return "loads_too_large"
         return "no_candidates"
-
-    def _calculate_adaptive_sleep(self, cycle_result: CycleResult) -> float:
-        """Calculate an adaptive sleep duration based on the current cycle state.
-
-        The returned value is always clamped to [5, config_interval * 2].
-
-        Args:
-            cycle_result: The CycleResult from run_cycle().
-
-        Returns:
-            Suggested sleep duration in seconds.
-        """
-        status = cycle_result.status
-        config_interval = self.config_interval_secs
-        min_interval = 5.0
-
-        # --- Disabled: normal interval ---
-        if status == "disabled":
-            return config_interval
-
-        # --- Stale data: minimum sleep, refresh ASAP ---
-        if status == "stale_data":
-            return min_interval
-
-        # --- No incomplete QH: minimum sleep ---
-        if status == "no_incomplete_qh":
-            return min_interval
-
-        # --- Shared lookups ---
-        seconds_remaining = self._seconds_remaining(cycle_result)
-
-        # --- Waiting for fresh data: wait until next NBC point ---
-        if status == "waiting_for_fresh_data":
-            return min(seconds_remaining, self._resolve_prediction_window())
-
-        # --- Shared lookups ---
-        predicted_wh = cycle_result.predicted_wh
-
-        # --- No deficit (predicted >= target): check how much QH remains ---
-        # When predicted_wh is unknown (None), fall through to deficit handling
-        if predicted_wh is not None and predicted_wh >= self.target_wh:
-            # No deficit. Early in the quarter -> sleep longer; late -> wake sooner.
-            if seconds_remaining > 300:  # more than 5 min left in QH
-                return min(config_interval * 1.5, config_interval * 2)
-
-            return min(config_interval * 1.25, config_interval * 2)
-
-        # --- Deficit with no actions possible: proportional sleep ---
-        # Guard against None predicted_wh; if unknown, use a sensible default gap
-        gap_wh = predicted_wh if predicted_wh is not None else self.target_wh or -50
-        gap = abs(gap_wh - self.target_wh) if self.target_wh is not None else 0.0
-
-        # Calculate total eligible capacity from candidates
-        max_load_capacity = 0.0
-        for candidate in cycle_result.candidates or []:
-            if candidate.power_watts is not None:
-                max_load_capacity += candidate.power_watts
-
-        if max_load_capacity > 0 and seconds_remaining > 0:
-            # Time to close the gap at full capacity (in seconds)
-            time_to_close = (gap / max_load_capacity) * 3600.0
-            # Proportion of config interval: if gap shrinks to fillable in half
-            # the QH, sleep half as long relative to config.
-            proportion = seconds_remaining / max(time_to_close, 1)
-            sleep = config_interval * min(proportion, 2.0)
-        else:
-            # No capacity or unknown -> minimum sleep
-            sleep = min_interval
-
-        return max(min_interval, min(sleep, config_interval * 2))
 
     @staticmethod
     def _seconds_remaining(cycle_result: CycleResult) -> float:
@@ -1719,6 +1674,35 @@ class LoadManager:
             The final bool is True when any sentinel device was detected on
             during sync, allowing the caller to disable the cycle.
         """
+        try:
+            return await self._cycle_async_phase_body(
+                gap_wh, adjusted_wh, now, seconds_remaining,
+                dry_run, qh_name=qh_name, data_point_at=data_point_at,
+            )
+        finally:
+            await self._cleanup_sessions()
+
+    async def _cycle_async_phase_body(
+        self,
+        _gap_wh: float,
+        adjusted_wh: float,
+        now: datetime,
+        seconds_remaining: int,
+        dry_run: bool,
+        qh_name: str | None = None,
+        data_point_at: datetime | None = None,
+    ) -> tuple[
+        TeslaState | None,
+        str | None,
+        str | None,
+        list[PendingEffect],
+        list[PendingEffect],
+        float,
+        float,
+        bool,
+    ]:
+        """Body of _cycle_async_phase, extracted for try/finally cleanup."""
+        self._vehicle_offline_this_cycle = False
         # Sync actual plug states before making decisions so the engine sees
         # external changes (user toggles, other automations, etc.)
         await self._sync_plug_states()
@@ -1799,14 +1783,18 @@ class LoadManager:
         # the window on a QH transition.
         settle_now = now
         # ── Post-increase: suppress turn-off ──
+        increase_eff = self.state.get_active_tesla_settle(
+            settle_now, current_qh=qh_name, data_point_at=data_point_at,
+            direction="increase",
+        )
         if (
             corrected_gap_wh < 0
             and abs(corrected_gap_wh) < self.engine.TESLA_SETTLE_SUPPRESS_WH
-            and self.state.is_settling_after_amp_increase(settle_now, current_qh=qh_name, data_point_at=data_point_at)
+            and increase_eff is not None
         ):
             settle_remaining = (
                 self.state.effective_settle_secs
-                - (settle_now - self.state.last_tesla_increase_at).total_seconds()  # type: ignore[operator]
+                - (settle_now - increase_eff.timestamp).total_seconds()
             )
             logger.info(
                 "[_cycle_async_phase] suppressing turn-off: settling after Tesla "
@@ -1825,14 +1813,17 @@ class LoadManager:
                 False,
             )
         # ── Post-decrease: suppress turn-on ──
+        decrease_eff = self.state.get_active_tesla_settle(
+            settle_now, current_qh=qh_name, data_point_at=data_point_at,
+            direction="decrease",
+        )
         if (
-            corrected_gap_wh > 0
-            and corrected_gap_wh < self.engine.TESLA_SETTLE_SUPPRESS_WH
-            and self.state.is_settling_after_amp_decrease(settle_now, current_qh=qh_name, data_point_at=data_point_at)
+            0 < corrected_gap_wh < self.engine.TESLA_SETTLE_SUPPRESS_WH
+            and decrease_eff is not None
         ):
             settle_remaining = (
                 self.state.effective_settle_secs
-                - (settle_now - self.state.last_tesla_decrease_at).total_seconds()  # type: ignore[operator]
+                - (settle_now - decrease_eff.timestamp).total_seconds()
             )
             logger.info(
                 "[_cycle_async_phase] suppressing turn-on: settling after Tesla "
@@ -1938,6 +1929,32 @@ class LoadManager:
 
         return tesla_state, tesla_error, tesla_login_url, succeeded_effects, results, corrected_gap_wh, corrected_adjusted_wh, False
 
+    async def _cleanup_sessions(self) -> None:
+        """Close aiohttp sessions held by controllers.
+
+        Must be called while the event loop is still alive (inside asyncio.run)
+        so that session.close() can be awaited.  Discards the session reference
+        afterward so reset_session() is a no-op on the next cycle.
+        """
+        if self.tesla_ctrl is not None:
+            session = getattr(self.tesla_ctrl, "_session", None)
+            if session is not None:
+                try:
+                    await session.close()
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+                self.tesla_ctrl._session = None  # type: ignore[attr-defined]
+        if self.telegram_sender is not None:
+            client = getattr(self.telegram_sender, "_telegram_client", None)
+            if client is not None:
+                session = getattr(client, "_session", None)
+                if session is not None:
+                    try:
+                        await session.close()
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        pass
+                    client._session = None
+
     @staticmethod
     def _plug_states_from_candidates(
         candidate_details: list[CandidateDetail],
@@ -1961,6 +1978,95 @@ class LoadManager:
             if c.name != "tesla"
         }
 
+    def reload_config(self) -> list[str]:
+        """Hot-reload settings from devices.json.
+
+        Must be called under self._lock (from run_cycle).
+        Returns list of human-readable change descriptions.
+        """
+        device_config.reload()
+        changes: list[str] = []
+
+        new_target = device_config.get_target_wh()
+        if new_target != self.target_wh:
+            changes.append(f"target_wh: {self.target_wh} -> {new_target}")
+            self.target_wh = new_target
+
+        new_nbc = device_config.get_smartmeter_device()
+        if new_nbc != self.nbc_device:
+            changes.append(f"nbc_device: {self.nbc_device} -> {new_nbc}")
+            self.nbc_device = new_nbc
+
+        new_homekit = load_plugs_from_file()
+        new_vocolinc = load_vocolinc_plugs_from_file()
+        new_all: dict[str, Any] = {**new_homekit, **new_vocolinc}
+        if set(new_all.keys()) != set(self.plugs.keys()) or any(
+            new_all[k] != v for k, v in self.plugs.items() if k in new_all
+        ):
+            changes.append(f"plugs updated: {sorted(new_all.keys())}")
+            self.plugs = new_all
+            self.plug_ctrl.plugs = new_all  # type: ignore[attr-defined]
+            self.sentinel_names = frozenset(
+                name for name, plug in new_all.items() if plug.sentinel
+            )
+
+        new_tesla = load_tesla_config(config=self._cfg)
+        if new_tesla != self.tesla_config:
+            changes.append("tesla_config updated")
+            self.tesla_config = new_tesla
+            if new_tesla:
+                self.engine = GapMinder(
+                    hysteresis_wh=self.engine.HYSTERESIS_WH,
+                    charge_amps_min=new_tesla.charge_amps_min,
+                    charge_amps_max=new_tesla.charge_amps_max,
+                )
+
+        tg_config = device_config.get_telegram_config()
+        new_devices = None
+        new_alert_on_auth = True
+        if tg_config:
+            new_alert_on_auth = tg_config.get("alert_on_auth_error", True)
+            devices = tg_config.get("devices")
+            if devices:
+                new_devices = {
+                    name.lower(): set(actions)
+                    for name, actions in devices.items()
+                }
+        if new_devices != self._telegram_devices:
+            changes.append("telegram devices whitelist updated")
+            self._telegram_devices = new_devices
+        if new_alert_on_auth != self._telegram_alert_on_auth_error:
+            self._telegram_alert_on_auth_error = new_alert_on_auth
+
+        return changes
+
+    def _check_config_changes(self) -> None:
+        """Check .env and devices.json for changes; reload and log results.
+
+        Called at the top of run_cycle() under self._lock.
+        """
+        config_changes = self._config_watcher.check()
+        if config_changes.devices_changed:
+            reload_changes = self.reload_config()
+            if reload_changes:
+                logger.info(
+                    "config_reloaded devices.json changes=%s",
+                    reload_changes,
+                    extra={"event": "config_reloaded", "changes": reload_changes},
+                )
+        if config_changes.env_changed:
+            restart_required = check_restart_required(config_changes.env_changed)
+            if restart_required:
+                logger.warning(
+                    "config_env_changed requires_restart=%s changed_keys=%s",
+                    restart_required, config_changes.env_changed,
+                )
+            else:
+                logger.info(
+                    "config_reloaded .env changed_keys=%s",
+                    config_changes.env_changed,
+                )
+
     def run_cycle(self, force: bool = False) -> CycleResult:
         """Execute one load management cycle. Returns a CycleResult.
 
@@ -1968,6 +2074,7 @@ class LoadManager:
         with concurrent endpoint calls.
 
         The cycle runs as a seven-stage pipeline:
+            0. Config check — detect .env / devices.json changes.
             1. Enabled check — bail early if disabled or outside time window.
             2. NBC fetch — obtain the current quarter-hour prediction.
             3. Pending-state check — skip if data is stale or pending effects
@@ -1987,6 +2094,8 @@ class LoadManager:
             CycleResult with status, diagnostics, and sleep_hint.
         """
         with self._lock:
+            self._check_config_changes()
+
             ctx = CycleContext(now=self._clock.now(), force=force)
             logger.info("cycle_start force=%s",
                         force,
@@ -2119,7 +2228,10 @@ class LoadManager:
 
         if action.action == "turn_off":
             try:
-                return await self.tesla_ctrl.stop_charging()
+                result = await self.tesla_ctrl.stop_charging()
+                if self.tesla_ctrl._last_command_vehicle_offline:
+                    self._vehicle_offline_this_cycle = True
+                return result
             except TeslaAuthError as e:
                 self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
                 return False
@@ -2129,7 +2241,10 @@ class LoadManager:
         if action.action == "set_amps":
             if action.target_amps is None or action.target_amps < 5:
                 try:
-                    return await self.tesla_ctrl.stop_charging()
+                    result = await self.tesla_ctrl.stop_charging()
+                    if self.tesla_ctrl._last_command_vehicle_offline:
+                        self._vehicle_offline_this_cycle = True
+                    return result
                 except TeslaAuthError as e:
                     self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
                     return False
@@ -2139,7 +2254,10 @@ class LoadManager:
             clamped_amps = min(action.target_amps, self.tesla_config.charge_amps_max)
             clamped_amps = min(clamped_amps, GapMinder.HARD_MAX_AMPS)
             try:
-                return await self.tesla_ctrl.set_charge_amps(clamped_amps)
+                result = await self.tesla_ctrl.set_charge_amps(clamped_amps)
+                if self.tesla_ctrl._last_command_vehicle_offline:
+                    self._vehicle_offline_this_cycle = True
+                return result
             except TeslaAuthError as e:
                 self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
                 return False

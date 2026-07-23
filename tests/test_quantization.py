@@ -38,18 +38,16 @@ class TestDetectQuantization:
         assert offset == 0
         assert confidence == 1.0
 
-    def test_n60_offset30(self):
-        """N=60, offset=30."""
+    def test_n60_offset30_prefers_n30(self):
+        """Preamble of 30s then 60s windows — N/2=30 scores higher confidence."""
         data = [0.0] * 30 + [1.0] * 60 + [2.0] * 60 + [3.0] * 60
         result = detect_quantization(data)
 
         assert result is not None
         sample_size, offset, confidence = result
-        assert sample_size == 60
-        assert offset == 30
-        conforming = 180
-        total = 210
-        assert confidence == pytest.approx(conforming / total, abs=1e-9)
+        assert sample_size == 30
+        assert offset == 0
+        assert confidence == pytest.approx(1.0, abs=1e-9)
 
     def test_n2_offset1(self):
         """N=2, offset=1 — each window has a constant pair, different pairs.
@@ -233,18 +231,16 @@ class TestDetectQuantization:
         assert offset == 0
         assert confidence == 1.0
 
-    def test_n50_offset25(self):
-        """N=50, offset=25 — a less common sample size."""
+    def test_n50_offset25_prefers_n25(self):
+        """Preamble of 25s then 50s windows — N/2=25 scores higher confidence."""
         data = [0.0] * 25 + [1.0] * 50 + [2.0] * 50 + [3.0] * 50
         result = detect_quantization(data)
 
         assert result is not None
         sample_size, offset, confidence = result
-        assert sample_size == 50
-        assert offset == 25
-        conforming = 150
-        total = 175
-        assert confidence == pytest.approx(conforming / total, abs=1e-9)
+        assert sample_size == 25
+        assert offset == 0
+        assert confidence == pytest.approx(1.0, abs=1e-9)
 
     def test_sample_size_capped_at_60(self):
         """If quantization only appears at N > 60, return None."""
@@ -323,3 +319,58 @@ class TestDetectQuantization:
         assert sample_size == 2
         assert offset == 0
         assert confidence == 1.0
+
+    def test_30s_quantization_with_60s_runs(self):
+        """30s-quantized data where adjacent windows sometimes match.
+
+        8 runs of 60s (adjacent 30s windows with identical values) and
+        4 runs of 30s.  Mode picks 60, but divisor check should prefer 30
+        because 30s runs appear in 4/12 = 33% of runs (≥30%).
+        """
+        data: list[float] = []
+        # 8 runs of 60s (paired 30s windows with same value)
+        for i in range(8):
+            data.extend([float(i)] * 60)
+        # 4 runs of 30s (single 30s windows)
+        for i in range(8, 12):
+            data.extend([float(i)] * 30)
+        # Total: 480 + 120 = 600
+
+        result = detect_quantization(data)
+
+        assert result is not None
+        sample_size, offset, confidence = result
+        # Divisor check prefers 30 over 60
+        assert sample_size == 30
+        assert offset == 0
+
+    def test_genuine_60s_quantization_preserved(self):
+        """Genuine 60s quantization — N/2 confidence ties, so N stays at 60."""
+        data: list[float] = []
+        for i in range(10):
+            data.extend([float(i)] * 60)
+        # Total: 600, 10 runs of 60, 0 runs of 30
+
+        result = detect_quantization(data)
+
+        assert result is not None
+        sample_size, offset, confidence = result
+        assert sample_size == 60
+        assert offset == 0
+        assert confidence == 1.0
+
+    def test_csv_real_data(self):
+        """Real Emporia data — 30s quantization with adjacent-window merging."""
+        import csv as csv_mod
+        data: list[float] = []
+        with open("tests/data/2026-06-25-quant.csv") as f:
+            for row in csv_mod.DictReader(f):
+                data.append(float(row["M1208.24-Mains (kWatts)"]))
+
+        result = detect_quantization(data)
+
+        assert result is not None
+        sample_size, offset, confidence = result
+        assert sample_size == 30
+        assert offset == 1
+        assert confidence >= 0.99

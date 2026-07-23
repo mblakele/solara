@@ -15,10 +15,10 @@ class TestEnergyCacheLowConfidenceLog:
     """Tests for low-confidence quantization warning log."""
 
     def test_low_confidence_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        """When detect_quantization returns confidence < 0.9, a warning is emitted.
+        """When detect_quantization returns confidence below the threshold, a warning is emitted.
 
-        Data: 7 preamble + 3 samples of 20 values each = 67 total.
-        Confidence = 60/67 ≈ 0.8955 < 0.9.
+        Mocks detect_quantization to return N=20, offset=0, confidence=0.60
+        which is below QUANTIZATION_CONFIDENCE_THRESHOLD (0.7).
         """
         cache = EnergyCache()
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
@@ -35,11 +35,12 @@ class TestEnergyCacheLowConfidenceLog:
             quantization_confidence=None,
         )
 
-        # Data that gives 60/67 ≈ 0.8955 confidence
         new_samples = [0.0] * 7 + [1.0] * 20 + [2.0] * 20 + [3.0] * 20
 
-        with caplog.at_level("WARNING", logger="energy_cache"):
-            cache._merge_samples(empty, new_samples, data_start, now)
+        from unittest.mock import patch
+        with patch("energy_cache.detect_quantization", return_value=(20, 0, 0.50)):
+            with caplog.at_level("WARNING", logger="energy_cache"):
+                cache._merge_samples(empty, new_samples, data_start, now)
 
         assert len(caplog.records) > 0
         assert any(
@@ -134,8 +135,8 @@ class TestGetCurrentQhQuantization:
             f"Expected 2560 (30s window) but got {result['predicted_wh']}"
         )
 
-    def test_get_current_qh_falls_back_to_60_when_no_quantization(self):
-        """get_current_qh falls back to 60s window when no quantization data.
+    def test_get_current_qh_falls_back_when_no_quantization(self):
+        """get_current_qh falls back to default window when no quantization data.
 
         Same samples as test_get_current_qh_uses_quantization_window.
         """
@@ -150,13 +151,13 @@ class TestGetCurrentQhQuantization:
 
         assert result is not None
         assert result["qh_name"] == "QH1"
-        # 1760 from 60s window
-        assert result["predicted_wh"] == pytest.approx(1760.0, abs=0.01), (
+        # 2560 from 30s window
+        assert result["predicted_wh"] == pytest.approx(2560.0, abs=0.01), (
             f"Expected 1760 (60s window) but got {result['predicted_wh']}"
         )
 
     def test_get_current_qh_falls_back_when_confidence_below_threshold(self):
-        """get_current_qh falls back to 60s window when confidence < 0.9.
+        """get_current_qh falls back to default window when confidence below threshold.
 
         Same samples as above, with quantization_seconds=30 but confidence=0.5.
         """
@@ -171,9 +172,9 @@ class TestGetCurrentQhQuantization:
 
         assert result is not None
         assert result["qh_name"] == "QH1"
-        # 1760 from 60s fallback (not 2560 from 30s window)
-        assert result["predicted_wh"] == pytest.approx(1760.0, abs=0.01), (
-            f"Expected 1760 (60s fallback) but got {result['predicted_wh']}"
+        # 2560 from 30s default (not 1760 from old 60s default)
+        assert result["predicted_wh"] == pytest.approx(2560.0, abs=0.01), (
+            f"Expected 2560 (30s default) but got {result['predicted_wh']}"
         )
 
     def test_get_current_qh_returns_none_when_no_data(self):
@@ -515,3 +516,208 @@ class TestGetOrFetchFetchFuncOverlapMismatch:
             cache.get_or_fetch(fetcher, now)
         # Cache should be cleared even if retry also fails
         assert cache._data is None or cache._data.samples is None
+
+
+class TestGetOrFetchTimeout:
+    """Tests for fetch timeout in EnergyCache.get_or_fetch."""
+
+    def test_slow_fetch_returns_none_on_timeout(self) -> None:
+        """When fetch_func exceeds timeout, returns (None, True) without hanging."""
+        import time
+
+        cache = EnergyCache(fetch_timeout_secs=0.5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def slow_fetcher() -> dict[str, Any] | None:
+            time.sleep(5)
+            return {"devices": []}
+
+        result, was_fresh = cache.get_or_fetch(slow_fetcher, now, force=True)
+        assert result is None
+        assert was_fresh is True
+
+    def test_fast_fetch_completes_within_timeout(self) -> None:
+        """When fetch_func completes before timeout, returns normally."""
+        cache = EnergyCache(fetch_timeout_secs=10)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def fast_fetcher() -> dict[str, Any] | None:
+            return {"devices": [], "data_start": now}
+
+        result, was_fresh = cache.get_or_fetch(fast_fetcher, now, force=True)
+        assert was_fresh is True
+        assert result is not None
+
+    def test_timeout_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Timeout emits a warning log message."""
+        import time
+
+        cache = EnergyCache(fetch_timeout_secs=0.5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def slow_fetcher() -> dict[str, Any] | None:
+            time.sleep(5)
+            return {"devices": []}
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            cache.get_or_fetch(slow_fetcher, now, force=True)
+
+        assert any(
+            "fetch timed out" in rec.message.lower()
+            for rec in caplog.records
+        ), f"Expected timeout warning, got: {[r.message for r in caplog.records]}"
+
+    def test_timeout_fetch_exception_returns_none(self) -> None:
+        """When fetch_func raises an exception, returns (None, True)."""
+        cache = EnergyCache(fetch_timeout_secs=5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def failing_fetcher() -> dict[str, Any] | None:
+            raise ConnectionError("API down")
+
+        result, was_fresh = cache.get_or_fetch(failing_fetcher, now, force=True)
+        assert result is None
+        assert was_fresh is True
+
+    def test_timeout_logs_underlying_exception(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Timeout warning includes the underlying thread exception details."""
+        import time
+
+        cache = EnergyCache(fetch_timeout_secs=0.3)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def slow_failing_fetcher() -> dict[str, Any] | None:
+            time.sleep(1)
+            raise ConnectionError("DNS resolution failed")
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            cache.get_or_fetch(slow_failing_fetcher, now, force=True)
+            # Give the thread time to log its exception after the timeout.
+            time.sleep(1.5)
+
+        all_msgs = [rec.message for rec in caplog.records]
+        assert any(
+            "fetch timed out" in msg.lower() for msg in all_msgs
+        ), f"Expected timeout warning, got: {all_msgs}"
+        assert any(
+            "ConnectionError" in msg for msg in all_msgs
+        ), f"Expected underlying exception in log, got: {all_msgs}"
+
+    def test_timeout_returns_stale_cache_if_available(self) -> None:
+        """When fetch times out, returns existing stale cache instead of None."""
+        import time
+        from datetime import timedelta
+
+        cache = EnergyCache(fetch_timeout_secs=1, ttl_seconds=30)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        stale_time = now - timedelta(seconds=60)
+
+        # Pre-populate cache with stale data.
+        cache._data = EnergyCacheData(
+            samples=[1.0] * 60,
+            data_start=stale_time,
+            last_sample_at=stale_time,
+            last_fetch_at=stale_time,
+            sample_count=60,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+            full_metrics_dict={"devices": [{"gid": 1}], "data_start": stale_time},
+        )
+
+        def slow_fetcher() -> dict[str, Any] | None:
+            time.sleep(5)
+            return None
+
+        result, was_fresh = cache.get_or_fetch(slow_fetcher, now, force=True)
+        # Should return stale cache, not None.
+        assert result is not None
+        assert was_fresh is False
+        assert result.get("devices") == [{"gid": 1}]
+
+    def test_default_timeout_is_30(self) -> None:
+        """Default fetch_timeout_secs is 30 seconds."""
+        cache = EnergyCache()
+        assert cache._fetch_timeout_secs == 30
+
+    def test_fetch_failure_no_stale_cache_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When fetch returns None and no stale cache exists, logs WARNING."""
+        cache = EnergyCache(fetch_timeout_secs=5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def failing_fetcher() -> dict[str, Any] | None:
+            raise ConnectionError("network down")
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            result, was_fresh = cache.get_or_fetch(failing_fetcher, now, force=True)
+
+        assert result is None
+        assert was_fresh is True
+        assert any(
+            "no stale cache" in rec.message.lower()
+            for rec in caplog.records
+        ), f"Expected 'no stale cache' warning, got: {[r.message for r in caplog.records]}"
+
+
+class TestGetOrFetchTimingLogs:
+    """Tests for timing/diagnostic logging in EnergyCache.get_or_fetch."""
+
+    def test_fetch_elapsed_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Fetch path logs elapsed time."""
+        cache = EnergyCache()
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def fetcher() -> dict[str, Any] | None:
+            return {"devices": [], "data_start": now}
+
+        with caplog.at_level("DEBUG", logger="energy_cache"):
+            cache.get_or_fetch(fetcher, now, force=True)
+
+        assert any(
+            "fetch_func completed" in rec.message.lower()
+            for rec in caplog.records
+        ), f"Expected fetch timing log, got: {[r.message for r in caplog.records]}"
+
+
+class TestPruneOldSamplesLastSampleAt:
+    """Tests that _prune_old_samples updates last_sample_at."""
+
+    def test_pruning_updates_last_sample_at(self) -> None:
+        """After pruning, last_sample_at must be >= data_start."""
+        from datetime import timedelta
+
+        cache = EnergyCache()
+        # 3241 samples starting at 03:29:00 — ends at 03:29:59.
+        # cutoff = ceil_to_qh(04:23:59 - 3600s) = 03:30:00.
+        # All 60 samples before 03:30:00 are pruned, advancing data_start
+        # to 03:30:00. Without the fix, last_sample_at stays 03:29:59
+        # which is before the new data_start.
+        data_start = datetime(2026, 7, 9, 3, 29, 0, tzinfo=timezone.utc)
+        # last_sample_at is 03:29:59 (60 seconds after data_start).
+        last_sample_at = data_start + timedelta(seconds=59)
+        samples = [0.0] * 60  # only 60 samples: 03:29:00 to 03:29:59
+        now = datetime(2026, 7, 9, 4, 23, 59, tzinfo=timezone.utc)
+
+        data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=last_sample_at,
+            last_fetch_at=now,
+            sample_count=60,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        pruned = cache._prune_old_samples(data, now)
+        # data_start should advance to 03:30:00.
+        expected_data_start = datetime(2026, 7, 9, 3, 30, 0, tzinfo=timezone.utc)
+        assert pruned.data_start == expected_data_start
+        # last_sample_at must be >= data_start (the invariant).
+        assert pruned.last_sample_at >= pruned.data_start, (
+            f"last_sample_at {pruned.last_sample_at} < data_start {pruned.data_start}"
+        )

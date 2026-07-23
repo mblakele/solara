@@ -11,6 +11,7 @@ import atexit
 from collections import deque
 
 import logging
+import logging.handlers
 
 import sys
 import threading
@@ -113,6 +114,8 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
     Returns:
         The enriched metrics dict (same object, modified in place).
     """
+    if metrics_data is None:
+        metrics_data = {"devices": [], "api_response": {}, "instant": now}
     if now is None:
         now = datetime.now(timezone.utc)
     fetched_at = metrics_data.get("_fetched_at")
@@ -135,12 +138,37 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
 # relative to the application path. Using the default root structure.
 
 
+def _setup_file_logging(config: Config) -> logging.Handler | None:
+    """Create a RotatingFileHandler if LOG_FILE is configured.
+
+    Returns the handler so callers can attach it to additional loggers
+    (e.g. gunicorn.error), or None if file logging is disabled.
+    """
+    log_file = config.log_file
+    if not log_file:
+        return None
+    handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=config.log_max_bytes,
+        backupCount=config.log_backup_count,
+    )
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S %z",
+    ))
+    return handler
+
+
 logger = app.logger
 if __name__ != "__main__":
     gunicorn_logger = logging.getLogger("gunicorn.error")
     root_logger = logging.getLogger()
     root_logger.handlers = gunicorn_logger.handlers
     root_logger.setLevel(logging.DEBUG if is_debug() else logging.INFO)
+    file_handler = _setup_file_logging(_config)
+    if file_handler:
+        root_logger.addHandler(file_handler)
+        gunicorn_logger.addHandler(file_handler)
 else:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
@@ -149,6 +177,9 @@ else:
     ))
     logging.basicConfig(handlers=[handler],
                         level=logging.DEBUG if is_debug() else logging.INFO)
+    file_handler = _setup_file_logging(_config)
+    if file_handler:
+        logging.getLogger().addHandler(file_handler)
 
 # squelch internal log messages
 for noisy in (
@@ -558,6 +589,7 @@ def _load_management_loop() -> None:
         _config.dry_run, _config.is_mock_mode, interval_secs_config
     )
     while True:
+        result = None
         try:
             lm = _get_load_manager()
             if lm is not None:
@@ -575,6 +607,13 @@ def _load_management_loop() -> None:
                     })
                     lm_payload = _build_load_management_payload_locked()
                 logger.debug("Load management cycle result: %s", result)
+                if (
+                    result.status == "no_incomplete_qh"
+                    and _energy_cache._data is None
+                ):
+                    logger.warning(
+                        "Load management: no data available (possible network issue)"
+                    )
                 _sse_broadcaster.publish("load_cycle", camelize(lm_payload))
                 cache_data = _energy_cache._data
                 if cache_data is not None and cache_data.full_metrics_dict is not None:
@@ -595,12 +634,16 @@ def _load_management_loop() -> None:
             if _consecutive_error_count == 1 or _consecutive_error_count % 10 == 0:
                 _send_error_alert(e)
         else:
-            interval_secs = result.sleep_hint
+            if result is not None:
+                interval_secs = result.sleep_hint
             _consecutive_error_count = 0
             _last_error_type = None
 
-        interval_secs_adjusted = _energy_cache.sleep_interval_adjust(
-            interval_secs, datetime.now(pytz.timezone(_config.timezone)))
+        if result is not None and result.status == "disabled":
+            interval_secs_adjusted: float = interval_secs
+        else:
+            interval_secs_adjusted = _energy_cache.sleep_interval_adjust(
+                interval_secs, datetime.now(pytz.timezone(_config.timezone)))
         logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
         time.sleep(interval_secs_adjusted)
 
@@ -715,9 +758,9 @@ if __name__ == "__main__":
             sys.exit(1)
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--provision-fleet-telemetry":
-        from load_manager import provision_fleet_telemetry
-        from load_models import FleetTelemetryProvisionConfig
         from pathlib import Path
+        from load_manager import provision_fleet_telemetry
+        from load_models import FleetTelemetryProvisionConfig  # pylint: disable=ungrouped-imports
 
         if len(sys.argv) < 4:
             print(

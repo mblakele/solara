@@ -140,7 +140,7 @@ project-root
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback)
 ├── clock.py               # Clock protocol (now()) with FakeClock for tests
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
-                           # load_tesla_config(), load_plug_configs(), etc.
+                           # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
 ├── config_loader.py       # LazyConfig deferred env loading (config.get(), config.set())
 ├── conftest.py            # Pytest shared fixtures & configuration
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS, etc.)
@@ -193,6 +193,9 @@ project-root
 - `init_tesla_state()` / `_init_from_rest()` in `load_controllers.py` — initializes
   vehicle state from telemetry with REST fallback when initial telemetry is missing
   (waits up to 60 s for telemetry, then falls back to REST API with minimal calls)
+- `_is_vehicle_offline_error()` in `load_controllers.py` — detects VehicleOffline
+  exceptions from Tesla fleet API; used to downgrade ERROR to WARNING and trigger
+  short sleep hint for faster retries
 - OAuth in `load_manager.py`
 - Tesla callback config dotfile: `.tesla-callback-config` (auto-created, auto-updated)
 - Pipeline orchestration in `load_manager.py` (`_stage_enabled_check`, `_stage_nbc_fetch`,
@@ -205,6 +208,7 @@ project-root
   (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
 - Data models in `load_models.py`
 - Routes in `app.py`
+- `_setup_file_logging()` in `app.py` — creates `RotatingFileHandler` when `LOG_FILE` is configured
 - Test data generation in `mockdata.py`
 - Quantization detection in `quantization.py`
 - Timezones in `util.py`
@@ -227,6 +231,8 @@ project-root
 - CycleContext tests in `tests/test_cycle_context.py`
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
+- Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
+- File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
 
 ### Actions Generation Flow
 - GapMinder.decide() generates actions as a list of PendingEffect objects
@@ -278,9 +284,10 @@ project-root
 - `NotificationEvent` (telegram.py) — frozen dataclass for structured notifications with `format_message()`
 - `load_telegram_config()` (telegram.py) — loads config from env vars (priority) or devices.json
 - `load_telegram_devices()` (telegram.py) — loads device whitelist dict from `LOAD_TELEGRAM_DEVICES` env var or devices.json
-- `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`
+- `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`; "tesla" is accepted as a special device name for Tesla stop-charging alerts
 - Whitelist gate: Telegram notifications are only sent when a telegram.devices whitelist is explicitly configured AND at least one action matches it. Without a whitelist, notifications are blocked to prevent unintended messages to unconfigured devices.
-- Plug notifications use emoji format: `🔵 device → ON` / `🔴 device → OFF`
+- Plug notifications use emoji format: `🟢 device → ON` / `🔘 device → OFF`
+- Tesla notifications use device-specific format: `🔌 Tesla charging stopped` / `⚡ Tesla charging started` / `🔋 Tesla charge amps → N A`
 
 ### EnergyCache & Incremental Fetch
 - `EnergyCache` (energy_cache.py) stores per-second energy samples with metadata in a

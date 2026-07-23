@@ -23,6 +23,7 @@ from load_manager import (
     load_tesla_config,
 )
 from load_models import CycleResult, TeslaAuthError
+from load_nbc import NBCFetchResult
 import device_config
 from energy_cache import EnergyCache
 from tests.helpers import _make_metrics_with_wh
@@ -818,7 +819,7 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
             fake_now,
             seconds_remaining=600,
             tesla_state=None,
-            tesla_error=None,
+            _tesla_error=None,
             tesla_configured=False,
         )
 
@@ -864,7 +865,7 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
             fake_now,
             seconds_remaining=600,
             tesla_state=None,
-            tesla_error=None,
+            _tesla_error=None,
             tesla_configured=False,
         )
 
@@ -1627,11 +1628,12 @@ def test_run_cycle_disabled_when_sentinel_on(mock_config):
     )
 
     with patch.object(mgr.nbc_reader, "get_current_qh") as mock_qh:
-        mock_qh.return_value = (
-            "QH1",
-            -5.0,
-            570,
-            data_point_at,
+        mock_qh.return_value = NBCFetchResult(
+            qh_name="QH1",
+            predicted_wh=-5.0,
+            seconds_remaining=570,
+            data_point_at=data_point_at,
+            samples_used=100,
         )
         result = mgr.run_cycle()
 

@@ -12,6 +12,7 @@ import pytest
 
 from energy_cache import EnergyCache
 from load_manager import NBCReader
+from load_nbc import NBCFetchResult
 
 
 def _make_energy_cache(
@@ -122,11 +123,11 @@ def test_get_current_qh_returns_tuple_from_cached_samples():
     result = reader.get_current_qh(now=fixed_now)
 
     assert result is not None
-    qh_name, predicted_wh, seconds_remaining, data_point_at = result
-    assert qh_name == "QH1"
-    assert predicted_wh < 0  # negative = generation
-    assert seconds_remaining > 0
-    assert data_point_at == fixed_now
+    assert isinstance(result, NBCFetchResult)
+    assert result.qh_name == "QH1"
+    assert result.predicted_wh < 0  # negative = generation
+    assert result.seconds_remaining > 0
+    assert result.data_point_at == fixed_now
 
 
 def test_get_current_qh_returns_correct_qh_for_minute_5():
@@ -139,8 +140,7 @@ def test_get_current_qh_returns_correct_qh_for_minute_5():
     result = reader.get_current_qh(now=now)
 
     assert result is not None
-    qh_name, _, _, _ = result
-    assert qh_name == "QH1"
+    assert result.qh_name == "QH1"
 
 
 def test_get_current_qh_returns_correct_qh_for_minute_40():
@@ -153,9 +153,8 @@ def test_get_current_qh_returns_correct_qh_for_minute_40():
     result = reader.get_current_qh(now=now)
 
     assert result is not None
-    qh_name, _, _, _ = result
     # With clock-boundary: QH1 = 15:30–15:44 (current, incomplete)
-    assert qh_name == "QH1"
+    assert result.qh_name == "QH1"
 
 
 def test_get_current_qh_returns_data_point_at_from_cache():
@@ -172,9 +171,9 @@ def test_get_current_qh_returns_data_point_at_from_cache():
         cache._last_fetch_at = now
     reader = NBCReader(energy_cache=cache)
 
-    _, _, _, data_point_at = reader.get_current_qh(now=now)
-
-    assert data_point_at == now
+    result = reader.get_current_qh(now=now)
+    assert result is not None
+    assert result.data_point_at == now
 
 
 def test_get_current_qh_with_positive_samples():
@@ -194,9 +193,8 @@ def test_get_current_qh_with_positive_samples():
     result = reader.get_current_qh(now=now)
 
     assert result is not None
-    qh_name, predicted_wh, _, _ = result
-    assert qh_name == "QH1"
-    assert predicted_wh > 0  # positive = consumption
+    assert result.qh_name == "QH1"
+    assert result.predicted_wh > 0  # positive = consumption
 
 
 def test_get_current_qh_force_true_triggers_refetch():
@@ -264,8 +262,7 @@ def test_get_current_qh_force_true_without_fetch_callable():
     result = reader.get_current_qh(force=True, now=fixed_now)
 
     assert result is not None
-    qh_name, _, _, _ = result
-    assert qh_name == "QH1"
+    assert result.qh_name == "QH1"
 
 
 # --- NBCReader.get_current_qh_direct() tests (unchanged) ---
@@ -445,9 +442,8 @@ def test_get_current_qh_falls_through_to_fetch_when_cache_valid_no_incomplete_qh
     assert fetch_called is True, "Expected _metrics_fetch to be called when cache has no incomplete QH"
     # The result should come from the fetch, not None.
     assert result is not None
-    qh_name, predicted_wh, seconds_remaining, data_point_at = result
-    assert qh_name == "QH1"
-    assert predicted_wh == -1500.0
+    assert result.qh_name == "QH1"
+    assert result.predicted_wh == -1500.0
 
 
 def test_get_current_qh_returns_none_when_fetch_fails_with_valid_complete_cache():
@@ -520,7 +516,6 @@ def test_get_current_qh_still_returns_from_cache_when_incomplete_qh_present():
     # Cache has incomplete QH → should NOT call fetch.
     assert fetch_called is False
     assert result is not None
-    qh_name, predicted_wh, _, _ = result
-    assert qh_name == "QH1"
+    assert result.qh_name == "QH1"
     # Should be from cache (predicted_wh from cache samples), not from fetch.
-    assert predicted_wh != -999.0
+    assert result.predicted_wh != -999.0

@@ -155,6 +155,50 @@ class TestValidateTelegramDevicesHappyPaths:
         # Should not raise
         device_config.validate_telegram_devices(config, telegram_section)
 
+    def test_telegram_devices_tesla_allowed(self):
+        """'tesla' is a valid telegram.devices key for stop-charging alerts."""
+        homekit = [
+            {"name": "pool_pump", "accessory_id": "1", "power_watts": 1000},
+        ]
+        config = _make_config(
+            homekit_plugs=homekit,
+            telegram_devices={
+                "pool_pump": ["turn_on"],
+                "tesla": ["turn_off"],
+            },
+        )
+        telegram_section = config["telegram"]
+        # Should not raise — "tesla" is accepted as a special device
+        device_config.validate_telegram_devices(config, telegram_section)
+
+    def test_telegram_devices_tesla_case_insensitive(self):
+        """'Tesla' and 'TESLA' are accepted as valid device names."""
+        homekit = [
+            {"name": "pool_pump", "accessory_id": "1", "power_watts": 1000},
+        ]
+        config = _make_config(
+            homekit_plugs=homekit,
+            telegram_devices={
+                "pool_pump": ["turn_on"],
+                "Tesla": ["turn_off"],
+                "TESLA": ["turn_off"],
+            },
+        )
+        telegram_section = config["telegram"]
+        # Should not raise
+        device_config.validate_telegram_devices(config, telegram_section)
+
+    def test_telegram_devices_tesla_alone(self):
+        """'tesla' as the only device key is valid."""
+        config = _make_config(
+            telegram_devices={
+                "tesla": ["turn_off"],
+            },
+        )
+        telegram_section = config["telegram"]
+        # Should not raise
+        device_config.validate_telegram_devices(config, telegram_section)
+
 
 # =============================================================================
 # Tests — error paths (DeviceConfigError raised)

@@ -16,6 +16,7 @@ from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 
 from clock import Clock, RealClock
+from constants import QUANTIZATION_CONFIDENCE_THRESHOLD
 from energy_cache import EnergyCache
 from energy_aggregator import EnergyDataAggregator, TOUBuckets
 from util import (
@@ -146,7 +147,7 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         return hp.metrics
 
     except AssertionError as ae:
-        logger.error(ae)
+        logger.error("AssertionError in create_metrics: %s", ae)
         # force clean cache and full fetch on next cycle
         energy_cache.invalidate()
         raise RetryableMetricsException(ae) from ae
@@ -325,7 +326,7 @@ def _build_incremental_fetch(
             start_time = capped
 
         # pyemvue throws error if start_time is earlier than end_time (now)
-        assert start_time <= now
+        assert start_time <= now, f"start_time {start_time} is after now {now}"
 
         try:
             usage_data, data_start = vue.get_chart_usage(
@@ -719,9 +720,10 @@ class HourlyProjection(MetricsBase):
                 usage_data_local, usage_data_start_local, _ = (
                     self._fetch_channel_data(chan, chart_start, self.instant)
                 )
-            except (requests.exceptions.RequestException, IOError):
-                self.logger.exception(
-                    "error fetching device data: skipping %s", vdi.device_name
+            except (requests.exceptions.RequestException, IOError) as exc:
+                self.logger.warning(
+                    "error fetching device data: skipping %s (%s)",
+                    vdi.device_name, exc,
                 )
                 return None
 
@@ -850,7 +852,7 @@ class HourlyProjection(MetricsBase):
         if energy_cache is not None and energy_cache.data is not None:
             qs = energy_cache.quantization_seconds
             qc = energy_cache.quantization_confidence
-            if qs is not None and qc is not None and qc >= 0.9:
+            if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
                 prediction_window_seconds = qs
 
         nbc_result = self._compute_nbc(nbc_seconds, prediction_window_seconds)

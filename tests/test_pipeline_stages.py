@@ -7,9 +7,11 @@ from unittest.mock import patch
 
 import pytest
 
+from constants import MIN_SAMPLES_FOR_PREDICTION
 from load_controllers import RealTeslaController, TeslaController
 from load_manager import LoadManager
 from load_models import CycleContext, PendingEffect, TeslaAuthError
+from load_nbc import NBCFetchResult
 
 
 @pytest.fixture
@@ -44,9 +46,12 @@ class TestStageNBCFetch:
     def test_fetch_returns_tuple_populates_ctx(
         self, lm: LoadManager, ctx: CycleContext
     ):
-        """When get_current_qh returns a tuple, ctx fields are populated."""
+        """When get_current_qh returns a result, ctx fields are populated."""
         data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        qh_result = ("QH2", 750.0, 450, data_point)
+        qh_result = NBCFetchResult(
+            qh_name="QH2", predicted_wh=750.0, seconds_remaining=450,
+            data_point_at=data_point, samples_used=300,
+        )
         with patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result):
             result = lm._stage_nbc_fetch(ctx)
         assert result is None
@@ -61,11 +66,43 @@ class TestStageNBCFetch:
         """The force flag from ctx is passed to get_current_qh."""
         ctx.force = True
         data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        qh_result = ("QH1", 500.0, 900, data_point)
+        qh_result = NBCFetchResult(
+            qh_name="QH1", predicted_wh=500.0, seconds_remaining=900,
+            data_point_at=data_point, samples_used=100,
+        )
         with patch.object(lm.nbc_reader, "get_current_qh") as mock_fetch:
             mock_fetch.return_value = qh_result
             lm._stage_nbc_fetch(ctx)
         mock_fetch.assert_called_once_with(force=True, now=ctx.now)
+
+    def test_fetch_insufficient_samples_returns_early(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """When samples_used < MIN_SAMPLES_FOR_PREDICTION, returns early."""
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        qh_result = NBCFetchResult(
+            qh_name="QH1", predicted_wh=359.83, seconds_remaining=899,
+            data_point_at=data_point, samples_used=1,
+        )
+        with patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result):
+            result = lm._stage_nbc_fetch(ctx)
+        assert result is not None
+        assert result.status == "no_incomplete_qh"
+        assert result.diagnostics.reason == "insufficient_samples"
+
+    def test_fetch_samples_used_none_continues(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """When samples_used is None (unknown), pipeline continues normally."""
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        qh_result = NBCFetchResult(
+            qh_name="QH1", predicted_wh=500.0, seconds_remaining=900,
+            data_point_at=data_point, samples_used=None,
+        )
+        with patch.object(lm.nbc_reader, "get_current_qh", return_value=qh_result):
+            result = lm._stage_nbc_fetch(ctx)
+        assert result is None
+        assert ctx.qh_name == "QH1"
 
 
 class TestStagePendingCheck:
@@ -665,6 +702,65 @@ class TestStageAsyncPhase:
         # ("Charging" state). "Starting" means the car hasn't started drawing power yet.
         assert len(ctx.actions) == 1
         assert ctx.actions[0].action == "turn_on"
+
+    def test_cycle_async_phase_closes_tesla_session(
+        self, lm: LoadManager
+    ):
+        """_cycle_async_phase closes the Tesla controller's aiohttp session.
+
+        When a RealTeslaController creates an aiohttp session during the
+        async phase, it must be closed before the event loop shuts down
+        to avoid 'Unclosed connector' warnings from aiohttp GC.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from load_controllers import RealTeslaController
+
+        ctrl = RealTeslaController.__new__(RealTeslaController)
+        ctrl.config = MagicMock()
+        ctrl.config.vehicle_command_proxy_url = ""
+        ctrl.config.vehicle_id = "VIN"
+        ctrl.config.client_id = ""
+        ctrl.config.client_secret = ""
+        ctrl.config.redirect_uri = ""
+        ctrl.config.private_key_path = ""
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.tesla_region = "na"
+        ctrl._api = MagicMock()
+        ctrl._api._access_token = None
+        ctrl._api.refresh_token = None
+        ctrl._api.expires = 0
+        ctrl.last_error = None
+        ctrl._backoff_secs = 0.0
+        ctrl._last_init_attempt = 0.0
+        ctrl._last_saved_tokens_at = 0.0
+        ctrl._init_state = None
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.close = AsyncMock()
+        ctrl._session = mock_session
+        ctrl._api.session = mock_session
+
+        lm.tesla_ctrl = ctrl
+        lm.telegram_sender = None
+
+        now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        async def _run():
+            return await lm._cycle_async_phase(
+                gap_wh=500.0,
+                adjusted_wh=-500.0,
+                now=now,
+                seconds_remaining=450,
+                dry_run=True,
+                qh_name="QH2",
+                data_point_at=now,
+            )
+
+        asyncio.run(_run())
+        mock_session.close.assert_awaited_once()
 
 
 class TestStageComputeGap:

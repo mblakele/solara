@@ -1,14 +1,36 @@
-"""Tests for util.compute_nbc_quarter prediction window behavior.
+"""Tests for util.py functions.
 
-Verifies that incomplete quarter-hour predictions use exactly the last 60
-per-second samples (or fewer if fewer are available), matching the docstring
-promise in compute_nbc_quarters: "computes a rate from the last 60 seconds of
-data within the current quarter".
+Covers:
+  - _haversine_distance (GPS distance calculation)
+  - compute_nbc_quarter prediction window behavior
 """
 
 import unittest
 
-from util import compute_nbc_quarter
+import pytest
+
+from util import _haversine_distance, compute_nbc_quarter
+
+
+class TestHaversineDistance:
+
+    def test_same_point_returns_zero(self):
+        """Identical coordinates should yield 0 m distance."""
+        assert _haversine_distance(37.0, -122.0, 37.0, -122.0) == pytest.approx(0, abs=0.01)
+
+    def test_known_distance_nyc_to_la(self):
+        """NYC to LA is approximately 3940 km — verify within +/-1%."""
+        # NYC: (40.7128, -74.0060), LA: (34.0522, -118.2437)
+        distance_m = _haversine_distance(40.7128, -74.0060, 34.0522, -118.2437)
+        expected_m = 3_940_000.0
+        assert distance_m == pytest.approx(expected_m, rel=0.01)
+
+    def test_same_lat_different_lon(self):
+        """Moving purely along longitude at equator should give known distance."""
+        # At the equator, 1 degree of longitude ~ 111.3 km
+        distance_m = _haversine_distance(0.0, 0.0, 0.0, 1.0)
+        # Roughly 111 km; allow generous tolerance for spherical approximation
+        assert distance_m == pytest.approx(111_000, rel=0.05)
 
 
 class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
@@ -65,7 +87,7 @@ class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
         and predicted_wh would be 120 + 840 * 3.0 = 2640 Wh — clearly wrong.
         """
         values = [0.001] * 30 + [0.003] * 30
-        result = compute_nbc_quarter(values)
+        result = compute_nbc_quarter(values, prediction_window_seconds=60)
 
         self.assertIsNotNone(result)
         self.assertFalse(result.complete)
@@ -141,11 +163,11 @@ class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
         self.assertAlmostEqual(result.prediction_w, expected_prediction_w, places=6)
         self.assertAlmostEqual(result.predicted_wh, expected_predicted_wh, places=6)
 
-    def test_default_prediction_window_60_when_none(self):
-        """With prediction_window_seconds=None, fall back to 60-second window.
+    def test_default_prediction_window_when_none(self):
+        """With prediction_window_seconds=None, fall back to the default window.
 
         Same data as test_prediction_capped_at_60_samples_when_more_available,
-        verifying the None default matches the existing hardcoded 60.
+        verifying the None default matches DEFAULT_PREDICTION_WINDOW_SECS.
         """
         values = [0.001] * 300 + [0.003] * 60
         result = compute_nbc_quarter(values, prediction_window_seconds=None)

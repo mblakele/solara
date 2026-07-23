@@ -4,19 +4,42 @@ Data caching and management.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import threading
+import time as _time_mod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 
 from clock import Clock, RealClock
-from constants import MIN_SLEEP_SECS
+from constants import MIN_SLEEP_SECS, QUANTIZATION_CONFIDENCE_THRESHOLD
 from quantization import detect_quantization
 from util import ceil_to_qh, compute_nbc_quarters, qh_seconds_remaining
 
 logger = logging.getLogger(__name__)
+
+
+def _root_cause(exc: BaseException) -> BaseException:
+    """Walk exception chain to find the most informative cause.
+
+    Follows ``__cause__`` then ``__context__`` links, but stops before
+    raw OS-level errors (``OSError`` subclasses like ``gaierror``) that
+    lack contextual details such as hostnames.  Returns the outermost
+    exception if no deeper cause exists.
+    """
+    seen: set[int] = set()
+    current = exc
+    while True:
+        seen.add(id(current))
+        cause = current.__cause__ or current.__context__
+        if cause is None or id(cause) in seen:
+            break
+        if isinstance(cause, OSError) and not isinstance(cause, ConnectionError):
+            break
+        current = cause
+    return current
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -103,11 +126,17 @@ class EnergyCache:
         _lock: Thread-safety lock.
     """
 
-    def __init__(self, ttl_seconds: int = 30, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        ttl_seconds: int = 30,
+        clock: Clock | None = None,
+        fetch_timeout_secs: int = 30,
+    ) -> None:
         self._data: EnergyCacheData | None = None
         self._ttl_seconds: int = ttl_seconds
         self._clock: Clock = clock if clock is not None else RealClock()
         self._lock: threading.Lock = threading.Lock()
+        self._fetch_timeout_secs: int = fetch_timeout_secs
 
     # ------------------------------------------------------------------
     # Public properties (mimic the old direct-attribute interface)
@@ -457,7 +486,9 @@ class EnergyCache:
         )
 
         # New samples should never arrive before the cache start.
-        assert result_data_start >= cache_start_time
+        assert result_data_start >= cache_start_time, (
+            f"data_start {result_data_start} < cache_start {cache_start_time}"
+        )
 
         # Verify overlap samples match cached data.
         if result_data_start <= cache_end_time:
@@ -561,7 +592,7 @@ class EnergyCache:
             logger.debug("EnergyCache quantization %s", quant_tuple)
             if quant_tuple is not None:
                 qs, qo, qc = quant_tuple
-                if qc < 0.9:
+                if qc < QUANTIZATION_CONFIDENCE_THRESHOLD:
                     logger.warning(
                         "Quantization detected (N=%d, offset=%d) with low confidence %.3f",
                         qs, qo, qc,
@@ -586,13 +617,9 @@ class EnergyCache:
 
         # Incremental merge path.
         logger.debug(
-            "EnergyCache incremental_merge: %d old + %d new samples, "
-            "quantization_preserved (qs=%s, qo=%s, qc=%.3f)",
+            "EnergyCache incremental_merge: %d old + %d new samples",
             len(existing.samples),
             len(new_samples),
-            existing.quantization_seconds,
-            existing.quantization_offset,
-            existing.quantization_confidence if existing.quantization_confidence else 0,
         )
         merged_data = self.merge_incremental(
             existing,
@@ -603,6 +630,28 @@ class EnergyCache:
 
         if merged_data is None:
             return existing
+
+        # Re-detect quantization when enough new samples arrived.
+        # A single detection can be noisy; re-running each cycle lets the
+        # correct period emerge over time.
+        if len(new_samples) > 1 and merged_data.samples is not None:
+            quant_tuple = detect_quantization(merged_data.samples)
+            if quant_tuple is not None:
+                qs, qo, qc = quant_tuple
+                if qc < QUANTIZATION_CONFIDENCE_THRESHOLD:
+                    logger.warning(
+                        "Quantization re-detected (N=%d, offset=%d) "
+                        "with low confidence %.3f",
+                        qs, qo, qc,
+                    )
+                merged_data = replace(
+                    merged_data,
+                    quantization_seconds=qs,
+                    quantization_offset=qo,
+                    quantization_confidence=qc,
+                )
+            # If detect_quantization returns None, keep the preserved
+            # values from the previous cycle.
 
         # Prune old samples.
         merged_data = self._prune_old_samples(merged_data, now)
@@ -646,10 +695,13 @@ class EnergyCache:
         if old_count > 0:
             trimmed = data.samples[old_count:]
             new_data_start = data.data_start + timedelta(seconds=old_count)
+            new_last_sample_at = (
+                new_data_start + timedelta(seconds=len(trimmed) - 1)
+            ) if trimmed else new_data_start
             return EnergyCacheData(
                 samples=trimmed,
                 data_start=new_data_start,
-                last_sample_at=data.last_sample_at,
+                last_sample_at=new_last_sample_at,
                 last_fetch_at=data.last_fetch_at,
                 sample_count=len(trimmed),
                 quantization_seconds=data.quantization_seconds,
@@ -695,6 +747,60 @@ class EnergyCache:
     # Main API
     # ------------------------------------------------------------------
 
+    def _run_fetch_with_timeout(
+        self,
+        fetch_func: Callable[[], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        """Run *fetch_func* with a timeout, returning ``None`` on expiry.
+
+        Uses a daemon thread so the caller is never blocked indefinitely
+        even if the fetch hangs on network I/O.  Domain exceptions such as
+        ``OverlapMismatchError`` propagate to the caller.
+
+        On timeout the pool is shut down without waiting for the stuck
+        thread — the caller returns immediately.  The thread's exception
+        (if any) is logged immediately inside the thread so the error
+        details appear in logs even when the thread is still blocked in
+        a system call (e.g. DNS resolution) at timeout time.
+        """
+        timed_out = threading.Event()
+
+        def _wrapped() -> dict[str, Any] | None:
+            try:
+                return fetch_func()
+            except BaseException as exc:
+                if timed_out.is_set():
+                    root = _root_cause(exc)
+                    logger.warning(
+                        "EnergyCache fetch raised after timeout: "
+                        "%s: %s",
+                        type(root).__name__,
+                        root,
+                    )
+                raise
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(_wrapped)
+        try:
+            return future.result(timeout=self._fetch_timeout_secs)
+        except concurrent.futures.TimeoutError:
+            timed_out.set()
+            logger.warning(
+                "EnergyCache fetch timed out after %ds",
+                self._fetch_timeout_secs,
+            )
+            pool.shutdown(wait=False, cancel_futures=True)
+            return None
+        except OverlapMismatchError:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("EnergyCache fetch_func raised")
+            pool.shutdown(wait=False, cancel_futures=True)
+            return None
+        else:
+            pool.shutdown(wait=False)
+
     def get_or_fetch(
         self,
         fetch_func: Callable[[], dict[str, Any] | None],
@@ -738,9 +844,10 @@ class EnergyCache:
                 )
                 return result, False
 
-            # Fetch fresh data.
+            # Fetch fresh data with timeout protection.
+            fetch_start = _time_mod.monotonic()
             try:
-                result = fetch_func()
+                result = self._run_fetch_with_timeout(fetch_func)
             except OverlapMismatchError as exc:
                 logger.warning(
                     "Overlap mismatch in fetch_func (%s) — "
@@ -757,7 +864,24 @@ class EnergyCache:
                     quantization_offset=None,
                     quantization_confidence=None,
                 )
-                result = fetch_func()
+                result = self._run_fetch_with_timeout(fetch_func)
+            fetch_elapsed = _time_mod.monotonic() - fetch_start
+            logger.debug(
+                "EnergyCache fetch_func completed in %.2fs, result=%s",
+                fetch_elapsed,
+                "ok" if result is not None else "None",
+            )
+
+            if result is None:
+                # Timed out or fetch_func returned None — return stale cache
+                # if available, so callers get stale-but-valid data instead
+                # of crashing on None.
+                if self._data is not None:
+                    return self._build_result(), False
+                logger.warning(
+                    "EnergyCache: fetch failed and no stale cache available"
+                )
+                return (None, True)
 
             if result is not None:
                 new_samples: list[float] = []
@@ -808,7 +932,7 @@ class EnergyCache:
                             quantization_offset=None,
                             quantization_confidence=None,
                         )
-                        result = fetch_func()
+                        result = self._run_fetch_with_timeout(fetch_func)
                         if result is not None:
                             new_samples = []
                             if "per_second_data" in result:
@@ -914,14 +1038,16 @@ class EnergyCache:
             return None
 
         # Required: data_start present and aligned to a QH boundary.
-        assert self._data.data_start is not None
-        assert self._data.data_start == ceil_to_qh(self._data.data_start)
+        assert self._data.data_start is not None, "data_start is None in get_current_qh"
+        assert self._data.data_start == ceil_to_qh(self._data.data_start), (
+            f"data_start {self._data.data_start} not aligned to QH boundary"
+        )
 
         # Use quantization-aware prediction window when available.
         prediction_window_seconds: int | None = None
         qs = self._data.quantization_seconds
         qc = self._data.quantization_confidence
-        if qs is not None and qc is not None and qc >= 0.9:
+        if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
             prediction_window_seconds = qs
 
         nbc = compute_nbc_quarters(samples, prediction_window_seconds)
@@ -960,6 +1086,7 @@ class EnergyCache:
             "predicted_wh": predicted_wh,
             "seconds_remaining": seconds_remaining,
             "data_start": self._data.data_start,
+            "samples_used": qh1_data.samples_used,
         }
 
     # ------------------------------------------------------------------
@@ -986,7 +1113,7 @@ class EnergyCache:
         """
         if self._data is None:
             return interval_seconds
-        if self._data.quantization_confidence is None or self._data.quantization_confidence < 0.9:
+        if self._data.quantization_confidence is None or self._data.quantization_confidence < QUANTIZATION_CONFIDENCE_THRESHOLD:
             return interval_seconds
 
         # Early-exit: data older than 2× quantum → sleep minimum.

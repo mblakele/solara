@@ -67,14 +67,33 @@ class NotificationEvent:
         if self.actions:
             action_lines = []
             for action in self.actions:
+                target_amps = None
                 if isinstance(action, dict):
                     device = action.get("device", "unknown")
                     action_type = action.get("type", "")
                 else:
                     device = action.device_name
                     action_type = action.action
-                bullet = "🔘" if action_type == "turn_off" else "🟢"
-                action_lines.append(f"  {bullet} {device}")
+                    target_amps = getattr(action, "target_amps", None)
+
+                if device.lower() == "tesla":
+                    if action_type == "turn_off":
+                        action_lines.append(
+                            "  🔌 Tesla charging stopped"
+                        )
+                    elif action_type == "turn_on":
+                        action_lines.append(
+                            "  ⚡ Tesla charging started"
+                        )
+                    elif action_type == "set_amps" and target_amps is not None:
+                        action_lines.append(
+                            f"  🔋 Tesla charge amps → {target_amps} A"
+                        )
+                    else:
+                        action_lines.append(f"  ⚡ Tesla {action_type}")
+                else:
+                    bullet = "🔘" if action_type == "turn_off" else "🟢"
+                    action_lines.append(f"  {bullet} {device}")
             action_list = "\n".join(action_lines)
 
         return (

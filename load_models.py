@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -109,6 +109,9 @@ class AbstractTeslaController(ABC):
     @abstractmethod
     async def get_charging_state(self) -> TeslaState | None:
         """Return full state: charging_bool, current_amps, soc_pct, plugged_in."""
+
+    _last_command_vehicle_offline: bool = False
+    """True when the last command failed with VehicleOffline."""
 
     def reset_session(self) -> None:
         """Reset cached HTTP session before a new asyncio.run() call.
@@ -223,6 +226,12 @@ class PendingEffect:
             Used alongside timestamp for dual-pruning checks.
         target_amps: Target amps for "set_amps" actions; None otherwise.
         power_watts: Expected power impact of the action in Watts.
+        direction: For Tesla "set_amps" actions, whether amps increased or
+            decreased. Used by settle-window queries. None for plug effects.
+        suppress_action: The action type to suppress during the settle window
+            (e.g. "turn_off" after an amp increase). None for plug effects.
+        qh_name: Quarter-hour name when the effect was created. Used for
+            QH-boundary expiry in settle-window checks. None for plug effects.
     """
 
     device_name: str
@@ -231,6 +240,9 @@ class PendingEffect:
     data_point_at: datetime
     power_watts: float
     target_amps: int | None = None
+    direction: Literal["increase", "decrease"] | None = None
+    suppress_action: Literal["turn_off", "turn_on"] | None = None
+    qh_name: str | None = None
 
 
 @dataclass
@@ -241,6 +253,22 @@ class TeslaState:
     current_amps: int | None
     plugged_in: bool
     at_home: bool
+
+
+def build_tesla_state(
+    *,
+    is_charging: bool,
+    current_amps: int | None,
+    plugged_in: bool,
+    at_home: bool,
+) -> TeslaState:
+    """Construct a TeslaState. Centralizes construction to avoid duplication."""
+    return TeslaState(
+        is_charging=is_charging,
+        current_amps=current_amps,
+        plugged_in=plugged_in,
+        at_home=at_home,
+    )
 
 
 @dataclass(frozen=True)
@@ -380,6 +408,7 @@ class CycleDiagnostics:
     sentinel_on: bool = False
     telemetry_registered: bool | None = None
     active_tesla_telemetry: dict[str, Any] | None = None
+    tesla_command_offline: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -413,6 +442,7 @@ class CycleDiagnostics:
             "sentinel_on": self.sentinel_on,
             "telemetry_registered": self.telemetry_registered,
             "active_tesla_telemetry": self.active_tesla_telemetry,
+            "tesla_command_offline": self.tesla_command_offline,
         }
 
 

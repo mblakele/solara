@@ -4,12 +4,15 @@ Utility functions and custom JSON provider for the application.
 
 from dataclasses import dataclass
 from datetime import datetime, time as TimeType, timedelta
+import math
 from typing import Any
 
 import isodate
 from flask.json.provider import DefaultJSONProvider
 
 from config import Config, _config
+
+from constants import DEFAULT_PREDICTION_WINDOW_SECS
 
 
 def get_timezone(config: Config | None = None) -> str:
@@ -104,6 +107,7 @@ class NBCQuarter:
     complete: bool
     raw_wh: float
     wh: float
+    prediction_values: int | None = None
     prediction_w: float | None = None
     predicted_wh: float | None = None
     remaining_seconds: int | None = None
@@ -115,6 +119,7 @@ class NBCQuarter:
             "complete": self.complete,
             "raw_wh": self.raw_wh,
             "wh": self.wh,
+            "prediction_values": self.prediction_values,
             "prediction_w": self.prediction_w,
             "predicted_wh": self.predicted_wh,
             "remaining_seconds": self.remaining_seconds,
@@ -165,8 +170,8 @@ def compute_nbc_quarter(
         values: Up to 900 per-second kWh values for a single QH period.
         prediction_window_seconds: Number of trailing seconds to use for
             rate extrapolation when the quarter is incomplete. Defaults to
-            60 when ``None``. Caps at ``len(values)``. A value of 0 also
-            falls back to 60.
+            ``DEFAULT_PREDICTION_WINDOW_SECS`` when ``None``. Caps at
+            ``len(values)``. A value of 0 also falls back to the default.
     """
     if values is None:
         return None
@@ -175,21 +180,25 @@ def compute_nbc_quarter(
     if values_len < 1:
         return None
 
-    assert values_len <= QH_PERIOD_SECONDS
+    assert values_len <= QH_PERIOD_SECONDS, (
+        f"QH slice has {values_len} values, expected <= {QH_PERIOD_SECONDS}"
+    )
 
     is_complete = values_len == QH_PERIOD_SECONDS
     raw_wh = 1000 * sum(values)
     wh = max(0, raw_wh)
 
     if not is_complete:
-        window = min(prediction_window_seconds or 60, values_len)
+        window = min(prediction_window_seconds or DEFAULT_PREDICTION_WINDOW_SECS, values_len)
         prediction_values = values[-window:]
-        prediction_w = 1000 * sum(prediction_values) / len(prediction_values)
+        prediction_values_len = len(prediction_values)
+        prediction_w = 1000 * sum(prediction_values) / prediction_values_len
         remaining_seconds = QH_PERIOD_SECONDS - values_len
         return NBCQuarter(
             complete=False,
             raw_wh=raw_wh,
             wh=wh,
+            prediction_values=prediction_values_len,
             prediction_w=prediction_w,
             predicted_wh=raw_wh + remaining_seconds * prediction_w,
             remaining_seconds=remaining_seconds,
@@ -225,7 +234,9 @@ def compute_nbc_quarters(
         ``None`` if the quarter has not yet started.
     """
     values_len = len(values)
-    assert values_len <= 3600
+    assert values_len <= 3600, (
+        f"total values {values_len} exceeds 3600 (one hour of per-second data)"
+    )
 
     incomplete_len = values_len % QH_PERIOD_SECONDS
 
@@ -284,3 +295,31 @@ def _clock_boundary_windows(now: datetime) -> list[tuple[datetime, datetime]]:
         windows.append((window_start, window_end))
 
     return windows
+
+
+def _haversine_distance(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """Calculate the great-circle distance between two GPS points.
+
+    Args:
+        lat1: Latitude of point 1 in degrees.
+        lon1: Longitude of point 1 in degrees.
+        lat2: Latitude of point 2 in degrees.
+        lon2: Longitude of point 2 in degrees.
+
+    Returns:
+        Distance in meters.
+    """
+    earth_radius_m = 6_371_000  # Earth radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(delta_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return earth_radius_m * c
