@@ -249,10 +249,10 @@ class TestPendingCheckLogging:
         """cycle_previous_qh event at WARNING level."""
         lm.enabled = True
         caplog.set_level(logging.WARNING)
-        # Use a data point in the previous QH but within 120 seconds
-        # (QH starts at 12:00, so 11:59:30 is previous QH but within stale threshold)
+        # Use a data point in the previous QH but within STALE_DATA_THRESHOLD_SECS
+        # (QH starts at 12:00, so 11:59:50 is previous QH but within stale threshold)
         now = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
-        previous_qh_point = datetime(2025, 6, 1, 11, 59, 30, tzinfo=timezone.utc)
+        previous_qh_point = datetime(2025, 6, 1, 11, 59, 50, tzinfo=timezone.utc)
         qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=750.0, seconds_remaining=840, data_point_at=previous_qh_point, samples_used=300)
         lm._clock = FakeClock(now)
         with (

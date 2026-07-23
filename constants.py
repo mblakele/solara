@@ -8,7 +8,7 @@ from __future__ import annotations
 
 # ── NBC / Data freshness ─────────────────────────────────────────────
 
-STALE_DATA_THRESHOLD_SECS: int = 120
+STALE_DATA_THRESHOLD_SECS: int = 80
 """Maximum age (in seconds) of a per-second data point before we consider
 the NBC prediction stale and skip the load management cycle."""
 

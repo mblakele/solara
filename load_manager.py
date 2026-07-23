@@ -875,7 +875,7 @@ class LoadManager:
                 sleep_hint_at=now_postfetch.isoformat(),
             )
 
-        # Stale-data gate: data_point_age > 120 s (accounting for Emporia lag).
+        # Stale-data gate: data_point_age > STALE_DATA_THRESHOLD_SECS (accounting for Emporia lag).
         data_lag = self.nbc_reader.get_data_lag_secs()
         base_diag: dict[str, Any] = {
             "gap_wh": None,
