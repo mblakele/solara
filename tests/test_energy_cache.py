@@ -17,30 +17,19 @@ class TestEnergyCacheLowConfidenceLog:
     def test_low_confidence_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
         """When detect_quantization returns confidence below the threshold, a warning is emitted.
 
-        Mocks detect_quantization to return N=20, offset=0, confidence=0.60
+        Mocks detect_quantization to return N=20, offset=0, confidence=0.50
         which is below QUANTIZATION_CONFIDENCE_THRESHOLD (0.7).
         """
         cache = EnergyCache()
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
-        empty = EnergyCacheData(
-            samples=[],
-            data_start=None,
-            last_sample_at=None,
-            last_fetch_at=None,
-            sample_count=None,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
         new_samples = [0.0] * 7 + [1.0] * 20 + [2.0] * 20 + [3.0] * 20
 
         from unittest.mock import patch
         with patch("energy_cache.detect_quantization", return_value=(20, 0, 0.50)):
             with caplog.at_level("WARNING", logger="energy_cache"):
-                cache._merge_samples(empty, new_samples, data_start, now)
+                cache._merge_samples_replace(new_samples, data_start, now)
 
         assert len(caplog.records) > 0
         assert any(
@@ -54,24 +43,13 @@ class TestEnergyCacheLowConfidenceLog:
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
-        empty = EnergyCacheData(
-            samples=[],
-            data_start=None,
-            last_sample_at=None,
-            last_fetch_at=None,
-            sample_count=None,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
         # Full hour with exact 30-second samples — confidence = 1.0
         new_samples: list[float] = []
         for i in range(120):
             new_samples.extend([float(i)] * 30)
 
         with caplog.at_level("WARNING", logger="energy_cache"):
-            cache._merge_samples(empty, new_samples, data_start, now)
+            cache._merge_samples_replace(new_samples, data_start, now)
 
         warning_records = [
             rec for rec in caplog.records
@@ -197,153 +175,10 @@ class TestGetCurrentQhQuantization:
         assert result is None
 
 
-class TestOverlapVerification:
-    """Tests for incremental fetch overlap verification."""
+class TestIncrementalFetch:
+    """Tests for _build_incremental_fetch and replace-path get_or_fetch."""
 
-    def _make_cache(
-        self,
-        samples: list[float],
-        data_start: datetime,
-        quantization_seconds: int | None = None,
-    ) -> EnergyCache:
-        """Create an EnergyCache with pre-set data."""
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=samples,
-            data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=len(samples) - 1),
-            last_fetch_at=data_start,
-            sample_count=len(samples),
-            quantization_seconds=quantization_seconds,
-            quantization_offset=0,
-            quantization_confidence=1.0 if quantization_seconds else None,
-        )
-        return cache
-
-    def test_merge_incremental_overlap_match(self) -> None:
-        """When all overlapping samples match, merge succeeds."""
-        from energy_cache import EnergyCacheData
-        from datetime import timedelta
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        existing = EnergyCacheData(
-            samples=[0.1, 0.2, 0.3, 0.4, 0.5],
-            data_start=base,
-            last_sample_at=base + timedelta(seconds=4),
-            last_fetch_at=base,
-            sample_count=5,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=1.0,
-        )
-        # New samples start 2 seconds before cache end → 3 samples overlap
-        # Cache: [0.1, 0.2, 0.3, 0.4, 0.5] at times 0,1,2,3,4
-        # New:   [0.3, 0.4, 0.5, 0.6, 0.7] at times 2,3,4,5,6
-        # Overlap at times 2,3,4 — values must match
-        new_samples = [0.3, 0.4, 0.5, 0.6, 0.7]
-        merged = EnergyCache.merge_incremental(
-            existing, new_samples, base + timedelta(seconds=2)
-        )
-        assert merged is not None
-        assert merged.samples == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
-
-    def test_merge_incremental_overlap_mismatch(self, caplog: pytest.LogCaptureFixture) -> None:
-        """When overlapping samples differ, merge succeeds with a warning."""
-        from energy_cache import EnergyCacheData
-        from datetime import timedelta
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        existing = EnergyCacheData(
-            samples=[0.1, 0.2, 0.3, 0.4, 0.5],
-            data_start=base,
-            last_sample_at=base + timedelta(seconds=4),
-            last_fetch_at=base,
-            sample_count=5,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=1.0,
-        )
-        # New sample at time 2 differs from cached value (0.3 vs 0.99)
-        # Merge keeps cached values for overlap, appends only new-after-cache-end
-        new_samples = [0.99, 0.4, 0.5, 0.6, 0.7]
-        with caplog.at_level("WARNING", logger="energy_cache"):
-            merged = EnergyCache.merge_incremental(
-                existing, new_samples, base + timedelta(seconds=2)
-            )
-        assert merged is not None
-        # Cached values kept for overlap; new samples after cache end appended
-        assert merged.samples == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
-        assert "Overlap mismatch" in caplog.text
-
-    def test_merge_incremental_overlap_tiny_difference(self) -> None:
-        """Reproduces the real-world mismatch: -1.25e-5 vs 0.0."""
-        from energy_cache import EnergyCacheData
-        from datetime import timedelta
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        existing = EnergyCacheData(
-            samples=[-1.2537916666666667e-05],
-            data_start=base,
-            last_sample_at=base,
-            last_fetch_at=base,
-            sample_count=1,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=1.0,
-        )
-        new_samples = [0.0]
-        merged = EnergyCache.merge_incremental(
-            existing, new_samples, base
-        )
-        assert merged is not None
-
-    def test_merge_incremental_overlap_real_world_values(self) -> None:
-        """Reproduces the second real-world mismatch: 0.001487 vs 0.001482."""
-        from energy_cache import EnergyCacheData
-        from datetime import timedelta
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        existing = EnergyCacheData(
-            samples=[0.0014865579166666667],
-            data_start=base,
-            last_sample_at=base,
-            last_fetch_at=base,
-            sample_count=1,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=1.0,
-        )
-        new_samples = [0.0014823023333333334]
-        merged = EnergyCache.merge_incremental(
-            existing, new_samples, base
-        )
-        assert merged is not None
-
-    def test_merge_incremental_no_overlap(self) -> None:
-        """When new samples start after cache end, no verification occurs."""
-        from energy_cache import EnergyCacheData
-        from datetime import timedelta
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        existing = EnergyCacheData(
-            samples=[0.1, 0.2, 0.3],
-            data_start=base,
-            last_sample_at=base + timedelta(seconds=2),
-            last_fetch_at=base,
-            sample_count=3,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=1.0,
-        )
-        # New samples start after cache end — no overlap
-        new_samples = [0.4, 0.5, 0.6]
-        merged = EnergyCache.merge_incremental(
-            existing, new_samples, base + timedelta(seconds=3)
-        )
-        assert merged is not None
-        assert merged.samples == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
-
-    def test_get_or_fetch_mismatch_succeeds_on_first_fetch(
+    def test_get_or_fetch_replace_succeeds(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """On overlap mismatch, merge tolerates it and succeeds without retry."""
@@ -408,9 +243,8 @@ class TestOverlapVerification:
         fetcher = _build_incremental_fetch(cache, FakeVue(), 12345, base + timedelta(minutes=5))
         fetcher()
 
-        # Should start 30 seconds before the end of cache (100 - 30 = 70)
-        expected_start = base + timedelta(seconds=70)
-        assert captured_start["start"] == expected_start
+        # Post-compaction: always starts from data_start (no overlap adjustment)
+        assert captured_start["start"] == base
 
     def test_build_incremental_fetch_no_quantization(self) -> None:
         """When quantization_seconds is None, no expansion occurs."""
@@ -440,82 +274,9 @@ class TestOverlapVerification:
         fetcher = _build_incremental_fetch(cache, FakeVue(), 12345, base + timedelta(minutes=5))
         fetcher()
 
-        # Without quantization, should start at exactly the end of cache (100)
-        expected_start = base + timedelta(seconds=100)
-        assert captured_start["start"] == expected_start
+        # Post-compaction: always starts from data_start
+        assert captured_start["start"] == base
 
-
-class TestGetOrFetchFetchFuncOverlapMismatch:
-    """When fetch_func() itself raises OverlapMismatchError."""
-
-    def test_fetch_func_overlap_clears_cache_and_retries(self) -> None:
-        """fetch_func raising OverlapMismatchError clears cache and retries once."""
-        from datetime import timedelta
-        from energy_cache import OverlapMismatchError
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=[0.1, 0.2, 0.3],
-            data_start=base,
-            last_sample_at=base + timedelta(seconds=2),
-            last_fetch_at=base,
-            sample_count=3,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=1.0,
-        )
-
-        call_count = 0
-
-        def fetcher() -> dict[str, Any] | None:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise OverlapMismatchError(
-                    mismatch_count=1, overlap_count=1,
-                    first_idx=0, cached_val=0.001, new_val=0.0,
-                )
-            return {
-                "per_second_data": [1.0] * 100,
-                "data_start": base,
-            }
-
-        now = base + timedelta(minutes=5)
-        result, was_fresh = cache.get_or_fetch(fetcher, now)
-        assert was_fresh is True
-        assert result is not None
-        assert call_count == 2, "Should have retried after overlap mismatch in fetch_func"
-
-    def test_fetch_func_overlap_clears_cache_data(self) -> None:
-        """After overlap mismatch from fetch_func, cache is cleared."""
-        from datetime import timedelta
-        from energy_cache import OverlapMismatchError
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=[0.1, 0.2, 0.3],
-            data_start=base,
-            last_sample_at=base + timedelta(seconds=2),
-            last_fetch_at=base,
-            sample_count=3,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=1.0,
-        )
-
-        def fetcher() -> dict[str, Any] | None:
-            raise OverlapMismatchError(
-                mismatch_count=1, overlap_count=1,
-                first_idx=0, cached_val=0.001, new_val=0.0,
-            )
-
-        now = base + timedelta(minutes=5)
-        with pytest.raises(OverlapMismatchError):
-            cache.get_or_fetch(fetcher, now)
-        # Cache should be cleared even if retry also fails
-        assert cache._data is None or cache._data.samples is None
 
 
 class TestGetOrFetchTimeout:

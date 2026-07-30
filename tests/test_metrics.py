@@ -1153,42 +1153,11 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
         result = fetcher()
 
-        # Should call get_chart_usage starting from last sample time
+        # Should call get_chart_usage starting from data_start
         vue_mock.get_chart_usage.assert_called_once()
         call_args = vue_mock.get_chart_usage.call_args
-        # Start time should be old_start + 300 seconds = now
-        expected_start = old_start + timedelta(seconds=300)  # next sample after last one
-        self.assertEqual(call_args[0][1], expected_start)
-
-    def test_incremental_fetch_merges_samples(self):
-        """New samples from API are appended to existing cache samples via get_or_fetch."""
-        import metrics
-
-        cache = EnergyCache(ttl_seconds=60)
-        vue_mock = MagicMock()
-        gid = 1
-
-        fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-        old_start = fixed_now - timedelta(minutes=5)
-
-        # Pre-populate cache with 300 samples
-        cache._samples = [0.1] * 300
-        cache._data_start = old_start
-        cache._last_sample_at = old_start + timedelta(seconds=299)
-
-        # Mock API to return new samples starting from where cache left off
-        vue_mock.get_chart_usage.return_value = (
-            [0.2] * 60,  # 60 new samples
-            old_start + timedelta(seconds=300),
-        )
-
-        fetcher = metrics._build_incremental_fetch(cache, vue_mock, gid, fixed_now)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        cache.get_or_fetch(fetcher, fixed_now, force=True)
-
-        # Cache should have merged samples: 300 + 60 = 360
-        self.assertEqual(len(cache._samples), 360)
+        # Post-compaction: always starts from data_start
+        self.assertEqual(call_args[0][1], old_start)
 
     def test_api_error_returns_none(self):
         """When API raises an error, fetcher returns None and cache is unchanged."""
@@ -1335,42 +1304,36 @@ class TestEnergyCacheSampleMetadata(unittest.TestCase):
 class TestIncrementalFetchIntegration(unittest.TestCase):
     """Integration tests for incremental fetch with get_or_fetch."""
 
-    def test_full_then_incremental(self):
-        """Full fetch followed by incremental fetch merges correctly."""
+    def test_full_then_replace(self):
+        """Full fetch followed by same-start fetch replaces correctly."""
         from metrics import EnergyCache, _build_incremental_fetch
 
         cache = EnergyCache(ttl_seconds=60)
         vue_mock = MagicMock()
         gid = 1
 
-        fixed_now = datetime(2025, 6, 1, 12, 30, 13, tzinfo=timezone.utc) # 12:30:13
-        call_count = 0
+        fixed_now = datetime(2025, 6, 1, 12, 5, 13, tzinfo=timezone.utc)
+        start = fixed_now - timedelta(seconds=500)
 
         def fetch_func_1():
-            # First fetch: full range, 3542 samples from previous 3600
-            start = fixed_now - timedelta(minutes=45, seconds=13)
             return {
-                "per_second_data": [0.1] * 2642,
+                "per_second_data": [0.1] * 500,
                 "data_start": start,
             }
 
         def fetch_func_2():
-            # Incremental fetch: 42 new samples starting right after first fetch
+            # Second fetch: same data_start → replace
             return {
-                "per_second_data": [0.2] * 42,
-                "data_start": fixed_now,
+                "per_second_data": [0.2] * 520,
+                "data_start": start,
             }
 
-        # Build incremental fetcher (to verify)
-        _fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
-
-        # First fetch: full range
         cache.get_or_fetch(fetch_func_1, fixed_now)
-        self.assertEqual(len(cache._samples), 2642)
+        self.assertEqual(len(cache._samples), 500)
 
-        # Second call with force=True to simulate incremental fetch
         cache.get_or_fetch(fetch_func_2, fixed_now, force=True)
-        self.assertEqual(len(cache._samples), 2684)
+        # Replace semantics: 520 new, not 500+520
+        self.assertEqual(len(cache._samples), 520)
 
 
 if __name__ == "__main__":
@@ -1522,92 +1485,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
             "data_start": data_start,
         }
 
-    def test_merge_new_samples_after_cache(self):
-        """New samples start exactly after cache ends → all new samples kept."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)  # 14:00:00
-        existing = _make_cache_with_samples(300, cache_start)
-
-        # New samples start at 14:05:00 (after current cache end at 14:04:59)
-        new_start = cache_start + timedelta(minutes=5)
-        new_samples = [0.002] * 60
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        self.assertIsNotNone(result)
-        self.assertEqual(len(existing._samples), 360)  # 300 + 60
-        # All 60 new samples should be present
-        self.assertEqual(existing._samples[-1], 0.002)
-
-    def test_merge_new_samples_before_cache(self):
-        """New samples end exactly before cache starts → AssertionError."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=5)  # 14:05:00
-        existing = _make_cache_with_samples(300, cache_start)
-
-        # New samples are entirely before the cache (13:59:59–14:04:58)
-        new_start = cache_start - timedelta(seconds=301)
-        new_samples = [0.003] * 300
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        with self.assertRaises(AssertionError):
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-    def test_merge_gap_between_cache_and_new(self):
-        """New samples start after a gap → gap samples NOT included."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)  # 14:00:00
-        existing = _make_cache_with_samples(300, cache_start)
-
-        # New samples start at 14:06:00 (1 minute gap after cache end at 14:05:00)
-        new_start = fixed_now - timedelta(minutes=4)  # 14:06:00
-        new_samples = [0.004] * 60
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        self.assertIsNotNone(result)
-        self.assertEqual(len(existing._samples), 360)  # 300 + 60, gap skipped
-        # The gap seconds (14:05:01–14:05:59) are not filled in
-
-    def test_merge_new_samples_end_exactly_at_cache_end(self):
-        """New samples' last timestamp equals cache _last_sample_at → overlap removed."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)
-        existing = _make_cache_with_samples(300, cache_start)
-        # cache = 14:00:00 to 14:04:59, 300 samples.
-
-        # 10 new samples, 14:04:59–14:05:09 (first sample overlaps with cache_end)
-        # Overlapping values must match existing (0.001) for verification
-        new_start = cache_start + timedelta(minutes=4, seconds=59)
-        new_samples = [0.001, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005]
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        self.assertIsNotNone(result)
-        # 10 new but 1 overlap = 9 new samples added
-        self.assertEqual(len(existing._samples), 309)
-
     def test_merge_new_samples_start_exactly_at_cache_start(self):
-        """New samples' first timestamp equals cache _data_start → overlap removed."""
+        """New samples' first timestamp equals cache _data_start → replace."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
@@ -1615,8 +1494,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         existing = _make_cache_with_samples(300, cache_start)
         # cache = 14:00:00 to 14:04:59, 300 samples.
 
-        # 6 new samples, 14:00:00–14:00:05 (first sample overlaps with cache_start)
-        # All overlapping values must match existing (0.001)
+        # 6 new samples starting at the same data_start → REPLACE (not merge)
         new_start = cache_start
         new_samples = [0.001] * 6
 
@@ -1625,74 +1503,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         self.assertIsNotNone(result)
-        # 6 new - 6 overlap = 0 new samples added
-        self.assertEqual(len(existing._samples), 300)
-
-    def test_merge_no_overlap_no_gap(self):
-        """New samples start exactly 1 second after cache ends → all 60 kept."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)
-        existing = _make_cache_with_samples(300, cache_start)
-
-        # Start exactly at cache_end + 1 second
-        new_start = existing._last_sample_at + timedelta(seconds=1)
-        new_samples = [0.007] * 60
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        self.assertIsNotNone(result)
-        self.assertEqual(len(existing._samples), 360)
-
-    def test_merge_partial_overlap_both_sides(self):
-        """New samples overlap before AND after cache → AssertionError."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)
-        existing = _make_cache_with_samples(300, cache_start)
-        # cache: 14:00:00 – 14:04:59
-
-        # New samples: 13:58:00 – 14:06:00 (overlaps both sides)
-        new_start = cache_start - timedelta(minutes=2)
-        new_samples = [0.008] * 360
-        # new_end = new_start + 359s = 14:03:59
-        new_end_time = new_start + timedelta(seconds=len(new_samples) - 1)
-        self.assertEqual(new_end_time, cache_start + timedelta(minutes=3, seconds=59))
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        with self.assertRaises(AssertionError):
-            result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-    def test_merge_all_overlap_new_samples_empty_after_filter(self):
-        """New samples entirely within cached range → empty after filter."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)
-        existing = _make_cache_with_samples(300, cache_start)
-
-        # New samples entirely inside cache range (14:01:00–14:01:05)
-        # All overlapping values must match existing (0.001)
-        new_start = cache_start + timedelta(minutes=1)
-        new_samples = [0.001] * 6
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        self.assertIsNotNone(result)
-        # No new samples: entirely within cache
-        self.assertEqual(len(existing._samples), 300)
-        # Values unchanged
-        self.assertEqual(existing._samples[60], 0.001)
+        # Post-compaction: same data_start → replace, not merge
+        self.assertEqual(len(existing._samples), 6)
 
     def test_merge_empty_new_samples_list(self):
         """New samples list is empty → cache unchanged."""
@@ -1710,46 +1522,6 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(len(result[0]["per_second_data"]), 0)
         self.assertEqual(len(existing._samples), 300)
-
-    def test_merge_updates_data_start_only_on_first(self):
-        """After merge, _data_start is NOT changed; on first fetch it IS set."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)
-        existing = _make_cache_with_samples(300, cache_start)
-        original_start = existing._data_start
-
-        new_start = cache_start + timedelta(minutes=5)
-        new_samples = [0.010] * 60
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        # _data_start should NOT change after merge
-        self.assertIsNotNone(result)
-        self.assertEqual(existing._data_start, original_start)
-
-    def test_merge_updates_sample_count(self):
-        """After merge, _sample_count equals total merged count."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)
-        existing = _make_cache_with_samples(300, cache_start)
-
-        new_start = cache_start + timedelta(minutes=5)
-        new_samples = [0.011] * 60
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        self.assertIsNotNone(result)
-        self.assertEqual(existing._sample_count, 360)
 
     def test_merge_updates_last_sample_at(self):
         """After merge, _last_sample_at equals last sample time."""
@@ -1772,52 +1544,24 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         expected_last = existing._data_start + timedelta(seconds=len(existing._samples) - 1)
         self.assertEqual(existing._last_sample_at, expected_last)
 
-    def test_merge_no_sample_duplication(self):
-        """Merging back-to-back ranges (300 + 300) yields exactly 600 samples."""
+    def test_replace_preserves_sample_values(self):
+        """Sample values from the latest fetch are stored exactly."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
         cache_start = fixed_now - timedelta(minutes=10)
         existing = _make_cache_with_samples(300, cache_start)
 
-        # New samples directly after existing
-        new_start = cache_start + timedelta(minutes=5)
-        new_samples = [0.013] * 300
+        new_samples = [float(i) for i in range(60)]
 
-        fetcher = self._fetcher_returns(new_start, new_samples)
+        fetcher = self._fetcher_returns(cache_start, new_samples)
 
         metrics.set_clock(FakeClock(fixed_now))
         result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
-        self.assertIsNotNone(result)
-        self.assertEqual(len(existing._samples), 600)
-
-    def test_merge_preserves_sample_values(self):
-        """Sample values from both old and new ranges are preserved exactly."""
-        import metrics
-
-        fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
-        cache_start = fixed_now - timedelta(minutes=10)
-        existing = _make_cache_with_samples(300, cache_start)
-
-        # Give old samples distinct values
-        for i in range(300):
-            existing._samples[i] = float(i)
-
-        new_start = cache_start + timedelta(minutes=5)
-        new_samples = [float(300 + i) for i in range(60)]
-
-        fetcher = self._fetcher_returns(new_start, new_samples)
-
-        metrics.set_clock(FakeClock(fixed_now))
-        result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
-
-        # Old values preserved
+        # New values stored exactly
         self.assertEqual(existing._samples[0], 0.0)
-        self.assertEqual(existing._samples[299], 299.0)
-        # New values preserved
-        self.assertEqual(existing._samples[300], 300.0)
-        self.assertEqual(existing._samples[359], 359.0)
+        self.assertEqual(existing._samples[-1], 59.0)
 
 
 # ===========================================================================
@@ -2099,15 +1843,14 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         # Should use first channel (channel_num=1)
         self.assertEqual(len(result.per_second_data), 100)
 
-    def test_incremental_merge_appends_data_after_cache_end(self):
-        """Merge correctly appends new samples after cache end."""
+    def test_replace_stores_new_data_at_new_start(self):
+        """Replace path stores new data with the new data_start."""
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
 
-        # Simulate a cache populated with samples starting at a QH boundary.
         qh_boundary = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        num_existing = 3278  # ~55 minutes of samples
+        num_existing = 500
         existing_samples = [0.01] * num_existing
 
         def initial_fetch():
@@ -2116,49 +1859,29 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
                 "data_start": qh_boundary,
             }
 
-        last_sample_time = qh_boundary + timedelta(seconds=num_existing - 1)
-        now1 = last_sample_time + timedelta(seconds=37)  # 37s after last sample
-
+        now1 = qh_boundary + timedelta(seconds=num_existing + 37)
         cache.get_or_fetch(initial_fetch, now1)
 
         self.assertEqual(len(cache._samples), num_existing)
         self.assertEqual(cache._data_start, qh_boundary)
-        self.assertEqual(cache._last_sample_at, last_sample_time)
 
-        # Simulate an incremental fetch where the new data genuinely starts
-        # after the cache end. The data_start is right after the cache end.
-        cache_end_time = qh_boundary + timedelta(seconds=num_existing - 1)
-        new_data_start = cache_end_time + timedelta(seconds=1)
+        # Second fetch: new data_start → replace
+        new_qh_start = qh_boundary + timedelta(seconds=500)
         num_new = 31
         new_samples = [0.02] * num_new
 
-        def incremental_fetch():
+        def second_fetch():
             return {
                 "per_second_data": new_samples,
-                "data_start": new_data_start,
+                "data_start": new_qh_start,
             }
 
         now2 = now1 + timedelta(seconds=30)
+        cache.get_or_fetch(second_fetch, now2, force=True)
 
-        # Use force=True because now2 is within the 60s TTL — without it the
-        # second call would return cached data and never exercise the merge
-        # logic.
-        cache.get_or_fetch(incremental_fetch, now2, force=True)
-
-        # All genuinely new samples must be appended — none dropped.
-        expected_total = num_existing + num_new
-        self.assertEqual(len(cache._samples), expected_total,
-                         "All new samples must be appended; none should be dropped")
-
-        # The cache's _data_start must remain at its original QH boundary
-        # and must NOT be changed to the API's QH-aligned data_start.
-        self.assertEqual(cache._data_start, qh_boundary,
-                         "_data_start must not be overwritten by the API's "
-                         "QH-aligned data_start during merge")
-
-        # Verify _last_sample_at was updated to include the new samples.
-        expected_last = qh_boundary + timedelta(seconds=expected_total - 1)
-        self.assertEqual(cache._last_sample_at, expected_last)
+        # Replace semantics: only the new samples stored
+        self.assertEqual(len(cache._samples), num_new)
+        self.assertEqual(cache._data_start, new_qh_start)
 
 
 # ===========================================================================
@@ -2178,82 +1901,6 @@ class TestNBCUsesFullCache(unittest.TestCase):
     def tearDown(self):
         self._p1.stop()
         self._p2.stop()
-
-    def test_nbc_uses_full_cache_on_incremental_fetch(self):
-        """_compute_nbc should use energy_cache.samples, not incremental delta.
-
-        After an incremental fetch where the API returns only ~60 new samples,
-        NBC computation should still produce complete QH2/QH3 from the
-        merged cache data instead of treating all 60 samples as belonging to
-        the incomplete QH1.
-        """
-        import metrics
-
-        now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
-
-        # Pre-populate EnergyCache with a full hour of data (3600 samples).
-        # data_start aligned to QH boundary (14:00).
-        full_hour_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
-        full_samples = [0.001] * 3600
-        cache = metrics.EnergyCache()
-        cache._samples = list(full_samples)
-        cache._data_start = full_hour_start
-        cache._sample_count = 3600
-        cache._last_sample_at = full_hour_start + timedelta(seconds=3599)
-
-        # Create an HourlyProjection with the cache.
-        hp = HourlyProjection(
-            instant=now,
-            logger_next=logging.getLogger("test"),
-            energy_cache=cache,
-        )
-
-        # Simulate a _PopulationResult from an incremental fetch (only 60 samples).
-        incremental_samples = [0.001] * 60
-        pop_result = _PopulationResult(
-            per_second_data=incremental_samples,
-
-            chart_data=incremental_samples[-300:],
-            nbc_seconds=incremental_samples,
-            nbc_data_start=full_hour_start + timedelta(seconds=3540),
-            nbc_sample_count=60,
-        )
-
-        pred_result = DevicePrediction(
-            lag=timedelta(seconds=5),
-            minute_predicted=1.0,
-            prediction=60.0,
-            prediction_min=55.0,
-            prediction_max=65.0,
-            seconds_remaining=900.0,
-
-        )
-
-        # Build a minimal mock VDeviceUsageInfo
-        mock_vdi = MagicMock()
-        mock_vdi.device_gid = 1234
-        mock_vdi.device_name = "TEST_DEVICE"
-        mock_vdi.time_zone = None
-
-        device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
-
-        # With 60 samples, compute_nbc_quarters would give only QH1 (60 % 900 = 60).
-        # QH2, QH3, QH4 would be None. But with the full cache (3600 samples),
-        # all four quarters should be present.
-        nbc = device_metrics.nbc
-
-        # QH1 — always present (has data points)
-        self.assertIsNotNone(nbc.qh1, "QH1 should have data")
-
-        # QH2, QH3 — should be computed from full cache (3600 samples)
-        self.assertIsNotNone(nbc.qh2,
-                             "QH2 should be computed from full cache, not incremental delta")
-        self.assertIsNotNone(nbc.qh3,
-                             "QH3 should be computed from full cache, not incremental delta")
-
-        # QH4 — may be partial (samples 2700-3599), but still present
-        self.assertIsNotNone(nbc.qh4,
-                             "QH4 should be present (partial) from full cache")
 
     def test_nbc_falls_back_to_pop_result_when_no_cache(self):
         """When energy_cache is None, _compute_nbc uses pop_result.nbc_seconds.
@@ -2565,6 +2212,52 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
                     "Third arg (energy_cache) must be the module-level _energy_cache",
                 )
                 self.assertEqual(call_args[1], {}, "No keyword args expected")
+
+    def test_create_metrics_uses_data_start_for_chart_start(self):
+        """create_metrics uses data_start (not last_sample_at) for incremental chart_start.
+
+        After compaction, data_start is QH-aligned and points to the start
+        of the current incomplete QH.  The incremental fetch should start
+        from data_start so the full QH's per-second data is refetched,
+        not from last_sample_at which would miss earlier data.
+        """
+        from energy_cache import EnergyCache, EnergyCacheData
+        from metrics import HourlyProjection, create_metrics
+        from datetime import timedelta
+
+        now = datetime(2026, 7, 30, 21, 33, 23, tzinfo=timezone.utc)
+
+        # Simulate post-compaction state: 121 samples from 21:30:00–21:32:00.
+        data_start = datetime(2026, 7, 30, 21, 30, 0, tzinfo=timezone.utc)
+        last_sample_at = datetime(2026, 7, 30, 21, 32, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 121
+
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=last_sample_at,
+            last_fetch_at=now - timedelta(seconds=3),
+            sample_count=121,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        with patch("metrics.HourlyProjection") as MockHP:
+            mock_instance = MockHP.return_value
+            create_metrics(cache, now, logging.getLogger("test"))
+
+            # Verify populate was called with data_start (21:30:00),
+            # NOT last_sample_at (21:32:00).
+            mock_instance.populate.assert_called_once()
+            call_args = mock_instance.populate.call_args
+            assert len(call_args[0]) >= 1
+            chart_start = call_args[0][0]
+            assert chart_start == data_start, (
+                f"chart_start should be data_start ({data_start}), "
+                f"got {chart_start}"
+            )
 
 
 class TestQuantizationAwarePrediction(unittest.TestCase):

@@ -157,6 +157,23 @@ class NBCQuarterSet:
         }
 
 
+@dataclass(frozen=True)
+class CompletedNBCPeriod:
+    """Immutable record of a completed 15-minute QH period.
+
+    Stores the start timestamp and raw Wh sum.  Used by EnergyCache
+    compaction to preserve completed QH data after per-second samples
+    are purged.
+
+    Attributes:
+        start: QH boundary (start of the 15-min window).
+        raw_wh: Sum of per-second kWh * 1000.
+    """
+
+    start: datetime
+    raw_wh: float
+
+
 def compute_nbc_quarter(
     values: list[float],
     prediction_window_seconds: int | None = None,

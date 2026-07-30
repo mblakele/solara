@@ -212,6 +212,10 @@ project-root
 - Test data generation in `mockdata.py`
 - Quantization detection in `quantization.py`
 - Timezones in `util.py`
+- `CompletedNBCPeriod` in `util.py` — immutable record of a compacted QH period
+- `_inject_completed_qh()` in `energy_cache.py` — fills QH2-QH4 from completed periods
+- `compact()` in `energy_cache.py` — compacts completed QH periods into `CompletedNBCPeriod` objects, called after every fetch in `get_or_fetch()`
+- `_merge_samples_replace()` in `energy_cache.py` — always-replace fetch path (no overlap merge)
 - Deferred config in `config_loader.py` (`LazyConfig`, `config.get()`, `config.set()`)
 - Tesla config in `config.py` (`TeslaConfig` dataclass, `load_tesla_config()`)
 - Tesla telemetry intervals in `config.py` (`tesla_telemetry_chargestate_interval`,
@@ -233,6 +237,7 @@ project-root
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 - Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
 - File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
+- Compaction tests in `tests/test_compaction.py` (`CompletedNBCPeriod`, `compact()`, `_inject_completed_qh()`, replace-not-merge behavior)
 
 ### Actions Generation Flow
 - GapMinder.decide() generates actions as a list of PendingEffect objects
@@ -312,7 +317,7 @@ project-root
 ### Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
   The optional `force=True` parameter bypasses the stale-data check and always fetches fresh NBC data from API.
-- EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`
+- EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`. After compaction, completed QH periods are stored as immutable `CompletedNBCPeriod` objects and per-second data only covers the current incomplete QH.
 - Controllers: PlugController (stub) / RealPlugController (aiohomekit), TeslaController (stub) / RealTeslaController (tesla-fleet-api)
 - Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>[:<priority>] env vars
 

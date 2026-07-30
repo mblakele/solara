@@ -120,17 +120,18 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         Metrics dict from HourlyProjection, or None on failure.
     """
     # First call: fetch up to four QH periods.
-    # Subsequent calls: fetch incremental data from the last sample timestamp.
+    # Subsequent calls: fetch incremental data from data_start.
     logger.debug(
         "create_metrics: len %d, last_sample_at %s",
         len(energy_cache._samples or []),
         energy_cache.last_sample_at
     )
     try:
+        data_start = energy_cache.data_start
         chart_start = (
             ceil_to_qh(now - MAX_FETCH_WINDOW)
-            if energy_cache.last_sample_at is None
-            else cap_chart_start(energy_cache.last_sample_at, now)
+            if data_start is None
+            else cap_chart_start(data_start, now)
         )
         hp = HourlyProjection(now, logger, energy_cache)
         hp.populate(chart_start)
@@ -282,10 +283,9 @@ def _build_incremental_fetch(
     """Build a callable for incremental partial-range API fetches.
 
     Returns a zero-argument function that can be passed to
-    ``energy_cache.get_or_fetch()``. The callable checks whether the cache
-    already has samples and, if so, computes a partial-range API call that
-    fetches only new data since the last sample. Old samples (older than
-    3600s) are pruned after merging.
+    ``energy_cache.get_or_fetch()``. The callable fetches from the current
+    QH boundary (``data_start``) on every cycle so the cache can use
+    replace semantics without needing overlap/merge logic.
 
     On the first call (no existing samples), a full-range fetch is performed
     covering the current hour up to ``now``.
@@ -307,11 +307,9 @@ def _build_incremental_fetch(
         ) == 0:
             start_time = ceil_to_qh(now - MAX_FETCH_WINDOW)
         else:
-            last_sample_idx = len(energy_cache.samples)
-            quant = energy_cache.quantization_seconds or 0
-            start_time = energy_cache.data_start + timedelta(
-                seconds=max(0, last_sample_idx - quant)
-            )
+            # Post-compaction: data_start is QH-aligned, fetch from start
+            # of current QH. Replace semantics — no overlap adjustment needed.
+            start_time = energy_cache.data_start
 
         # Guard against stale cache: if the incremental window would be >1h,
         # fall back to a full-hour fetch to avoid API rejection.
@@ -809,42 +807,7 @@ class HourlyProjection(MetricsBase):
         pop_data_start = pop_result.nbc_data_start
         energy_cache = self.energy_cache
 
-        def _maybe_merge_with_cache(raw_data: list[float] | None) -> list[float]:
-            """Merge raw incremental data with cached samples when available.
-
-            When the cache holds a previous fetch (e.g. a full hour) and the
-            API returns only an incremental delta (~60 samples), this produces
-            a complete, gapless time series by appending the delta to the
-            cached data.
-
-            Args:
-                raw_data: Per-second data from the API (incremental delta).
-
-            Returns:
-                Merged data list, or the original input when no cache is
-                available or merge yields nothing.
-            """
-            if raw_data is None:
-                return raw_data or []
-            if energy_cache is None or energy_cache._data is None:
-                return raw_data
-            merged = energy_cache.merge_incremental(
-                energy_cache._data,
-                raw_data,
-                pop_data_start,
-            )
-            if merged is not None and merged.samples is not None:
-                return merged.samples
-            return raw_data
-
-        nbc_seconds = _maybe_merge_with_cache(pop_result.nbc_seconds)
-        # Use raw API samples for per_second_data so that the EnergyCache
-        # re-ingests only genuinely new points.  _maybe_merge_with_cache
-        # returns the full merged cache (old + new), which EnergyCache then
-        # re-extracts and mis-labels with the incremental data_start.  That
-        # mismatch inflates merged_last_sample_at into the future, which
-        # causes the next call to send start > end to the Emporia API (400).
-        # NBC still uses nbc_seconds (merged) for prediction accuracy.
+        nbc_seconds = list(pop_result.nbc_seconds) if pop_result.nbc_seconds is not None else []
         per_second_data = list(pop_result.per_second_data) if pop_result.per_second_data is not None else []
 
         # Determine the prediction window from quantization data, if available.
@@ -856,6 +819,15 @@ class HourlyProjection(MetricsBase):
                 prediction_window_seconds = qs
 
         nbc_result = self._compute_nbc(nbc_seconds, prediction_window_seconds)
+
+        # If cache has completed periods, inject QH2-QH4 from them.
+        if (energy_cache is not None
+                and energy_cache._data is not None
+                and energy_cache._data.completed_periods):
+            from energy_cache import _inject_completed_qh
+            nbc_result = _inject_completed_qh(
+                nbc_result, energy_cache._data.completed_periods,
+            )
 
         return DeviceMetrics(
             gid=vdi.device_gid,

@@ -1017,51 +1017,6 @@ class TestIndexEndpointPerSecondData(unittest.TestCase):
         self.assertEqual(psd[-1], 499,
             "Last sample should be 499 (most recent)")
 
-    def test_incremental_fetch_returns_300_from_merged_cache(self):
-        """After an incremental fetch (30 new samples on top of 500 existing),
-        perSecondData contains 300 samples from the merged cache — not just
-        the 30-sample delta."""
-        import app as app_mod
-        from energy_cache import EnergyCache
-
-        now = datetime.now(timezone.utc)
-        full_start = now - timedelta(seconds=500)
-
-        full_samples = list(range(500))
-        full_metrics = self._make_metrics(full_samples, full_start, now)
-
-        incr_start = full_start + timedelta(seconds=500)
-        incr_samples = list(range(500, 530))
-        incr_metrics = self._make_metrics(incr_samples, incr_start, now)
-
-        fetch_count = 0
-
-        def controlled_create_metrics(*_args, **_kwargs):
-            nonlocal fetch_count
-            fetch_count += 1
-            return full_metrics if fetch_count == 1 else incr_metrics
-
-        fresh_cache = EnergyCache(ttl_seconds=0)
-
-        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
-            with patch.object(app_mod, "_energy_cache", fresh_cache):
-                with patch("app.create_metrics", side_effect=controlled_create_metrics):
-                    resp1 = self.app.get("/", headers={"Accept": "application/json"})
-                    self.assertEqual(resp1.status_code, 200)
-
-                    resp2 = self.app.get("/", headers={"Accept": "application/json"})
-
-        self.assertEqual(resp2.status_code, 200)
-        data2 = json.loads(resp2.data)
-        psd = data2["devices"][0]["perSecondData"]
-
-        self.assertEqual(len(psd), 300,
-            f"Expected 300 samples from merged cache, got {len(psd)} "
-            f"(incremental delta only has 30)")
-        self.assertEqual(psd[-1], 529,
-            "Last sample should be 529, the most recent merged sample")
-        self.assertEqual(psd[0], 230,
-            "First sample should be 230 (last 300 of the merged 530)")
 
 
 class TestNetworkOutageGracefulDegradation(unittest.TestCase):
@@ -1082,7 +1037,6 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
             with patch.object(app_mod, "_energy_cache") as mock_cache:
                 mock_cache.get_or_fetch.return_value = (None, True)
                 mock_cache._data = None
-                mock_cache.merge_incremental = MagicMock(return_value=None)
                 resp = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(resp.status_code, 200)
