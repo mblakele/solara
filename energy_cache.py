@@ -425,8 +425,7 @@ class EnergyCache:
             offset += 900
 
         if offset == 0:
-            # No new completed QH periods to compact (old periods
-            # already pruned at the top of compact()).
+            # data_start is QH-aligned and no complete periods found — nothing to do.
             return
 
         # Merge new completed periods with existing, deduplicate by start time.
