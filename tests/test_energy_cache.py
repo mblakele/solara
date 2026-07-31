@@ -215,8 +215,8 @@ class TestIncrementalFetch:
         assert result is not None
         assert call_count == 1, "Should succeed on first fetch (no retry needed)"
 
-    def test_build_incremental_fetch_expands_by_quantum(self) -> None:
-        """_build_incremental_fetch shifts start_time back by quantization_seconds."""
+    def test_build_incremental_fetch_with_quantization_starts_from_qh(self) -> None:
+        """Quantization metadata does not shift the fetch start — it starts from floor_to_qh(now)."""
         from metrics import _build_incremental_fetch
         from datetime import timedelta
 
@@ -243,11 +243,12 @@ class TestIncrementalFetch:
         fetcher = _build_incremental_fetch(cache, FakeVue(), 12345, base + timedelta(minutes=5))
         fetcher()
 
-        # Post-compaction: always starts from data_start (no overlap adjustment)
+        # Always starts from the current QH boundary (floor_to_qh(now)),
+        # which equals base here since base is QH-aligned.
         assert captured_start["start"] == base
 
-    def test_build_incremental_fetch_no_quantization(self) -> None:
-        """When quantization_seconds is None, no expansion occurs."""
+    def test_build_incremental_fetch_without_quantization_starts_from_qh(self) -> None:
+        """Without quantization metadata the fetch still starts from floor_to_qh(now)."""
         from metrics import _build_incremental_fetch
         from datetime import timedelta
 
@@ -274,7 +275,7 @@ class TestIncrementalFetch:
         fetcher = _build_incremental_fetch(cache, FakeVue(), 12345, base + timedelta(minutes=5))
         fetcher()
 
-        # Post-compaction: always starts from data_start
+        # Always starts from the current QH boundary (floor_to_qh(now)).
         assert captured_start["start"] == base
 
 

@@ -18,8 +18,6 @@ from constants import MIN_SLEEP_SECS, QUANTIZATION_CONFIDENCE_THRESHOLD
 from quantization import detect_quantization
 from util import (
     CompletedNBCPeriod,
-    NBCQuarter,
-    NBCQuarterSet,
     ceil_to_qh,
     compute_nbc_quarters,
     qh_seconds_remaining,
@@ -81,56 +79,6 @@ class EnergyCacheData:
     full_metrics_dict: dict[str, Any] | None = None
     completed_periods: list["CompletedNBCPeriod"] | None = None
 
-
-
-def _completed_quarter(period: CompletedNBCPeriod) -> NBCQuarter:
-    """Build a complete NBCQuarter from a completed period.
-
-    Args:
-        period: The completed period to convert.
-
-    Returns:
-        A complete NBCQuarter carrying the period's raw Wh.
-    """
-    return NBCQuarter(
-        complete=True,
-        raw_wh=period.raw_wh,
-        wh=max(0.0, period.raw_wh),
-    )
-
-
-def _inject_completed_qh(
-    nbc: NBCQuarterSet,
-    completed_periods: list[CompletedNBCPeriod],
-) -> NBCQuarterSet:
-    """Fill QH2-QH4 from completed periods into NBCQuarterSet.
-
-    QH1 is preserved as-is (computed from per-second data).
-    QH2-QH4 are reconstructed from CompletedNBCPeriod raw_wh values.
-
-    Args:
-        nbc: The NBC quarter set (QH1 may be present, QH2-QH4 may be None).
-        completed_periods: Completed QH periods sorted by start time.
-
-    Returns:
-        New NBCQuarterSet with QH2-QH4 filled from completed periods.
-    """
-    # Stack of completed periods with the most recent on top; each vacant
-    # QH slot pops the next most recent period.
-    stack = sorted(completed_periods, key=lambda p: p.start)
-
-    qh2 = nbc.qh2
-    qh3 = nbc.qh3
-    qh4 = nbc.qh4
-
-    if qh2 is None and stack:
-        qh2 = _completed_quarter(stack.pop())
-    if qh3 is None and stack:
-        qh3 = _completed_quarter(stack.pop())
-    if qh4 is None and stack:
-        qh4 = _completed_quarter(stack.pop())
-
-    return NBCQuarterSet(qh1=nbc.qh1, qh2=qh2, qh3=qh3, qh4=qh4)
 
 
 class EnergyCache:
@@ -406,13 +354,8 @@ class EnergyCache:
                 full_metrics_dict=data.full_metrics_dict,
             )
 
-        # Also prune completed periods older than 1 hour.
-        period_cutoff = now - timedelta(seconds=3600)
-        if result.completed_periods:
-            pruned = [p for p in result.completed_periods if p.start >= period_cutoff]
-            if len(pruned) != len(result.completed_periods):
-                result = replace(result, completed_periods=pruned)
-
+        # Completed-period pruning is owned exclusively by compact(), which
+        # runs after every fetch and applies the same 1-hour cutoff.
         return result
 
     def compact(self, now: datetime) -> None:  # pylint: disable=too-many-locals
@@ -431,6 +374,7 @@ class EnergyCache:
             now: Current time for QH boundary computation.
         """
         # Caller must hold self._lock (get_or_fetch holds it).
+        assert self._lock.locked(), "compact() must be called under self._lock"
         if self._data is None:
             return
 
@@ -456,7 +400,16 @@ class EnergyCache:
         existing_completed = list(self._data.completed_periods or [])
         new_completed: list[CompletedNBCPeriod] = []
 
-        offset = 0
+        # If data_start is not QH-aligned (API drift), trim the leading
+        # partial chunk so 900-sample chunks start on real QH boundaries.
+        # This also keeps remaining_data_start aligned by construction —
+        # the old ceil-based snap could jump it into the future.
+        aligned_start = ceil_to_qh(data_start)
+        offset = int((aligned_start - data_start).total_seconds())
+        if offset >= len(samples):
+            # Entire window is one partial chunk — nothing to compact.
+            return
+
         while offset + 900 <= len(samples):
             qh_start_time = data_start + timedelta(seconds=offset)
             qh_end_time = qh_start_time + timedelta(seconds=899)
@@ -495,9 +448,10 @@ class EnergyCache:
 
         # Trim per-second samples: remove compacted chunks.
         remaining_samples = samples[offset:]
-        # Snap to QH boundary so _build_incremental_fetch always starts
-        # from a clean quarter-hour edge on the next cycle.
-        remaining_data_start = ceil_to_qh(data_start + timedelta(seconds=offset))
+        # QH-aligned by construction: offset starts at the aligned boundary
+        # (see lead-trim above) and advances in whole QH steps, so the next
+        # fetch always starts from a clean quarter-hour edge.
+        remaining_data_start = data_start + timedelta(seconds=offset)
 
         # Re-detect quantization on remaining samples.
         quant_tuple = detect_quantization(remaining_samples) if remaining_samples else None

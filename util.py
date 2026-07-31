@@ -75,6 +75,18 @@ def ceil_to_qh(dt: datetime) -> datetime:
     minutes_to_next = (15 - remainder) % 15 or 15
     return truncated + timedelta(minutes=minutes_to_next)
 
+def floor_to_qh(dt: datetime) -> datetime:
+    """Return dt truncated to the most recent quarter-hour boundary.
+
+    Args:
+        dt: datetime to truncate.
+
+    Returns:
+        A datetime on a quarter-hour boundary no later than ``dt``.
+    """
+    truncated = dt.replace(second=0, microsecond=0)
+    return truncated - timedelta(minutes=truncated.minute % 15)
+
 def qh_seconds_remaining(dt: datetime) -> int:
     """Calculate seconds remaining in the QH period,
     using input datetime.
@@ -283,6 +295,56 @@ def compute_nbc_quarters(
         quarters.append(None)
 
     return NBCQuarterSet(qh1=quarters[0], qh2=quarters[1], qh3=quarters[2], qh4=quarters[3])
+
+
+def _completed_quarter(period: CompletedNBCPeriod) -> NBCQuarter:
+    """Build a complete NBCQuarter from a completed period.
+
+    Args:
+        period: The completed period to convert.
+
+    Returns:
+        A complete NBCQuarter carrying the period's raw Wh.
+    """
+    return NBCQuarter(
+        complete=True,
+        raw_wh=period.raw_wh,
+        wh=max(0.0, period.raw_wh),
+    )
+
+
+def inject_completed_qh(
+    nbc: NBCQuarterSet,
+    completed_periods: list[CompletedNBCPeriod],
+) -> NBCQuarterSet:
+    """Fill QH2-QH4 from completed periods into NBCQuarterSet.
+
+    QH1 is preserved as-is (computed from per-second data).
+    QH2-QH4 are reconstructed from CompletedNBCPeriod raw_wh values.
+
+    Args:
+        nbc: The NBC quarter set (QH1 may be present, QH2-QH4 may be None).
+        completed_periods: Completed QH periods sorted by start time.
+
+    Returns:
+        New NBCQuarterSet with QH2-QH4 filled from completed periods.
+    """
+    # Stack of completed periods with the most recent on top; each vacant
+    # QH slot pops the next most recent period.
+    stack = sorted(completed_periods, key=lambda p: p.start)
+
+    qh2 = nbc.qh2
+    qh3 = nbc.qh3
+    qh4 = nbc.qh4
+
+    if qh2 is None and stack:
+        qh2 = _completed_quarter(stack.pop())
+    if qh3 is None and stack:
+        qh3 = _completed_quarter(stack.pop())
+    if qh4 is None and stack:
+        qh4 = _completed_quarter(stack.pop())
+
+    return NBCQuarterSet(qh1=nbc.qh1, qh2=qh2, qh3=qh3, qh4=qh4)
 
 
 def _clock_boundary_windows(now: datetime) -> list[tuple[datetime, datetime]]:

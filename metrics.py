@@ -25,6 +25,8 @@ from util import (
     ceil_to_qh,
     compute_nbc_quarters,
     custom_json_default,
+    floor_to_qh,
+    inject_completed_qh,
     is_debug,
 )
 
@@ -109,7 +111,8 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
 
     On the first call, EnergyCache has no samples, so chart_start is set to
     3600 seconds ago (full hour of historical data). After that, chart_start
-    advances to the most recent sample timestamp from the cache.
+    is floored to the current QH boundary so the full quarter-hour is
+    refetched on every cycle regardless of the API's data_start alignment.
 
     Args:
         energy_cache: instance of EnergyCache.
@@ -131,7 +134,7 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         chart_start = (
             ceil_to_qh(now - MAX_FETCH_WINDOW)
             if data_start is None
-            else cap_chart_start(data_start, now)
+            else cap_chart_start(floor_to_qh(now), now)
         )
         hp = HourlyProjection(now, logger, energy_cache)
         hp.populate(chart_start)
@@ -284,7 +287,7 @@ def _build_incremental_fetch(
 
     Returns a zero-argument function that can be passed to
     ``energy_cache.get_or_fetch()``. The callable fetches from the current
-    QH boundary (``data_start``) on every cycle so the cache can use
+    QH boundary (``floor_to_qh(now)``) on every cycle so the cache can use
     replace semantics without needing overlap/merge logic.
 
     On the first call (no existing samples), a full-range fetch is performed
@@ -307,9 +310,12 @@ def _build_incremental_fetch(
         ) == 0:
             start_time = ceil_to_qh(now - MAX_FETCH_WINDOW)
         else:
-            # Post-compaction: data_start is QH-aligned, fetch from start
-            # of current QH. Replace semantics — no overlap adjustment needed.
-            start_time = energy_cache.data_start
+            # Always fetch from the start of the current QH.  The API can
+            # return a non-QH-aligned data_start (e.g. minute-aligned), so
+            # trusting it would shrink the window to the tail of the QH and
+            # the cache would never accumulate a full quarter-hour.  Floors
+            # to a real boundary regardless of API alignment.
+            start_time = floor_to_qh(now)
 
         # Guard against stale cache: if the incremental window would be >1h,
         # fall back to a full-hour fetch to avoid API rejection.
@@ -518,8 +524,8 @@ class HourlyProjection(MetricsBase):
 
         The caller must compute chart_start. On the first call, use
         now - 3600 seconds, aligned to QH boundary, for up to a full hour
-        of historical data. On subsequent calls, use the most recent sample
-        timestamp from EnergyCache to fetch only incremental new data.
+        of historical data. On subsequent calls, use the current QH
+        boundary (floor_to_qh(now)) so the full quarter-hour is refetched.
 
         Evict older data so that the cache contains at most 3600 samples.
 
@@ -824,8 +830,7 @@ class HourlyProjection(MetricsBase):
             energy_cache.completed_periods if energy_cache is not None else None
         )
         if completed_periods:
-            from energy_cache import _inject_completed_qh
-            nbc_result = _inject_completed_qh(nbc_result, completed_periods)
+            nbc_result = inject_completed_qh(nbc_result, completed_periods)
 
         return DeviceMetrics(
             gid=vdi.device_gid,

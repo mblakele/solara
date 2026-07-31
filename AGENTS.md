@@ -213,7 +213,7 @@ project-root
 - Quantization detection in `quantization.py`
 - Timezones in `util.py`
 - `CompletedNBCPeriod` in `util.py` — immutable record of a compacted QH period
-- `_inject_completed_qh()` in `energy_cache.py` — fills QH2-QH4 from completed periods
+- `inject_completed_qh()` in `util.py` — fills QH2-QH4 from completed periods
 - `compact()` in `energy_cache.py` — compacts completed QH periods into `CompletedNBCPeriod` objects, called after every fetch in `get_or_fetch()`
 - `_merge_samples_replace()` in `energy_cache.py` — always-replace fetch path (no overlap merge)
 - Deferred config in `config_loader.py` (`LazyConfig`, `config.get()`, `config.set()`)
@@ -236,7 +236,7 @@ project-root
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 - Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
 - File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
-- Compaction tests in `tests/test_compaction.py` (`CompletedNBCPeriod`, `compact()`, `_inject_completed_qh()`, replace-not-merge behavior)
+- Compaction tests in `tests/test_compaction.py` (`CompletedNBCPeriod`, `compact()`, `inject_completed_qh()`, replace-not-merge behavior)
 
 ### Actions Generation Flow
 - GapMinder.decide() generates actions as a list of PendingEffect objects
@@ -301,8 +301,9 @@ project-root
   - `sample_count`, `last_sample_at`: metadata for diagnostics
   - `full_metrics_dict`: dict[str, Any] | None — metrics dict refreshed on every fetch (not just the first),
     returned on cache hits to preserve keys like `devices`, `nbc`, `instant`
-- `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that returns
-  only new samples since the last data point. Returns `None` on API error.
+- `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that fetches
+  from `floor_to_qh(now)` (the current QH boundary) on repeat calls so the cache
+  accumulates a full quarter-hour regardless of API data_start alignment. Returns `None` on API error.
 - `_merge_samples_replace(existing, new_data)`: replaces existing samples with new
   data (always-replace, no overlap merge), updating metadata.
 - `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent

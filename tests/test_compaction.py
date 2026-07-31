@@ -3,10 +3,10 @@
 Covers:
   - CompletedNBCPeriod dataclass
   - EnergyCache.compact()
-  - EnergyCache._inject_completed_qh()
+  - util.inject_completed_qh()
   - EnergyCache._merge_samples_replace()
   - get_or_fetch replace-not-merge behavior
-  - _build_incremental_fetch starting from data_start
+  - _build_incremental_fetch starting from the current QH boundary
   - _compute_device_metrics injecting completed QH
 """
 
@@ -155,7 +155,8 @@ class TestCompact:
         """compact() is a no-op when cache is empty."""
         cache = EnergyCache()
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
         assert cache._data is None
 
     def test_no_completed_periods_noop(self) -> None:
@@ -168,7 +169,8 @@ class TestCompact:
             data_start=data_start,
             now=now,
         )
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
         assert cache._data is not None
         assert len(cache._data.samples) == 500
         assert cache._data.completed_periods is None
@@ -184,7 +186,8 @@ class TestCompact:
         # Actually let's do 2700 + 300 = 3000 samples to have a partial QH1
         samples = [0.001] * 2700 + [0.002] * 300
         cache = self._make_cache(samples=samples, data_start=data_start, now=now)
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
         assert cache._data is not None
         assert cache._data.completed_periods is not None
         # 3 completed QH periods (QH2, QH3, QH4)
@@ -199,7 +202,8 @@ class TestCompact:
         # 1200 samples = 1 complete QH (900) + 300 in current QH
         samples = [0.001] * 900 + [0.002] * 300
         cache = self._make_cache(samples=samples, data_start=data_start, now=now)
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
         assert cache._data is not None
         assert len(cache._data.samples) == 300
         assert cache._data.data_start == datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
@@ -221,7 +225,8 @@ class TestCompact:
             now=now,
             completed_periods=[old_period],
         )
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
         assert cache._data is not None
         # Old period should be pruned
         if cache._data.completed_periods:
@@ -244,7 +249,8 @@ class TestCompact:
             now=now,
             completed_periods=[existing],
         )
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
         assert cache._data is not None
         assert cache._data.completed_periods is not None
         # Should have 3 periods (QH2, QH3, QH4), deduplicated
@@ -266,7 +272,8 @@ class TestCompact:
         # All 4 are complete. But we keep at most 3.
         samples = [0.001] * 3600
         cache = self._make_cache(samples=samples, data_start=data_start, now=now)
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
         assert cache._data is not None
         assert cache._data.completed_periods is not None
         assert len(cache._data.completed_periods) <= 3
@@ -278,22 +285,23 @@ class TestCompact:
         # 1200 samples = 1 complete QH (900) + 300 in current QH
         samples = [0.001] * 900 + [0.002] * 300
         cache = self._make_cache(samples=samples, data_start=data_start, now=now)
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
         assert cache._data is not None
         # data_start should be 14:15 (start of current QH)
         assert cache._data.data_start == datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: _inject_completed_qh()
+# Phase 2: inject_completed_qh()
 # ---------------------------------------------------------------------------
 
 class TestInjectCompletedQH:
-    """Tests for _inject_completed_qh() helper."""
+    """Tests for inject_completed_qh() helper."""
 
     def test_injects_qh2_qh4_from_completed(self) -> None:
-        """_inject_completed_qh() fills QH2-QH4 from completed periods."""
-        from energy_cache import _inject_completed_qh
+        """inject_completed_qh() fills QH2-QH4 from completed periods."""
+        from util import inject_completed_qh
 
         # Start with NBC that has only QH1
         qh1 = NBCQuarter(
@@ -317,7 +325,7 @@ class TestInjectCompletedQH:
             ),
         ]
 
-        result = _inject_completed_qh(nbc, completed)
+        result = inject_completed_qh(nbc, completed)
         assert result.qh1 is not None
         assert result.qh1.raw_wh == 100.0  # QH1 preserved
         assert result.qh2 is not None
@@ -334,7 +342,7 @@ class TestInjectCompletedQH:
         The most recent completed period goes into QH3 and the next most
         recent goes into QH4, rather than skipping the most recent period.
         """
-        from energy_cache import _inject_completed_qh
+        from util import inject_completed_qh
 
         qh1 = NBCQuarter(
             complete=False,
@@ -358,7 +366,7 @@ class TestInjectCompletedQH:
             ),
         ]
 
-        result = _inject_completed_qh(nbc, completed)
+        result = inject_completed_qh(nbc, completed)
         assert result.qh1 is not None
         assert result.qh1.raw_wh == 100.0  # QH1 preserved
         assert result.qh2 is not None
@@ -371,8 +379,8 @@ class TestInjectCompletedQH:
         assert result.qh4.raw_wh == 300.0  # Second most recent → QH4
 
     def test_preserves_qh1_from_per_second(self) -> None:
-        """_inject_completed_qh() preserves QH1 from per-second data."""
-        from energy_cache import _inject_completed_qh
+        """inject_completed_qh() preserves QH1 from per-second data."""
+        from util import inject_completed_qh
 
         qh1 = NBCQuarter(
             complete=False,
@@ -384,13 +392,13 @@ class TestInjectCompletedQH:
         )
         nbc = NBCQuarterSet(qh1=qh1, qh2=None, qh3=None, qh4=None)
 
-        result = _inject_completed_qh(nbc, [])
+        result = inject_completed_qh(nbc, [])
         assert result.qh1 is not None
         assert result.qh1.raw_wh == 50.0
 
     def test_empty_completed_periods(self) -> None:
-        """_inject_completed_qh() returns original NBC when no completed periods."""
-        from energy_cache import _inject_completed_qh
+        """inject_completed_qh() returns original NBC when no completed periods."""
+        from util import inject_completed_qh
 
         qh1 = NBCQuarter(
             complete=False,
@@ -402,12 +410,12 @@ class TestInjectCompletedQH:
         )
         nbc = NBCQuarterSet(qh1=qh1, qh2=None, qh3=None, qh4=None)
 
-        result = _inject_completed_qh(nbc, [])
+        result = inject_completed_qh(nbc, [])
         assert result == nbc
 
     def test_does_not_overwrite_existing_qh2(self) -> None:
-        """_inject_completed_qh() does not overwrite QH2 if already present."""
-        from energy_cache import _inject_completed_qh
+        """inject_completed_qh() does not overwrite QH2 if already present."""
+        from util import inject_completed_qh
 
         qh1 = NBCQuarter(
             complete=False,
@@ -431,7 +439,7 @@ class TestInjectCompletedQH:
             ),
         ]
 
-        result = _inject_completed_qh(nbc, completed)
+        result = inject_completed_qh(nbc, completed)
         assert result.qh2 is not None
         assert result.qh2.raw_wh == 999.0  # Existing preserved, not overwritten
 
@@ -591,11 +599,11 @@ class TestGetOrFetchReplace:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: _build_incremental_fetch starting from data_start
+# Phase 3: _build_incremental_fetch starting from the current QH boundary
 # ---------------------------------------------------------------------------
 
 class TestBuildIncrementalFetch:
-    """Tests for _build_incremental_fetch starting from data_start."""
+    """Tests for _build_incremental_fetch starting from the current QH boundary."""
 
     def test_starts_from_data_start_after_compaction(self) -> None:
         """After compaction, fetcher starts from data_start (QH-aligned)."""
@@ -628,6 +636,43 @@ class TestBuildIncrementalFetch:
         # Verify the fetch started from data_start
         call_args = vue.get_chart_usage.call_args
         assert call_args[0][1] == data_start  # start_time arg
+
+    def test_starts_from_current_qh_boundary(self) -> None:
+        """Fetcher starts from floor_to_qh(now), not non-aligned data_start.
+
+        A minute-aligned data_start (14:16:00) must not drive the fetch
+        start — the request window must cover the full current QH so the
+        cache accumulates a complete quarter-hour.
+        """
+        from metrics import _build_incremental_fetch
+
+        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
+        data_start = datetime(2025, 6, 15, 14, 16, 0, tzinfo=timezone.utc)
+
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=[0.001] * 240,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=239),
+            last_fetch_at=now,
+            sample_count=240,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        vue = MagicMock()
+        vue.get_chart_usage.return_value = ([0.002] * 300, data_start)
+
+        fetcher = _build_incremental_fetch(cache, vue, 12345, now)
+        fetcher()
+
+        # Verify the fetch started from the current QH boundary (14:15:00),
+        # NOT the non-aligned data_start (14:16:00).
+        call_args = vue.get_chart_usage.call_args
+        assert call_args[0][1] == datetime(
+            2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc
+        )
 
     def test_full_fetch_when_cache_empty(self) -> None:
         """When cache is empty, fetcher does a full-hour fetch."""
@@ -782,20 +827,22 @@ class TestCompactionIntegration:
 class TestDataStartQHAlignment:
     """Tests that compact() snaps data_start to the QH boundary."""
 
-    def test_compact_snaps_data_start_to_qh_boundary(self) -> None:
-        """After compaction, remaining samples must have QH-aligned data_start.
+    def test_compact_trims_leading_partial_chunk(self) -> None:
+        """Non-aligned data_start is trimmed to the QH boundary, not ceil-snapped.
 
-        Reproduces the bug where samples from an incomplete QH keep their
-        original non-aligned start time instead of snapping to the QH
-        boundary.  This caused _build_incremental_fetch to request from a
-        non-QH-aligned time on every subsequent cycle.
+        Reproduces the bug where the leading partial chunk was compacted
+        as a bogus straddling period and the remaining samples were snapped
+        FORWARD to the next QH boundary (03:00:00 while the samples only
+        reach 02:54:00).  Instead, the partial chunk must be trimmed so
+        data_start lands on a real QH boundary without jumping into the
+        future.
         """
         now = datetime(2026, 7, 30, 2, 50, 0, tzinfo=timezone.utc)
         data_start = datetime(2026, 7, 30, 2, 34, 1, tzinfo=timezone.utc)
 
-        # 1200 samples: first 900-sample block (02:34:01–02:49:00) ends
-        # before ceil_to_qh(now)=03:00:00, so it gets compacted.  The
-        # remaining 300 samples (02:49:01–02:54:00) snap to 03:00:00.
+        # 1200 samples: data_start is not QH-aligned (02:34:01).  The
+        # leading partial chunk (02:34:01–02:44:59, 659 samples) must be
+        # trimmed so chunking starts on the 02:45:00 boundary.
         samples = [0.001] * 900 + [0.002] * 300
 
         cache = EnergyCache()
@@ -810,15 +857,19 @@ class TestDataStartQHAlignment:
             quantization_confidence=None,
         )
 
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
 
         assert cache._data is not None
-        # After compact: only the 300 incomplete-QH samples remain.
-        assert len(cache._data.samples) == 300
-        # data_start must be snapped to a QH boundary, NOT left at 02:34:01.
+        # 1200 - 659 trimmed = 541 samples, aligned to 02:45:00.
+        assert len(cache._data.samples) == 541
         assert cache._data.data_start == datetime(
-            2026, 7, 30, 3, 0, 0, tzinfo=timezone.utc
+            2026, 7, 30, 2, 45, 0, tzinfo=timezone.utc
         )
+        # data_start must never jump past the last sample time.
+        assert cache._data.data_start <= cache._data.last_sample_at
+        # No bogus straddling periods compacted.
+        assert not cache._data.completed_periods
 
     def test_compact_preserves_qh_aligned_data_start(self) -> None:
         """When data_start is already QH-aligned and no compaction occurs, compact keeps it unchanged."""
@@ -837,7 +888,8 @@ class TestDataStartQHAlignment:
             quantization_confidence=None,
         )
 
-        cache.compact(now)
+        with cache._lock:
+            cache.compact(now)
 
         assert cache._data is not None
         assert len(cache._data.samples) == 300
