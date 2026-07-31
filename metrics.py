@@ -22,6 +22,7 @@ from energy_aggregator import EnergyDataAggregator, TOUBuckets
 from util import (
     CustomJSONProvider,
     NBCQuarterSet,
+    RetryableError,
     ceil_to_qh,
     compute_nbc_quarters,
     custom_json_default,
@@ -354,7 +355,7 @@ class VueAuthenticationError(Exception):
     """Raised when Vue authentication fails."""
 
 
-class RetryableMetricsException(Exception):
+class RetryableMetricsException(RetryableError):
     """Signal that the Emporia VUE API responded with a server error and the caller should retry."""
 
     def __init__(self, message, *args):

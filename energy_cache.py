@@ -18,6 +18,7 @@ from constants import MIN_SLEEP_SECS, QUANTIZATION_CONFIDENCE_THRESHOLD
 from quantization import detect_quantization
 from util import (
     CompletedNBCPeriod,
+    RetryableError,
     ceil_to_qh,
     compute_nbc_quarters,
     qh_seconds_remaining,
@@ -611,8 +612,20 @@ class EnergyCache:
             )
             pool.shutdown(wait=False, cancel_futures=True)
             return None
-        except Exception:  # noqa: BLE001
-            logger.exception("EnergyCache fetch_func raised")
+        except Exception as exc:  # noqa: BLE001
+            # RetryableError subclasses (e.g. RetryableMetricsException) are
+            # known transient conditions (e.g. the Emporia API returned no
+            # data for the hour) that get_or_fetch handles by serving stale
+            # cache and retrying next cycle — log as a warning, not an error.
+            # Unexpected exceptions keep the ERROR log.
+            if isinstance(exc, RetryableError):
+                logger.warning(
+                    "EnergyCache fetch_func raised %s: %s (transient, will retry)",
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                logger.exception("EnergyCache fetch_func raised")
             pool.shutdown(wait=False, cancel_futures=True)
             return None
         else:

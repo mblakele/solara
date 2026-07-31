@@ -15,6 +15,16 @@ from config import Config, _config
 from constants import DEFAULT_PREDICTION_WINDOW_SECS
 
 
+class RetryableError(Exception):
+    """Base class for transient, retryable API errors.
+
+    Subclasses signal a known, temporary upstream condition (e.g. the
+    Emporia VUE API returned no data for the hour).  Callers handle
+    these by serving stale data and retrying on the next cycle, so they
+    are logged as warnings rather than errors.
+    """
+
+
 def get_timezone(config: Config | None = None) -> str:
     """Return the configured timezone, evaluated lazily for testability.
 

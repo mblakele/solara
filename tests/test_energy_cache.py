@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -340,6 +341,51 @@ class TestGetOrFetchTimeout:
         result, was_fresh = cache.get_or_fetch(failing_fetcher, now, force=True)
         assert result is None
         assert was_fresh is True
+
+    def test_retryable_exception_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A RetryableMetricsException from fetch_func logs a warning, not an error."""
+        from metrics import RetryableMetricsException
+
+        cache = EnergyCache(fetch_timeout_secs=5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def retryable_fetcher() -> dict[str, Any] | None:
+            raise RetryableMetricsException("No data for hour")
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            result, was_fresh = cache.get_or_fetch(retryable_fetcher, now, force=True)
+
+        assert result is None
+        assert was_fresh is True
+        assert not any(rec.levelno == logging.ERROR for rec in caplog.records), (
+            f"Expected no ERROR records, got: {[r.message for r in caplog.records]}"
+        )
+        assert any(
+            rec.levelno == logging.WARNING and "RetryableMetricsException" in rec.message
+            for rec in caplog.records
+        ), f"Expected WARNING mentioning exception, got: {[r.message for r in caplog.records]}"
+
+    def test_unexpected_exception_still_logs_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Non-retryable exceptions from fetch_func keep the ERROR traceback log."""
+        cache = EnergyCache(fetch_timeout_secs=5)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        def failing_fetcher() -> dict[str, Any] | None:
+            raise ValueError("boom")
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            result, was_fresh = cache.get_or_fetch(failing_fetcher, now, force=True)
+
+        assert result is None
+        assert was_fresh is True
+        assert any(
+            rec.levelno == logging.ERROR and "fetch_func raised" in rec.message
+            for rec in caplog.records
+        ), f"Expected ERROR log, got: {[r.message for r in caplog.records]}"
 
     def test_timeout_logs_underlying_exception(
         self, caplog: pytest.LogCaptureFixture
