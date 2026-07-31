@@ -1141,8 +1141,8 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
         old_start = now - timedelta(minutes=5)  # 300 seconds ago
 
-        cache._samples = [0.1] * 300
-        cache._data_start = old_start
+        cache.samples = [0.1] * 300
+        cache.data_start = old_start
 
         # Mock API to return new samples starting from where cache left off
         vue_mock.get_chart_usage.return_value = (
@@ -1171,8 +1171,8 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         old_start = now - timedelta(minutes=5)
 
         # Pre-populate cache with samples
-        cache._samples = [0.1] * 300
-        cache._data_start = old_start
+        cache.samples = [0.1] * 300
+        cache.data_start = old_start
 
         # Mock API to raise an error
         vue_mock.get_chart_usage.side_effect = requests.exceptions.HTTPError("API error")
@@ -1182,7 +1182,7 @@ class TestBuildIncrementalFetch(unittest.TestCase):
 
         self.assertIsNone(result)
         # Cache should be unchanged
-        self.assertEqual(len(cache._samples), 300)
+        self.assertEqual(len(cache.samples), 300)
 
     def test_prunes_old_samples(self):
         """Samples older than 3600s from now are pruned via get_or_fetch."""
@@ -1197,8 +1197,8 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         old_start = fixed_now - timedelta(hours=2)
 
         # Pre-populate cache with 7200 samples (2 hours of per-second data)
-        cache._samples = [0.1] * 7200
-        cache._data_start = old_start
+        cache.samples = [0.1] * 7200
+        cache.data_start = old_start
 
         # Mock API to return new samples (only the last 10 minutes worth)
         vue_mock.get_chart_usage.return_value = (
@@ -1212,9 +1212,9 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         # After merging: 7200 + 600 = 7800 samples
         # After pruning (keep only last 3600s): should be ~4200 samples
         # (7800 - 3600 = 4200)
-        self.assertLessEqual(len(cache._samples), 7800)
+        self.assertLessEqual(len(cache.samples), 7800)
         # Should have pruned old samples
-        self.assertLess(len(cache._samples), 7200)
+        self.assertLess(len(cache.samples), 7200)
 
     def test_stale_cache_falls_back_to_full_fetch(self):
         """When incremental window >1h, fetcher falls back to full fetch."""
@@ -1230,8 +1230,8 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         old_start = fixed_now - timedelta(hours=9)
 
         # cache holds samples from 9h ago — the incremental window is 8h.
-        cache._samples = [0.1] * 3456
-        cache._data_start = old_start
+        cache.samples = [0.1] * 3456
+        cache.data_start = old_start
 
         expected_start = ceil_to_qh(fixed_now - timedelta(hours=1))
         vue_mock.get_chart_usage.return_value = (
@@ -1254,37 +1254,21 @@ class TestEnergyCacheSampleMetadata(unittest.TestCase):
     """Tests for EnergyCache sample metadata tracking."""
 
     def test_initial_state_has_sample_count_none(self):
-        """Fresh cache has _sample_count = None."""
+        """Fresh cache has sample_count = None."""
         from metrics import EnergyCache
 
         cache = EnergyCache()
-        self.assertIsNone(cache._sample_count)
+        self.assertIsNone(cache.sample_count)
 
     def test_initial_state_has_last_sample_at_none(self):
-        """Fresh cache has _last_sample_at = None."""
+        """Fresh cache has last_sample_at = None."""
         from metrics import EnergyCache
 
         cache = EnergyCache()
-        self.assertIsNone(cache._last_sample_at)
-
-    def test_get_or_fetch_sets_sample_count(self):
-        """After get_or_fetch, _sample_count reflects the number of samples."""
-        from metrics import EnergyCache
-
-        cache = EnergyCache(ttl_seconds=60)
-        fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
-
-        def fetch_func():
-            return {
-                "per_second_data": [0.1] * 50,
-                "data_start": fixed_now,
-            }
-
-        cache.get_or_fetch(fetch_func, fixed_now)
-        self.assertEqual(cache._sample_count, 50)
+        self.assertIsNone(cache.last_sample_at)
 
     def test_get_or_fetch_sets_last_sample_at(self):
-        """After get_or_fetch, _last_sample_at reflects the last sample time."""
+        """After get_or_fetch, last_sample_at reflects the last sample time."""
         from metrics import EnergyCache
 
         cache = EnergyCache(ttl_seconds=60)
@@ -1298,7 +1282,7 @@ class TestEnergyCacheSampleMetadata(unittest.TestCase):
 
         cache.get_or_fetch(fetch_func, datetime.now(timezone.utc))
         # Last sample time = data_start + (count - 1) seconds ≈ now
-        self.assertIsNotNone(cache._last_sample_at)
+        self.assertIsNotNone(cache.last_sample_at)
 
 
 class TestIncrementalFetchIntegration(unittest.TestCase):
@@ -1329,11 +1313,11 @@ class TestIncrementalFetchIntegration(unittest.TestCase):
             }
 
         cache.get_or_fetch(fetch_func_1, fixed_now)
-        self.assertEqual(len(cache._samples), 500)
+        self.assertEqual(len(cache.samples), 500)
 
         cache.get_or_fetch(fetch_func_2, fixed_now, force=True)
         # Replace semantics: 520 new, not 500+520
-        self.assertEqual(len(cache._samples), 520)
+        self.assertEqual(len(cache.samples), 520)
 
 
 if __name__ == "__main__":
@@ -1390,10 +1374,10 @@ def _make_cache_with_samples(count: int, start: datetime | None = None) -> "metr
 
     samples = [0.001] * count
     cache = metrics.EnergyCache()
-    cache._samples = list(samples)
-    cache._data_start = start
-    cache._sample_count = count
-    cache._last_sample_at = start + timedelta(seconds=count - 1)
+    cache.samples = list(samples)
+    cache.data_start = start
+    cache.sample_count = count
+    cache.last_sample_at = start + timedelta(seconds=count - 1)
     return cache
 
 
@@ -1486,7 +1470,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         }
 
     def test_merge_new_samples_start_exactly_at_cache_start(self):
-        """New samples' first timestamp equals cache _data_start → replace."""
+        """New samples' first timestamp equals cache data_start → replace."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
@@ -1504,7 +1488,7 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         self.assertIsNotNone(result)
         # Post-compaction: same data_start → replace, not merge
-        self.assertEqual(len(existing._samples), 6)
+        self.assertEqual(len(existing.samples), 6)
 
     def test_merge_empty_new_samples_list(self):
         """New samples list is empty → cache unchanged."""
@@ -1521,10 +1505,10 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(len(result[0]["per_second_data"]), 0)
-        self.assertEqual(len(existing._samples), 300)
+        self.assertEqual(len(existing.samples), 300)
 
     def test_merge_updates_last_sample_at(self):
-        """After merge, _last_sample_at equals last sample time."""
+        """After merge, last_sample_at equals last sample time."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
@@ -1541,8 +1525,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
 
         self.assertIsNotNone(result)
 
-        expected_last = existing._data_start + timedelta(seconds=len(existing._samples) - 1)
-        self.assertEqual(existing._last_sample_at, expected_last)
+        expected_last = existing.data_start + timedelta(seconds=len(existing.samples) - 1)
+        self.assertEqual(existing.last_sample_at, expected_last)
 
     def test_replace_preserves_sample_values(self):
         """Sample values from the latest fetch are stored exactly."""
@@ -1560,8 +1544,8 @@ class TestEnergyCacheMergeEdgeCases(unittest.TestCase):
         result = existing.get_or_fetch(fetcher, now=fixed_now, force=True)
 
         # New values stored exactly
-        self.assertEqual(existing._samples[0], 0.0)
-        self.assertEqual(existing._samples[-1], 59.0)
+        self.assertEqual(existing.samples[0], 0.0)
+        self.assertEqual(existing.samples[-1], 59.0)
 
 
 # ===========================================================================
@@ -1590,7 +1574,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         cache_start = datetime(2025, 6, 15, 14, 13, 20, tzinfo=timezone.utc)
         cache = _make_cache_with_samples(101, cache_start)  # 101 samples
 
-        original_count = len(cache._samples)
+        original_count = len(cache.samples)
         fetcher = lambda: {"per_second_data": [], "data_start": fixed_now}
 
         metrics.set_clock(FakeClock(fixed_now))
@@ -1598,11 +1582,11 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         # Samples from 14:13:20 to 14:14:59 (100 samples) are < 14:15:00 → removed
         # Sample at 14:15:00 (cutoff) is NOT removed (uses <, not <=)
-        self.assertEqual(len(cache._samples), 1)
-        self.assertEqual(len(cache._samples), original_count - 100)
+        self.assertEqual(len(cache.samples), 1)
+        self.assertEqual(len(cache.samples), original_count - 100)
 
     def test_prune_updates_data_start(self):
-        """After pruning, _data_start advances by the number of removed samples."""
+        """After pruning, data_start advances by the number of removed samples."""
         import metrics
 
         # Use fixed_now such that ceil_to_qh(now - 3600) lands at 14:15:00.
@@ -1621,9 +1605,9 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         # Samples from 14:13:20 to 14:14:59 (100 samples) are < 14:15:00 → removed
         # Samples from 14:15:00 to 14:18:19 (200 samples) are >= cutoff → kept
-        self.assertEqual(len(cache._samples), 200)
-        # _data_start advances by the number of removed samples (100 seconds)
-        self.assertEqual(cache._data_start, new_start)
+        self.assertEqual(len(cache.samples), 200)
+        # data_start advances by the number of removed samples (100 seconds)
+        self.assertEqual(cache.data_start, new_start)
 
     def test_prune_keeps_sample_at_cutoff(self):
         """Sample at the exact cutoff boundary is kept (within 3600s window).
@@ -1641,7 +1625,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         # 3601 samples from 13:15:00 to 14:15:00 (inclusive)
         cache = _make_cache_with_samples(3601, cache_start)
 
-        original_start = cache._data_start
+        original_start = cache.data_start
         fetcher = self._fetcher_returns(datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc), [])
 
         metrics.set_clock(FakeClock(fixed_now))
@@ -1649,7 +1633,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         # 3600 samples from 13:15:00 to 14:14:59 are < 14:15:00 → removed
         # Sample at 14:15:00 (cutoff) is kept (uses <, not <=)
-        self.assertEqual(len(cache._samples), 1)
+        self.assertEqual(len(cache.samples), 1)
 
     def test_prune_no_samples_to_remove(self):
         """All samples are recent → no pruning, list unchanged."""
@@ -1659,17 +1643,17 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         cache_start = fixed_now - timedelta(minutes=5)
         cache = _make_cache_with_samples(300, cache_start)
 
-        original_samples = list(cache._samples)
+        original_samples = list(cache.samples)
         fetcher = lambda: None
 
         metrics.set_clock(FakeClock(fixed_now))
         cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        self.assertEqual(len(cache._samples), 300)
-        self.assertEqual(cache._samples, original_samples)
+        self.assertEqual(len(cache.samples), 300)
+        self.assertEqual(cache.samples, original_samples)
 
     def test_prune_updates_sample_count(self):
-        """_sample_count reflects pruned length."""
+        """sample_count reflects pruned length."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
@@ -1681,10 +1665,10 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         metrics.set_clock(FakeClock(fixed_now))
         cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        self.assertEqual(cache._sample_count, len(cache._samples))
+        self.assertEqual(cache.sample_count, len(cache.samples))
 
     def test_prune_updates_last_sample_at(self):
-        """_last_sample_at recalculated after pruning."""
+        """last_sample_at recalculated after pruning."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
@@ -1696,10 +1680,10 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         metrics.set_clock(FakeClock(fixed_now))
         cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        assert len(cache._samples) > 0
+        assert len(cache.samples) > 0
 
-        expected_last = cache._data_start + timedelta(seconds=len(cache._samples) - 1)
-        self.assertEqual(cache._last_sample_at, expected_last)
+        expected_last = cache.data_start + timedelta(seconds=len(cache.samples) - 1)
+        self.assertEqual(cache.last_sample_at, expected_last)
 
     def test_prune_empty_samples_list_noop(self):
         """Empty samples → no crash, no change."""
@@ -1707,25 +1691,25 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
         cache = metrics.EnergyCache()
-        cache._samples = []
+        cache.samples = []
 
         fetcher = lambda: None
 
         metrics.set_clock(FakeClock(fixed_now))
         cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        self.assertEqual(len(cache._samples), 0)
+        self.assertEqual(len(cache.samples), 0)
 
     def test_prune_with_data_start_none_noop(self):
-        """No _data_start → no pruning (can't compute times)."""
+        """No data_start → no pruning (can't compute times)."""
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 15, 10, 0, tzinfo=timezone.utc)
         cache = metrics.EnergyCache()
-        cache._samples = [0.001] * 500
-        cache._data_start = None
+        cache.samples = [0.001] * 500
+        cache.data_start = None
 
-        original_samples = list(cache._samples)
+        original_samples = list(cache.samples)
 
         new_start = fixed_now + timedelta(minutes=10)
         new_samples = []
@@ -1734,9 +1718,9 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         metrics.set_clock(FakeClock(fixed_now))
         cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        # Without _data_start, pruning can't compute times → no pruning
-        self.assertEqual(len(cache._samples), 500)
-        self.assertEqual(cache._samples, original_samples)
+        # Without data_start, pruning can't compute times → no pruning
+        self.assertEqual(len(cache.samples), 500)
+        self.assertEqual(cache.samples, original_samples)
 
     def test_prune_exact_3600_samples_removed(self):
         """All samples older than 3600s from fixed_now → all removed."""
@@ -1756,7 +1740,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
 
         # All 3600 samples are >= 3600s old (from 14:10:00 to 15:09:59)
         # cutoff = 15:10:00, so all samples < cutoff
-        self.assertEqual(len(cache._samples), 0)
+        self.assertEqual(len(cache.samples), 0)
 
     def test_prune_one_sample_kept(self):
         """3601-sample cache, empty fetch → truncate → prune → 1 kept.
@@ -1764,7 +1748,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         Reproduces the production bug on 2026-05-21 where a production
         server hit an AssertionError in compute_nbc_quarters. When the
         cache held 3601 samples and the fetch returned empty data,
-        merge_incremental truncated to 3600 but left _data_start
+        merge_incremental truncated to 3600 but left data_start
         pointing to the original time. This caused the pruning loop
         to miscalculate sample timestamps and prune every sample,
         leaving 0 instead of the expected 1 boundary sample.
@@ -1774,8 +1758,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         fixed_now = datetime(2025, 6, 15, 15, 15, 0, tzinfo=timezone.utc)
         # 3601 samples from 13:15:00 to 14:15:00 (inclusive)
         # merge(3601 + 0) → 3601 → truncate to 3600
-        # Without fix: _data_start still 13:15:00 → all 3600 samples < 14:15:00 → 0 kept
-        # With fix: _data_start becomes 13:15:01 → samples at 13:15:01–14:14:59 pruned → 1 kept
+        # Without fix: data_start still 13:15:00 → all 3600 samples < 14:15:00 → 0 kept
+        # With fix: data_start becomes 13:15:01 → samples at 13:15:01–14:14:59 pruned → 1 kept
         cache_start = datetime(2025, 6, 15, 13, 15, 0, tzinfo=timezone.utc)
         cache = _make_cache_with_samples(3601, cache_start)
 
@@ -1786,8 +1770,8 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         cache.get_or_fetch(fetcher, fixed_now, force=True)
 
         # Prune should keep 1 sample at 14:15:00 (the boundary)
-        self.assertEqual(len(cache._samples), 1)
-        self.assertEqual(cache._samples[0], 0.001)
+        self.assertEqual(len(cache.samples), 1)
+        self.assertEqual(cache.samples[0], 0.001)
 
 
 # ===========================================================================
@@ -1862,8 +1846,8 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         now1 = qh_boundary + timedelta(seconds=num_existing + 37)
         cache.get_or_fetch(initial_fetch, now1)
 
-        self.assertEqual(len(cache._samples), num_existing)
-        self.assertEqual(cache._data_start, qh_boundary)
+        self.assertEqual(len(cache.samples), num_existing)
+        self.assertEqual(cache.data_start, qh_boundary)
 
         # Second fetch: new data_start → replace
         new_qh_start = qh_boundary + timedelta(seconds=500)
@@ -1880,8 +1864,8 @@ class TestHourlyProjectionPopulationCompleteness(unittest.TestCase):
         cache.get_or_fetch(second_fetch, now2, force=True)
 
         # Replace semantics: only the new samples stored
-        self.assertEqual(len(cache._samples), num_new)
-        self.assertEqual(cache._data_start, new_qh_start)
+        self.assertEqual(len(cache.samples), num_new)
+        self.assertEqual(cache.data_start, new_qh_start)
 
 
 # ===========================================================================
@@ -2001,7 +1985,7 @@ class TestPerSecondDataMergesCache(unittest.TestCase):
     so that the EnergyCache re-ingestion step attributes the correct sample count
     and data_start to the new samples.  Merging the full cache into per_second_data
     and then re-extracting it with the incremental data_start inflates
-    merged_last_sample_at into the future, which causes the next API call to
+    the merged last_sample_at into the future, which causes the next API call to
     send start > end and receive a 400 (see bugs/2026-05-30-api-httperror.log).
 
     NBC accuracy is preserved via nbc_seconds, which still uses the merged cache.
@@ -2038,10 +2022,10 @@ class TestPerSecondDataMergesCache(unittest.TestCase):
         full_hour_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         full_samples = [0.01] * 3600
         cache = metrics.EnergyCache()
-        cache._samples = list(full_samples)
-        cache._data_start = full_hour_start
-        cache._sample_count = 3600
-        cache._last_sample_at = full_hour_start + timedelta(seconds=3599)
+        cache.samples = list(full_samples)
+        cache.data_start = full_hour_start
+        cache.sample_count = 3600
+        cache.last_sample_at = full_hour_start + timedelta(seconds=3599)
 
         hp = HourlyProjection(
             instant=now,

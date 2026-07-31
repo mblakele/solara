@@ -41,11 +41,11 @@ def _make_energy_cache(predicted_wh: float = -2000.0, now: datetime | None = Non
     cache = EnergyCache(ttl_seconds=30)
     samples = [sample_value] * sample_count
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = data_start
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = sample_count
-        cache._last_fetch_at = now - timedelta(seconds=0)
+        cache.samples = samples
+        cache.data_start = data_start
+        cache.last_sample_at = now - timedelta(seconds=1)
+        cache.sample_count = sample_count
+        cache.last_fetch_at = now - timedelta(seconds=0)
     return cache
 
 

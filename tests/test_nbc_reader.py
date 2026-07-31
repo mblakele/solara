@@ -36,11 +36,11 @@ def _make_energy_cache(
     samples = [value] * sample_count
     # Build the cache as if data was just fetched.
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = now - timedelta(seconds=sample_count)
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = sample_count
-        cache._last_fetch_at = now
+        cache.samples = samples
+        cache.data_start = now - timedelta(seconds=sample_count)
+        cache.last_sample_at = now - timedelta(seconds=1)
+        cache.sample_count = sample_count
+        cache.last_fetch_at = now
     return cache
 
 
@@ -49,7 +49,7 @@ def _make_energy_cache_with_data_point(
     value: float = -0.001,
     now: datetime | None = None,
 ) -> EnergyCache:
-    """Same as _make_energy_cache but sets _last_fetch_at to now for is_valid()."""
+    """Same as _make_energy_cache but sets last_fetch_at to now for is_valid()."""
     if now is None:
         now = datetime.now(timezone.utc)
     cache = _make_energy_cache(sample_count, value, now)
@@ -97,7 +97,7 @@ def test_get_current_qh_returns_none_when_cache_empty():
 
 def test_get_current_qh_returns_none_when_cache_invalid():
     """get_current_qh returns None when EnergyCache is_valid() is False."""
-    # Cache with no _last_fetch_at → is_valid() returns False.
+    # Cache with no last_fetch_at → is_valid() returns False.
     now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
     reader = NBCReader(energy_cache=EnergyCache(ttl_seconds=30))
     result = reader.get_current_qh(now)
@@ -113,11 +113,11 @@ def test_get_current_qh_returns_tuple_from_cached_samples():
     samples = [-0.001] * sample_len
 
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = data_start
-        cache._last_sample_at = fixed_now - timedelta(seconds=1)
-        cache._sample_count = sample_len
-        cache._last_fetch_at = fixed_now
+        cache.samples = samples
+        cache.data_start = data_start
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = sample_len
+        cache.last_fetch_at = fixed_now
 
     reader = NBCReader(energy_cache=cache)
     result = reader.get_current_qh(now=fixed_now)
@@ -164,11 +164,11 @@ def test_get_current_qh_returns_data_point_at_from_cache():
     cache = EnergyCache(ttl_seconds=30)
     samples = [-0.001] * 1200
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = 1200
-        cache._last_fetch_at = now
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = now - timedelta(seconds=1)
+        cache.sample_count = 1200
+        cache.last_fetch_at = now
     reader = NBCReader(energy_cache=cache)
 
     result = reader.get_current_qh(now=now)
@@ -183,11 +183,11 @@ def test_get_current_qh_with_positive_samples():
     cache = EnergyCache(ttl_seconds=30)
     samples = [0.001] * 1200
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = 1200
-        cache._last_fetch_at = now
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = now - timedelta(seconds=1)
+        cache.sample_count = 1200
+        cache.last_fetch_at = now
     reader = NBCReader(energy_cache=cache)
 
     result = reader.get_current_qh(now=now)
@@ -204,11 +204,11 @@ def test_get_current_qh_force_true_triggers_refetch():
     cache = EnergyCache(ttl_seconds=30)
     samples = [-0.001] * 1200
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
-        cache._last_sample_at = fixed_now - timedelta(seconds=1)
-        cache._sample_count = 1200
-        cache._last_fetch_at = fixed_now
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 1200
+        cache.last_fetch_at = fixed_now
     reader = NBCReader(energy_cache=cache)
 
     fetch_count = 0
@@ -251,11 +251,11 @@ def test_get_current_qh_force_true_without_fetch_callable():
     cache = EnergyCache(ttl_seconds=30)
     samples = [-0.001] * 1200
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
-        cache._last_sample_at = fixed_now - timedelta(seconds=1)
-        cache._sample_count = 1200
-        cache._last_fetch_at = fixed_now
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 1200
+        cache.last_fetch_at = fixed_now
     reader = NBCReader(energy_cache=cache)
 
     # No metrics_fetch set. force=True should still read from cache.
@@ -400,11 +400,11 @@ def test_get_current_qh_falls_through_to_fetch_when_cache_valid_no_incomplete_qh
     cache = EnergyCache(ttl_seconds=30)
     samples = [-0.001] * 3600
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
-        cache._last_sample_at = fixed_now - timedelta(seconds=1)
-        cache._sample_count = 3600
-        cache._last_fetch_at = fixed_now
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 3600
+        cache.last_fetch_at = fixed_now
 
     reader = NBCReader(energy_cache=cache)
 
@@ -452,11 +452,11 @@ def test_get_current_qh_returns_none_when_fetch_fails_with_valid_complete_cache(
     cache = EnergyCache(ttl_seconds=30)
     samples = [-0.001] * 3600
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
-        cache._last_sample_at = fixed_now - timedelta(seconds=1)
-        cache._sample_count = 3600
-        cache._last_fetch_at = fixed_now
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 3600
+        cache.last_fetch_at = fixed_now
 
     reader = NBCReader(energy_cache=cache)
 
@@ -482,11 +482,11 @@ def test_get_current_qh_still_returns_from_cache_when_incomplete_qh_present():
     cache = EnergyCache(ttl_seconds=30)
     samples = [-0.001] * 1200
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
-        cache._last_sample_at = fixed_now - timedelta(seconds=1)
-        cache._sample_count = 1200
-        cache._last_fetch_at = fixed_now
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 1200
+        cache.last_fetch_at = fixed_now
 
     reader = NBCReader(energy_cache=cache)
 

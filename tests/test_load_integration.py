@@ -47,7 +47,7 @@ def _make_energy_cache_with_prediction(
         predicted_wh: Target Wh prediction for the incomplete quarter.
         now: Current time for sample timestamps.
         data_lag_secs: Simulated API lag in seconds. The NBCReader computes
-            ``data_point_at = _last_fetch_at - timedelta(seconds=data_lag_secs)``.
+            ``data_point_at = last_fetch_at - timedelta(seconds=data_lag_secs)``.
         fetch_offset_secs: How many seconds ago the data was "fetched". Defaults to 0
             (fresh). Pass a positive value to simulate older fetch time.
 
@@ -66,11 +66,11 @@ def _make_energy_cache_with_prediction(
     cache = EnergyCache(ttl_seconds=30)
     samples = [sample_value] * sample_count
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = data_start
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = sample_count
-        cache._last_fetch_at = now - timedelta(seconds=fetch_offset_secs)
+        cache.samples = samples
+        cache.data_start = data_start
+        cache.last_sample_at = now - timedelta(seconds=1)
+        cache.sample_count = sample_count
+        cache.last_fetch_at = now - timedelta(seconds=fetch_offset_secs)
     # Store _data_lag_secs on the cache so NBCReader picks it up.
     cache._data_lag_secs = data_lag_secs  # type: ignore[attr-defined]
     return cache
@@ -255,7 +255,7 @@ class TestLoadIntegration(unittest.TestCase):
       # p200 pool pump turns on
       # p100 water heater would fit gap without pool pump, but stays off
       mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-1000.0)
-      samples = mgr.nbc_reader.energy_cache._samples
+      samples = mgr.nbc_reader.energy_cache.samples
       assert len(samples) == 900 + 8 * 60
       asyncio.run(plug_ctrl.set_state("pool_pump", False))
       asyncio.run(plug_ctrl.set_state("water_heater", False))

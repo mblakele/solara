@@ -231,7 +231,6 @@ project-root
 - Telegram sender in `telegram.py` (`TelegramSender`, `NotificationEvent`)
 - SSE broadcaster and endpoint tests in `tests/test_sse.py` (`SSEBroadcaster`, `event_stream`)
 - Pipeline stage tests in `tests/test_pipeline_stages.py`
-- Pipeline stage tests in `tests/test_pipeline_stages.py`
 - CycleContext tests in `tests/test_cycle_context.py`
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
@@ -304,15 +303,14 @@ project-root
     returned on cache hits to preserve keys like `devices`, `nbc`, `instant`
 - `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that returns
   only new samples since the last data point. Returns `None` on API error.
-- `_merge_samples(existing, new_data)`: merges new samples into existing cache, updating
-  metadata. Handles overlapping and non-overlapping data ranges.
+- `_merge_samples_replace(existing, new_data)`: replaces existing samples with new
+  data (always-replace, no overlap merge), updating metadata.
 - `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent
   unbounded memory growth. Called automatically by `get_or_fetch()`.
 - `get_or_fetch(fetcher, force=False)`: returns cached data if valid (within TTL), otherwise
-  calls the fetcher. When an incremental fetcher is available, it merges new samples into
-  existing cache instead of replacing them entirely. On cache hits, returns the full metrics
-  dict (including `devices`) if stored from a prior fetch. Always updates `full_metrics_dict`
-  on every fetch to keep predictions current.
+  calls the fetcher. Fetch results replace the cached samples (no overlap merge). On cache
+  hits, returns the full metrics dict (including `devices`) if stored from a prior fetch.
+  Always updates `full_metrics_dict` on every fetch to keep predictions current.
 
 ### Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.

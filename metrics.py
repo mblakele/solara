@@ -123,7 +123,7 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
     # Subsequent calls: fetch incremental data from data_start.
     logger.debug(
         "create_metrics: len %d, last_sample_at %s",
-        len(energy_cache._samples or []),
+        len(energy_cache.samples or []),
         energy_cache.last_sample_at
     )
     try:
@@ -571,8 +571,8 @@ class HourlyProjection(MetricsBase):
         )
 
         # Expose the actual API-reported data start so that EnergyCache can
-        # update _data_start and _last_sample_at.  Without this key the
-        # get_or_fetch merge block silently skips the _last_sample_at update,
+        # update data_start and last_sample_at.  Without this key the
+        # get_or_fetch merge block silently skips the last_sample_at update,
         # leaving it permanently None and causing every call to create_metrics
         # to request a full-hour fetch instead of an incremental one.
         if population:
@@ -804,7 +804,6 @@ class HourlyProjection(MetricsBase):
         Returns:
             DeviceMetrics instance with all derived fields.
         """
-        pop_data_start = pop_result.nbc_data_start
         energy_cache = self.energy_cache
 
         nbc_seconds = list(pop_result.nbc_seconds) if pop_result.nbc_seconds is not None else []
@@ -821,13 +820,12 @@ class HourlyProjection(MetricsBase):
         nbc_result = self._compute_nbc(nbc_seconds, prediction_window_seconds)
 
         # If cache has completed periods, inject QH2-QH4 from them.
-        if (energy_cache is not None
-                and energy_cache._data is not None
-                and energy_cache._data.completed_periods):
+        completed_periods = (
+            energy_cache.completed_periods if energy_cache is not None else None
+        )
+        if completed_periods:
             from energy_cache import _inject_completed_qh
-            nbc_result = _inject_completed_qh(
-                nbc_result, energy_cache._data.completed_periods,
-            )
+            nbc_result = _inject_completed_qh(nbc_result, completed_periods)
 
         return DeviceMetrics(
             gid=vdi.device_gid,

@@ -124,9 +124,9 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
         for d in metrics_data.get("devices", []):
             cached_lag = d.get("lag", timedelta(0))
             d["lag"] = timedelta(seconds=cached_lag.total_seconds() + elapsed)
-    cache_data = _energy_cache._data
-    if cache_data is not None and cache_data.samples:
-        accumulated = list(cache_data.samples)
+    samples = _energy_cache.samples
+    if samples:
+        accumulated = list(samples)
         devices = metrics_data.get("devices", [])
         if len(devices) == 1:
             devices[0]["per_second_data"] = accumulated
@@ -609,17 +609,17 @@ def _load_management_loop() -> None:
                 logger.debug("Load management cycle result: %s", result)
                 if (
                     result.status == "no_incomplete_qh"
-                    and _energy_cache._data is None
+                    and _energy_cache.data is None
                 ):
                     logger.warning(
                         "Load management: no data available (possible network issue)"
                     )
                 _sse_broadcaster.publish("load_cycle", camelize(lm_payload))
-                cache_data = _energy_cache._data
-                if cache_data is not None and cache_data.full_metrics_dict is not None:
+                full_metrics_dict = _energy_cache.full_metrics_dict
+                if full_metrics_dict is not None:
                     _sse_broadcaster.publish(
                         "metrics_update",
-                        camelize(_enrich_metrics_for_sse(dict(cache_data.full_metrics_dict))),
+                        camelize(_enrich_metrics_for_sse(dict(full_metrics_dict))),
                     )
             interval_secs = interval_secs_config
         except RetryableMetricsException as e:
@@ -707,10 +707,10 @@ def stream_status():
     initial: list[tuple[str, object]] = [
         ("initial_load_state", camelize(_build_load_management_payload())),
     ]
-    cache_data = _energy_cache._data
-    if cache_data is not None and cache_data.full_metrics_dict is not None:
+    full_metrics_dict = _energy_cache.full_metrics_dict
+    if full_metrics_dict is not None:
         initial.append(
-            ("initial_metrics", camelize(_enrich_metrics_for_sse(dict(cache_data.full_metrics_dict))))
+            ("initial_metrics", camelize(_enrich_metrics_for_sse(dict(full_metrics_dict))))
         )
     return Response(
         event_stream(_sse_broadcaster, initial_events=initial, dumper=app.json.dumps),

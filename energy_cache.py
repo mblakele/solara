@@ -196,12 +196,22 @@ class EnergyCache:
             return None
         return self._data.samples
 
+    @samples.setter
+    def samples(self, value: list[float] | None) -> None:
+        """Set the per-second samples."""
+        self._set_data_field(samples=value)
+
     @property
     def data_start(self) -> datetime | None:
         """Timestamp of the first sample, or ``None`` if empty."""
         if self._data is None:
             return None
         return self._data.data_start
+
+    @data_start.setter
+    def data_start(self, value: datetime | None) -> None:
+        """Set the timestamp of the first sample."""
+        self._set_data_field(data_start=value)
 
     @property
     def last_sample_at(self) -> datetime | None:
@@ -210,12 +220,22 @@ class EnergyCache:
             return None
         return self._data.last_sample_at
 
+    @last_sample_at.setter
+    def last_sample_at(self, value: datetime | None) -> None:
+        """Set the timestamp of the most recent sample."""
+        self._set_data_field(last_sample_at=value)
+
     @property
     def last_fetch_at(self) -> datetime | None:
         """Timestamp of the last API fetch, or ``None`` if no fetch yet."""
         if self._data is None:
             return None
         return self._data.last_fetch_at
+
+    @last_fetch_at.setter
+    def last_fetch_at(self, value: datetime | None) -> None:
+        """Set the timestamp of the last API fetch."""
+        self._set_data_field(last_fetch_at=value)
 
     @property
     def sample_count(self) -> int | None:
@@ -224,12 +244,22 @@ class EnergyCache:
             return None
         return self._data.sample_count
 
+    @sample_count.setter
+    def sample_count(self, value: int | None) -> None:
+        """Set the cached sample count."""
+        self._set_data_field(sample_count=value)
+
     @property
     def quantization_seconds(self) -> int | None:
         """Detected quantization interval in seconds, or ``None``."""
         if self._data is None:
             return None
         return self._data.quantization_seconds
+
+    @quantization_seconds.setter
+    def quantization_seconds(self, value: int | None) -> None:
+        """Set the detected quantization interval in seconds."""
+        self._set_data_field(quantization_seconds=value)
 
     @property
     def quantization_offset(self) -> int | None:
@@ -238,6 +268,11 @@ class EnergyCache:
             return None
         return self._data.quantization_offset
 
+    @quantization_offset.setter
+    def quantization_offset(self, value: int | None) -> None:
+        """Set the offset within the quantization period."""
+        self._set_data_field(quantization_offset=value)
+
     @property
     def quantization_confidence(self) -> float | None:
         """Confidence in quantization detection (0–1), or ``None``."""
@@ -245,185 +280,50 @@ class EnergyCache:
             return None
         return self._data.quantization_confidence
 
+    @quantization_confidence.setter
+    def quantization_confidence(self, value: float | None) -> None:
+        """Set the quantization detection confidence (0–1)."""
+        self._set_data_field(quantization_confidence=value)
+
     # ------------------------------------------------------------------
-    # Backward-compatible aliases for old private attributes
+    # Field setters & extra getters
     # ------------------------------------------------------------------
 
-    @property
-    def _samples(self) -> list[float] | None:
-        """Alias for samples (backward compatibility)."""
-        return self.samples
+    def _set_data_field(self, **updates: Any) -> None:
+        """Create a fresh backing snapshot, or replace fields on the current one.
 
-    @_samples.setter
-    def _samples(self, value: list[float] | None) -> None:
-        """Set samples via the old private-name path (backward compatibility)."""
+        Args:
+            **updates: EnergyCacheData fields to set.
+        """
         if self._data is None:
-            self._data = EnergyCacheData(
-                samples=value,
-                data_start=None,
-                last_sample_at=None,
-                last_fetch_at=None,
-                sample_count=None,
-                quantization_seconds=None,
-                quantization_offset=None,
-                quantization_confidence=None,
-            )
+            defaults: dict[str, Any] = {
+                "samples": None,
+                "data_start": None,
+                "last_sample_at": None,
+                "last_fetch_at": None,
+                "sample_count": None,
+                "quantization_seconds": None,
+                "quantization_offset": None,
+                "quantization_confidence": None,
+            }
+            defaults.update(updates)
+            self._data = EnergyCacheData(**defaults)
         else:
-            self._data = replace(self._data, samples=value)
-
-    @property
-    def _data_start(self) -> datetime | None:
-        """Alias for data_start (backward compatibility)."""
-        return self.data_start
-
-    @_data_start.setter
-    def _data_start(self, value: datetime | None) -> None:
-        """Set data_start via the old private-name path."""
-        if self._data is None:
-            self._data = EnergyCacheData(
-                samples=self._data.samples if self._data else None,
-                data_start=value,
-                last_sample_at=None,
-                last_fetch_at=None,
-                sample_count=None,
-                quantization_seconds=None,
-                quantization_offset=None,
-                quantization_confidence=None,
-            )
-        else:
-            self._data = replace(self._data, data_start=value)
+            self._data = replace(self._data, **updates)
 
     @property
-    def _last_sample_at(self) -> datetime | None:
-        """Alias for last_sample_at (backward compatibility)."""
-        return self.last_sample_at
-
-    @_last_sample_at.setter
-    def _last_sample_at(self, value: datetime | None) -> None:
-        """Set last_sample_at via the old private-name path."""
+    def full_metrics_dict(self) -> dict[str, Any] | None:
+        """Full metrics dict from the last fetch, or ``None`` if empty."""
         if self._data is None:
-            self._data = EnergyCacheData(
-                samples=self._data.samples if self._data else None,
-                data_start=self._data.data_start if self._data else None,
-                last_sample_at=value,
-                last_fetch_at=None,
-                sample_count=None,
-                quantization_seconds=None,
-                quantization_offset=None,
-                quantization_confidence=None,
-            )
-        else:
-            self._data = replace(self._data, last_sample_at=value)
+            return None
+        return self._data.full_metrics_dict
 
     @property
-    def _sample_count(self) -> int | None:
-        """Alias for sample_count (backward compatibility)."""
-        return self.sample_count
-
-    @_sample_count.setter
-    def _sample_count(self, value: int | None) -> None:
-        """Set sample_count via the old private-name path."""
+    def completed_periods(self) -> list[CompletedNBCPeriod] | None:
+        """Completed NBC periods preserved by compaction, or ``None``."""
         if self._data is None:
-            self._data = EnergyCacheData(
-                samples=self._data.samples if self._data else None,
-                data_start=self._data.data_start if self._data else None,
-                last_sample_at=self._data.last_sample_at if self._data else None,
-                last_fetch_at=None,
-                sample_count=value,
-                quantization_seconds=None,
-                quantization_offset=None,
-                quantization_confidence=None,
-            )
-        else:
-            self._data = replace(self._data, sample_count=value)
-
-    @property
-    def _last_fetch_at(self) -> datetime | None:
-        """Alias for last_fetch_at (backward compatibility)."""
-        return self.last_fetch_at
-
-    @_last_fetch_at.setter
-    def _last_fetch_at(self, value: datetime | None) -> None:
-        """Set last_fetch_at via the old private-name path."""
-        if self._data is None:
-            self._data = EnergyCacheData(
-                samples=self._data.samples if self._data else None,
-                data_start=self._data.data_start if self._data else None,
-                last_sample_at=self._data.last_sample_at if self._data else None,
-                last_fetch_at=value,
-                sample_count=None,
-                quantization_seconds=None,
-                quantization_offset=None,
-                quantization_confidence=None,
-            )
-        else:
-            self._data = replace(self._data, last_fetch_at=value)
-
-    @property
-    def _quantization_seconds(self) -> int | None:
-        """Alias for quantization_seconds (backward compatibility)."""
-        return self.quantization_seconds
-
-    @_quantization_seconds.setter
-    def _quantization_seconds(self, value: int | None) -> None:
-        """Set quantization_seconds via the old private-name path."""
-        if self._data is None:
-            self._data = EnergyCacheData(
-                samples=self._data.samples if self._data else None,
-                data_start=self._data.data_start if self._data else None,
-                last_sample_at=self._data.last_sample_at if self._data else None,
-                last_fetch_at=self._data.last_fetch_at if self._data else None,
-                sample_count=None,
-                quantization_seconds=value,
-                quantization_offset=None,
-                quantization_confidence=None,
-            )
-        else:
-            self._data = replace(self._data, quantization_seconds=value)
-
-    @property
-    def _quantization_offset(self) -> int | None:
-        """Alias for quantization_offset (backward compatibility)."""
-        return self.quantization_offset
-
-    @_quantization_offset.setter
-    def _quantization_offset(self, value: int | None) -> None:
-        """Set quantization_offset via the old private-name path."""
-        if self._data is None:
-            self._data = EnergyCacheData(
-                samples=self._data.samples if self._data else None,
-                data_start=self._data.data_start if self._data else None,
-                last_sample_at=self._data.last_sample_at if self._data else None,
-                last_fetch_at=self._data.last_fetch_at if self._data else None,
-                sample_count=None,
-                quantization_seconds=self._quantization_seconds,
-                quantization_offset=value,
-                quantization_confidence=None,
-            )
-        else:
-            self._data = replace(self._data, quantization_offset=value)
-
-    @property
-    def _quantization_confidence(self) -> float | None:
-        """Alias for quantization_confidence (backward compatibility)."""
-        return self.quantization_confidence
-
-    @_quantization_confidence.setter
-    def _quantization_confidence(self, value: float | None) -> None:
-        """Set quantization_confidence via the old private-name path."""
-        if self._data is None:
-            self._data = EnergyCacheData(
-                samples=self._data.samples if self._data else None,
-                data_start=self._data.data_start if self._data else None,
-                last_sample_at=self._data.last_sample_at if self._data else None,
-                last_fetch_at=self._data.last_fetch_at if self._data else None,
-                sample_count=None,
-                quantization_seconds=self._quantization_seconds,
-                quantization_offset=self._quantization_offset,
-                quantization_confidence=value,
-            )
-        else:
-            self._data = replace(self._data, quantization_confidence=value)
+            return None
+        return self._data.completed_periods
 
     # ------------------------------------------------------------------
     # Validation
@@ -749,7 +649,7 @@ class EnergyCache:
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = pool.submit(_wrapped)
         try:
-            return future.result(timeout=self._fetch_timeout_secs)
+            result = future.result(timeout=self._fetch_timeout_secs)
         except concurrent.futures.TimeoutError:
             timed_out.set()
             logger.warning(
@@ -764,6 +664,7 @@ class EnergyCache:
             return None
         else:
             pool.shutdown(wait=False)
+            return result
 
     def get_or_fetch(
         self,

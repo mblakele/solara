@@ -13,7 +13,7 @@ Covers:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,7 +23,6 @@ from util import (
     NBCQuarter,
     NBCQuarterSet,
     ceil_to_qh,
-    compute_nbc_quarters,
 )
 
 
@@ -33,10 +32,6 @@ from util import (
 
 class TestCompletedNBCPeriod:
     """Tests for the CompletedNBCPeriod frozen dataclass."""
-
-    def test_exists(self) -> None:
-        """CompletedNBCPeriod must be importable from util."""
-        from util import CompletedNBCPeriod  # noqa: F401
 
     def test_is_frozen(self) -> None:
         """CompletedNBCPeriod must be immutable."""
@@ -554,7 +549,7 @@ class TestGetOrFetchReplace:
         }
         fetch_func = MagicMock(return_value=fetch_result)
 
-        result, was_fresh = cache.get_or_fetch(fetch_func, now, force=True)
+        _, was_fresh = cache.get_or_fetch(fetch_func, now, force=True)
         assert was_fresh is True
         assert cache._data is not None
         # Should be replaced, not merged (500 new, not 300+500=800)
@@ -587,7 +582,7 @@ class TestGetOrFetchReplace:
         }
         fetch_func = MagicMock(return_value=fetch_result)
 
-        result, was_fresh = cache.get_or_fetch(fetch_func, now, force=True)
+        _, was_fresh = cache.get_or_fetch(fetch_func, now, force=True)
         assert was_fresh is True
         assert cache._data is not None
         # Replace semantics: only new 60 samples stored
@@ -628,7 +623,7 @@ class TestBuildIncrementalFetch:
         )
 
         fetcher = _build_incremental_fetch(cache, vue, 12345, now)
-        result = fetcher()
+        fetcher()
 
         # Verify the fetch started from data_start
         call_args = vue.get_chart_usage.call_args
@@ -650,7 +645,7 @@ class TestBuildIncrementalFetch:
         )
 
         fetcher = _build_incremental_fetch(cache, vue, 12345, now)
-        result = fetcher()
+        fetcher()
 
         # Verify the fetch started from a QH-aligned time
         call_args = vue.get_chart_usage.call_args
