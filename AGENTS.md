@@ -181,8 +181,10 @@ project-root
 
 ### Key entry points
 
-- **Guard functions** `metrics.py`: `cap_chart_start()`, `cap_fetch_window()` —
-  prevent over-fetching when cache is stale; pure functions, independently tested
+- **Guard functions** `metrics.py`: `cap_chart_start()`, `cap_fetch_window()`,
+  `_chart_start_for()` — cap over-fetching when cache is stale and keep the
+  fetch window anchored to a stale QH-aligned `data_start` so a completed QH
+  is not lost at a boundary; pure functions, independently tested
 - `EnergyCache` in `energy_cache.py` with `get_or_fetch()`, `is_valid()`,
   `sleep_interval_adjust()`, and quantization detection
 - NBC calculation in `metrics.py` (`get_current_qh()` helper)
@@ -302,8 +304,10 @@ project-root
   - `full_metrics_dict`: dict[str, Any] | None — metrics dict refreshed on every fetch (not just the first),
     returned on cache hits to preserve keys like `devices`, `nbc`, `instant`
 - `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that fetches
-  from `floor_to_qh(now)` (the current QH boundary) on repeat calls so the cache
-  accumulates a full quarter-hour regardless of API data_start alignment. Returns `None` on API error.
+  from a QH boundary via `_chart_start_for()` on repeat calls so the cache
+  accumulates a full quarter-hour regardless of API data_start alignment,
+  keeping a stale QH-aligned `data_start` anchored so a completed QH compacts.
+  Returns `None` on API error.
 - `_merge_samples_replace(existing, new_data)`: replaces existing samples with new
   data (always-replace, no overlap merge), updating metadata.
 - `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent

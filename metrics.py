@@ -107,13 +107,48 @@ def cap_fetch_window(start_time: datetime, now: datetime) -> datetime:
     return ceil_to_qh(now - MAX_FETCH_WINDOW)
 
 
+def _chart_start_for(energy_cache: EnergyCache, now: datetime) -> datetime:
+    """Pick the fetch window start for the current cycle.
+
+    On the first call (``data_start`` is None) the full hour up to *now* is
+    fetched.  In steady state the window starts at the current QH boundary
+    so replace semantics need no overlap/merge logic.  When the cached
+    window still starts in an already-completed QH (QH-aligned
+    ``data_start`` older than the current QH), the window stays anchored to
+    that older boundary so the completed QH reaches 900 samples and is
+    compacted into a ``CompletedNBCPeriod`` on the first fetch after the
+    boundary — otherwise ``EnergyCache`` replace semantics would discard
+    the un-compacted window and lose the QH.
+
+    Args:
+        energy_cache: The EnergyCache instance storing per-second samples.
+        now: Current time.
+
+    Returns:
+        A QH-aligned fetch window start time.
+    """
+    data_start = energy_cache.data_start
+    if data_start is None:
+        return ceil_to_qh(now - MAX_FETCH_WINDOW)
+    current_qh_start = floor_to_qh(now)
+    if data_start < current_qh_start and data_start == ceil_to_qh(data_start):
+        # Anchor to the stale QH-aligned data_start so samples accumulate to
+        # 900 and compact() materialises a CompletedNBCPeriod.  This applies
+        # to any number of QHs back — compact() processes all complete chunks
+        # in one pass, so a two-QH gap is handled correctly as well.
+        return data_start
+    return current_qh_start
+
+
 def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Logger) -> dict[str, Any] | None:
     """Fetch metrics with incremental chart_start tracking via EnergyCache.
 
     On the first call, EnergyCache has no samples, so chart_start is set to
     3600 seconds ago (full hour of historical data). After that, chart_start
     is floored to the current QH boundary so the full quarter-hour is
-    refetched on every cycle regardless of the API's data_start alignment.
+    refetched on every cycle regardless of the API's data_start alignment;
+    a stale QH-aligned data_start keeps the window anchored so a completed
+    QH is not lost (see ``_chart_start_for``).
 
     Args:
         energy_cache: instance of EnergyCache.
@@ -124,19 +159,14 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         Metrics dict from HourlyProjection, or None on failure.
     """
     # First call: fetch up to four QH periods.
-    # Subsequent calls: fetch incremental data from data_start.
+    # Subsequent calls: incremental fetch anchored at a QH boundary.
     logger.debug(
         "create_metrics: len %d, last_sample_at %s",
         len(energy_cache.samples or []),
         energy_cache.last_sample_at
     )
     try:
-        data_start = energy_cache.data_start
-        chart_start = (
-            ceil_to_qh(now - MAX_FETCH_WINDOW)
-            if data_start is None
-            else cap_chart_start(floor_to_qh(now), now)
-        )
+        chart_start = cap_chart_start(_chart_start_for(energy_cache, now), now)
         hp = HourlyProjection(now, logger, energy_cache)
         hp.populate(chart_start)
         logger.debug(
@@ -288,8 +318,8 @@ def _build_incremental_fetch(
 
     Returns a zero-argument function that can be passed to
     ``energy_cache.get_or_fetch()``. The callable fetches from the current
-    QH boundary (``floor_to_qh(now)``) on every cycle so the cache can use
-    replace semantics without needing overlap/merge logic.
+    QH boundary on every cycle so the cache can use replace semantics
+    without needing overlap/merge logic (see ``_chart_start_for``).
 
     On the first call (no existing samples), a full-range fetch is performed
     covering the current hour up to ``now``.
@@ -306,17 +336,7 @@ def _build_incremental_fetch(
     """
 
     def fetcher() -> dict[str, Any] | None:
-        if energy_cache.data_start is None or energy_cache.samples is None or len(
-            energy_cache.samples
-        ) == 0:
-            start_time = ceil_to_qh(now - MAX_FETCH_WINDOW)
-        else:
-            # Always fetch from the start of the current QH.  The API can
-            # return a non-QH-aligned data_start (e.g. minute-aligned), so
-            # trusting it would shrink the window to the tail of the QH and
-            # the cache would never accumulate a full quarter-hour.  Floors
-            # to a real boundary regardless of API alignment.
-            start_time = floor_to_qh(now)
+        start_time = _chart_start_for(energy_cache, now)
 
         # Guard against stale cache: if the incremental window would be >1h,
         # fall back to a full-hour fetch to avoid API rejection.

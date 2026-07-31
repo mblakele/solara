@@ -2331,6 +2331,92 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
                 f"got {chart_start}"
             )
 
+    def test_create_metrics_extends_window_across_qh_boundary(self):
+        """A stale QH-aligned data_start must be retained across a QH boundary.
+
+        If the last fetch before a QH boundary holds <900 samples of the
+        just-completed QH, the next fetch must start from the old data_start
+        so the QH reaches 900 samples and is compacted into a
+        CompletedNBCPeriod.  Starting from floor_to_qh(now) would replace
+        the un-compacted window and lose the QH forever.
+        """
+        from energy_cache import EnergyCache, EnergyCacheData
+        from metrics import HourlyProjection, create_metrics
+        from datetime import timedelta
+
+        now = datetime(2026, 7, 31, 18, 45, 40, tzinfo=timezone.utc)
+
+        # Cache holds 890 samples of the 18:30 QH (just ended, not yet
+        # compacted because 890 < 900).
+        data_start = datetime(2026, 7, 31, 18, 30, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 890
+
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=889),
+            last_fetch_at=now - timedelta(seconds=3),
+            sample_count=890,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        with patch("metrics.HourlyProjection") as MockHP:
+            mock_instance = MockHP.return_value
+            create_metrics(cache, now, logging.getLogger("test"))
+
+            mock_instance.populate.assert_called_once()
+            chart_start = mock_instance.populate.call_args[0][0]
+            assert chart_start == data_start, (
+                f"chart_start must stay at {data_start} so the 18:30 QH "
+                f"completes 900 samples and compacts, got {chart_start}"
+            )
+
+    def test_create_metrics_non_aligned_stale_data_start_floors_to_qh(self):
+        """A stale non-QH-aligned data_start must not drive chart_start.
+
+        If data_start is not QH-aligned (e.g. the API returned a
+        minute-aligned start), fetching from it would produce a misaligned
+        window that compact() cannot chunk onto real QH boundaries.
+        chart_start must fall back to the current QH boundary.
+        """
+        from energy_cache import EnergyCache, EnergyCacheData
+        from metrics import HourlyProjection, create_metrics
+        from datetime import timedelta
+
+        now = datetime(2026, 7, 30, 21, 33, 23, tzinfo=timezone.utc)
+
+        # data_start is stale (21:27:00 < 21:30:00) but NOT QH-aligned.
+        data_start = datetime(2026, 7, 30, 21, 27, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 384
+
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=383),
+            last_fetch_at=now - timedelta(seconds=3),
+            sample_count=384,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        with patch("metrics.HourlyProjection") as MockHP:
+            mock_instance = MockHP.return_value
+            create_metrics(cache, now, logging.getLogger("test"))
+
+            mock_instance.populate.assert_called_once()
+            chart_start = mock_instance.populate.call_args[0][0]
+            assert chart_start == datetime(
+                2026, 7, 30, 21, 30, 0, tzinfo=timezone.utc
+            ), (
+                f"non-aligned stale data_start must floor to current QH "
+                f"(21:30:00), got {chart_start}"
+            )
+
 
 class TestQuantizationAwarePrediction(unittest.TestCase):
     """Integration tests for quantization-aware NBC prediction window.

@@ -697,6 +697,52 @@ class TestBuildIncrementalFetch:
         start_time = call_args[0][1]
         assert start_time == ceil_to_qh(now - timedelta(hours=1))
 
+    def test_boundary_fetch_compacts_missed_qh(self) -> None:
+        """Fetching across a QH boundary completes and compacts the missed QH.
+
+        If the last fetch before a QH boundary held <900 samples of the
+        just-completed QH (e.g. 890), the next fetch must start from the old
+        QH-aligned data_start so the window reaches 900 samples and compact()
+        materializes a CompletedNBCPeriod.  Starting from floor_to_qh(now)
+        would replace the un-compacted window and lose the QH.
+        """
+        from metrics import _build_incremental_fetch
+
+        now = datetime(2026, 7, 31, 18, 45, 40, tzinfo=timezone.utc)
+        data_start = datetime(2026, 7, 31, 18, 30, 0, tzinfo=timezone.utc)
+
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=[0.001] * 890,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=889),
+            last_fetch_at=now,
+            sample_count=890,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        class FakeVue:
+            def get_chart_usage(self, gid, start, end, **kwargs):
+                # The API returns data starting at the requested start.
+                return (
+                    [0.001] * int((end - start).total_seconds()),
+                    start,
+                )
+
+        fetcher = _build_incremental_fetch(cache, FakeVue(), 12345, now)
+        cache.get_or_fetch(fetcher, now, force=True)
+
+        assert cache._data is not None
+        completed = cache._data.completed_periods or []
+        assert any(
+            p.start == data_start for p in completed
+        ), (
+            f"expected a CompletedNBCPeriod at {data_start}, "
+            f"got {[p.start for p in completed]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Phase 3: _compute_device_metrics injecting completed QH
