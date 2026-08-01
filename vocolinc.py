@@ -22,9 +22,11 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
-import time
 import logging
+import os
+import time
 from dataclasses import dataclass
 
 import boto3
@@ -327,14 +329,20 @@ class VOCOlinc:
 # CLI for quick testing
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    import argparse
-    import os
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for quick VOCOlinc plug testing.
 
+    ``--user``/``--password`` default to the ``VOCOLINC_USERNAME`` and
+    ``VOCOLINC_PASSWORD`` environment variables — the same names the app
+    reads via ``Config.vocolinc_username``/``vocolinc_password`` (and
+    env.example documents).
+
+    Returns:
+        The configured ArgumentParser.
+    """
     parser = argparse.ArgumentParser(description="VOCOlinc plug controller")
-    parser.add_argument("--user", default=os.environ.get("VOCOLINC_USER"))
+    parser.add_argument("--user", default=os.environ.get("VOCOLINC_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("VOCOLINC_PASSWORD"))
     sub = parser.add_subparsers(dest="cmd")
 
@@ -349,11 +357,25 @@ if __name__ == "__main__":
     p_status = sub.add_parser("status", help="Get plug state")
     p_status.add_argument("name")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the VOCOlinc CLI (list/on/off/status commands).
+
+    Args:
+        argv: Optional argument list; defaults to ``sys.argv[1:]``.
+
+    Raises:
+        SystemExit: When credentials are missing (exit code 2).
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
     if not args.user or not args.password:
         parser.error(
-            "Provide --user/--password or set VOCOLINC_USER/VOCOLINC_PASSWORD"
+            "Provide --user/--password or set "
+            "VOCOLINC_USERNAME/VOCOLINC_PASSWORD"
         )
 
     client = VOCOlinc(args.user, args.password)
@@ -377,3 +399,8 @@ if __name__ == "__main__":
 
     else:
         parser.print_help()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    main()
