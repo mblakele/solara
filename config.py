@@ -234,10 +234,7 @@ class Config:
         """Return integer config value, checking each source in order."""
         if key in self._overrides:
             return int(self._overrides[key])
-        try:
-            raw = _lookup(key, None)
-        except UndefinedValueError:
-            raw = None
+        raw = _lookup(key, None)
         if raw is None:
             return default
         return int(raw)
@@ -551,6 +548,12 @@ def _parse_env_file(path: Path) -> dict[str, str]:
         v = v.strip()
         if len(v) >= 2 and ((v[0] == "'" and v[-1] == "'") or (v[0] == '"' and v[-1] == '"')):
             v = v[1:-1]
+        else:
+            # Strip inline comments from unquoted values: KEY=value # comment
+            # Only strip when " #" appears so a lone "#" in a value is kept.
+            comment_pos = v.find(" #")
+            if comment_pos != -1:
+                v = v[:comment_pos].rstrip()
         data[k] = v
     return data
 

@@ -2,8 +2,8 @@
 NBC reader, device state tracking, and the bin-packing decision engine.
 
 NBCReader reads current quarter-hour predictions from a shared EnergyCache
-instance instead of maintaining its own NBCCache layer. NBC quarters are
-computed on demand from raw per-second samples via util.compute_nbc_quarters().
+instance. NBC quarters are computed on demand from raw per-second samples
+via util.compute_nbc_quarters().
 """
 
 from __future__ import annotations
@@ -110,8 +110,8 @@ class NBCPeriod:
 class NBCReader:
     """Reads current QH predicted_wh from cached energy samples.
 
-    Reads directly from EnergyCache instead of wrapping a fetch callable
-    and using NBCCache. NBC quarters are computed on demand from raw samples.
+    Reads directly from EnergyCache. NBC quarters are computed on demand
+    from raw samples.
 
     Attributes:
         energy_cache: Shared EnergyCache instance for reading cached per-second data.

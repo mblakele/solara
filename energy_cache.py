@@ -701,7 +701,7 @@ class EnergyCache:
         * A full metrics dict (e.g. ``HourlyProjection.metrics``) — stored
           as a nested ``_data`` fallback and returned directly to the
           caller.
-        * An incremental dict with ``"per_second_data"`` and ``"data_start"``
+        * A per-second dict with ``"per_second_data"`` and ``"data_start"``
           keys — the per-second samples are stored via always-replace
           semantics (``_merge_samples_replace``); ``compact()`` runs after
           every fetch.
@@ -826,8 +826,7 @@ class EnergyCache:
         """Extract current incomplete QH prediction from cached samples.
 
         Computes NBC quarters using clock-boundary alignment (QH1 = most
-        recent 15-min window) and returns the same structure that
-        ``NBCCache.get_or_fetch()`` would return:
+        recent 15-min window) and returns a dict with keys
         ``{qh_name, predicted_wh, seconds_remaining}``.
 
         ``seconds_remaining`` is derived from wall-clock time so it stays

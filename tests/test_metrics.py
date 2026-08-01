@@ -1602,7 +1602,7 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         Reproduces the production bug on 2026-05-21 where a production
         server hit an AssertionError in compute_nbc_quarters. When the
         cache held 3601 samples and the fetch returned empty data,
-        merge_incremental truncated to 3600 but left data_start
+        the old incremental-merge path truncated to 3600 but left data_start
         pointing to the original time. This caused the pruning loop
         to miscalculate sample timestamps and prune every sample,
         leaving 0 instead of the expected 1 boundary sample.

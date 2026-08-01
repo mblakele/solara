@@ -1,8 +1,8 @@
-"""Tests for NBCReader backed by EnergyCache (subtask 4).
+"""Tests for NBCReader backed by EnergyCache.
 
-NBCReader now reads directly from a shared EnergyCache instance instead of
-wrapping a fetch callable and using NBCCache. NBC quarters are computed on
-demand from raw per-second samples via util.compute_nbc_quarters().
+NBCReader reads directly from a shared EnergyCache instance. NBC quarters
+are computed on demand from raw per-second samples via
+util.compute_nbc_quarters().
 """
 
 from datetime import datetime, timedelta, timezone
