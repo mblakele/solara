@@ -348,7 +348,7 @@ class TestGetOrFetchTimeout:
         now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
         def slow_fetcher() -> dict[str, Any] | None:
-            time.sleep(5)
+            time.sleep(0.8)
             return {"devices": []}
 
         result, was_fresh = cache.get_or_fetch(slow_fetcher, now, force=True)
@@ -375,7 +375,7 @@ class TestGetOrFetchTimeout:
         now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
         def slow_fetcher() -> dict[str, Any] | None:
-            time.sleep(5)
+            time.sleep(0.8)
             return {"devices": []}
 
         with caplog.at_level("WARNING", logger="energy_cache"):
@@ -453,13 +453,13 @@ class TestGetOrFetchTimeout:
         now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
         def slow_failing_fetcher() -> dict[str, Any] | None:
-            time.sleep(1)
+            time.sleep(0.6)
             raise ConnectionError("DNS resolution failed")
 
         with caplog.at_level("WARNING", logger="energy_cache"):
             cache.get_or_fetch(slow_failing_fetcher, now, force=True)
             # Give the thread time to log its exception after the timeout.
-            time.sleep(1.5)
+            time.sleep(0.9)
 
         all_msgs = [rec.message for rec in caplog.records]
         assert any(
@@ -492,7 +492,7 @@ class TestGetOrFetchTimeout:
         )
 
         def slow_fetcher() -> dict[str, Any] | None:
-            time.sleep(5)
+            time.sleep(1.2)
             return None
 
         result, was_fresh = cache.get_or_fetch(slow_fetcher, now, force=True)

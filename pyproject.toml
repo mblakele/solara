@@ -24,7 +24,8 @@ dependencies = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "--cov=. --cov-report=term-missing"
+# Coverage is opt-in to keep default runs fast: use `uv run pytest --cov=.`
+addopts = ""
 testpaths = ["tests"]
 filterwarnings = [
     "ignore:module 'sre_parse' is deprecated:DeprecationWarning",

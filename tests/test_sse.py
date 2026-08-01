@@ -99,7 +99,7 @@ class TestEventStream:
 
     def test_subscribed_events_appear_in_stream(self) -> None:
         b = SSEBroadcaster()
-        gen = event_stream(b, timeout=1)
+        gen = event_stream(b, timeout=0.1)
         # Read past heartbeat, then publish from another thread
         next(gen)  # heartbeat or initial
 
@@ -115,7 +115,7 @@ class TestEventStream:
 
     def test_unsubscribe_on_generator_exit(self) -> None:
         b = SSEBroadcaster()
-        gen = event_stream(b, timeout=1)
+        gen = event_stream(b, timeout=0.1)
         next(gen)  # heartbeat
         assert b.subscriber_count() == 1
         gen.close()
@@ -125,7 +125,7 @@ class TestEventStream:
 
     def test_generator_exit_does_not_raise(self) -> None:
         b = SSEBroadcaster()
-        gen = event_stream(b, timeout=1)
+        gen = event_stream(b, timeout=0.1)
         next(gen)
         gen.close()  # should not raise
 

@@ -392,8 +392,13 @@ to the next step if a prior step fails.
 ```bash
 uv run pylint *.py                     # 1. Style and bug checks
 uv run mypy                            # 2. Type correctness
-uv run pytest                          # 3. Full test suite
+uv run pytest                          # 3. Full test suite (fast, no coverage)
+uv run pytest --cov=.                  # 4. Coverage check (opt-in)
 ```
+
+Coverage is opt-in: `uv run pytest` runs without instrumentation for speed.
+Run `uv run pytest --cov=.` (or add `--cov=<module>`) when coverage validation
+is required (e.g. CI, or after changing test-relevant code).
 
 ### Individual Commands
 

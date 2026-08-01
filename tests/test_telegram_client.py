@@ -42,6 +42,7 @@ def telegram_client(telegram_config):
     """TelegramClient with session mocked out."""
     ctrl = TelegramClient(telegram_config)
     ctrl._session = MagicMock()
+    ctrl._session.closed = False  # keep _get_session() from discarding the mock
     ctrl._session.close = AsyncMock()  # close() is async
     return ctrl
 
@@ -235,7 +236,12 @@ class TestSendMessageParseError:
         mock_response = MagicMock()
         mock_response.status = 200
         mock_response.json = AsyncMock(side_effect=ValueError("invalid json"))
-        telegram_client._session.post = AsyncMock(return_value=mock_response)
+
+        post_mock = MagicMock()
+        post_mock.return_value = AsyncMock(return_value=mock_response)
+        post_mock.return_value.__aenter__ = AsyncMock(return_value=mock_response)
+        post_mock.return_value.__aexit__ = AsyncMock(return_value=False)
+        telegram_client._session.post = post_mock
 
         result = asyncio.run(telegram_client.send_message("should fail"))
         assert result is False
@@ -245,7 +251,12 @@ class TestSendMessageParseError:
         mock_response = MagicMock()
         mock_response.status = 200
         mock_response.json = AsyncMock(side_effect=OSError("disk full"))
-        telegram_client._session.post = AsyncMock(return_value=mock_response)
+
+        post_mock = MagicMock()
+        post_mock.return_value = AsyncMock(return_value=mock_response)
+        post_mock.return_value.__aenter__ = AsyncMock(return_value=mock_response)
+        post_mock.return_value.__aexit__ = AsyncMock(return_value=False)
+        telegram_client._session.post = post_mock
 
         result = asyncio.run(telegram_client.send_message("should fail"))
         assert result is False

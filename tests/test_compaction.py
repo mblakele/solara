@@ -13,11 +13,12 @@ Covers:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from energy_cache import EnergyCache, EnergyCacheData
+from metrics import MetricsBase
 from util import (
     CompletedNBCPeriod,
     NBCQuarter,
@@ -819,7 +820,11 @@ class TestComputeDeviceMetricsCompletedPeriods:
             ],
         )
 
-        hp = HourlyProjection(now, MagicMock(), energy_cache=cache)
+        # Patch base-class network calls so the constructor never touches
+        # the real Emporia API (same pattern as test_metrics.py).
+        with patch.object(MetricsBase, "vue_init"), \
+             patch.object(MetricsBase, "get_device_info"):
+            hp = HourlyProjection(now, MagicMock(), energy_cache=cache)
 
         # Create a mock vdi
         vdi = MagicMock()
