@@ -1,10 +1,16 @@
 """
 Pytest tests for EnergyDataAggregator consolidation (Subtask D).
 
-Covers all four public aggregate methods and their shared _aggregate
-implementation.  Each test uses assert-based assertions (pytest style)
-and exercises distinct inputs to validate correctness before and after
-the DRY refactoring.
+Covers the classify_hour bucket rules, the shared _aggregate
+implementation (all step variants: seconds, minutes, 15-min, hourly),
+and the remaining public aggregate_from_15min API.  Each test uses
+assert-based assertions (pytest style) and exercises distinct inputs to
+validate correctness before and after the DRY refactoring.
+
+Note: the test classes for aggregate_from_seconds() and
+aggregate_from_hourly() were removed together with those methods (same
+branch); their behavior was identical to the shared _aggregate path with
+a different step, which is still covered here (see TestAggregate).
 """
 
 from datetime import datetime, timedelta

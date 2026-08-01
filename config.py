@@ -45,6 +45,23 @@ _UNDEFINED = _Undefined()
 # "parsed and empty" (so ``clear_all()`` prevents .env re-pollution).
 _env_data: dict[str, str] | None = None
 
+# Environment variables owned by this application. ``clear_all()`` removes
+# only these keys from ``os.environ`` so unrelated environment variables
+# (PATH, HOME, test-runner vars, etc.) are left intact.
+_APP_ENV_KEY_PREFIXES = (
+    "LOAD_", "LOG_", "MQTT_", "TELEGRAM_", "TESLA_", "VOCOLINC_", "VUE_",
+)
+_APP_ENV_KEY_NAMES = frozenset({
+    "DEBUG", "MOCK", "MOCK_ERROR", "PUBLIC_URL", "TIMEZONE",
+})
+
+
+def _is_app_key(key: str) -> bool:
+    """Return True when *key* is an environment variable owned by this app."""
+    if key in _APP_ENV_KEY_NAMES:
+        return True
+    return any(key.startswith(prefix) for prefix in _APP_ENV_KEY_PREFIXES)
+
 
 def _strtobool(value: str) -> bool:
     """Convert a string representation of truth to a bool."""
@@ -166,18 +183,18 @@ class Config:
         _get_env_data().pop(key, None)
 
     def clear_all(self) -> None:
-        """Remove all known config keys from ``os.environ``.
+        """Remove all app-owned config keys from ``os.environ``.
 
-        Walks every key in ``os.environ`` and the lazily-parsed .env file
-        and removes them, then marks the .env cache as parsed-empty so
-        subsequent lookups cannot be re-polluted by the .env file.
+        Only keys owned by this application (see ``_APP_ENV_KEY_PREFIXES``
+        and ``_APP_ENV_KEY_NAMES``) are removed; unrelated environment
+        variables are left intact. The lazily-parsed .env cache is then
+        marked parsed-empty so subsequent lookups cannot be re-polluted by
+        the .env file.
         """
         global _env_data
         for key in list(os.environ):
-            os.environ.pop(key, None)
-        env_data = _get_env_data()
-        for key in env_data:
-            os.environ.pop(key, None)
+            if _is_app_key(key):
+                os.environ.pop(key, None)
         _env_data = {}
 
     def get_all(self) -> dict[str, str]:

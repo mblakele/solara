@@ -181,5 +181,36 @@ class TestComputeNBCQuarterPredictionWindow(unittest.TestCase):
         self.assertAlmostEqual(result.predicted_wh, expected_predicted_wh, places=6)
 
 
+class TestRetryableError:
+    """RetryableError is the base class for transient, retryable failures.
+
+    Subclasses (e.g. RetryableMetricsException) are handled as warnings and
+    trigger stale-data serving; the base class relationship is what the
+    EnergyCache fetch lock checks (energy_cache._with_fetch_lock), so it is
+    locked in directly here.
+    """
+
+    def test_subclass_is_caught_by_base_class(self):
+        """A RetryableError subclass is catchable as RetryableError."""
+        from util import RetryableError
+
+        class _Transient(RetryableError):
+            """Test-only transient failure."""
+
+        caught = False
+        try:
+            raise _Transient("transient failure")
+        except RetryableError:
+            caught = True
+        assert caught
+
+    def test_retryable_metrics_exception_is_subclass(self):
+        """RetryableMetricsException derives from RetryableError."""
+        from util import RetryableError
+        from metrics import RetryableMetricsException
+
+        assert issubclass(RetryableMetricsException, RetryableError)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

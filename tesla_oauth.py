@@ -19,11 +19,6 @@ from flask import Blueprint, abort, redirect, request, Response
 from flask.typing import ResponseReturnValue
 
 from config_loader import load_tesla_config
-from load_controllers import (
-    RealTeslaController,
-    load_tesla_tokens,
-    save_tesla_tokens,
-)
 
 bp = Blueprint("tesla", __name__)
 logger = logging.getLogger(__name__)
@@ -31,6 +26,20 @@ logger = logging.getLogger(__name__)
 
 # State token tracking: maps state_token -> expiry timestamp.
 _oauth_states: dict[str, float] = {}
+
+
+def _controllers():
+    """Import and return the load_controllers symbols used by the OAuth routes.
+
+    Imported lazily so this module can be imported without aiohttp — the
+    heavy controller machinery is only needed once a request handler runs.
+    """
+    from load_controllers import (
+        RealTeslaController,
+        load_tesla_tokens,
+        save_tesla_tokens,
+    )
+    return RealTeslaController, load_tesla_tokens, save_tesla_tokens
 
 
 def _json_response(payload: object) -> Response:
@@ -54,6 +63,7 @@ def tesla_auth_initiate() -> ResponseReturnValue:
         return abort(503, "Tesla Fleet API not configured in .env")
 
     # Check if already authenticated
+    RealTeslaController, load_tesla_tokens, _ = _controllers()
     tokens = load_tesla_tokens()
 
     if tokens and tokens.get("expires", 0) > _time_module.time():
@@ -124,6 +134,7 @@ def tesla_auth_callback() -> ResponseReturnValue:
         )
 
     async def _exchange() -> None:
+        RealTeslaController, _, save_tesla_tokens = _controllers()
         controller = RealTeslaController(tesla_config)
         await controller.exchange_code(code)
         # pylint: disable=protected-access
@@ -167,6 +178,7 @@ def tesla_status() -> Response:
             "message": "Tesla Fleet API not configured in .env",
         })
 
+    _, load_tesla_tokens, _ = _controllers()
     tokens = load_tesla_tokens()
     if tokens is None:
         return _json_response({  # type: ignore[return-value]

@@ -1,5 +1,6 @@
 """Tests for centralized Config class and module-level helpers."""
 
+import os
 from unittest.mock import patch, PropertyMock
 
 import pytest
@@ -350,3 +351,51 @@ class TestConfigVocolincProperties:
         cfg = Config()
         assert cfg.vocolinc_username == ""
         assert cfg.vocolinc_password == ""
+
+
+class TestConfigClearAll:
+    """clear_all() removes app-owned keys but leaves unrelated env vars."""
+
+    def test_clear_all_removes_app_owned_keys(self):
+        """App-owned keys (prefixes and exact names) are removed."""
+        _Config().set("MOCK", "True")
+        _Config().set("LOAD_MANAGE_ENABLED", "True")
+        _Config().set("TESLA_CLIENT_ID", "client-id")
+        _Config().set("VUE_USERNAME", "user")
+        _Config().set("TIMEZONE", "America/New_York")
+
+        _Config().clear_all()
+
+        for key in (
+            "MOCK", "LOAD_MANAGE_ENABLED",
+            "TESLA_CLIENT_ID", "VUE_USERNAME", "TIMEZONE",
+        ):
+            assert key not in os.environ, f"{key} should have been removed"
+
+    def test_clear_all_preserves_unrelated_env_vars(self, monkeypatch):
+        """Non-app env vars survive clear_all()."""
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("UNRELATED_VAR", "keep-me")
+
+        _Config().clear_all()
+
+        assert os.environ.get("UNRELATED_VAR") == "keep-me"
+        assert os.environ.get("PATH") == "/usr/bin:/bin"
+
+    def test_clear_all_blocks_env_file_repollution(self, tmp_path, monkeypatch):
+        """After clear_all(), .env values are not re-read into lookups."""
+        from config import Config
+        import config as config_module
+
+        monkeypatch.delenv("VUE_USERNAME", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("VUE_USERNAME=env-file-user\n")
+        # Ensure the lazy cache is empty so a lookup would parse the file.
+        monkeypatch.setattr(config_module, "_env_data", None)
+        assert Config().vue_username == "env-file-user"
+
+        _Config().clear_all()
+
+        # Cache is marked parsed-empty: the .env value must not reappear.
+        cfg = Config()
+        assert cfg.vue_username is None
