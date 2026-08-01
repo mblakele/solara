@@ -48,6 +48,24 @@ def _root_cause(exc: BaseException) -> BaseException:
     return current
 
 
+class EnergyCacheAlignmentError(Exception):
+    """Raised when cached per-second data is not aligned to a QH boundary.
+
+    The Emporia API reports the actual start of its data via
+    ``firstUsageInstant``, which can drift off a quarter-hour boundary when
+    data is missing at the head of the requested window.  Fetch-site checks
+    (``_fetch_channel_data`` in metrics.py) reject such responses before
+    they are stored, and ``compact()`` can only realign windows with
+    >=900 samples — so this guard is a safety net for any path that stores
+    misaligned data.
+
+    A plain ``Exception`` (not ``AssertionError``) is used so the failure
+    survives ``python -O`` and degrades loudly via the load-management
+    loop's generic-except branch (ERROR + invalidate + alert) instead of
+    being stripped or swallowed silently.
+    """
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EnergyCacheData:
     """Immutable snapshot of cached per-second energy data.
@@ -86,9 +104,12 @@ class EnergyCache:
     """Unified cache for per-second energy samples with sliding-window semantics.
 
     Stores raw Wh-per-second data points in a time-ordered list keyed by
-    device name (currently only one device is used).  Supports incremental
-    partial-range fetches: when new data arrives, old points older than
-    3600 s are pruned and only the delta is fetched from pyemvue.
+    device name (currently only one device is used).  Fetches use
+    QH-window semantics (see ``_chart_start_for`` in metrics.py): the first
+    fetch covers a full hour; steady-state fetches start at the current QH
+    boundary.  Every fetch replaces the stored samples (``_merge_samples_replace``),
+    completed QH periods are compacted into ``CompletedNBCPeriod`` records
+    after every fetch, and quantization is re-detected on each replace.
 
     Thread-safe via internal lock for concurrent access between Flask and
     LoadManager background threads.
@@ -315,6 +336,11 @@ class EnergyCache:
     ) -> EnergyCacheData:
         """Remove samples older than 3600 s from *now*.
 
+        Runs only on the no-new-samples fallback path in ``get_or_fetch``
+        — with always-replace semantics the sliding window is otherwise
+        maintained by compaction plus QH-anchored fetches.  Kept as a
+        safety net.
+
         Args:
             data: Current ``EnergyCacheData`` snapshot.
             now: Current time for the pruning window.
@@ -387,8 +413,8 @@ class EnergyCache:
             if len(pruned) != len(existing_completed):
                 self._data = replace(self._data, completed_periods=pruned or None)
 
-        # Fast path: no data or not enough data for a complete QH.
-        if self._data.samples is None or len(self._data.samples) == 0 or len(self._data.samples) < 900:
+        # Fast path: not enough data for a complete QH.
+        if self._data.samples is None or len(self._data.samples) < 900:
             return
 
         samples = self._data.samples
@@ -493,10 +519,13 @@ class EnergyCache:
         data_start: datetime,
         now: datetime,
     ) -> EnergyCacheData:
-        """Replace per-second data entirely (post-compaction path).
+        """Replace per-second data entirely (always-replace model).
 
-        Unlike ``_merge_samples``, this discards existing samples and stores
-        only the new ones.  Completed QH periods are preserved from ``_data``.
+        Discards existing samples and stores only the new ones; completed
+        QH periods are preserved from ``_data``.  Callers are expected to
+        reject misaligned API responses (see the drift checks in
+        ``_fetch_channel_data`` / ``_build_incremental_fetch`` in metrics.py),
+        so the stored ``data_start`` is QH-aligned by construction.
 
         Args:
             new_samples: New per-second samples.
@@ -575,14 +604,19 @@ class EnergyCache:
     ) -> dict[str, Any] | None:
         """Run *fetch_func* with a timeout, returning ``None`` on expiry.
 
-        Uses a daemon thread so the caller is never blocked indefinitely
-        even if the fetch hangs on network I/O.
+        Runs the fetch in a worker thread so the caller is never blocked
+        indefinitely even if the fetch hangs on network I/O.
 
         On timeout the pool is shut down without waiting for the stuck
-        thread — the caller returns immediately.  The thread's exception
+        worker — the caller returns immediately.  The worker's exception
         (if any) is logged immediately inside the thread so the error
         details appear in logs even when the thread is still blocked in
         a system call (e.g. DNS resolution) at timeout time.
+
+        Note: known pre-existing thread leak — the executor's workers are
+        non-daemon, so a worker still blocked in a system call survives
+        ``shutdown(wait=False)`` until the call returns.  Deferred fix: a
+        daemon thread factory for the pool.
         """
         timed_out = threading.Event()
 
@@ -642,7 +676,8 @@ class EnergyCache:
 
         If cache is valid and *force* is ``False``, return cached data with
         ``was_fresh=False``.  Otherwise calls *fetch_func* (which should do
-        an incremental or full API call), stores the result, and returns
+        a QH-window API call — full hour on the first fetch, current-QH
+        boundary afterwards), stores the result, and returns
         ``was_fresh=True``.
 
         The *fetch_func* may return either:
@@ -651,8 +686,9 @@ class EnergyCache:
           as a nested ``_data`` fallback and returned directly to the
           caller.
         * An incremental dict with ``"per_second_data"`` and ``"data_start"``
-          keys — the per-second samples are merged into the internal data
-          for use by callers that need raw data (e.g. ``NBCReader``).
+          keys — the per-second samples are stored via always-replace
+          semantics (``_merge_samples_replace``); ``compact()`` runs after
+          every fetch.
 
         Args:
             fetch_func: Callable that returns fresh data dict.
@@ -792,15 +828,26 @@ class EnergyCache:
 
             samples = self._data.samples
             samples_len = len(samples)
+            data_start = self._data.data_start
 
         if samples_len == 0:
             return None
 
-        # Required: data_start present and aligned to a QH boundary.
-        assert self._data.data_start is not None, "data_start is None in get_current_qh"
-        assert self._data.data_start == ceil_to_qh(self._data.data_start), (
-            f"data_start {self._data.data_start} not aligned to QH boundary"
-        )
+        # Required: data_start present and aligned to a QH boundary.  A
+        # misaligned value means a fetch stored raw API data that drifted
+        # off the quarter-hour (see EnergyCacheAlignmentError); compact()
+        # can only realign windows with >=900 samples, so raise explicitly
+        # (an assert would be stripped under `python -O`) to force a cache
+        # refresh on the caller side.
+        if data_start is None or data_start != ceil_to_qh(data_start):
+            logger.warning(
+                "EnergyCache get_current_qh: data_start %s not QH-aligned; "
+                "raising to force cache refresh",
+                data_start,
+            )
+            raise EnergyCacheAlignmentError(
+                f"data_start {data_start} not aligned to QH boundary"
+            )
 
         # Use quantization-aware prediction window when available.
         prediction_window_seconds: int | None = None
@@ -826,7 +873,7 @@ class EnergyCache:
                         "qh_name": label,
                         "predicted_wh": qh_data.predicted_wh or 0,
                         "seconds_remaining": qh_data.remaining_seconds or 0,
-                        "data_start": self._data.data_start,
+                        "data_start": data_start,
                     }
             return None
 
@@ -844,7 +891,7 @@ class EnergyCache:
             "qh_name": "QH1",
             "predicted_wh": predicted_wh,
             "seconds_remaining": seconds_remaining,
-            "data_start": self._data.data_start,
+            "data_start": data_start,
             "samples_used": qh1_data.samples_used,
         }
 

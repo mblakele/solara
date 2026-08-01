@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
 
-from energy_cache import EnergyCache, EnergyCacheData
+from energy_cache import EnergyCache, EnergyCacheAlignmentError, EnergyCacheData
 from util import ceil_to_qh
 
 
@@ -174,6 +174,62 @@ class TestGetCurrentQhQuantization:
         )
         result = cache.get_current_qh(now)
         assert result is None
+
+
+class TestGetCurrentQhAlignmentGuard:
+    """Tests for the QH-alignment guard in get_current_qh.
+
+    A misaligned or missing ``data_start`` must raise the named
+    ``EnergyCacheAlignmentError`` (not a bare assert, which is stripped
+    under ``python -O``) so any path that stored bad data degrades loudly.
+    """
+
+    def test_get_current_qh_raises_when_data_start_misaligned(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Misaligned data_start (14:16:00) raises EnergyCacheAlignmentError."""
+        cache = EnergyCache()
+        data_start = datetime(2025, 6, 15, 14, 16, 0, tzinfo=timezone.utc)
+        cache._data = EnergyCacheData(
+            samples=[0.001] * 240,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=239),
+            last_fetch_at=data_start,
+            sample_count=240,
+            quantization_seconds=None,
+            quantization_offset=0,
+            quantization_confidence=None,
+        )
+        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
+
+        with caplog.at_level("WARNING", logger="energy_cache"):
+            with pytest.raises(EnergyCacheAlignmentError):
+                cache.get_current_qh(now)
+
+        assert any(
+            "not QH-aligned" in rec.message for rec in caplog.records
+        ), (
+            "Expected WARNING about QH alignment, got "
+            f"{[r.message for r in caplog.records]}"
+        )
+
+    def test_get_current_qh_raises_when_data_start_none(self) -> None:
+        """Missing data_start raises EnergyCacheAlignmentError."""
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=[0.001] * 240,
+            data_start=None,
+            last_sample_at=None,
+            last_fetch_at=datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc),
+            sample_count=240,
+            quantization_seconds=None,
+            quantization_offset=0,
+            quantization_confidence=None,
+        )
+        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
+
+        with pytest.raises(EnergyCacheAlignmentError):
+            cache.get_current_qh(now)
 
 
 class TestIncrementalFetch:

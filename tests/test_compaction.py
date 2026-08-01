@@ -662,7 +662,10 @@ class TestBuildIncrementalFetch:
         )
 
         vue = MagicMock()
-        vue.get_chart_usage.return_value = ([0.002] * 300, data_start)
+        vue.get_chart_usage.return_value = (
+            [0.002] * 300,
+            datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc),
+        )
 
         fetcher = _build_incremental_fetch(cache, vue, 12345, now)
         fetcher()
@@ -673,6 +676,42 @@ class TestBuildIncrementalFetch:
         assert call_args[0][1] == datetime(
             2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc
         )
+
+    def test_fetcher_raises_when_data_start_drifted(self) -> None:
+        """Fetcher raises RetryableMetricsException when API data_start != requested start.
+
+        The API's ``firstUsageInstant`` differs from the requested (aligned)
+        start when data is missing at the head of the window; raising here
+        (rather than storing a misaligned data_start) keeps the cache
+        QH-aligned by construction.
+        """
+        from metrics import RetryableMetricsException, _build_incremental_fetch
+
+        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
+        data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
+
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=[0.001] * 300,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=299),
+            last_fetch_at=now,
+            sample_count=300,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        vue = MagicMock()
+        # API reports data starting one minute after the requested start.
+        vue.get_chart_usage.return_value = (
+            [0.002] * 300,
+            data_start + timedelta(minutes=1),
+        )
+
+        fetcher = _build_incremental_fetch(cache, vue, 12345, now)
+        with pytest.raises(RetryableMetricsException):
+            fetcher()
 
     def test_full_fetch_when_cache_empty(self) -> None:
         """When cache is empty, fetcher does a full-hour fetch."""

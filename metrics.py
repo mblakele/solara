@@ -120,6 +120,13 @@ def _chart_start_for(energy_cache: EnergyCache, now: datetime) -> datetime:
     boundary — otherwise ``EnergyCache`` replace semantics would discard
     the un-compacted window and lose the QH.
 
+    The anchor is intentionally QH-aligned-only: a stale *misaligned*
+    ``data_start`` (e.g. ``13:45:31`` when ``now`` is ``14:00:10``) falls
+    through to ``current_qh_start``, so its partially-filled QH is
+    discarded by the next replace.  That is correct — the head of that QH
+    genuinely is missing (the misalignment itself means the API never
+    returned those samples).
+
     Args:
         energy_cache: The EnergyCache instance storing per-second samples.
         now: Current time.
@@ -141,7 +148,7 @@ def _chart_start_for(energy_cache: EnergyCache, now: datetime) -> datetime:
 
 
 def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Logger) -> dict[str, Any] | None:
-    """Fetch metrics with incremental chart_start tracking via EnergyCache.
+    """Fetch metrics with QH-window chart_start tracking via EnergyCache.
 
     On the first call, EnergyCache has no samples, so chart_start is set to
     3600 seconds ago (full hour of historical data). After that, chart_start
@@ -159,7 +166,7 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         Metrics dict from HourlyProjection, or None on failure.
     """
     # First call: fetch up to four QH periods.
-    # Subsequent calls: incremental fetch anchored at a QH boundary.
+    # Subsequent calls: QH-window fetch anchored at a QH boundary.
     logger.debug(
         "create_metrics: len %d, last_sample_at %s",
         len(energy_cache.samples or []),
@@ -314,7 +321,7 @@ def _build_incremental_fetch(
     device_gid: int,
     now: datetime,
 ) -> Callable[[], dict[str, Any] | None]:
-    """Build a callable for incremental partial-range API fetches.
+    """Build a callable for QH-window partial-range API fetches.
 
     Returns a zero-argument function that can be passed to
     ``energy_cache.get_or_fetch()``. The callable fetches from the current
@@ -363,6 +370,19 @@ def _build_incremental_fetch(
             )
             if not usage_data:
                 return None
+            if data_start is None or data_start != start_time:
+                # Mirror of _fetch_channel_data: reject a drifted data_start
+                # (API firstUsageInstant != requested start) so a misaligned
+                # window is never stored in the cache.
+                logger.warning(
+                    "[_build_incremental_fetch] data_start %s != requested "
+                    "start %s; treating as transient",
+                    data_start,
+                    start_time,
+                )
+                raise RetryableMetricsException(
+                    f"data_start {data_start} != start_time {start_time}"
+                )
             return {"per_second_data": list(usage_data), "data_start": data_start}
         except (requests.exceptions.RequestException, IOError):
             logger.exception("error fetching incremental data for device %d", device_gid)
@@ -640,6 +660,21 @@ class HourlyProjection(MetricsBase):
         ):
             self.logger.debug({"usage_data": usage_data_local})
             raise RetryableMetricsException("No data for hour")
+        if usage_data_start_local != chart_start:
+            # pyemvue returns the API's ``firstUsageInstant`` as the start,
+            # which drifts off the requested (QH-aligned) chart_start when
+            # data is missing at the head of the window.  Storing it would
+            # leave a misaligned data_start in the cache — treat as a
+            # transient condition and let the caller retry with stale data.
+            self.logger.warning(
+                "get_chart_usage returned data_start %s != requested "
+                "chart_start %s; treating as transient",
+                usage_data_start_local,
+                chart_start,
+            )
+            raise RetryableMetricsException(
+                f"data_start {usage_data_start_local} != chart_start {chart_start}"
+            )
         self.metrics["api_response"]["get_chart_usage/" + str(chan.channel_num)] = (
             _CLOCK.now() - chart_start
         )

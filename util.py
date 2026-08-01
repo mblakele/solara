@@ -332,6 +332,12 @@ def inject_completed_qh(
     QH1 is preserved as-is (computed from per-second data).
     QH2-QH4 are reconstructed from CompletedNBCPeriod raw_wh values.
 
+    Slots are filled most-recent-first **without a contiguity check**: if a
+    QH is genuinely missing (e.g. a fetch outage), the periods shift up a
+    slot and an older period's Wh is displayed under a newer window's
+    label.  This is display-only and transient (the template labels rows by
+    slot name QH1-QH4), so it self-corrects once fresh data arrives.
+
     Args:
         nbc: The NBC quarter set (QH1 may be present, QH2-QH4 may be None).
         completed_periods: Completed QH periods sorted by start time.

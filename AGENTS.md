@@ -218,6 +218,9 @@ project-root
 - `inject_completed_qh()` in `util.py` — fills QH2-QH4 from completed periods
 - `compact()` in `energy_cache.py` — compacts completed QH periods into `CompletedNBCPeriod` objects, called after every fetch in `get_or_fetch()`
 - `_merge_samples_replace()` in `energy_cache.py` — always-replace fetch path (no overlap merge)
+- `EnergyCacheAlignmentError` in `energy_cache.py` — raised by `get_current_qh()` when `data_start`
+  is missing or not QH-aligned; a plain `Exception` (asserts are stripped under `python -O`), kept as a
+  safety net since the fetch-site drift checks below reject misaligned data before it is stored
 - Deferred config in `config_loader.py` (`LazyConfig`, `config.get()`, `config.set()`)
 - Tesla config in `config.py` (`TeslaConfig` dataclass, `load_tesla_config()`)
 - Tesla telemetry intervals in `config.py` (`tesla_telemetry_chargestate_interval`,
@@ -307,7 +310,13 @@ project-root
   from a QH boundary via `_chart_start_for()` on repeat calls so the cache
   accumulates a full quarter-hour regardless of API data_start alignment,
   keeping a stale QH-aligned `data_start` anchored so a completed QH compacts.
-  Returns `None` on API error.
+  Returns `None` on API error. Currently test-only (production paths use
+  `create_metrics`); mirrors the `_fetch_channel_data` drift check below.
+- `_fetch_channel_data()` in `metrics.py` (HourlyProjection) — rejects a drifted API
+  `data_start` (`firstUsageInstant != requested chart_start`) by raising
+  `RetryableMetricsException` before any misaligned data is stored; `_run_fetch_with_timeout`
+  logs it as transient ("will retry"), `get_or_fetch` serves stale cache, and the next cycle
+  refetches (quiet self-heal, no invalidate/alert).
 - `_merge_samples_replace(existing, new_data)`: replaces existing samples with new
   data (always-replace, no overlap merge), updating metadata.
 - `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent

@@ -943,6 +943,60 @@ class TestFetchChannelDataErrors(unittest.TestCase):
 
         self.assertIn("No data for hour", str(ctx.exception))
 
+    def test_fetch_channel_data_raises_when_data_start_drifted(self):
+        """_fetch_channel_data raises when API data_start != requested chart_start.
+
+        pyemvue returns the API's ``firstUsageInstant`` as the second tuple
+        element, so a response whose start differs from the requested
+        (QH-aligned) chart_start means the head of the window is missing —
+        storing it would leave a non-aligned data_start in the cache.
+        """
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+
+        chart_start = now.replace(minute=0)  # QH-aligned
+        drifted = now.replace(minute=16)  # API reports a later start (missing head)
+        hp.vue.get_chart_usage.return_value = ([0.1] * 60, drifted)
+
+        chan_mock = MagicMock()
+        chan_mock.channel_num = 3
+
+        with self.assertRaises(RetryableMetricsException) as ctx:
+            hp._fetch_channel_data(chan_mock, chart_start, now)
+
+        self.assertIn("chart_start", str(ctx.exception))
+
+    def test_fetch_channel_data_accepts_matching_data_start(self):
+        """_fetch_channel_data returns data unchanged when data_start == chart_start."""
+        from unittest.mock import MagicMock
+
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+        hp.metrics = {"api_response": {}}
+
+        chart_start = now.replace(minute=0)  # QH-aligned
+        hp.vue.get_chart_usage.return_value = ([0.1] * 60, chart_start)
+
+        chan_mock = MagicMock()
+        chan_mock.channel_num = 4
+
+        usage, data_start, channel_num = hp._fetch_channel_data(
+            chan_mock, chart_start, now
+        )
+        self.assertEqual(usage, [0.1] * 60)
+        self.assertEqual(data_start, chart_start)
+        self.assertEqual(channel_num, 4)
+
 
 class TestComputeNBCEdgeCases(unittest.TestCase):
     """Tests for _compute_nbc edge cases."""
@@ -1238,18 +1292,18 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         cache.samples = [0.1] * 7200
         cache.data_start = old_start
 
-        # Mock API to return new samples (only the last 10 minutes worth)
+        # Mock API to return new samples (only the last 10 minutes worth),
+        # starting at the capped request start (11:30:00).
         vue_mock.get_chart_usage.return_value = (
             [0.2] * 600,  # 600 new samples (10 minutes)
-            old_start + timedelta(seconds=7200),
+            ceil_to_qh(fixed_now - timedelta(hours=1)),
         )
 
         fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
         cache.get_or_fetch(fetcher, fixed_now, force=True)
 
-        # After merging: 7200 + 600 = 7800 samples
-        # After pruning (keep only last 3600s): should be ~4200 samples
-        # (7800 - 3600 = 4200)
+        # Replace semantics discard the stale 2-hour window: the cache now
+        # holds only the fresh 600 samples.
         self.assertLessEqual(len(cache.samples), 7800)
         # Should have pruned old samples
         self.assertLess(len(cache.samples), 7200)
@@ -1278,10 +1332,12 @@ class TestBuildIncrementalFetch(unittest.TestCase):
         cache.samples = [0.1] * 3456
         cache.data_start = old_start
 
-        expected_start = ceil_to_qh(fixed_now - timedelta(hours=1))
+        # The API returns data starting at the requested start (the current
+        # QH boundary, 13:00:00) — not at the stale 9h-old cache start.
+        fetch_start = floor_to_qh(fixed_now)
         vue_mock.get_chart_usage.return_value = (
             [0.2] * 3123,
-            expected_start,
+            fetch_start,
         )
 
         fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
@@ -1467,8 +1523,13 @@ def _make_hourly_mock(
     # The channel must iterate over itself so _populate_device's for-loop works
     mock_channel.channels = [mock_channel]
 
-    # Configure the mocked VUE API to return real per-second data
-    mock_vue.get_chart_usage.return_value = (per_second_data, chart_start)
+    # Configure the mocked VUE API to behave like the real one: data starts
+    # at the requested start (firstUsageInstant == requested start when no
+    # head data is missing).
+    def _api_get_chart_usage(channel, start, end, **kwargs):
+        return (per_second_data, start)
+
+    mock_vue.get_chart_usage.side_effect = _api_get_chart_usage
 
     # The channel .data attribute is used by some tests
     mock_channel.data = {
@@ -2046,18 +2107,15 @@ class TestPerSecondDataMergesCache(unittest.TestCase):
         self._p1.stop()
         self._p2.stop()
 
-    def test_per_second_data_is_raw_api_delta_not_merged_cache(self):
-        """per_second_data must be the raw API delta, not the merged cache.
+    def test_per_second_data_is_raw_api_data(self):
+        """per_second_data must be the raw API data, not the merged cache.
 
         Pre-populate the cache with 3600 samples (full hour), then simulate
-        an incremental fetch returning 60 new samples that start right after
-        the cache end.  The resulting DeviceMetrics.per_second_data must equal
-        the raw 60-sample delta — NOT the merged 3600-sample cache — so that
-        EnergyCache.get_or_fetch re-ingests only the genuinely new points.
-
-        Merging the full cache into per_second_data causes last_sample_at to
-        overshoot the actual latest data point, producing a future timestamp
-        that the Emporia API rejects with a 400 Client Error.
+        a fetch returning 60 new samples.  The resulting
+        DeviceMetrics.per_second_data must equal the raw 60-sample API data
+        — NOT the 3600-sample cache — so that EnergyCache.get_or_fetch
+        re-ingests only the genuinely new points under always-replace
+        semantics.
         """
         import metrics
 
@@ -2108,16 +2166,13 @@ class TestPerSecondDataMergesCache(unittest.TestCase):
 
         device_metrics = hp._compute_device_metrics(mock_vdi, pop_result, pred_result)
 
-        # per_second_data must be the raw 60-sample delta.
-        # Storing the merged 3600-sample cache here caused the EnergyCache to
-        # re-merge those samples with the incremental data_start (15:00:00),
-        # computing new_end = 15:00:00 + 3599s ≈ 16:00:00 — far in the future —
-        # and setting last_sample_at to a future timestamp that became chart_start
-        # on the next cycle, triggering a 400 from the Emporia API.
+        # per_second_data must be the raw 60 samples returned by the API.
+        # Always-replace semantics mean the fetch result is ingested as-is;
+        # storing the full cached window here would double-count data.
         self.assertEqual(
             len(device_metrics.per_second_data),
             60,
-            "per_second_data must be the raw API delta (60), not the merged cache",
+            "per_second_data must be the raw API data (60), not the cached window",
         )
         self.assertEqual(device_metrics.per_second_data, incremental_samples)
 
