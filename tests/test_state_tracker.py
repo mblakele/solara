@@ -6,14 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from constants import DEFAULT_PREDICTION_WINDOW_SECS
-from load_manager import (
-    PlugConfig,
-    DeviceState,
-    PendingEffect,
-    StateTracker,
-    TeslaState,
-    TeslaVehicleTelemetry,
-)
+from load_models import PlugConfig, DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
+from load_nbc import StateTracker
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 
@@ -419,21 +413,21 @@ class TestTeslaInflightWh:
     def test_no_command_returns_zero(self) -> None:
         """Returns 0 when no command has been issued."""
         tracker = StateTracker()
-        result = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900)
+        result = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900, now=fixed_now)
         assert result == 0.0
 
     def test_no_report_returns_zero(self) -> None:
         """Returns 0 when no amps data is reported."""
         tracker = StateTracker()
         tracker.last_commanded_amps = 18
-        result = tracker.tesla_inflight_wh(reported_amps=None, seconds_remaining=900)
+        result = tracker.tesla_inflight_wh(reported_amps=None, seconds_remaining=900, now=fixed_now)
         assert result == 0.0
 
     def test_charging_at_commanded_level_returns_zero(self) -> None:
         """Returns 0 when car is already at the commanded amp level."""
         tracker = StateTracker()
         tracker.last_commanded_amps = 18
-        result = tracker.tesla_inflight_wh(reported_amps=18, seconds_remaining=900)
+        result = tracker.tesla_inflight_wh(reported_amps=18, seconds_remaining=900, now=fixed_now)
         assert result == 0.0
 
     def test_charging_at_reduced_level_returns_partial_delta(self) -> None:
@@ -442,7 +436,7 @@ class TestTeslaInflightWh:
         tracker.last_commanded_amps = 18
         # delta = 18 - 5 = 13 A, 900s remaining, 240V
         # wh = 13 * 240 * 900 / 3600 = 780 Wh
-        result = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900)
+        result = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900, now=fixed_now)
         assert pytest.approx(result) == 13 * 240 * 900 / 3600
 
     def test_charging_stopped_clears_command_and_returns_zero(self) -> None:
@@ -452,7 +446,7 @@ class TestTeslaInflightWh:
         """
         tracker = StateTracker()
         tracker.last_commanded_amps = 18
-        result = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900)
+        result = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
         assert result == 0.0
         # last_commanded_amps should be cleared so it doesn't leak
         assert tracker.last_commanded_amps is None
@@ -511,7 +505,7 @@ class TestTeslaInflightWh:
         tracker.last_commanded_amps = 18
         # Car is at 10 A, commanded 18 A, 450s remaining
         # delta = 8 A, wh = 8 * 240 * 450 / 3600 = 240
-        result = tracker.tesla_inflight_wh(reported_amps=10, seconds_remaining=450)
+        result = tracker.tesla_inflight_wh(reported_amps=10, seconds_remaining=450, now=fixed_now)
         assert pytest.approx(result) == 8 * 240 * 450 / 3600
 
     def test_negative_delta_returns_negative_wh(self) -> None:
@@ -520,14 +514,14 @@ class TestTeslaInflightWh:
         tracker.last_commanded_amps = 10
         # Car is at 15 A but only commanded 10 A, 900s remaining
         # delta = -5 A, wh = -5 * 240 * 900 / 3600 = -300
-        result = tracker.tesla_inflight_wh(reported_amps=15, seconds_remaining=900)
+        result = tracker.tesla_inflight_wh(reported_amps=15, seconds_remaining=900, now=fixed_now)
         assert pytest.approx(result) == -5 * 240 * 900 / 3600
 
     def test_no_command_stays_none_when_called(self) -> None:
         """Calling with no command doesn't mutate state."""
         tracker = StateTracker()
         assert tracker.last_commanded_amps is None
-        tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900)
+        tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
         assert tracker.last_commanded_amps is None
 
     def test_one_amp_with_data_point_at_keeps_alive(self) -> None:

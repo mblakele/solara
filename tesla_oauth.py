@@ -18,6 +18,13 @@ import pytz
 from flask import Blueprint, abort, redirect, request, Response
 from flask.typing import ResponseReturnValue
 
+from config_loader import load_tesla_config
+from load_controllers import (
+    RealTeslaController,
+    load_tesla_tokens,
+    save_tesla_tokens,
+)
+
 bp = Blueprint("tesla", __name__)
 logger = logging.getLogger(__name__)
 
@@ -42,12 +49,6 @@ def tesla_auth_initiate() -> ResponseReturnValue:
     Returns JSON with the authorization URL, or HTML with an auto-redirect
     when the client accepts text/html. The callback will be handled at /callback.
     """
-    from load_manager import (  # noqa: PLC0415
-        RealTeslaController,
-        load_tesla_config,
-        load_tesla_tokens,
-    )
-
     tesla_config = load_tesla_config()
     if tesla_config is None:
         return abort(503, "Tesla Fleet API not configured in .env")
@@ -97,12 +98,6 @@ def tesla_auth_callback() -> ResponseReturnValue:
     Receives the authorization code, exchanges it for tokens, and persists them.
     Returns a success page on completion.
     """
-    from load_manager import (  # noqa: PLC0415
-        RealTeslaController,
-        save_tesla_tokens,
-        load_tesla_config,
-    )
-
     state = request.args.get("state", "")
     state_expiry = _oauth_states.pop(state, None)
     if not state or state_expiry is None or _time_module.time() > state_expiry:
@@ -164,11 +159,6 @@ def tesla_status() -> Response:
 
     Returns whether a valid token exists and its expiration time.
     """
-    from load_manager import (  # noqa: PLC0415
-        load_tesla_tokens,
-        load_tesla_config,
-    )
-
     tesla_config = load_tesla_config()
     if tesla_config is None:
         return _json_response({  # type: ignore[return-value]

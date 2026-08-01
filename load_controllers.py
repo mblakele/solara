@@ -1246,20 +1246,12 @@ class VocolincPlugController(AbstractPlugController):
                 "and VOCOLINC_PASSWORD environment variables."
             )
 
-        # Look up VOCOlinc via load_manager so that patch("load_manager.VOCOlinc")
-        # intercepts it correctly in tests.  Also check sys.modules["vocolinc"]
-        # first so that monkeypatch.setitem(sys.modules, "vocolinc", mock) works.
+        # Check sys.modules["vocolinc"] first so that
+        # monkeypatch.setitem(sys.modules, "vocolinc", mock) works in tests.
         _sys_voc = sys.modules.get("vocolinc")
         if isinstance(_sys_voc, MagicMock):
             VOCOlinc = _sys_voc.VOCOlinc  # type: ignore[attr-defined]
         else:
-            _load_manager = sys.modules.get("load_manager")
-            VOCOlinc = (
-                getattr(_load_manager, "VOCOlinc", None)
-                if _load_manager is not None
-                else None
-            )
-        if VOCOlinc is None:
             from vocolinc import VOCOlinc  # type: ignore[assignment]
 
         assert VOCOlinc is not None, "VOCOlinc class could not be imported"

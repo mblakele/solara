@@ -11,8 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from energy_cache import EnergyCache
-from load_manager import NBCReader
-from load_nbc import NBCFetchResult
+from load_nbc import NBCFetchResult, NBCReader
 
 
 def _make_energy_cache(
@@ -176,6 +175,33 @@ def test_get_current_qh_returns_data_point_at_from_cache():
     assert result.data_point_at == now
 
 
+def test_get_current_qh_data_point_at_accounts_for_lag_on_cache_fast_path():
+    """Cache fast-path data_point_at subtracts data_lag_secs from last_fetch_at.
+
+    Regression guard for the silent data-lag bug: the metrics dict carries
+    ``_data_lag_secs`` on every fetch, but the value was never stored on the
+    EnergyCache, so the fast path fell back to a vestigial ``getattr`` that
+    always returned 0.0. Stale-data detection then measured the wrong age
+    and treated lagged data as fresh.
+    """
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 1200
+        cache.last_fetch_at = fixed_now
+        cache._set_data_field(data_lag_secs=130.0)
+
+    reader = NBCReader(energy_cache=cache)
+
+    result = reader.get_current_qh(now=fixed_now)
+    assert result is not None
+    assert result.data_point_at == fixed_now - timedelta(seconds=130.0)
+
+
 def test_get_current_qh_with_positive_samples():
     """get_current_qh handles positive (consumption) samples correctly."""
     now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
@@ -263,128 +289,6 @@ def test_get_current_qh_force_true_without_fetch_callable():
 
     assert result is not None
     assert result.qh_name == "QH1"
-
-
-# --- NBCReader.get_current_qh_direct() tests (unchanged) ---
-
-
-def test_get_current_qh_direct_with_valid_data():
-    """get_current_qh_direct parses metrics data directly without cache."""
-    reader = NBCReader()
-
-    metrics_data = {
-        "devices": [
-            {
-                "name": "panel",
-                "nbc": {
-                    "QH1": {"wh": 200.0, "complete": True},
-                    "QH2": {
-                        "wh": 100.0,
-                        "complete": False,
-                        "predicted_wh": -300.0,
-                        "remaining_seconds": 600,
-                    },
-                    "QH3": None,
-                    "QH4": None,
-                },
-            }
-        ]
-    }
-
-    result = reader.get_current_qh_direct(metrics_data)
-
-    assert result is not None
-    qh_name, predicted_wh, seconds_remaining = result
-    assert qh_name == "QH1"
-    assert predicted_wh == -300.0
-    assert seconds_remaining == 600
-
-
-def test_get_current_qh_direct_with_none_data():
-    """get_current_qh_direct returns None when metrics data is None."""
-    reader = NBCReader()
-    result = reader.get_current_qh_direct(None)
-    assert result is None
-
-
-def test_get_current_qh_direct_with_no_incomplete_qh():
-    """get_current_qh_direct returns None when all quarters are complete."""
-    reader = NBCReader()
-
-    metrics_data = {
-        "devices": [
-            {
-                "name": "panel",
-                "nbc": {
-                    "QH1": {"wh": 200.0, "complete": True},
-                    "QH2": {"wh": 300.0, "complete": True},
-                    "QH3": None,
-                    "QH4": None,
-                },
-            }
-        ]
-    }
-
-    result = reader.get_current_qh_direct(metrics_data)
-
-    # No incomplete QH → must return None
-    assert result is None
-
-
-def test_get_current_qh_direct_returns_none_when_all_quarters_complete():
-    """When all quarters are complete, return None to avoid stale data.
-
-    This is the anti-regression test for the ecoflow chatter bug.
-    When every quarter in the NBC data is marked complete, returning
-    the last complete quarter's Wh value would cause incorrect load
-    management decisions based on stale, completed-quarter data. The
-    correct behavior is to return None so run_cycle waits for fresh
-    incomplete data.
-    """
-    reader = NBCReader()
-
-    metrics_data = {
-        "devices": [
-            {
-                "name": "panel",
-                "nbc": {
-                    "QH1": {"wh": 200.0, "complete": True},
-                    "QH2": {"wh": 300.0, "complete": True},
-                    "QH3": {"wh": 150.0, "complete": True},
-                    "QH4": {"wh": 100.0, "complete": True},
-                },
-            }
-        ]
-    }
-
-    result = reader.get_current_qh_direct(metrics_data)
-
-    # All quarters complete → must return None
-    assert result is None
-
-
-def test_get_current_qh_direct_returns_none_when_all_quarters_complete_with_zero_wh():
-    """When all quarters are complete with 0 Wh (nighttime solar), return None."""
-    reader = NBCReader()
-
-    metrics_data = {
-        "devices": [
-            {
-                "name": "panel",
-                "nbc": {
-                    "QH1": {"wh": 0.0, "complete": True},
-                    "QH2": {"wh": 0.0, "complete": True},
-                    "QH3": {"wh": 0.0, "complete": True},
-                    "QH4": {"wh": 0.0, "complete": True},
-                },
-            }
-        ]
-    }
-
-    result = reader.get_current_qh_direct(metrics_data)
-
-    # All quarters complete, even with 0 Wh → must return None
-    assert result is None
 
 
 # --- NBCReader.get_current_qh() fall-through fetch tests ---

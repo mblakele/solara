@@ -136,12 +136,16 @@ This is a flat-layout Python project. All source files live at the project root 
 
 ```
 project-root
-├── app.py                 # Flask application entrypoint & route definitions (/, /health,
-                           # /api/v1/tou, /api/v1/load/status, /api/tesla/callback)
+├── app.py                 # Flask app factory (create_app()), route definitions (/, /health,
+                           # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
+                           # _AppState runtime singletons, start_background_services()
+├── wsgi.py                # Gunicorn entry point: app = create_app(); start_background_services()
 ├── clock.py               # Clock protocol (now()) with FakeClock for tests
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
                            # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
-├── config_loader.py       # LazyConfig deferred env loading (config.get(), config.set())
+├── config_loader.py       # Config loading helpers (load_tesla_config,
+                           # load_plugs_from_file, load_vocolinc_*) reading
+                           # env via the Config class + devices.json
 ├── conftest.py            # Pytest shared fixtures & configuration
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS, etc.)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
@@ -181,7 +185,7 @@ project-root
 
 ### Key entry points
 
-- **Guard functions** `metrics.py`: `cap_chart_start()`, `cap_fetch_window()`,
+- **Guard functions** `metrics.py`: `cap_chart_start()`,
   `_chart_start_for()` — cap over-fetching when cache is stale and keep the
   fetch window anchored to a stale QH-aligned `data_start` so a completed QH
   is not lost at a boundary; pure functions, independently tested
@@ -209,7 +213,11 @@ project-root
   `Location` is absent in the snapshot. Delegates to controller's `init_tesla_state()`
   (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
 - Data models in `load_models.py`
-- Routes in `app.py`
+- `create_app()` factory + routes in `app.py` (module-level `app` singleton; no
+  background threads start at import time)
+- `start_background_services()` in `app.py` — explicitly starts the MQTT subscriber
+  and load-management thread; called from `wsgi.py` and the `__main__` block, never
+  at import time (so tests can import the module safely)
 - `_setup_file_logging()` in `app.py` — creates `RotatingFileHandler` when `LOG_FILE` is configured
 - Test data generation in `mockdata.py`
 - Quantization detection in `quantization.py`
@@ -221,7 +229,9 @@ project-root
 - `EnergyCacheAlignmentError` in `energy_cache.py` — raised by `get_current_qh()` when `data_start`
   is missing or not QH-aligned; a plain `Exception` (asserts are stripped under `python -O`), kept as a
   safety net since the fetch-site drift checks below reject misaligned data before it is stored
-- Deferred config in `config_loader.py` (`LazyConfig`, `config.get()`, `config.set()`)
+- Deferred config in `config.py` (`Config.get()`, `Config.set()`, `_lookup` chain:
+  overrides -> os.environ -> .env); config loading helpers in `config_loader.py`
+  (`load_tesla_config`, `load_plugs_from_file`, `load_vocolinc_*`)
 - Tesla config in `config.py` (`TeslaConfig` dataclass, `load_tesla_config()`)
 - Tesla telemetry intervals in `config.py` (`tesla_telemetry_chargestate_interval`,
   `tesla_telemetry_location_interval`, `tesla_telemetry_chargeamps_interval`,
@@ -260,7 +270,7 @@ project-root
 - Returns "status": "dry-run" vs "status": "ok" depending on mode
 
 ### Index Endpoint
-- app.py / route (lines 171-195) serves HTML or JSON based on Accept header
+- `index()` in app.py serves HTML or JSON based on Accept header
 - Returns model.metrics which includes:
   - devices: list with gid, lag, name, prediction, nbc (clock-boundary quarter-hour data),
     prev_hour_data
@@ -306,12 +316,6 @@ project-root
   - `sample_count`, `last_sample_at`: metadata for diagnostics
   - `full_metrics_dict`: dict[str, Any] | None — metrics dict refreshed on every fetch (not just the first),
     returned on cache hits to preserve keys like `devices`, `nbc`, `instant`
-- `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that fetches
-  from a QH boundary via `_chart_start_for()` on repeat calls so the cache
-  accumulates a full quarter-hour regardless of API data_start alignment,
-  keeping a stale QH-aligned `data_start` anchored so a completed QH compacts.
-  Returns `None` on API error. Currently test-only (production paths use
-  `create_metrics`); mirrors the `_fetch_channel_data` drift check below.
 - `_fetch_channel_data()` in `metrics.py` (HourlyProjection) — rejects a drifted API
   `data_start` (`firstUsageInstant != requested chart_start`) by raising
   `RetryableMetricsException` before any misaligned data is stored; `_run_fetch_with_timeout`
@@ -409,7 +413,7 @@ is required (e.g. CI, or after changing test-relevant code).
 | Lint | `uv run pylint *.py` |
 | Type check | `uv run mypy` |
 | Dev server | `uv run python app.py` |
-| Production-like server | `gunicorn --reload --worker-class=gthread --threads=4 --timeout=0 --bind 127.0.0.1:8000 app:app` |
+| Production-like server | `gunicorn --reload --worker-class=gthread --threads=4 --timeout=31 --bind 127.0.0.1:8000 wsgi:app` |
 
 The dev server reads credentials from `.env` (`VUE_USERNAME`, `VUE_PASSWORD`).
 Ensure that file is present and sourced before running.
@@ -480,8 +484,8 @@ Ensure that file is present and sourced before running.
 ### 5. Security
 
 - **No hardcoded secrets.** Read all credentials and API keys from environment
-  variables via the local `decouple.py` library. If you find hardcoded secrets,
-  fix them immediately.
+  variables via the `config` module (`Config`/`Config.set`). If you find
+  hardcoded secrets, fix them immediately.
 - **Validate all user input** (URL params, form fields, query strings) before
   use or storage.
 
@@ -522,12 +526,12 @@ Ensure that file is present and sourced before running.
 
 **Write tests for all new functionality.** A PR with new behavior but no new
   tests is incomplete. This includes changes driven by pre-existing plans — a plan file is never a substitute for tests.
-- **Always guard against pollution from `devices.json` and `.env` files** The local `.env` (loaded by `decouple`) may conflict with your test. Consider that and guard against it. Use deferred config in app code, and monkeypatch.setenv in pytest fixtures.
+- **Always guard against pollution from `devices.json` and `.env` files** The local `.env` (read lazily by the `config` module) may conflict with your test. Consider that and guard against it. Use deferred config in app code, and monkeypatch.setenv in pytest fixtures.
 ```
 # ❌ Evaluated at import — hard to mock
 DATABASE_URL = config('DATABASE_URL')
 
-# ✅ Deferred — evaluated when called, so we can patch decouple's config before the values are ever resolved, giving tests full control.
+# ✅ Deferred — evaluated when called, so we can patch config's lookup before the values are ever resolved, giving tests full control.
 def get_database_url():
     return config('DATABASE_URL')
 

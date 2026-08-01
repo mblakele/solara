@@ -18,6 +18,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -118,20 +119,22 @@ def load_telegram_config(config: Config | None = None) -> dict[str, str] | None:
     devices.json "telegram" section. Returns None if no config found.
 
     Args:
-        config: Optional Config instance (unused — Telegram config is
-            loaded directly from env vars and devices.json). Accepted
-            for API consistency across config loading functions.
+        config: Optional Config instance. When provided, its lookup chain
+            (instance overrides → module override store → os.environ →
+            .env file) is used; otherwise os.environ is read directly.
+            Accepted for API consistency across config loading functions.
 
     Returns:
         A dict with "bot_token" and "chat_id" keys, or None if
         no Telegram config is available from any source.
     """
-    _ = config  # accepted for API consistency
-    from decouple import config as _decouple_config
-
     # Priority 1: environment variables
-    bot_token = _decouple_config("TELEGRAM_BOT_TOKEN", default=None)
-    chat_id = _decouple_config("TELEGRAM_CHAT_ID", default=None)
+    if config is not None:
+        bot_token = config._get("TELEGRAM_BOT_TOKEN")  # pylint: disable=protected-access
+        chat_id = config._get("TELEGRAM_CHAT_ID")  # pylint: disable=protected-access
+    else:
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
     if bot_token and chat_id:
         return {"bot_token": bot_token, "chat_id": chat_id}

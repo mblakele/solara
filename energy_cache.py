@@ -83,6 +83,9 @@ class EnergyCacheData:
         quantization_seconds: Detected quantization interval in seconds.
         quantization_offset: Offset within the quantization period (seconds).
         quantization_confidence: Confidence in the quantization detection (0–1).
+        data_lag_secs: Seconds of lag between the fetched data and wall clock,
+            captured from the metrics dict (``_data_lag_secs``) on every fetch.
+            Stale-data detection uses it to compute ``data_point_at``.
         full_metrics_dict: Optional full metrics dict (e.g. with "devices" key)
             returned on cache hits, preserved from the original fetch.
     """
@@ -95,6 +98,7 @@ class EnergyCacheData:
     quantization_seconds: int | None
     quantization_offset: int | None
     quantization_confidence: float | None
+    data_lag_secs: float = 0.0
     full_metrics_dict: dict[str, Any] | None = None
     completed_periods: list["CompletedNBCPeriod"] | None = None
 
@@ -294,6 +298,18 @@ class EnergyCache:
         if self._data is None:
             return None
         return self._data.completed_periods
+
+    @property
+    def data_lag_secs(self) -> float:
+        """Seconds of API data lag captured from the last fetch, or ``0.0``."""
+        if self._data is None:
+            return 0.0
+        return self._data.data_lag_secs
+
+    @data_lag_secs.setter
+    def data_lag_secs(self, value: float) -> None:
+        """Set the API data lag in seconds."""
+        self._set_data_field(data_lag_secs=value)
 
     # ------------------------------------------------------------------
     # Validation
@@ -523,8 +539,8 @@ class EnergyCache:
 
         Discards existing samples and stores only the new ones; completed
         QH periods are preserved from ``_data``.  Callers are expected to
-        reject misaligned API responses (see the drift checks in
-        ``_fetch_channel_data`` / ``_build_incremental_fetch`` in metrics.py),
+        reject misaligned API responses (see the drift check in
+        ``_fetch_channel_data`` in metrics.py),
         so the stored ``data_start`` is QH-aligned by construction.
 
         Args:
@@ -778,7 +794,9 @@ class EnergyCache:
                 # values from the initial fetch.
                 if self._data is not None:
                     self._data = replace(
-                        self._data, full_metrics_dict=result
+                        self._data,
+                        full_metrics_dict=result,
+                        data_lag_secs=float(result.get("_data_lag_secs", 0.0)),
                     )
 
                 # Always compact after fetch — O(1) no-op when

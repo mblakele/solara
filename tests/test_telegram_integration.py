@@ -104,7 +104,7 @@ def _make_manager(
         )
     )
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_nbc_metrics(predicted_wh),
         energy_cache=_make_energy_cache(predicted_wh, now),
         plug_ctrl=plug_ctrl,
@@ -114,7 +114,7 @@ def _make_manager(
         enabled=True,
         dry_run=dry_run,
         telegram_sender=telegram_sender,
-    )
+    ))
 
     return mgr
 
@@ -561,7 +561,7 @@ def _make_manager_with_telegram_devices(
         )
     )
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_nbc_metrics(predicted_wh),
         energy_cache=_make_energy_cache(predicted_wh, now),
         plug_ctrl=plug_ctrl,
@@ -571,7 +571,7 @@ def _make_manager_with_telegram_devices(
         enabled=True,
         dry_run=dry_run,
         telegram_sender=telegram_sender,
-    )
+    ))
 
     # Override the whitelist loaded during __init__ so tests have full control.
     if telegram_devices is not None:

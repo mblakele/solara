@@ -5,14 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
-from load_manager import (
-    PlugConfig,
-    DeviceState,
-    StateTracker,
-    TeslaState,
-    GapMinder,
-)
-from load_nbc import DecideContext
+from load_models import PlugConfig, DeviceState, TeslaState
+from load_nbc import DecideContext, GapMinder, StateTracker
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 

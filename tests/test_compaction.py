@@ -6,13 +6,14 @@ Covers:
   - util.inject_completed_qh()
   - EnergyCache._merge_samples_replace()
   - get_or_fetch replace-not-merge behavior
-  - _build_incremental_fetch starting from the current QH boundary
+  - boundary fetch compacting a missed QH
   - _compute_device_metrics injecting completed QH
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -600,142 +601,11 @@ class TestGetOrFetchReplace:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: _build_incremental_fetch starting from the current QH boundary
+# Phase 3: boundary fetch compacting a missed QH
 # ---------------------------------------------------------------------------
 
-class TestBuildIncrementalFetch:
-    """Tests for _build_incremental_fetch starting from the current QH boundary."""
-
-    def test_starts_from_data_start_after_compaction(self) -> None:
-        """After compaction, fetcher starts from data_start (QH-aligned)."""
-        from metrics import _build_incremental_fetch
-
-        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
-        data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
-
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=[0.001] * 300,
-            data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=299),
-            last_fetch_at=now,
-            sample_count=300,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
-        vue = MagicMock()
-        vue.get_chart_usage.return_value = (
-            [0.002] * 300,
-            data_start,
-        )
-
-        fetcher = _build_incremental_fetch(cache, vue, 12345, now)
-        fetcher()
-
-        # Verify the fetch started from data_start
-        call_args = vue.get_chart_usage.call_args
-        assert call_args[0][1] == data_start  # start_time arg
-
-    def test_starts_from_current_qh_boundary(self) -> None:
-        """Fetcher starts from floor_to_qh(now), not non-aligned data_start.
-
-        A minute-aligned data_start (14:16:00) must not drive the fetch
-        start — the request window must cover the full current QH so the
-        cache accumulates a complete quarter-hour.
-        """
-        from metrics import _build_incremental_fetch
-
-        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
-        data_start = datetime(2025, 6, 15, 14, 16, 0, tzinfo=timezone.utc)
-
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=[0.001] * 240,
-            data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=239),
-            last_fetch_at=now,
-            sample_count=240,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
-        vue = MagicMock()
-        vue.get_chart_usage.return_value = (
-            [0.002] * 300,
-            datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc),
-        )
-
-        fetcher = _build_incremental_fetch(cache, vue, 12345, now)
-        fetcher()
-
-        # Verify the fetch started from the current QH boundary (14:15:00),
-        # NOT the non-aligned data_start (14:16:00).
-        call_args = vue.get_chart_usage.call_args
-        assert call_args[0][1] == datetime(
-            2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc
-        )
-
-    def test_fetcher_raises_when_data_start_drifted(self) -> None:
-        """Fetcher raises RetryableMetricsException when API data_start != requested start.
-
-        The API's ``firstUsageInstant`` differs from the requested (aligned)
-        start when data is missing at the head of the window; raising here
-        (rather than storing a misaligned data_start) keeps the cache
-        QH-aligned by construction.
-        """
-        from metrics import RetryableMetricsException, _build_incremental_fetch
-
-        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
-        data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
-
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=[0.001] * 300,
-            data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=299),
-            last_fetch_at=now,
-            sample_count=300,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
-        vue = MagicMock()
-        # API reports data starting one minute after the requested start.
-        vue.get_chart_usage.return_value = (
-            [0.002] * 300,
-            data_start + timedelta(minutes=1),
-        )
-
-        fetcher = _build_incremental_fetch(cache, vue, 12345, now)
-        with pytest.raises(RetryableMetricsException):
-            fetcher()
-
-    def test_full_fetch_when_cache_empty(self) -> None:
-        """When cache is empty, fetcher does a full-hour fetch."""
-        from metrics import _build_incremental_fetch
-
-        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
-
-        cache = EnergyCache()
-        # No _data set
-
-        vue = MagicMock()
-        vue.get_chart_usage.return_value = (
-            [0.001] * 3600,
-            ceil_to_qh(now - timedelta(hours=1)),
-        )
-
-        fetcher = _build_incremental_fetch(cache, vue, 12345, now)
-        fetcher()
-
-        # Verify the fetch started from a QH-aligned time
-        call_args = vue.get_chart_usage.call_args
-        start_time = call_args[0][1]
-        assert start_time == ceil_to_qh(now - timedelta(hours=1))
+class TestBoundaryFetchCompaction:
+    """Tests for fetching across a QH boundary to compact a missed QH."""
 
     def test_boundary_fetch_compacts_missed_qh(self) -> None:
         """Fetching across a QH boundary completes and compacts the missed QH.
@@ -746,8 +616,6 @@ class TestBuildIncrementalFetch:
         materializes a CompletedNBCPeriod.  Starting from floor_to_qh(now)
         would replace the un-compacted window and lose the QH.
         """
-        from metrics import _build_incremental_fetch
-
         now = datetime(2026, 7, 31, 18, 45, 40, tzinfo=timezone.utc)
         data_start = datetime(2026, 7, 31, 18, 30, 0, tzinfo=timezone.utc)
 
@@ -763,15 +631,15 @@ class TestBuildIncrementalFetch:
             quantization_confidence=None,
         )
 
-        class FakeVue:
-            def get_chart_usage(self, gid, start, end, **kwargs):
-                # The API returns data starting at the requested start.
-                return (
-                    [0.001] * int((end - start).total_seconds()),
-                    start,
-                )
+        def fetcher() -> dict[str, Any]:
+            # Mirrors the production fetcher contract: the request starts at
+            # the old QH-aligned data_start and the API returns data starting
+            # at the requested start, covering the completed QH (940 seconds).
+            return {
+                "per_second_data": [0.001] * 940,
+                "data_start": data_start,
+            }
 
-        fetcher = _build_incremental_fetch(cache, FakeVue(), 12345, now)
         cache.get_or_fetch(fetcher, now, force=True)
 
         assert cache._data is not None

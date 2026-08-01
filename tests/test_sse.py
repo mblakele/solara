@@ -14,7 +14,7 @@ import pytest
 from sse_event import SSEBroadcaster, event_stream
 
 pytest.importorskip("app")
-from app import _enrich_metrics_for_sse, _energy_cache, _trim_output_device, app, camelize
+from app import _enrich_metrics_for_sse, _state, _trim_output_device, app, camelize
 
 
 class TestSSEBroadcaster:
@@ -97,6 +97,19 @@ class TestEventStream:
         frame = next(gen)
         assert "event: heartbeat" in frame
 
+    def test_default_heartbeat_timeout_is_30s(self) -> None:
+        """Default heartbeat fires every 30s, below typical 60s proxy timeouts.
+
+        The heartbeat is the only traffic on /stream/status when load
+        management is disabled, so it must arrive well before proxy read
+        timeouts (nginx default 60s) would kill an idle connection.
+        """
+        import inspect
+
+        default = inspect.signature(event_stream).parameters["timeout"].default
+        assert default == 30
+        assert default < 60
+
     def test_subscribed_events_appear_in_stream(self) -> None:
         b = SSEBroadcaster()
         gen = event_stream(b, timeout=0.1)
@@ -152,13 +165,13 @@ class TestMetricsEnrichment:
             "_fetched_at": fetched_at,
         }
         # Save original _data and restore after test
-        orig_data = _energy_cache._data
-        _energy_cache._data = MagicMock(samples=[])
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = MagicMock(samples=[])
         try:
             now = fetched_at + timedelta(seconds=10)
             result = _enrich_metrics_for_sse(metrics_data, now=now)
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
 
         device = result["devices"][0]
         expected_lag = 5.0 + 10.0  # cached + elapsed
@@ -172,12 +185,12 @@ class TestMetricsEnrichment:
             "_fetched_at": fetched_at,
         }
         accumulated = [10.0, 20.0, 30.0, 40.0]
-        orig_data = _energy_cache._data
-        _energy_cache._data = MagicMock(samples=accumulated)
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = MagicMock(samples=accumulated)
         try:
             result = _enrich_metrics_for_sse(metrics_data, now=fetched_at)
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
 
         device = result["devices"][0]
         assert device["per_second_data"] == accumulated
@@ -191,12 +204,12 @@ class TestMetricsEnrichment:
             "_fetched_at": fetched_at,
         }
         metrics_data["devices"][0]["per_second_data"] = long_data
-        orig_data = _energy_cache._data
-        _energy_cache._data = MagicMock(samples=[])
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = MagicMock(samples=[])
         try:
             result = _enrich_metrics_for_sse(metrics_data, now=fetched_at)
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
 
         device = result["devices"][0]
         assert len(device["per_second_data"]) == 300  # trimmed to 300
@@ -207,12 +220,12 @@ class TestMetricsEnrichment:
         metrics_data: dict[str, Any] = {
             "devices": [self._make_device()],
         }
-        orig_data = _energy_cache._data
-        _energy_cache._data = MagicMock(samples=[])
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = MagicMock(samples=[])
         try:
             result = _enrich_metrics_for_sse(metrics_data)
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
 
         assert "devices" in result
         assert len(result["devices"]) == 1
@@ -220,12 +233,12 @@ class TestMetricsEnrichment:
     def test_enrich_handles_no_devices(self) -> None:
         """No crash when devices list is empty."""
         metrics_data: dict[str, Any] = {"_fetched_at": datetime.now(timezone.utc)}
-        orig_data = _energy_cache._data
-        _energy_cache._data = MagicMock(samples=[])
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = MagicMock(samples=[])
         try:
             result = _enrich_metrics_for_sse(metrics_data)
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
 
         assert result["devices"] == []
 
@@ -236,9 +249,9 @@ class TestSSEEndpoint:
     def _setup_mock_load_manager(self) -> MagicMock:
         """Set up a mock LoadManager and inject it into the app module."""
         import app as app_mod
-        from decouple import config as dc_config
+        from config import Config
 
-        dc_config.set("LOAD_MANAGE_ENABLED", "True")
+        Config().set("LOAD_MANAGE_ENABLED", "True")
         mock_lm = MagicMock()
         mock_lm.enabled = True
         mock_lm.dry_run = True
@@ -246,22 +259,22 @@ class TestSSEEndpoint:
         mock_lm.nbc_device = "test_nbc"
         mock_lm.state.to_dict.return_value = {"devices": {}}
         mock_lm.config_interval_secs = 30
-        app_mod._load_manager = mock_lm
-        app_mod._load_manager_init_failed = False
-        app_mod._last_cycle_result = {
+        app_mod._state.load_manager = mock_lm
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = {
             "status": "ok",
             "sleep_hint": 30.0,
             "sleep_hint_at": "2025-01-15T12:00:00+00:00",
         }
-        app_mod._recent_cycles.clear()
+        app_mod._state.recent_cycles.clear()
         return mock_lm
 
     def _cleanup_load_manager(self) -> None:
         import app as app_mod
 
-        app_mod._load_manager = None
-        app_mod._last_cycle_result = None
-        app_mod._recent_cycles.clear()
+        app_mod._state.load_manager = None
+        app_mod._state.last_cycle_result = None
+        app_mod._state.recent_cycles.clear()
 
     @pytest.fixture(autouse=True)
     def setup_app(self) -> Any:
@@ -271,34 +284,34 @@ class TestSSEEndpoint:
     def test_stream_status_content_type(self) -> None:
         """Response has text/event-stream content type."""
         self._setup_mock_load_manager()
-        orig_data = _energy_cache._data
-        _energy_cache._data = None
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = None
         try:
             resp = self.client.get("/stream/status")
             assert resp.status_code == 200
             assert resp.mimetype == "text/event-stream"
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
             self._cleanup_load_manager()
 
     def test_stream_status_headers(self) -> None:
         """Required SSE headers are present."""
         self._setup_mock_load_manager()
-        orig_data = _energy_cache._data
-        _energy_cache._data = None
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = None
         try:
             resp = self.client.get("/stream/status")
             assert resp.headers.get("Cache-Control") == "no-cache"
             assert resp.headers.get("X-Accel-Buffering") == "no"
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
             self._cleanup_load_manager()
 
     def test_stream_status_initial_event(self) -> None:
         """First frame is an initial_load_state event with valid JSON."""
         self._setup_mock_load_manager()
-        orig_data = _energy_cache._data
-        _energy_cache._data = None
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = None
         try:
             resp = self.client.get("/stream/status")
             iter_ = resp.response
@@ -314,13 +327,13 @@ class TestSSEEndpoint:
                 assert payload.get("dryRun") is True
                 break  # only need first frame
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
             self._cleanup_load_manager()
 
     def test_stream_status_initial_metrics(self) -> None:
         """When cached metrics exist, initial_metrics event is emitted."""
         self._setup_mock_load_manager()
-        orig_data = _energy_cache._data
+        orig_data = _state.energy_cache._data
         # Set up mock MetricsData with full_metrics_dict
         mock_cache = MagicMock()
         mock_cache.full_metrics_dict = {
@@ -328,7 +341,7 @@ class TestSSEEndpoint:
             "_fetched_at": datetime.now(timezone.utc),
         }
         mock_cache.samples = [1.0, 2.0, 3.0]
-        _energy_cache._data = mock_cache
+        _state.energy_cache._data = mock_cache
         try:
             resp = self.client.get("/stream/status")
             frames_read = 0
@@ -345,14 +358,14 @@ class TestSSEEndpoint:
                 if frames_read > 5:
                     pytest.fail("initial_metrics event not found in first 5 frames")
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
             self._cleanup_load_manager()
 
     def test_stream_status_event_format(self) -> None:
         """SSE frames follow the 'event: NAME\ndata: JSON\n\n' format."""
         self._setup_mock_load_manager()
-        orig_data = _energy_cache._data
-        _energy_cache._data = None
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = None
         try:
             resp = self.client.get("/stream/status")
             for chunk in resp.response:
@@ -365,14 +378,14 @@ class TestSSEEndpoint:
                 assert text.endswith("\n\n")
                 break  # only check first frame
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
             self._cleanup_load_manager()
 
     def test_sse_payload_camelcase(self) -> None:
         """SSE payloads use camelCase keys matching the legacy index endpoint."""
         self._setup_mock_load_manager()
-        orig_data = _energy_cache._data
-        _energy_cache._data = None
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = None
         try:
             resp = self.client.get("/stream/status")
             for chunk in resp.response:
@@ -396,5 +409,5 @@ class TestSSEEndpoint:
                     assert "sleep_hint" not in lcr
                 break
         finally:
-            _energy_cache._data = orig_data
+            _state.energy_cache._data = orig_data
             self._cleanup_load_manager()

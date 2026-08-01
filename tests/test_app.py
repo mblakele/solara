@@ -14,16 +14,16 @@ from app import app
 
 @contextlib.contextmanager
 def mock_config(**overrides: Any):
-    """Patch decouple config with default mock values plus any overrides.
+    """Patch config with default mock values plus any overrides.
 
-    This replaces the old approach of patching app.config (which was a decouple
-    import) with direct patches on the decouple config singleton used by Config.
+    Writes the values into os.environ for the duration of the context,
+    restoring the previous values (or removing them) on exit. Since the
+    Config lookup chain checks os.environ before the .env file, these
+    values win over conftest's clean_env defaults.
 
     Args:
-        overrides: Key-value pairs to set in decouple config (e.g., MOCK=True).
+        overrides: Key-value pairs to set in config (e.g., MOCK=True).
     """
-    from unittest.mock import patch
-
     defaults = {
         "VUE_USERNAME": None,
         "MOCK_ERROR": False,
@@ -31,55 +31,17 @@ def mock_config(**overrides: Any):
     }
     config_values = {**defaults, **overrides}
 
-    # Patch decouple's config function in the 'config' module where
-    # _decouple_config is imported, since that's where it gets called from.
-
-    class _Undefined:
-        """Sentinel for undefined config values."""
-
-    _UNDEFINED = _Undefined()  # type: ignore[misc]
-
-    import decouple, config as cfg_mod  # noqa: F811
-
-    # Save a reference to the original decouple config function so we can
-    # read from its internal store inside mock_decouple (avoiding recursion).
-    _original_config = decouple.config  # type: ignore[misc]
-
-    def mock_decouple(key, default=_UNDEFINED, cast=None):  # type: ignore[no-untyped-def]
-        import os as _os
-
-        # Check our own defaults/overrides first so they take precedence
-        if key in config_values:
-            val = config_values[key]
-            if cast is not None and val is not None:
-                return cast(val)  # type: ignore[arg-type]
-            if val is None and default is not _UNDEFINED:  # type: ignore[name-defined]
-                return cast(default) if cast is not None else default  # type: ignore[arg-type]
-            return val
-
-        # Check decouple's internal config store for values set via dc_config.set()
-        # inside the mock_config context (e.g. test overrides). This takes priority
-        # over os.environ so tests can override conftest's clean_env values.
-        try:
-            store_val = _original_config(key, default=_UNDEFINED)  # type: ignore[no-untyped-call]
-            if store_val is not _UNDEFINED and default is not _UNDEFINED:  # type: ignore[name-defined]
-                return cast(store_val) if cast is not None else store_val  # type: ignore[arg-type]
-        except decouple.UndefinedValueError:
-            pass
-
-        env_val = _os.environ.get(key)  # type: ignore[attr-defined]
-        if env_val is not None:
-            return cast(env_val) if cast is not None else env_val
-
-        if default is not _UNDEFINED:  # type: ignore[name-defined]
-            return cast(default) if (cast is not None and default is not _UNDEFINED) else default  # type: ignore[arg-type]
-
-        raise decouple.UndefinedValueError(key)  # type: ignore[attr-defined]
-
-
-    cfg_patch = patch.object(cfg_mod, "_decouple_config", side_effect=mock_decouple)
-    with cfg_patch:
+    saved = {key: os.environ.get(key) for key in config_values}
+    try:
+        for key, value in config_values.items():
+            os.environ[key] = "" if value is None else str(value)
         yield
+    finally:
+        for key, old in saved.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
 
 
 
@@ -113,7 +75,8 @@ class TestApp(unittest.TestCase):
 
     def test_index_json_time_range_enabled(self):
         """Index JSON endpoint serializes time-range enabled value correctly."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         with mock_config():
             dc_config.set("LOAD_MANAGE_ENABLED", "06:45-15:00")
@@ -124,15 +87,16 @@ class TestApp(unittest.TestCase):
 
     def test_index_html_time_range_enabled(self):
         """Index HTML shows time range when enabled is a time-range tuple."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         with mock_config():
             dc_config.set("LOAD_MANAGE_ENABLED", "06:45-15:00")
             # Reset LoadManager singleton so it reinitializes with the new config.
             import app as app_mod
 
-            app_mod._load_manager = None
-            app_mod._load_manager_init_failed = False
+            app_mod._state.load_manager = None
+            app_mod._state.load_manager_init_failed = False
             response = self.app.get("/", headers={"Accept": "text/html"})
         self.assertEqual(response.status_code, 200)
         data = response.data.decode("utf-8")
@@ -267,7 +231,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_includes_sleep_hint_meta(self):
         """Index HTML includes a meta tag with the sleep_hint value for JS."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -303,9 +268,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -315,7 +280,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_includes_top_level_sleep_hint(self):
         """Index JSON loadManagement includes top-level sleepHint."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -337,9 +303,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -350,7 +316,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_fallback_sleep_hint_to_config_interval(self):
         """Index JSON falls back to config_interval_secs when lastCycleResult is empty."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -371,9 +338,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = None
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = None
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -384,7 +351,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_missing_sleep_hint_no_crash(self):
         """Index HTML handles a cycle result without sleep_hint without crashing."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -420,9 +388,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = mock_result
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = mock_result
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -431,7 +399,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         """Index JSON loadManagement includes sleepHintAt timestamp."""
         from datetime import datetime
 
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -453,9 +422,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -469,7 +438,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_includes_sleep_hint_at_meta(self):
         """Index HTML includes a meta tag with the sleep_hint_at value for JS."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -491,9 +461,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -503,7 +473,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_missing_sleep_hint_at_no_crash(self):
         """Index JSON handles missing sleepHintAt gracefully."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -525,9 +496,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -538,7 +509,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_missing_sleep_hint_at_no_crash(self):
         """Index HTML handles missing sleep_hint_at without crashing."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -576,16 +548,17 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = mock_result
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = mock_result
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
 
     def test_index_html_handles_none_predicted_wh(self):
         """Index template renders when predicted_wh is None (no crash)."""
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -617,9 +590,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             dc_config.set("LOAD_MANAGE_ENABLED", "True")
             import app as app_mod
 
-            app_mod._load_manager = mock_lm
-            app_mod._load_manager_init_failed = False
-            app_mod._last_cycle_result = mock_lm.run_cycle.return_value
+            app_mod._state.load_manager = mock_lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -1002,7 +975,7 @@ class TestIndexEndpointPerSecondData(unittest.TestCase):
         fresh_cache = EnergyCache(ttl_seconds=0)
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
-            with patch.object(app_mod, "_energy_cache", fresh_cache):
+            with patch.object(app_mod._state, "energy_cache", fresh_cache):
                 with patch("app.create_metrics", return_value=metrics_dict):
                     resp = self.app.get("/", headers={"Accept": "application/json"})
 
@@ -1034,7 +1007,7 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
         import app as app_mod
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
-            with patch.object(app_mod, "_energy_cache") as mock_cache:
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
                 mock_cache.get_or_fetch.return_value = (None, True)
                 mock_cache._data = None
                 resp = self.app.get("/", headers={"Accept": "application/json"})
@@ -1115,22 +1088,23 @@ if __name__ == "__main__":
 
 
 class TestBuildLoadManagementPayloadLocked(unittest.TestCase):
-    """Tests for _build_load_management_payload_locked().
+    """Tests for _build_load_management_payload() when an lm is passed in.
 
-    This function is called while _load_manager_lock is held.  It must
-    NOT call _get_load_manager() because that function also tries to
-    acquire _load_manager_lock, causing a non-reentrant Lock deadlock.
+    The background loop passes the LoadManager instance directly (it
+    already holds _state.load_manager_lock).  The payload builder must NOT
+    call _get_load_manager() because that function also tries to
+    acquire _state.load_manager_lock, causing a non-reentrant Lock deadlock.
     """
 
     def setUp(self):
         import app as app_mod
-        app_mod._load_manager = None
-        app_mod._last_cycle_result = None
+        app_mod._state.load_manager = None
+        app_mod._state.last_cycle_result = None
 
     def test_does_not_call_get_load_manager(self):
-        """Locked variant reads _load_manager directly, not via _get_load_manager."""
+        """Passing lm builds the payload without calling _get_load_manager."""
         import app as app_mod
-        from app import _build_load_management_payload_locked
+        from app import _build_load_management_payload
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
@@ -1140,11 +1114,8 @@ class TestBuildLoadManagementPayloadLocked(unittest.TestCase):
         mock_lm.state.to_dict.return_value = {"devices": {}}
         mock_lm.config_interval_secs = 30
 
-        app_mod._load_manager = mock_lm
-
         with patch("app._get_load_manager", side_effect=Exception("would deadlock")):
-            with app_mod._load_manager_lock:
-                result = _build_load_management_payload_locked()
+            result = _build_load_management_payload(mock_lm)
 
         self.assertEqual(result["enabled"], True)
         self.assertEqual(result["target_wh"], -500)
@@ -1155,20 +1126,21 @@ class TestBuildLoadManagementPayloadDisabled(unittest.TestCase):
     """Tests for _build_load_management_payload() when load management is disabled.
 
     When LOAD_MANAGE_ENABLED=False, the payload builder must return {}
-    immediately without touching _get_load_manager() or _load_manager_lock.
+    immediately without touching _get_load_manager() or _state.load_manager_lock.
     This avoids a lock contention crash where the background thread holds
     the lock during LoadManager init while the request handler blocks on it.
     """
 
     def setUp(self):
         import app as app_mod
-        app_mod._load_manager = None
+        app_mod._state.load_manager = None
 
     def test_returns_empty_when_disabled(self):
         """Returns {} without calling _get_load_manager when disabled."""
         import app as app_mod
         from app import _build_load_management_payload
-        from decouple import config as dc_config
+        from config import Config
+        dc_config = Config()
 
         dc_config.set("LOAD_MANAGE_ENABLED", "False")
         with patch("app._get_load_manager", side_effect=Exception("should not be called")):
@@ -1188,7 +1160,7 @@ class TestSendErrorAlert(unittest.TestCase):
         mock_sender.is_configured = True
         mock_sender.send_notification_sync = unittest.mock.MagicMock(return_value=True)
 
-        app_mod._telegram_sender = mock_sender
+        app_mod._state.telegram_sender = mock_sender
         try:
             exc = ValueError("test error")
             app_mod._send_error_alert(exc)
@@ -1196,13 +1168,13 @@ class TestSendErrorAlert(unittest.TestCase):
             call_args = mock_sender.send_notification_sync.call_args[0][0]
             assert "test error" in call_args.description
         finally:
-            app_mod._telegram_sender = None
+            app_mod._state.telegram_sender = None
 
     def test_noop_when_sender_none(self):
         """When telegram sender is None, no-op without error."""
         import app as app_mod
 
-        app_mod._telegram_sender = None
+        app_mod._state.telegram_sender = None
         app_mod._send_error_alert(ValueError("ignored"))
 
     def test_noop_when_sender_not_configured(self):
@@ -1212,12 +1184,12 @@ class TestSendErrorAlert(unittest.TestCase):
         mock_sender = unittest.mock.MagicMock()
         mock_sender.is_configured = False
 
-        app_mod._telegram_sender = mock_sender
+        app_mod._state.telegram_sender = mock_sender
         try:
             app_mod._send_error_alert(ValueError("ignored"))
             mock_sender.send_notification_sync.assert_not_called()
         finally:
-            app_mod._telegram_sender = None
+            app_mod._state.telegram_sender = None
 
 
 class TestLoadManagementLoopErrorHandling(unittest.TestCase):
@@ -1229,7 +1201,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         from energy_cache import EnergyCacheData
 
         base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        app_mod._energy_cache._data = EnergyCacheData(
+        app_mod._state.energy_cache._data = EnergyCacheData(
             samples=[0.1, 0.2],
             data_start=base,
             last_sample_at=base + timedelta(seconds=1),
@@ -1243,18 +1215,18 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         mock_lm = unittest.mock.MagicMock()
         mock_lm.run_cycle.side_effect = RuntimeError("test crash")
 
-        app_mod._telegram_sender = None
-        app_mod._consecutive_error_count = 0
-        app_mod._last_error_type = None
+        app_mod._state.telegram_sender = None
+        app_mod._state.consecutive_error_count = 0
+        app_mod._state.last_error_type = None
 
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=InterruptedError("stop")):
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
-        assert app_mod._energy_cache._data is None
-        app_mod._consecutive_error_count = 0
-        app_mod._last_error_type = None
+        assert app_mod._state.energy_cache._data is None
+        app_mod._state.consecutive_error_count = 0
+        app_mod._state.last_error_type = None
 
     def test_error_counter_increments_on_error(self):
         """Error counter increments on each error."""
@@ -1263,24 +1235,24 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         mock_lm = unittest.mock.MagicMock()
         mock_lm.run_cycle.side_effect = RuntimeError("test crash")
 
-        app_mod._telegram_sender = None
-        app_mod._consecutive_error_count = 0
+        app_mod._state.telegram_sender = None
+        app_mod._state.consecutive_error_count = 0
 
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=InterruptedError("stop")):
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
-        assert app_mod._consecutive_error_count == 1
-        app_mod._consecutive_error_count = 0
-        app_mod._last_error_type = None
+        assert app_mod._state.consecutive_error_count == 1
+        app_mod._state.consecutive_error_count = 0
+        app_mod._state.last_error_type = None
 
     def test_error_counter_resets_on_success(self):
         """Error counter resets when cycle succeeds."""
         import app as app_mod
         from load_models import CycleResult, CycleDiagnostics
 
-        app_mod._consecutive_error_count = 5
+        app_mod._state.consecutive_error_count = 5
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.run_cycle.return_value = CycleResult(
@@ -1297,15 +1269,15 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         )
         mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
 
-        app_mod._telegram_sender = None
+        app_mod._state.telegram_sender = None
 
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=InterruptedError("stop")):
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
-        assert app_mod._consecutive_error_count == 0
-        assert app_mod._last_error_type is None
+        assert app_mod._state.consecutive_error_count == 0
+        assert app_mod._state.last_error_type is None
 
     def test_rate_limited_telegram_alert(self):
         """Telegram alert sent on first error, then every 10th."""
@@ -1318,8 +1290,8 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         mock_lm = unittest.mock.MagicMock()
         mock_lm.run_cycle.side_effect = RuntimeError("crash")
 
-        app_mod._telegram_sender = mock_sender
-        app_mod._consecutive_error_count = 0
+        app_mod._state.telegram_sender = mock_sender
+        app_mod._state.consecutive_error_count = 0
 
         call_count = 0
 
@@ -1336,9 +1308,9 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
 
         # First error (count=1) triggers alert, second (count=2) doesn't
         assert mock_sender.send_notification_sync.call_count == 1
-        app_mod._consecutive_error_count = 0
-        app_mod._last_error_type = None
-        app_mod._telegram_sender = None
+        app_mod._state.consecutive_error_count = 0
+        app_mod._state.last_error_type = None
+        app_mod._state.telegram_sender = None
 
     def test_disabled_cycle_skips_sleep_interval_adjust(self):
         """When cycle is disabled, sleep_interval_adjust is skipped.
@@ -1354,7 +1326,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         # Set up cache with stale data: last_sample_at is old enough that
         # sleep_interval_adjust would return MIN_SLEEP_SECS (5.0).
-        app_mod._energy_cache._data = EnergyCacheData(
+        app_mod._state.energy_cache._data = EnergyCacheData(
             samples=[0.1] * 100,
             data_start=base - timedelta(minutes=55),
             last_sample_at=base - timedelta(minutes=50),
@@ -1380,9 +1352,9 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         )
         mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
 
-        app_mod._consecutive_error_count = 0
-        app_mod._last_error_type = None
-        app_mod._telegram_sender = None
+        app_mod._state.consecutive_error_count = 0
+        app_mod._state.last_error_type = None
+        app_mod._state.telegram_sender = None
 
         captured_sleep_values: list[float] = []
 
@@ -1400,8 +1372,8 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
             f"Expected 30.0 for disabled cycle, got {captured_sleep_values[0]}"
         )
 
-        app_mod._consecutive_error_count = 0
-        app_mod._last_error_type = None
+        app_mod._state.consecutive_error_count = 0
+        app_mod._state.last_error_type = None
 
 
 if __name__ == "__main__":

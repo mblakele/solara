@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, List, Tuple
+from typing import Any, List
 
 import pytz
 
@@ -124,79 +124,6 @@ class EnergyDataAggregator:
 
         return TOUBuckets(
             total=total, peak=peak, part_peak=part_peak, off_peak=off_peak,
-        )
-
-    @staticmethod
-    def aggregate_from_hourly(
-        hourly_data: List[Tuple[datetime, float]],
-    ) -> TOUBuckets:
-        """
-        Aggregate hourly energy data into TOU buckets.
-
-        Args:
-            hourly_data: List of (timestamp, usage_kwh) tuples.
-                        Timestamp should be hour-aligned.
-
-        Returns:
-            TOUBuckets with bucket totals in Wh.
-        """
-        total = 0.0
-        peak = 0.0
-        part_peak = 0.0
-        off_peak = 0.0
-
-        for timestamp, usage_kwh in hourly_data:
-            if usage_kwh is None:
-                continue
-            usage_wh = usage_kwh * 1000.0
-            local_hour = EnergyDataAggregator._get_local_hour(timestamp)
-            bucket = EnergyDataAggregator.classify_hour(local_hour)
-            if bucket == "peak":
-                peak += usage_wh
-            elif bucket == "part_peak":
-                part_peak += usage_wh
-            else:
-                off_peak += usage_wh
-            total += usage_wh
-
-        return TOUBuckets(
-            total=total, peak=peak, part_peak=part_peak, off_peak=off_peak,
-        )
-
-    @staticmethod
-    def aggregate_from_seconds(
-        start_time: datetime, usage_data: List[float]
-    ) -> TOUBuckets:
-        """
-        Aggregate per-second energy data into TOU buckets.
-
-        Args:
-            start_time: Start time of the first data point.
-            usage_data: List of kWh values, one per second.
-
-        Returns:
-            TOUBuckets with bucket totals in Wh.
-        """
-        return EnergyDataAggregator._aggregate(
-            start_time, usage_data, timedelta(seconds=1)
-        )
-
-    @staticmethod
-    def aggregate_from_minutes(
-        start_time: datetime, usage_data: List[float]
-    ) -> TOUBuckets:
-        """
-        Aggregate per-minute energy data into TOU buckets.
-
-        Args:
-            start_time: Start time of the first data point.
-            usage_data: List of kWh values, one per minute.
-
-        Returns:
-            TOUBuckets with bucket totals in Wh.
-        """
-        return EnergyDataAggregator._aggregate(
-            start_time, usage_data, timedelta(minutes=1)
         )
 
     @staticmethod

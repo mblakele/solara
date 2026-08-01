@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from clock import FakeClock
-from load_manager import LoadManager
+from load_manager import LoadManager, LoadManagerConfig
 from load_models import CycleContext, PendingEffect, TeslaState
 from load_nbc import NBCFetchResult
 
@@ -22,7 +22,7 @@ from load_nbc import NBCFetchResult
 @pytest.fixture
 def lm() -> LoadManager:
     """Default LoadManager with minimal config, no real controllers."""
-    return LoadManager(dry_run=True, config_interval_secs=30)
+    return LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
 
 
 @pytest.fixture
@@ -278,15 +278,15 @@ class TestRecentCycles:
     """Recent cycle ring buffer on diagnostics endpoint (F6)."""
 
     def test_recent_cycles_collected(self):
-        """Verify _recent_cycles in app.py collects cycle results."""
+        """Verify _state.recent_cycles in app.py collects cycle results."""
         import app as app_module
 
-        assert hasattr(app_module, "_recent_cycles"), "app module missing _recent_cycles"
+        assert hasattr(app_module._state, "recent_cycles"), "app module missing recent_cycles"
 
     def test_recent_cycles_capped(self):
         """_recent_cycles deque should have maxlen 10."""
         from collections import deque
         import app as app_module
 
-        assert isinstance(app_module._recent_cycles, deque), "_recent_cycles is not a deque"
-        assert app_module._recent_cycles.maxlen == 10, "_recent_cycles maxlen is not 10"
+        assert isinstance(app_module._state.recent_cycles, deque), "_recent_cycles is not a deque"
+        assert app_module._state.recent_cycles.maxlen == 10, "_recent_cycles maxlen is not 10"

@@ -2,8 +2,7 @@
 Load management for solar self-consumption optimization.
 
 LoadManager orchestrator, config loading functions, time-range parsing,
-and TeslaAuthError exception. Re-exports all public symbols from submodules
-for backward compatibility.
+and TeslaAuthError exception.
 """
 
 from __future__ import annotations
@@ -35,31 +34,25 @@ from constants import (
     STALE_DATA_THRESHOLD_SECS,
 )
 
-from config_loader import (  # noqa: F401
+from config_loader import (
     _parse_load_manage_enabled,
 )
 
-from config_loader import (  # runtime imports — also re-exported via __all__
+from config_loader import (
     load_plugs_from_file,
     load_tesla_config,
     load_vocolinc_credentials,
     load_vocolinc_plugs_from_file,
 )
 
-from load_controllers import (  # noqa: F401
+from load_controllers import (
     CompositePlugController,
-    PAIRINGS_FILE,
     PlugController,
     RealPlugController,
     RealTeslaController,
-    TESLA_TOKENS_FILE,
     TeslaController,
     VocolincPlugController,
     load_tesla_tokens,
-    pair_homekit_accessory,
-    remove_tesla_tokens,
-    save_tesla_tokens,
-    tesla_auth_cli,
 )
 from mqtt_telemetry import (
     get_field_update_at,
@@ -69,7 +62,7 @@ from mqtt_telemetry import (
 )
 
 
-from load_models import (  # noqa: F401
+from load_models import (
     AbstractPlugController,
     AbstractTeslaController,
     CandidateDetail,
@@ -79,30 +72,22 @@ from load_models import (  # noqa: F401
     DeviceState,
     FleetTelemetryProvisionConfig,
     PendingEffect,
-    PlugAction,
     PlugConfig,
     TeslaAuthError,
-    TeslaConfig,
     TeslaState,
-    TeslaVehicleTelemetry,
     _tesla_state_to_dict,
 )
 
-from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder, DecideContext  # noqa: F401
+from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder, DecideContext
 
-from metrics import EnergyCache
+from energy_cache import EnergyCache
 
-from telegram import (  # noqa: F401
+from telegram import (
     NotificationEvent,
     TelegramSender,
     build_error_notification,
     build_notification,
 )
-
-from vocolinc import VOCOlinc  # pylint: disable=W0611
-
-# Re-exported for test patching — pylint complains about unused import but it's
-# intentionally exposed so tests can monkey-patch vocolinc.VOCOlinc.
 
 
 @dataclass(frozen=True)
@@ -146,8 +131,6 @@ class LoadManagerConfig:
     telegram_sender: TelegramSender | None = None
     clock: Any | None = None  # clock.Clock | None — forward ref, resolved at runtime
 
-# Re-exported for backward compatibility.
-
 
 logger = logging.getLogger(__name__)
 
@@ -166,99 +149,46 @@ class LoadManager:
     Wires together NBCReader+Cache, StateTracker, controllers, and GapMinder
     to execute one load management cycle per call. Thread-safe via internal lock.
 
-    Accepts either a single LoadManagerConfig object or individual keyword
-    arguments for backward compatibility with existing callers.
+    Accepts a single LoadManagerConfig object; all settings are resolved
+    from it (env vars / devices.json when fields are left as None).
 
     Usage::
 
-        # New style — single config object
         mgr = LoadManager(LoadManagerConfig(dry_run=True))
-
-        # Legacy style — individual kwargs (still supported)
-        mgr = LoadManager(dry_run=True, config_interval_secs=60)
 
     """
 
-    def __init__(  # noqa: C901
-        self,
-        config: LoadManagerConfig | None = None,
-        **kwargs: Any,  # type: ignore[assignment]
-    ) -> None:
+    def __init__(self, config: LoadManagerConfig | None = None) -> None:
 
-        """Initialize LoadManager with optional dependency injection.
+        """Initialize LoadManager with dependency injection.
 
-        Accepts a single `LoadManagerConfig` object containing all settings,
-        or individual keyword arguments for backward compatibility with existing
-        callers.
+        Accepts a single `LoadManagerConfig` object containing all settings.
+        Passing None uses all defaults (env vars / devices.json).
 
         Usage::
 
-            # New style — single config object (recommended)
             mgr = LoadManager(LoadManagerConfig(dry_run=True))
-
-            # Legacy style — individual kwargs (still supported)
-            mgr = LoadManager(dry_run=True, config_interval_secs=60)
 
         Args:
             config: Optional LoadManagerConfig dataclass containing all settings.
-                When provided, overrides individual kwargs entirely.
-
-        **Backward-compatible keyword arguments** (deprecated in favour of
-        ``LoadManagerConfig``):
-
-            metrics_fetch: Callable that returns fresh metrics data.
-            plug_ctrl: Plug controller instance. If None, selected via
-                LOAD_PLUG_CONTROLLER env var (real or stub).
-            tesla_ctrl: Tesla controller instance. If None, loaded from env.
-            engine: GapMinder instance. If None, creates default.
-            target_wh: Target Wh per QH. Defaults to smartmeter.target_wh in
-                devices.json.
-            nbc_device: Device name for NBC readings. Defaults to
-                smartmeter.device in devices.json.
-            enabled: Whether load management is active. Accepts True/False, or a
-                time range string like "06:45-15:00" (24-hr clock). When a time
-                range is given, load management is only active during that window
-                (inclusive start, exclusive end) in the device timezone. Defaults to
-                LOAD_MANAGE_ENABLED env var.
-            dry_run: If True, log actions without executing them. Defaults to
-                LOAD_MANAGE_DRY_RUN env var.
-            config_interval_secs: Target interval between cycles in seconds.
-                Used by adaptive sleep to clamp min/max sleep durations.
-                Defaults to 30 seconds.
+                When None, defaults are resolved from env vars / devices.json.
         """
 
-        # ── Resolve config from either a LoadManagerConfig object or legacy kwargs
-        if config is not None:
-            # Primary path — use the LoadManagerConfig object directly.
-            metrics_fetch = config.metrics_fetch  # type: ignore[assignment]
-            energy_cache = config.energy_cache
-            plug_ctrl = config.plug_ctrl  # type: ignore[assignment]
-            tesla_ctrl = config.tesla_ctrl  # type: ignore[assignment]
-            engine = config.engine  # type: ignore[assignment]
-            target_wh = config.target_wh
-            nbc_device = config.nbc_device  # type: ignore[assignment]
-            enabled = config.enabled  # type: ignore[assignment]
-            dry_run = config.dry_run
-            interval_secs = config.config_interval_secs  # type: ignore[assignment]
-            telegram_sender = config.telegram_sender
-            clock = config.clock  # type: ignore[assignment]
-            # Resolve injected Config — use the provided one, or fall back to singleton
-            config_obj: Config | None = config.config  # type: ignore[assignment]
-        else:
-            # Legacy path — accept individual kwargs for backward compatibility.
-            metrics_fetch = kwargs.get("metrics_fetch")  # type: ignore[assignment]
-            energy_cache = kwargs.get("energy_cache")  # type: ignore[assignment]
-            plug_ctrl = kwargs.get("plug_ctrl")  # type: ignore[assignment]
-            tesla_ctrl = kwargs.get("tesla_ctrl")  # type: ignore[assignment]
-            engine = kwargs.get("engine")  # type: ignore[assignment]
-            target_wh = kwargs.get("target_wh", None)  # type: ignore[assignment]
-            nbc_device = kwargs.get("nbc_device", None)  # type: ignore[assignment]
-            enabled = kwargs.get("enabled")  # type: ignore[assignment]
-            dry_run = kwargs.get("dry_run", None)  # type: ignore[assignment]
-            interval_secs = kwargs.get("config_interval_secs", 30)
-            telegram_sender = kwargs.get("telegram_sender")
-            clock = kwargs.get("clock")  # type: ignore[assignment]
-            config_obj = kwargs.get("_config")  # type: ignore[assignment]
+        # ── Resolve settings from the LoadManagerConfig object.
+        cfg = config if config is not None else LoadManagerConfig()
+        metrics_fetch = cfg.metrics_fetch
+        energy_cache = cfg.energy_cache
+        plug_ctrl = cfg.plug_ctrl
+        tesla_ctrl = cfg.tesla_ctrl
+        engine = cfg.engine
+        target_wh = cfg.target_wh
+        nbc_device = cfg.nbc_device
+        enabled = cfg.enabled
+        dry_run = cfg.dry_run
+        interval_secs = cfg.config_interval_secs
+        telegram_sender = cfg.telegram_sender
+        clock = cfg.clock
+        config_obj = cfg.config
 
         self._cfg = config_obj if config_obj is not None else _config
         self._clock: Clock = clock if clock is not None else RealClock()
@@ -277,13 +207,7 @@ class LoadManager:
             nbc_device = device_config.get_smartmeter_device()
         self.nbc_device = nbc_device
 
-        if isinstance(enabled, str):
-            try:
-                enabled = _parse_load_manage_enabled(enabled)
-            except ValueError as e:
-                logger.error("%s. Disabling load management.", e)
-                enabled = False
-        elif enabled is None:
+        if enabled is None:
             enabled = self._resolve_enabled(self._cfg)
         self.enabled: bool | tuple[time, time] = enabled
         logger.info("LoadManager %s", self.enabled)
@@ -414,12 +338,8 @@ class LoadManager:
 
         self.nbc_reader = NBCReader(
             energy_cache=energy_cache,
+            metrics_fetch=metrics_fetch,
         )
-
-        # Wire the metrics fetch callable into the NBCReader so that
-        # run_cycle(force=True) can trigger a fresh API fetch.
-        if metrics_fetch is not None:
-            self.nbc_reader._metrics_fetch = metrics_fetch  # noqa: SLF001
 
     @staticmethod
     def _resolve_enabled(cfg: Config | None = None) -> bool | tuple[time, time]:
@@ -2371,48 +2291,3 @@ def provision_fleet_telemetry(config: FleetTelemetryProvisionConfig) -> bool:
     except Exception as e:
         logger.error("provision_fleet_telemetry CLI failed: %s", e)
         return False
-
-
-# === Backward-compatible re-exports ===
-# All public symbols are imported at the top of this module so that existing
-# `from load_manager import X` statements in tests and app.py continue to work.
-
-__all__ = [
-    # Orchestrator
-    "LoadManager",
-    "TeslaAuthError",
-    # Config loading
-    "load_plugs_from_file",
-    "load_tesla_config",
-    "load_vocolinc_credentials",
-    "load_vocolinc_plugs_from_file",
-    # Re-exported from submodules (backward compat)
-    "AbstractPlugController",
-    "AbstractTeslaController",
-    "CompositePlugController",
-    "DeviceState",
-    "NBCReader",
-    "PAIRINGS_FILE",
-    "PendingEffect",
-    "PlugAction",
-    "PlugConfig",
-    "PlugController",
-    "RealPlugController",
-    "RealTeslaController",
-    "TESLA_TOKENS_FILE",
-    "GapMinder",
-    "TeslaConfig",
-    "TeslaController",
-    "TeslaState",
-    "FleetTelemetryProvisionConfig",
-    "TeslaVehicleTelemetry",
-    "VocolincPlugController",
-    "_parse_load_manage_enabled",
-    "_tesla_state_to_dict",
-    "load_tesla_tokens",
-    "pair_homekit_accessory",
-    "provision_fleet_telemetry",
-    "remove_tesla_tokens",
-    "save_tesla_tokens",
-    "tesla_auth_cli",
-]

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import json
 import locale
 import logging
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, ClassVar, Optional
 
 import requests
 from pyemvue import PyEmVue
@@ -79,30 +79,6 @@ def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
 
     if now - chart_start <= MAX_FETCH_WINDOW:
         return chart_start
-
-    return ceil_to_qh(now - MAX_FETCH_WINDOW)
-
-
-def cap_fetch_window(start_time: datetime, now: datetime) -> datetime:
-    """Cap a fetch start_time to prevent over-fetching after stale cache.
-
-    If *start_time* is more than 1 hour before *now*, return the earliest
-    appropriate quarter-hour boundary.  Otherwise return start_time unchanged.
-
-    Used by the incremental fetch builder to guard against stale
-    EnergyCache state that would otherwise request hours of 1-second
-    data.
-
-    Args:
-        start_time: The proposed fetch window start time.
-        now: The current time.
-
-    Returns:
-        A datetime no more than 1 hour before *now*, or *start_time*
-        unchanged if it is already within the 1-hour window.
-    """
-    if now - start_time <= MAX_FETCH_WINDOW:
-        return start_time
 
     return ceil_to_qh(now - MAX_FETCH_WINDOW)
 
@@ -313,82 +289,6 @@ class TOUResult:
             "buckets": self.buckets.to_dict(),
             "nbc": self.nbc,
         }
-
-
-def _build_incremental_fetch(
-    energy_cache: "EnergyCache",
-    vue: PyEmVue,
-    device_gid: int,
-    now: datetime,
-) -> Callable[[], dict[str, Any] | None]:
-    """Build a callable for QH-window partial-range API fetches.
-
-    Returns a zero-argument function that can be passed to
-    ``energy_cache.get_or_fetch()``. The callable fetches from the current
-    QH boundary on every cycle so the cache can use replace semantics
-    without needing overlap/merge logic (see ``_chart_start_for``).
-
-    On the first call (no existing samples), a full-range fetch is performed
-    covering the current hour up to ``now``.
-
-    Args:
-        energy_cache: The EnergyCache instance storing per-second samples.
-        vue: A PyEmVue client instance for API calls.
-        device_gid: The group ID (device identifier) to fetch data for.
-        now: Current time. Required.
-
-    Returns:
-        A callable that returns a dict with ``per_second_data`` and
-        ``data_start``, or None on API error.
-    """
-
-    def fetcher() -> dict[str, Any] | None:
-        start_time = _chart_start_for(energy_cache, now)
-
-        # Guard against stale cache: if the incremental window would be >1h,
-        # fall back to a full-hour fetch to avoid API rejection.
-        capped = cap_fetch_window(start_time, now)
-        if capped != start_time:
-            logger.debug(
-                "[_build_incremental_fetch] incremental window %s-%s >1h, "
-                "falling back to full-hour fetch",
-                start_time,
-                now,
-            )
-            start_time = capped
-
-        # pyemvue throws error if start_time is earlier than end_time (now)
-        assert start_time <= now, f"start_time {start_time} is after now {now}"
-
-        try:
-            usage_data, data_start = vue.get_chart_usage(
-                device_gid,
-                start_time,
-                now,
-                scale=Scale.SECOND.value,
-                unit=Unit.KWH.value,
-            )
-            if not usage_data:
-                return None
-            if data_start is None or data_start != start_time:
-                # Mirror of _fetch_channel_data: reject a drifted data_start
-                # (API firstUsageInstant != requested start) so a misaligned
-                # window is never stored in the cache.
-                logger.warning(
-                    "[_build_incremental_fetch] data_start %s != requested "
-                    "start %s; treating as transient",
-                    data_start,
-                    start_time,
-                )
-                raise RetryableMetricsException(
-                    f"data_start {data_start} != start_time {start_time}"
-                )
-            return {"per_second_data": list(usage_data), "data_start": data_start}
-        except (requests.exceptions.RequestException, IOError):
-            logger.exception("error fetching incremental data for device %d", device_gid)
-            return None
-
-    return fetcher
 
 
 class VueAuthenticationError(Exception):

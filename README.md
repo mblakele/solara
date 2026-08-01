@@ -122,7 +122,7 @@ gunicorn --reload \
     --reload-extra-file .env \
     --reload-extra-file templates \
     --worker-class=gthread --threads=4 --timeout=0 \
-    app:app
+    wsgi:app
 ```
 
 The output should look something like this:

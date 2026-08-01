@@ -199,19 +199,19 @@ class TestLoadManagerClockInjection:
         lm = LoadManager(config)
         assert lm._clock is clock
 
-    def test_constructor_accepts_clock_via_kwargs(self):
-        """LoadManager must accept a Clock via legacy kwargs."""
-        from load_manager import LoadManager
+    def test_constructor_accepts_clock_via_config(self):
+        """LoadManager must accept a Clock via LoadManagerConfig."""
+        from load_manager import LoadManager, LoadManagerConfig
 
         clock = FakeClock(self.FIXED)
-        lm = LoadManager(clock=clock, enabled=False)
+        lm = LoadManager(LoadManagerConfig(clock=clock, enabled=False))
         assert lm._clock is clock
 
     def test_defaults_to_realclock(self):
         """LoadManager must use RealClock when no clock is provided."""
-        from load_manager import LoadManager
+        from load_manager import LoadManager, LoadManagerConfig
 
-        lm = LoadManager(enabled=False)
+        lm = LoadManager(LoadManagerConfig(enabled=False))
         assert isinstance(lm._clock, RealClock)
 
     def test_clock_propagates_to_run_cycle(self):

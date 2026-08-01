@@ -26,8 +26,8 @@ class TestTOUReporterAggregate(unittest.TestCase):
         """Verify aggregate_tou doesn't reference self.EnergyDataAggregator.
 
         When EnergyDataAggregator was moved from class body to module-level,
-        the call site changed from self.EnergyDataAggregator.aggregate_from_minutes()
-        to EnergyDataAggregator.aggregate_from_minutes(). This test ensures
+        the call site changed from self.EnergyDataAggregator.aggregate_from_15min()
+        to EnergyDataAggregator.aggregate_from_15min(). This test ensures
         the TOUReporter instance can successfully run aggregate_tou without
         raising AttributeError.
         """
@@ -537,48 +537,6 @@ class TestFloorToQh(unittest.TestCase):
             floor_to_qh(dt),
             datetime(2026, 5, 19, 14, 0, 0, tzinfo=timezone.utc),
         )
-
-
-class TestCapFetchWindow(unittest.TestCase):
-    """Tests for the cap_fetch_window guard function."""
-
-    def test_caps_old_start(self):
-        """When start_time >1h before now, return current QH boundary."""
-        from metrics import cap_fetch_window
-
-        now = datetime(2026, 5, 19, 13, 7, 43, tzinfo=timezone.utc)
-        old_start = now - timedelta(hours=9)
-        expected_start = ceil_to_qh(now - timedelta(hours=1))
-        result = cap_fetch_window(old_start, now)
-        self.assertEqual(result, expected_start)
-
-    def test_caps_old_start_at_exact_boundary(self):
-        """When start_time is exactly 1h before now, it should NOT cap."""
-        from metrics import cap_fetch_window
-
-        now = datetime(2026, 5, 19, 13, 0, 0, tzinfo=timezone.utc)
-        old_start = now - timedelta(hours=1)
-        result = cap_fetch_window(old_start, now)
-        self.assertEqual(result, old_start)
-
-    def test_preserves_nearby_start(self):
-        """When start_time is within 1h of now, return it unchanged."""
-        from metrics import cap_fetch_window
-
-        now = datetime(2026, 5, 19, 13, 0, 0, tzinfo=timezone.utc)
-        nearby = now - timedelta(minutes=30)
-        result = cap_fetch_window(nearby, now)
-        self.assertEqual(result, nearby)
-
-    def test_caps_across_qh_boundary(self):
-        """Guard works when the 1h window crosses a QH boundary."""
-        from metrics import cap_fetch_window
-
-        now = datetime(2026, 5, 19, 13, 30, 0, tzinfo=timezone.utc)
-        old_start = now - timedelta(hours=2)
-        expected_start = ceil_to_qh(now - timedelta(hours=1))
-        result = cap_fetch_window(old_start, now)
-        self.assertEqual(result, expected_start)
 
 
 class TestHourlyProjectionEdgeCases(unittest.TestCase):
@@ -1176,181 +1134,6 @@ class TestHourlyProjectionNoPredictions(unittest.TestCase):
         self.assertNotIn("_data_lag_secs", hp.metrics)
 
 
-class TestBuildIncrementalFetch(unittest.TestCase):
-    """Tests for _build_incremental_fetch helper function."""
-
-    def test_returns_callable(self):
-        """_build_incremental_fetch returns a callable (zero-arg function)."""
-        from metrics import EnergyCache, _build_incremental_fetch
-
-        cache = EnergyCache(ttl_seconds=60)
-        fetcher = _build_incremental_fetch(cache, MagicMock(), 1, datetime.now(timezone.utc))
-        self.assertTrue(callable(fetcher))
-
-    def test_first_fetch_no_existing_samples(self):
-        """When cache has no samples, fetcher calls API with full range."""
-        from metrics import EnergyCache, _build_incremental_fetch
-
-        cache = EnergyCache(ttl_seconds=60)
-        vue_mock = MagicMock()
-        gid = 1
-        fixed_now = datetime(2025, 6, 1, 12, 30, 10, tzinfo=timezone.utc)
-        chart_start = ceil_to_qh(fixed_now - timedelta(hours=1))
-
-        vue_mock.get_chart_usage.return_value = (
-            [0.1] * 2710,
-            chart_start,
-        )
-        self.assertEqual(chart_start, datetime(2025, 6, 1, 11, 45, 0, tzinfo=timezone.utc))
-
-        fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
-        result = fetcher()
-
-        # Should have called get_chart_usage with full range (chart_start to fixed_now)
-        vue_mock.get_chart_usage.assert_called_once()
-        call_args = vue_mock.get_chart_usage.call_args
-        # chart_start should now align to previous QH boundary 12:30
-        chart_start = call_args[0][1]
-        self.assertEqual(chart_start, fixed_now.replace(hour=11, minute=45, second=0))
-        self.assertEqual(call_args[0][2], fixed_now)
-
-    def test_incremental_fetch_starts_from_current_qh_boundary(self):
-        """When cache has samples, fetcher starts from floor_to_qh(now).
-
-        The API-returned data_start may be non-QH-aligned (e.g. minute
-        aligned); trusting it would shrink the window to the tail of the
-        QH.  The fetch must start from the current QH boundary so the
-        cache accumulates a full quarter-hour.
-        """
-        from metrics import EnergyCache, _build_incremental_fetch
-        from util import floor_to_qh
-
-        cache = EnergyCache(ttl_seconds=60)
-        vue_mock = MagicMock()
-        gid = 1
-
-        # Pre-populate cache with samples
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-        old_start = now - timedelta(minutes=5)  # 300 seconds ago, non-aligned
-
-        cache.samples = [0.1] * 300
-        cache.data_start = old_start
-
-        # Mock API to return new samples starting from where cache left off
-        vue_mock.get_chart_usage.return_value = (
-            [0.2] * 60,  # 60 new samples
-            old_start + timedelta(seconds=300),
-        )
-
-        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
-        result = fetcher()
-
-        # Should call get_chart_usage starting from the current QH boundary,
-        # NOT the non-aligned data_start.
-        vue_mock.get_chart_usage.assert_called_once()
-        call_args = vue_mock.get_chart_usage.call_args
-        self.assertEqual(call_args[0][1], floor_to_qh(now))
-
-    def test_api_error_returns_none(self):
-        """When API raises an error, fetcher returns None and cache is unchanged."""
-        from metrics import EnergyCache, _build_incremental_fetch
-
-        cache = EnergyCache(ttl_seconds=60)
-        vue_mock = MagicMock()
-        gid = 1
-
-        now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-        old_start = now - timedelta(minutes=5)
-
-        # Pre-populate cache with samples
-        cache.samples = [0.1] * 300
-        cache.data_start = old_start
-
-        # Mock API to raise an error
-        vue_mock.get_chart_usage.side_effect = requests.exceptions.HTTPError("API error")
-
-        fetcher = _build_incremental_fetch(cache, vue_mock, gid, now)
-        result = fetcher()
-
-        self.assertIsNone(result)
-        # Cache should be unchanged
-        self.assertEqual(len(cache.samples), 300)
-
-    def test_prunes_old_samples(self):
-        """Samples older than 3600s from now are pruned via get_or_fetch."""
-        from metrics import EnergyCache, _build_incremental_fetch
-
-        cache = EnergyCache(ttl_seconds=60)
-        vue_mock = MagicMock()
-        gid = 1
-
-        fixed_now = datetime(2025, 6, 1, 12, 30, 0, tzinfo=timezone.utc)
-        # Old samples from 2 hours ago (7200 seconds)
-        old_start = fixed_now - timedelta(hours=2)
-
-        # Pre-populate cache with 7200 samples (2 hours of per-second data)
-        cache.samples = [0.1] * 7200
-        cache.data_start = old_start
-
-        # Mock API to return new samples (only the last 10 minutes worth),
-        # starting at the capped request start (11:30:00).
-        vue_mock.get_chart_usage.return_value = (
-            [0.2] * 600,  # 600 new samples (10 minutes)
-            ceil_to_qh(fixed_now - timedelta(hours=1)),
-        )
-
-        fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
-        cache.get_or_fetch(fetcher, fixed_now, force=True)
-
-        # Replace semantics discard the stale 2-hour window: the cache now
-        # holds only the fresh 600 samples.
-        self.assertLessEqual(len(cache.samples), 7800)
-        # Should have pruned old samples
-        self.assertLess(len(cache.samples), 7200)
-
-    def test_stale_cache_fetches_current_qh(self):
-        """Stale data_start does not trigger a full-hour fallback.
-
-        The fetch start no longer derives from data_start, so a stale
-        cache cannot produce an oversized incremental window.  The fetch
-        simply starts from the current QH boundary and replace semantics
-        discard the stale samples.
-        """
-        from metrics import EnergyCache, _build_incremental_fetch
-        from util import floor_to_qh
-
-        cache = EnergyCache(ttl_seconds=60)
-        vue_mock = MagicMock()
-        gid = 1
-
-        # Use a non-QH-boundary time so the test exercises floor_to_qh.
-        fixed_now = datetime(2026, 5, 19, 13, 7, 43, tzinfo=timezone.utc)
-        old_start = fixed_now - timedelta(hours=9)
-
-        # cache holds samples from 9h ago — stale, but no longer relevant
-        # to the fetch start.
-        cache.samples = [0.1] * 3456
-        cache.data_start = old_start
-
-        # The API returns data starting at the requested start (the current
-        # QH boundary, 13:00:00) — not at the stale 9h-old cache start.
-        fetch_start = floor_to_qh(fixed_now)
-        vue_mock.get_chart_usage.return_value = (
-            [0.2] * 3123,
-            fetch_start,
-        )
-
-        fetcher = _build_incremental_fetch(cache, vue_mock, gid, fixed_now)
-        result = fetcher()
-
-        vue_mock.get_chart_usage.assert_called_once()
-        call_args = vue_mock.get_chart_usage.call_args
-        # Fetch starts from the current QH boundary, not the stale data_start.
-        self.assertEqual(call_args[0][1], floor_to_qh(fixed_now))
-        self.assertEqual(call_args[0][2], fixed_now)
-        self.assertIn("per_second_data", result)
-
-
 class TestEnergyCacheSampleMetadata(unittest.TestCase):
     """Tests for EnergyCache sample metadata tracking."""
 
@@ -1386,51 +1169,16 @@ class TestEnergyCacheSampleMetadata(unittest.TestCase):
         self.assertIsNotNone(cache.last_sample_at)
 
 
-class TestIncrementalFetchIntegration(unittest.TestCase):
-    """Integration tests for incremental fetch with get_or_fetch."""
-
-    def test_full_then_replace(self):
-        """Full fetch followed by same-start fetch replaces correctly."""
-        from metrics import EnergyCache, _build_incremental_fetch
-
-        cache = EnergyCache(ttl_seconds=60)
-        vue_mock = MagicMock()
-        gid = 1
-
-        fixed_now = datetime(2025, 6, 1, 12, 5, 13, tzinfo=timezone.utc)
-        start = fixed_now - timedelta(seconds=500)
-
-        def fetch_func_1():
-            return {
-                "per_second_data": [0.1] * 500,
-                "data_start": start,
-            }
-
-        def fetch_func_2():
-            # Second fetch: same data_start → replace
-            return {
-                "per_second_data": [0.2] * 520,
-                "data_start": start,
-            }
-
-        cache.get_or_fetch(fetch_func_1, fixed_now)
-        self.assertEqual(len(cache.samples), 500)
-
-        cache.get_or_fetch(fetch_func_2, fixed_now, force=True)
-        # Replace semantics: 520 new, not 500+520
-        self.assertEqual(len(cache.samples), 520)
-
 
 if __name__ == "__main__":
     unittest.main()
 
 
-"""End-to-end and unit tests for EnergyCache merge, incremental fetch,
-pruning, and HourlyProjection population/prediction logic.
+"""End-to-end and unit tests for EnergyCache replace semantics, pruning,
+and HourlyProjection population/prediction logic.
 
 These tests verify:
-- Merge logic in EnergyCache.get_or_fetch() handles all overlap scenarios
-- Incremental fetch computes correct API start times
+- Replace semantics in EnergyCache.get_or_fetch() handle overlap scenarios
 - Pruning removes old samples without gaps or duplicates
 - HourlyProjection.fetch_channel_data() and _populate_device() work correctly
 - Prediction math uses per-second data correctly
@@ -2271,7 +2019,7 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
         from metrics import HourlyProjection, EnergyCache, create_metrics
 
         with mock_config():
-            cache = app_mod._energy_cache
+            cache = app_mod._state.energy_cache
             self.assertIsInstance(cache, EnergyCache)
 
             # Replace HourlyProjection with a MagicMock so we can inspect

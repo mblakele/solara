@@ -6,23 +6,27 @@ from unittest.mock import patch
 
 import pytz
 import pytest
-from decouple import UndefinedValueError, config
+from config import Config, UndefinedValueError
+config = Config()
 
 from clock import FakeClock
 
-from load_manager import (
-    AbstractPlugController,
-    DeviceState,
-    LoadManager,
-    PlugConfig,
-    PlugController,
-    TeslaConfig,
-    TeslaState,
+from config_loader import (
     _parse_load_manage_enabled,
     load_plugs_from_file,
     load_tesla_config,
 )
-from load_models import CycleResult, TeslaAuthError
+from load_controllers import PlugController
+from load_manager import LoadManager, LoadManagerConfig
+from load_models import (
+    AbstractPlugController,
+    CycleResult,
+    DeviceState,
+    PlugConfig,
+    TeslaAuthError,
+    TeslaConfig,
+    TeslaState,
+)
 from load_nbc import NBCFetchResult
 import device_config
 from energy_cache import EnergyCache
@@ -114,7 +118,7 @@ def test_load_tesla_config_missing_vehicle_id():
     config.set("TESLA_CLIENT_ID", "client-id")
     config.set("TESLA_CLIENT_SECRET", "client-secret")
 
-    def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+    def mock_lookup(key, default=None, cast=str):  # type: ignore[no-untyped-def]
         if key == "TESLA_VEHICLE_ID":
             return ""
         if key == "TESLA_HOME_LAT":
@@ -125,7 +129,7 @@ def test_load_tesla_config_missing_vehicle_id():
             return default
         raise UndefinedValueError(key)
 
-    with patch("config._decouple_config", side_effect=mock_decouple):
+    with patch("config._lookup", side_effect=mock_lookup):
         config_result = load_tesla_config()
 
     assert config_result is None
@@ -138,14 +142,14 @@ def test_load_tesla_config_missing_home_lat():
     config.set("TESLA_VEHICLE_ID", "7SAYGDED7TF555555")
     config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
 
-    def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+    def mock_lookup(key, default=None, cast=str):  # type: ignore[no-untyped-def]
         if key == "TESLA_HOME_LAT":
             return ""
         if default is not None:
             return default
         raise UndefinedValueError(key)
 
-    with patch("config._decouple_config", side_effect=mock_decouple):
+    with patch("config._lookup", side_effect=mock_lookup):
         config_result = load_tesla_config()
 
     assert config_result is None
@@ -154,14 +158,14 @@ def test_load_tesla_config_missing_home_lat():
 def test_load_tesla_config_missing_vars():
     """Returns None when required vars missing."""
 
-    def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+    def mock_lookup(key, default=None, cast=str):  # type: ignore[no-untyped-def]
         if key == "TESLA_CLIENT_ID":
             return ""  # empty client_id means missing
         if default is not None:
             return default
         raise UndefinedValueError(key)
 
-    with patch("config._decouple_config", side_effect=mock_decouple):
+    with patch("config._lookup", side_effect=mock_lookup):
         config_result = load_tesla_config()
 
     assert config_result is None
@@ -318,7 +322,7 @@ def _make_manager_with_enabled(
     metrics_data = _make_metrics_with_wh("main_panel", predicted_wh)
 
     energy_cache = EnergyCache()
-    return LoadManager(
+    return LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: metrics_data,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -328,7 +332,7 @@ def _make_manager_with_enabled(
         enabled=enabled,
         dry_run=False,
         clock=clock,
-    )
+    ))
 
 
 def test_is_enabled_at_bool_true():
@@ -345,7 +349,7 @@ def test_is_enabled_at_bool_false():
     assert mgr.is_enabled_at(now) is False
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_is_enabled_at_in_range(mock_config):
     """is_enabled_at returns True when current time is in range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -355,7 +359,7 @@ def test_is_enabled_at_in_range(mock_config):
     assert mgr.is_enabled_at(now) is True
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_is_enabled_at_before_range(mock_config):
     """is_enabled_at returns False when current time is before range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -365,7 +369,7 @@ def test_is_enabled_at_before_range(mock_config):
     assert mgr.is_enabled_at(now) is False
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_is_enabled_at_after_range(mock_config):
     """is_enabled_at returns False when current time is after range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -375,7 +379,7 @@ def test_is_enabled_at_after_range(mock_config):
     assert mgr.is_enabled_at(now) is False
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_is_enabled_at_inclusive_start(mock_config):
     """is_enabled_at returns True exactly at start time."""
     mock_config.return_value = "America/Los_Angeles"
@@ -385,7 +389,7 @@ def test_is_enabled_at_inclusive_start(mock_config):
     assert mgr.is_enabled_at(now) is True
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_is_enabled_at_exclusive_end(mock_config):
     """is_enabled_at returns False exactly at end time."""
     mock_config.return_value = "America/Los_Angeles"
@@ -395,7 +399,7 @@ def test_is_enabled_at_exclusive_end(mock_config):
     assert mgr.is_enabled_at(now) is False
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_run_cycle_disabled_outside_range(mock_config):
     """run_cycle returns disabled when outside time range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -411,7 +415,7 @@ def test_run_cycle_disabled_outside_range(mock_config):
     assert "outside_time_range" in result.diagnostics.reason
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_run_cycle_enabled_in_range(mock_config):
     """run_cycle proceeds when inside time range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -442,7 +446,7 @@ def test_sync_reconciles_external_turn_off():
     plug_ctrl = PlugController(plugs)
     plug_ctrl._state["heater"] = False
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -450,7 +454,7 @@ def test_sync_reconciles_external_turn_off():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
     mgr.state.devices["heater"] = DeviceState(
         name="heater", desired_state=True, actual_state=True
     )
@@ -475,7 +479,7 @@ def test_sync_populates_new_device():
     plug_ctrl = PlugController(plugs)
     plug_ctrl._state["pump"] = True
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -483,7 +487,7 @@ def test_sync_populates_new_device():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
     assert "pump" not in mgr.state.devices
 
     asyncio.run(mgr._sync_plug_states())
@@ -520,7 +524,7 @@ def test_sync_handles_controller_error():
     }
     plug_ctrl = FailingController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -528,7 +532,7 @@ def test_sync_handles_controller_error():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
 
     asyncio.run(mgr._sync_plug_states())
 
@@ -546,7 +550,7 @@ def test_sync_no_reconciliation_when_states_match():
     plug_ctrl = PlugController(plugs)
     plug_ctrl._state["heater"] = True
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -554,7 +558,7 @@ def test_sync_no_reconciliation_when_states_match():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
     mgr.state.devices["heater"] = DeviceState(
         name="heater", desired_state=True, actual_state=True
     )
@@ -569,7 +573,7 @@ def test_sync_no_reconciliation_when_states_match():
 # --- Time range midnight wrapping tests ---
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_time_range_wraps_midnight(mock_config):
     """A time range like 22:00-06:00 that wraps midnight always returns False
     with the current simple comparison logic (start <= now < end), since no
@@ -592,7 +596,7 @@ def test_time_range_wraps_midnight(mock_config):
 
 def test_tesla_tokens_save_and_load(tmp_path):
     """Tokens saved to a file can be loaded back with matching values."""
-    from load_manager import save_tesla_tokens, load_tesla_tokens
+    from load_controllers import load_tesla_tokens, save_tesla_tokens
 
     tokens_path = tmp_path / "tokens.json"
     save_tesla_tokens(
@@ -612,7 +616,7 @@ def test_tesla_tokens_save_and_load(tmp_path):
 
 def test_remove_tesla_tokens_deletes_file(tmp_path):
     """Removing tokens deletes the file cleanly."""
-    from load_manager import save_tesla_tokens, remove_tesla_tokens, load_tesla_tokens
+    from load_controllers import load_tesla_tokens, remove_tesla_tokens, save_tesla_tokens
 
     tokens_path = tmp_path / "tokens.json"
     save_tesla_tokens(
@@ -687,7 +691,7 @@ def test_load_plug_invalid_time_range():
 
 def test_load_vocolinc_plug_time_range_parsed():
     """VOCOlinc plug with time_range string parses correctly."""
-    from load_manager import load_vocolinc_plugs_from_file
+    from config_loader import load_vocolinc_plugs_from_file
 
     with patch("device_config._load", return_value={
         "plugs": {
@@ -737,7 +741,7 @@ def test_is_device_in_time_range_no_restriction():
     assert mgr._is_device_in_time_range(datetime.now(timezone.utc), None) is True
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_is_device_in_time_range_inside(mock_config):
     """Current time within range returns True."""
     mock_config.return_value = "America/Los_Angeles"
@@ -759,7 +763,7 @@ def test_is_device_in_time_range_inside(mock_config):
     assert result is True
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_is_device_in_time_range_outside(mock_config):
     """Current time outside range returns False."""
     mock_config.return_value = "America/Los_Angeles"
@@ -781,7 +785,7 @@ def test_is_device_in_time_range_outside(mock_config):
     assert result is False
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_candidate_details_shows_outside_range_reason(mock_config):
     """Diagnostics include reason for outside-range device."""
     mock_config.return_value = "America/Los_Angeles"
@@ -797,7 +801,7 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
     }
     plug_ctrl = PlugController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -805,7 +809,7 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
 
     # 03:00 PT is outside the heater's time range
     tz = pytz.timezone("America/Los_Angeles")
@@ -827,7 +831,7 @@ def test_candidate_details_shows_outside_range_reason(mock_config):
     assert heater_detail.reason == "outside_time_range"
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_candidate_details_no_reason_when_in_range(mock_config):
     """Diagnostics omit reason when device is inside time range."""
     mock_config.return_value = "America/Los_Angeles"
@@ -843,7 +847,7 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
     }
     plug_ctrl = PlugController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -851,7 +855,7 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
 
     # 12:00 PT is inside the heater's time range
     tz = pytz.timezone("America/Los_Angeles")
@@ -873,7 +877,7 @@ def test_candidate_details_no_reason_when_in_range(mock_config):
     assert heater_detail.reason is None
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_cycle_filters_outside_range_plug(mock_config):
     """Plug outside time range is excluded from engine.decide() call."""
     mock_config.return_value = "America/Los_Angeles"
@@ -889,7 +893,7 @@ def test_cycle_filters_outside_range_plug(mock_config):
     }
     plug_ctrl = PlugController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -897,7 +901,7 @@ def test_cycle_filters_outside_range_plug(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
 
     # 03:00 PT is outside the heater's time range
     tz = pytz.timezone("America/Los_Angeles")
@@ -925,7 +929,7 @@ def test_cycle_filters_outside_range_plug(mock_config):
     assert ctx.plugs == {}
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_cycle_includes_plug_inside_range(mock_config):
     """Plug inside time range is included in engine.decide() call."""
     mock_config.return_value = "America/Los_Angeles"
@@ -941,7 +945,7 @@ def test_cycle_includes_plug_inside_range(mock_config):
     }
     plug_ctrl = PlugController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -949,7 +953,7 @@ def test_cycle_includes_plug_inside_range(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
 
     # 12:00 PT is inside the heater's time range
     tz = pytz.timezone("America/Los_Angeles")
@@ -975,7 +979,7 @@ def test_cycle_includes_plug_inside_range(mock_config):
     assert "heater" in ctx.plugs
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_cycle_filters_outside_range_tesla(mock_config):
     """Tesla outside time range is excluded from engine.decide() call."""
     mock_config.return_value = "America/Los_Angeles"
@@ -994,7 +998,7 @@ def test_cycle_filters_outside_range_tesla(mock_config):
         time_range=(time(8, 0), time(20, 0)),
     )
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1002,7 +1006,7 @@ def test_cycle_filters_outside_range_tesla(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
     mgr.tesla_config = tesla_cfg
 
     # 03:00 PT is outside Tesla's time range
@@ -1042,7 +1046,7 @@ def test_cycle_filters_outside_range_tesla(mock_config):
     assert ctx.tesla is None
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_no_action_reason_skips_outside_range_plug(mock_config):
     """_determine_no_action_reason skips outside-range plugs when checking eligibility."""
     mock_config.return_value = "America/Los_Angeles"
@@ -1058,7 +1062,7 @@ def test_no_action_reason_skips_outside_range_plug(mock_config):
     }
     plug_ctrl = PlugController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1066,7 +1070,7 @@ def test_no_action_reason_skips_outside_range_plug(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
 
     # 03:00 PT is outside the heater's time range
     tz = pytz.timezone("America/Los_Angeles")
@@ -1105,7 +1109,7 @@ def test_authenticate_calls_access_token_not_check_access_token(tmp_path):
     lc.TESLA_TOKENS_FILE = tokens_path
 
     try:
-        from load_manager import save_tesla_tokens
+        from load_controllers import save_tesla_tokens
 
         future_expires = 9999999999
         save_tesla_tokens(
@@ -1160,7 +1164,7 @@ def test_authenticate_saves_refreshed_tokens(tmp_path):
     lc.TESLA_TOKENS_FILE = tokens_path
 
     try:
-        from load_manager import save_tesla_tokens, load_tesla_tokens
+        from load_controllers import load_tesla_tokens, save_tesla_tokens
 
         # Write an old token
         save_tesla_tokens(
@@ -1260,7 +1264,7 @@ def test_load_plug_sentinel_without_power_watts():
     assert plugs["floorlamp"].power_watts is None
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_load_plug_no_sentinel_defaults_false(mock_config):
     """Verify sentinel defaults to False when not specified."""
     with patch("device_config._load", return_value={
@@ -1280,7 +1284,7 @@ def test_load_plug_no_sentinel_defaults_false(mock_config):
     assert plugs["water_heater"].sentinel is False
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_sentinel_not_in_eligible_plugs(mock_config):
     """In a cycle, a sentinel plug is excluded from eligible_plugs even when
     inside its time range."""
@@ -1304,7 +1308,7 @@ def test_sentinel_not_in_eligible_plugs(mock_config):
     }
     plug_ctrl = PlugController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1312,7 +1316,7 @@ def test_sentinel_not_in_eligible_plugs(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
 
     # 12:00 PT is inside both plugs' time ranges
     tz = pytz.timezone("America/Los_Angeles")
@@ -1339,7 +1343,7 @@ def test_sentinel_not_in_eligible_plugs(mock_config):
     assert "home_presence" not in ctx.plugs
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_cycle_no_actions_when_sentinel_on(mock_config):
     """When a sentinel's actual state is True, _cycle_async_phase returns
     empty actions (skips decide)."""
@@ -1357,7 +1361,7 @@ def test_cycle_no_actions_when_sentinel_on(mock_config):
     # Set the sentinel to on
     plug_ctrl._state["home_presence"] = True
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1365,7 +1369,7 @@ def test_cycle_no_actions_when_sentinel_on(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
 
     tz = pytz.timezone("America/Los_Angeles")
     fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
@@ -1396,7 +1400,7 @@ def test_cycle_no_actions_when_sentinel_on(mock_config):
     assert sentinel_on is True
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_cycle_actions_when_sentinel_off(mock_config):
     """When a sentinel's actual state is False, the cycle proceeds normally
     (decide is called)."""
@@ -1414,7 +1418,7 @@ def test_cycle_actions_when_sentinel_off(mock_config):
     # Set the sentinel to off
     plug_ctrl._state["home_presence"] = False
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1422,7 +1426,7 @@ def test_cycle_actions_when_sentinel_off(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
 
     tz = pytz.timezone("America/Los_Angeles")
     fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
@@ -1446,7 +1450,7 @@ def test_cycle_actions_when_sentinel_off(mock_config):
         mock_decide.assert_called_once()
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_sentinel_state_still_tracked(mock_config):
     """The sentinel's DeviceState entry is created during sync even though
     no actions are taken on it."""
@@ -1463,7 +1467,7 @@ def test_sentinel_state_still_tracked(mock_config):
     plug_ctrl = PlugController(plugs)
     plug_ctrl._state["home_presence"] = True
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1471,7 +1475,7 @@ def test_sentinel_state_still_tracked(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
 
     assert "home_presence" not in mgr.state.devices
 
@@ -1504,7 +1508,7 @@ def test_sentinel_state_still_tracked(mock_config):
     assert sentinel_on is True
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_no_action_reason_skips_sentinel_plugs(mock_config):
     """_determine_no_action_reason skips sentinel plugs when checking eligibility."""
     mock_config.return_value = "America/Los_Angeles"
@@ -1519,7 +1523,7 @@ def test_no_action_reason_skips_sentinel_plugs(mock_config):
     }
     plug_ctrl = PlugController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1527,7 +1531,7 @@ def test_no_action_reason_skips_sentinel_plugs(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
 
     tz = pytz.timezone("America/Los_Angeles")
     fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
@@ -1550,7 +1554,7 @@ def test_no_action_reason_skips_sentinel_plugs(mock_config):
     assert reason == "no_eligible"
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_diagnostics_include_sentinel_info(mock_config):
     """Diagnostics dict includes sentinel_names and sentinel_on fields."""
     mock_config.return_value = "America/Los_Angeles"
@@ -1565,7 +1569,7 @@ def test_diagnostics_include_sentinel_info(mock_config):
     }
     plug_ctrl = PlugController(plugs)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1573,7 +1577,7 @@ def test_diagnostics_include_sentinel_info(mock_config):
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
 
     tz = pytz.timezone("America/Los_Angeles")
     fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
@@ -1595,7 +1599,7 @@ def test_diagnostics_include_sentinel_info(mock_config):
 # --- Sentinel disabled status tests ---
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_run_cycle_disabled_when_sentinel_on(mock_config):
     """When a sentinel's actual state is True, run_cycle returns status: 'disabled'."""
     mock_config.return_value = "America/Los_Angeles"
@@ -1616,7 +1620,7 @@ def test_run_cycle_disabled_when_sentinel_on(mock_config):
     fake_now = tz.localize(datetime(2025, 6, 15, 12, 5, 0)).astimezone(timezone.utc)
     data_point_at = fake_now - timedelta(seconds=30)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1625,7 +1629,7 @@ def test_run_cycle_disabled_when_sentinel_on(mock_config):
         enabled=True,
         dry_run=True,
         clock=FakeClock(fake_now),
-    )
+    ))
 
     with patch.object(mgr.nbc_reader, "get_current_qh") as mock_qh:
         mock_qh.return_value = NBCFetchResult(
@@ -1648,7 +1652,7 @@ def test_run_cycle_disabled_when_sentinel_on(mock_config):
 # =============================================================================
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_fetch_tesla_state_async_passes_timeout_zero(mock_config):
     """When telemetry is unavailable, init_tesla_state is called with
     timeout=0 because the fast path already checked telemetry moments ago."""
@@ -1668,12 +1672,12 @@ def test_fetch_tesla_state_async_passes_timeout_zero(mock_config):
         is_charging=True, current_amps=12, plugged_in=True, at_home=True,
     )
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         tesla_ctrl=ctrl,
         plug_ctrl=PlugController({}),
         dry_run=True,
         enabled=False,
-    )
+    ))
 
     with patch("load_manager.has_telemetry", return_value=False):
         with patch.object(
@@ -1694,7 +1698,7 @@ def test_fetch_tesla_state_async_passes_timeout_zero(mock_config):
     assert result_url is None
 
 
-@patch("config._decouple_config")
+@patch("config._lookup")
 def test_fetch_tesla_state_async_falls_through_on_incomplete_telemetry(
     mock_config,
 ):
@@ -1717,12 +1721,12 @@ def test_fetch_tesla_state_async_falls_through_on_incomplete_telemetry(
         is_charging=True, current_amps=12, plugged_in=True, at_home=True,
     )
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         tesla_ctrl=ctrl,
         plug_ctrl=PlugController({}),
         dry_run=True,
         enabled=False,
-    )
+    ))
 
     with patch("load_manager.has_telemetry", return_value=True):
         with patch(

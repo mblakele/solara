@@ -1,7 +1,7 @@
 """Configuration parsing helpers for Solara.
 
 Extracted from load_manager.py to reduce its size and improve testability
-of config parsing logic. Re-exported from load_manager for backward compat.
+of config parsing logic; load_manager.py imports these functions directly.
 
 Functions in this module read configuration from environment variables
 (via the centralized Config class) and devices.json, providing a unified
@@ -181,7 +181,7 @@ def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[retu
     """Load Tesla configuration.
 
     Secrets and device identifiers (client_id, client_secret, vehicle_id,
-    redirect_uri) come from environment variables via decouple.
+    redirect_uri) come from environment variables via the config module.
     Home coordinates (home_lat, home_lon) are optional — when both are
     provided the decision engine will gate Tesla charging on the vehicle
             being at home. When either is missing, Tesla charging is allowed

@@ -9,7 +9,7 @@ import pytest
 
 from constants import MIN_SAMPLES_FOR_PREDICTION
 from load_controllers import RealTeslaController, TeslaController
-from load_manager import LoadManager
+from load_manager import LoadManager, LoadManagerConfig
 from load_models import CycleContext, PendingEffect, TeslaAuthError
 from load_nbc import NBCFetchResult
 
@@ -23,7 +23,7 @@ def ctx() -> CycleContext:
 @pytest.fixture
 def lm() -> LoadManager:
     """Default LoadManager with minimal config, no real controllers."""
-    return LoadManager(dry_run=True, config_interval_secs=30)
+    return LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
 
 
 class TestStageNBCFetch:
@@ -886,9 +886,9 @@ class TestTeslaActionClamping:
     def lm_with_tesla_config(self) -> LoadManager:
         """LoadManager with a TeslaConfig that has a low charge_amps_max."""
         from load_controllers import TeslaController
-        from load_manager import TeslaConfig
+        from load_models import TeslaConfig
 
-        mgr = LoadManager(dry_run=True, config_interval_secs=30)
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
         mgr.tesla_config = TeslaConfig(
             client_id="test",
             client_secret="test",
@@ -948,9 +948,9 @@ class TestTeslaActionClamping:
         """When tesla_config is None, uses default max of 48."""
         import asyncio
 
-        mgr = LoadManager(dry_run=True, config_interval_secs=30)
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
         from load_controllers import TeslaController
-        from load_manager import TeslaConfig
+        from load_models import TeslaConfig
 
         config = TeslaConfig(
             client_id="test",
@@ -1013,7 +1013,7 @@ class TestTeslaActionClamping:
 
         # Override tesla_config with a high max to simulate misconfiguration.
         # Also update the controller's config so it doesn't clamp first.
-        from load_manager import TeslaConfig
+        from load_models import TeslaConfig
         from load_controllers import TeslaController
         high_config = TeslaConfig(
             client_id="test",
@@ -1055,10 +1055,10 @@ class TestTeslaAuthErrorNotification:
     def lm_with_auth_failing_ctrl(self) -> LoadManager:
         """LoadManager with a mock controller that raises TeslaAuthError."""
         from load_controllers import TeslaController
-        from load_manager import TeslaConfig
+        from load_models import TeslaConfig
         from unittest.mock import AsyncMock, MagicMock
 
-        mgr = LoadManager(dry_run=True, config_interval_secs=30)
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
 
         # Use a real config
         config = TeslaConfig(
@@ -1162,9 +1162,9 @@ class TestAuthErrorFromInitTeslaState:
         """LoadManager with a mock RealTeslaController whose init_tesla_state raises."""
         from unittest.mock import AsyncMock, MagicMock
 
-        mgr = LoadManager(dry_run=True, config_interval_secs=30)
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
         # Use a real TeslaConfig so the controller can build login URLs
-        from load_manager import TeslaConfig
+        from load_models import TeslaConfig
 
         config = TeslaConfig(
             client_id="test-client-id", client_secret="test-secret",
@@ -1193,8 +1193,8 @@ class TestAuthErrorFromInitTeslaState:
         """LoadManager with mock RealTeslaController whose init_tesla_state succeeds."""
         from unittest.mock import AsyncMock, MagicMock
 
-        mgr = LoadManager(dry_run=True, config_interval_secs=30)
-        from load_manager import TeslaConfig
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
+        from load_models import TeslaConfig
         from load_models import TeslaState
 
         config = TeslaConfig(

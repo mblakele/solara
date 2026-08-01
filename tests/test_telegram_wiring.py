@@ -39,8 +39,8 @@ class TestAppTelegramWiring:
         import app as app_mod
 
         # Reset the singleton so _get_load_manager runs fresh init logic.
-        app_mod._load_manager = None
-        app_mod._load_manager_init_failed = False
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
 
         created_config = None
 
@@ -68,7 +68,7 @@ class TestAppTelegramWiring:
         ):
             # Also need to suppress the background thread start.
             with patch.object(app_mod, "_load_management_loop"):
-                with patch.object(app_mod, "_lm_thread_started", False):
+                with patch.object(app_mod._state, "lm_thread_started", False):
                     lm = app_mod._get_load_manager()
 
         assert lm is not None
@@ -82,8 +82,8 @@ class TestAppTelegramWiring:
         """When no Telegram env vars or devices.json, telegram_sender should be None."""
         import app as app_mod
 
-        app_mod._load_manager = None
-        app_mod._load_manager_init_failed = False
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
 
         created_config = None
 
@@ -109,7 +109,7 @@ class TestAppTelegramWiring:
             autospec=False,
         ):
             with patch.object(app_mod, "_load_management_loop"):
-                with patch.object(app_mod, "_lm_thread_started", False):
+                with patch.object(app_mod._state, "lm_thread_started", False):
                     lm = app_mod._get_load_manager()
 
         assert lm is not None

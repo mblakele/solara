@@ -13,7 +13,7 @@ from load_controllers import (
     PlugController,
     TeslaController,
 )
-from load_manager import LoadManager
+from load_manager import LoadManager, LoadManagerConfig
 from load_models import (
     CycleDiagnostics,
     CycleResult,
@@ -43,7 +43,7 @@ def _make_manager(interval=30, **kwargs):
         return None  # no data → will hit early returns
 
     energy_cache = EnergyCache()
-    return LoadManager(
+    return LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -51,7 +51,7 @@ def _make_manager(interval=30, **kwargs):
         target_wh=-500,
         config_interval_secs=interval,
         **kwargs,
-    )
+    ))
 
 
 class TestRunCycleReturnsCycleResult:

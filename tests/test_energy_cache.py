@@ -233,7 +233,7 @@ class TestGetCurrentQhAlignmentGuard:
 
 
 class TestIncrementalFetch:
-    """Tests for _build_incremental_fetch and replace-path get_or_fetch."""
+    """Tests for replace-path get_or_fetch."""
 
     def test_get_or_fetch_replace_succeeds(
         self, monkeypatch: pytest.MonkeyPatch
@@ -272,68 +272,6 @@ class TestIncrementalFetch:
         assert result is not None
         assert call_count == 1, "Should succeed on first fetch (no retry needed)"
 
-    def test_build_incremental_fetch_with_quantization_starts_from_qh(self) -> None:
-        """Quantization metadata does not shift the fetch start — it starts from floor_to_qh(now)."""
-        from metrics import _build_incremental_fetch
-        from datetime import timedelta
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=[0.1] * 100,
-            data_start=base,
-            last_sample_at=base + timedelta(seconds=99),
-            last_fetch_at=base,
-            sample_count=100,
-            quantization_seconds=30,
-            quantization_offset=0,
-            quantization_confidence=1.0,
-        )
-
-        captured_start = {}
-
-        class FakeVue:
-            def get_chart_usage(self, gid, start, end, **kwargs):
-                captured_start["start"] = start
-                return ([0.001] * 60, start)
-
-        fetcher = _build_incremental_fetch(cache, FakeVue(), 12345, base + timedelta(minutes=5))
-        fetcher()
-
-        # Always starts from the current QH boundary (floor_to_qh(now)),
-        # which equals base here since base is QH-aligned.
-        assert captured_start["start"] == base
-
-    def test_build_incremental_fetch_without_quantization_starts_from_qh(self) -> None:
-        """Without quantization metadata the fetch still starts from floor_to_qh(now)."""
-        from metrics import _build_incremental_fetch
-        from datetime import timedelta
-
-        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=[0.1] * 100,
-            data_start=base,
-            last_sample_at=base + timedelta(seconds=99),
-            last_fetch_at=base,
-            sample_count=100,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
-        captured_start = {}
-
-        class FakeVue:
-            def get_chart_usage(self, gid, start, end, **kwargs):
-                captured_start["start"] = start
-                return ([0.001] * 60, start)
-
-        fetcher = _build_incremental_fetch(cache, FakeVue(), 12345, base + timedelta(minutes=5))
-        fetcher()
-
-        # Always starts from the current QH boundary (floor_to_qh(now)).
-        assert captured_start["start"] == base
 
 
 

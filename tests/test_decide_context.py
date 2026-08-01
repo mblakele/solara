@@ -11,14 +11,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from load_manager import (
-    DeviceState,
-    GapMinder,
-    PlugConfig,
-    StateTracker,
-    TeslaState,
-)
-from load_nbc import DecideContext
+from load_models import DeviceState, PlugConfig, TeslaState
+from load_nbc import DecideContext, GapMinder, StateTracker
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 

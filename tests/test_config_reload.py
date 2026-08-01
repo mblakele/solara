@@ -19,7 +19,7 @@ from config import (
 
 
 class TestReloadDotenv:
-    """Tests for reload_dotenv() — re-reading .env into os.environ + decouple."""
+    """Tests for reload_dotenv() — re-reading .env into os.environ."""
 
     def test_returns_empty_when_no_changes(self, tmp_path: Path) -> None:
         """No changes → empty list."""
@@ -98,9 +98,9 @@ class TestReloadDotenv:
         finally:
             os.environ.pop("KEY", None)
 
-    def test_updates_decouple_repository(self, tmp_path: Path) -> None:
-        """Changed values are reflected when reading via decouple config()."""
-        from decouple import config as decouple_config
+    def test_updates_env_cache_after_reload(self, tmp_path: Path) -> None:
+        """Changed values are reflected when reading via Config()."""
+        from config import Config
         import os
         env_file = tmp_path / ".env"
         env_file.write_text("DC_TEST_KEY=old\n")
@@ -108,8 +108,8 @@ class TestReloadDotenv:
         try:
             env_file.write_text("DC_TEST_KEY=new\n")
             reload_dotenv(env_file)
-            # decouple reads from os.environ first, so this should work
-            assert decouple_config("DC_TEST_KEY") == "new"
+            # Config reads from os.environ first, so this should work
+            assert Config().get("DC_TEST_KEY") == "new"
         finally:
             os.environ.pop("DC_TEST_KEY", None)
 
