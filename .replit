@@ -63,12 +63,12 @@ waitForPort = 5000
 name = "pytest"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "pytest"
-
 [workflows.workflow.metadata]
 isValidation = true
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run python -m pytest"
 
 [[workflows.workflow]]
 name = "pylint"
