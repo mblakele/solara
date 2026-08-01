@@ -18,14 +18,13 @@ Usage::
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 
 import pytz
 
-from config import Config
+from config import Config, _config
 from load_models import PendingEffect
 from telegram_client import TelegramClient, TelegramConfig
 
@@ -120,21 +119,21 @@ def load_telegram_config(config: Config | None = None) -> dict[str, str] | None:
 
     Args:
         config: Optional Config instance. When provided, its lookup chain
-            (instance overrides → module override store → os.environ →
-            .env file) is used; otherwise os.environ is read directly.
-            Accepted for API consistency across config loading functions.
+            (instance overrides → os.environ → .env file) is used;
+            otherwise the module-level Config singleton is used.
 
     Returns:
         A dict with "bot_token" and "chat_id" keys, or None if
         no Telegram config is available from any source.
     """
-    # Priority 1: environment variables
-    if config is not None:
-        bot_token = config._get("TELEGRAM_BOT_TOKEN")  # pylint: disable=protected-access
-        chat_id = config._get("TELEGRAM_CHAT_ID")  # pylint: disable=protected-access
-    else:
-        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    # Priority 1: environment variables / .env file. Resolve through the
+    # Config lookup chain (overrides → os.environ → .env file) so tokens
+    # kept in a .env file are found — matching the pre-refactor decouple
+    # behavior. Falls back to the module singleton when no Config is
+    # injected (the path used by TelegramSender.from_config()).
+    cfg = config if config is not None else _config
+    bot_token = cfg._get("TELEGRAM_BOT_TOKEN")  # pylint: disable=protected-access
+    chat_id = cfg._get("TELEGRAM_CHAT_ID")  # pylint: disable=protected-access
 
     if bot_token and chat_id:
         return {"bot_token": bot_token, "chat_id": chat_id}
@@ -376,12 +375,7 @@ def build_notification(
     if config is not None:
         tz_name = config.timezone
     else:
-        try:
-            from config import _config
-
-            tz_name = _config.timezone
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
+        tz_name = _config.timezone
 
     try:
         local_tz = pytz.timezone(tz_name)
@@ -424,12 +418,7 @@ def build_error_notification(
     if config is not None:
         tz_name = config.timezone
     else:
-        try:
-            from config import _config
-
-            tz_name = _config.timezone
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
+        tz_name = _config.timezone
 
     try:
         local_tz = pytz.timezone(tz_name)

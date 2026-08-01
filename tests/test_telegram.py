@@ -35,6 +35,28 @@ from telegram import (
 
 
 @pytest.fixture()
+def telegram_env_file(monkeypatch, tmp_path):
+    """Provide Telegram tokens via a temp .env file, not os.environ.
+
+    Simulates a deployment where TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+    live in the .env file rather than as exported env vars. Resets the
+    config module's lazy .env cache and chdirs to tmp_path so the lookup
+    re-reads the temp file; monkeypatch restores both afterwards.
+    """
+    import config as config_module
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    (tmp_path / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=env-file-token\n"
+        "TELEGRAM_CHAT_ID=env-file-chat\n"
+    )
+    monkeypatch.setattr(config_module, "_env_data", None)
+    monkeypatch.chdir(tmp_path)
+    return {"bot_token": "env-file-token", "chat_id": "env-file-chat"}
+
+
+@pytest.fixture()
 def sample_event():
     """A NotificationEvent for testing."""
     return NotificationEvent(
@@ -109,6 +131,37 @@ class TestLoadTelegramConfig:
         monkeypatch.setattr("device_config._load", lambda: {})
         result = load_telegram_config()
         assert result is None
+
+    def test_env_file_fallback(self, telegram_env_file):
+        """Tokens in a .env file are found when env vars are absent.
+
+        Regression test: load_telegram_config() must consult the .env
+        file via the Config lookup chain, not just os.environ — prod
+        deployments commonly keep TELEGRAM_* in .env.
+        """
+        result = load_telegram_config()
+        assert result is not None
+        assert result["bot_token"] == telegram_env_file["bot_token"]
+        assert result["chat_id"] == telegram_env_file["chat_id"]
+
+    def test_mixed_env_and_env_file(self, monkeypatch, tmp_path):
+        """Each key resolves independently through os.environ → .env.
+
+        Matches the pre-refactor decouple behavior where each key is
+        looked up individually (env vars first, then the .env file).
+        """
+        import config as config_module
+
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "env-token")
+        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+        (tmp_path / ".env").write_text("TELEGRAM_CHAT_ID=env-file-chat\n")
+        monkeypatch.setattr(config_module, "_env_data", None)
+        monkeypatch.chdir(tmp_path)
+
+        result = load_telegram_config()
+        assert result is not None
+        assert result["bot_token"] == "env-token"
+        assert result["chat_id"] == "env-file-chat"
 
 
 # =============================================================================
@@ -294,6 +347,18 @@ class TestTelegramSender:
     def test_from_raw_none_values(self):
         """from_raw returns None for None values."""
         assert TelegramSender.from_raw(None, "chat456") is None  # type: ignore[arg-type]
+
+    def test_from_config_uses_env_file(self, telegram_env_file):
+        """from_config finds tokens in a .env file.
+
+        Regression test for prod: TelegramSender.from_config() must use
+        the Config lookup chain (which reads .env), not just os.environ.
+        """
+        sender = TelegramSender.from_config()
+        assert sender is not None
+        assert sender.is_configured is True
+        assert sender.config.bot_token == telegram_env_file["bot_token"]
+        assert sender.config.chat_id == telegram_env_file["chat_id"]
 
     def test_is_configured_false_when_no_config(self):
         """is_configured is False when config is None."""

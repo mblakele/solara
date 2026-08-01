@@ -118,7 +118,8 @@ Key capabilities:
 - `LOAD_TARGET_WH` — Target Wh per quarter-hour for load decisions (default: `-50`)
 - `LOAD_NBC_DEVICE` — Device name for NBC predictions
 - `LOAD_MANAGE_INTERVAL_SECS` — Seconds between load management cycles (default: 30)
-- `LOAD_TELEGRAM_DEVICES` — JSON string of device→actions whitelist for Telegram notifications.
+- Telegram device whitelist comes from the `telegram.devices` section of `devices.json`
+  (there is no env-var override; the old `LOAD_TELEGRAM_DEVICES` env var is gone).
   Notifications are **only sent** when this whitelist is configured AND at least one
   action matches. If omitted or empty, no Telegram notifications are sent.
   Example: `{"pool_pump": ["turn_on", "turn_off"], "jackery": ["turn_on"]}`
@@ -301,8 +302,8 @@ project-root
 - `TelegramClient` (telegram_client.py) — async aiohttp client, fire-and-forget, returns `bool`, never raises
 - `TelegramSender` (telegram.py) — high-level sender with config loading from env vars and devices.json
 - `NotificationEvent` (telegram.py) — frozen dataclass for structured notifications with `format_message()`
-- `load_telegram_config()` (telegram.py) — loads config from env vars (priority) or devices.json
-- `load_telegram_devices()` (telegram.py) — loads device whitelist dict from `LOAD_TELEGRAM_DEVICES` env var or devices.json
+- `load_telegram_config()` (telegram.py) — loads config via the Config lookup chain (env vars → `.env` file) first, then devices.json
+- Telegram device whitelist: loaded from the `telegram.devices` section of devices.json in `LoadManager.__init__` / `reload_config()` (there is no env-var override; the old `LOAD_TELEGRAM_DEVICES` env var is gone)
 - `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`; "tesla" is accepted as a special device name for Tesla stop-charging alerts
 - Whitelist gate: Telegram notifications are only sent when a telegram.devices whitelist is explicitly configured AND at least one action matches it. Without a whitelist, notifications are blocked to prevent unintended messages to unconfigured devices.
 - Plug notifications use emoji format: `🟢 device → ON` / `🔘 device → OFF`
