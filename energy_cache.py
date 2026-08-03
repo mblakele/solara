@@ -471,6 +471,20 @@ class EnergyCache:
             # data_start is QH-aligned and no complete periods found — nothing to do.
             return
 
+        if not new_completed:
+            # The leading partial chunk is trimmed but no completed period
+            # was materialized: up to 899 seconds of data vanish.  The trim
+            # itself is correct (the partial chunk predates the first QH
+            # boundary and can never form a period; keeping it would leave
+            # a misaligned data_start), but the loss should be loud, not
+            # silent — warn instead of dropping data quietly.
+            logger.warning(
+                "compact: trimming %d leading samples of a partial chunk "
+                "starting %s with no completed period materialized",
+                offset,
+                data_start,
+            )
+
         # Merge new completed periods with existing, deduplicate by start time.
         all_completed = existing_completed + new_completed
         seen_starts: set[datetime] = set()

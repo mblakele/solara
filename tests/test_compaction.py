@@ -853,3 +853,88 @@ class TestDataStartQHAlignment:
         assert len(cache._data.samples) == 300
         # Already QH-aligned and no compaction occurred — should stay unchanged.
         assert cache._data.data_start == data_start
+
+
+class TestCompactPartialChunkWarning:
+    """compact() must not silently drop a misaligned leading chunk.
+
+    When data_start is misaligned and the leading partial chunk cannot
+    form a full QH (``offset + 900 > len(samples)``), compact() trims it
+    with no CompletedNBCPeriod materialized — up to 899 seconds of data
+    vanish.  The trim itself is correct (the partial chunk predates the
+    window's first QH boundary and can never be completed; keeping it
+    would leave a misaligned data_start that trips
+    EnergyCacheAlignmentError), but the loss must be loud, not silent.
+    """
+
+    def test_warns_when_trimming_partial_chunk_without_materializing(
+        self, caplog
+    ) -> None:
+        """A misaligned leading chunk trimmed with no completed period warns."""
+        import logging
+
+        now = datetime(2026, 7, 30, 2, 50, 0, tzinfo=timezone.utc)
+        data_start = datetime(2026, 7, 30, 2, 34, 1, tzinfo=timezone.utc)
+
+        # 1200 samples: offset = 659 (02:34:01 -> 02:45:00) but
+        # offset + 900 = 1559 > 1200, so the while loop runs zero times
+        # and the leading partial chunk is trimmed without materializing
+        # a CompletedNBCPeriod.
+        samples = [0.001] * 1200
+
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=1199),
+            last_fetch_at=now,
+            sample_count=1200,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="energy_cache"):
+            with cache._lock:
+                cache.compact(now)
+
+        assert any(
+            "partial chunk" in record.message
+            for record in caplog.records
+        ), "compact() should warn when trimming a partial chunk"
+
+        # Trim behavior unchanged: current-QH tail preserved and aligned.
+        assert cache._data is not None
+        assert len(cache._data.samples) == 541
+        assert cache._data.data_start == datetime(
+            2026, 7, 30, 2, 45, 0, tzinfo=timezone.utc
+        )
+        assert not cache._data.completed_periods
+
+    def test_no_warning_when_aligned_and_nothing_to_do(self, caplog) -> None:
+        """QH-aligned data_start with no completed periods logs nothing."""
+        import logging
+
+        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
+        data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
+
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=[0.001] * 300,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=299),
+            last_fetch_at=now,
+            sample_count=300,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="energy_cache"):
+            with cache._lock:
+                cache.compact(now)
+
+        assert not any(
+            "partial chunk" in record.message
+            for record in caplog.records
+        )

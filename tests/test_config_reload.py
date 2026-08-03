@@ -15,6 +15,77 @@ from config import (
 )
 
 
+# === _parse_env_file tests ===
+
+
+class TestParseEnvFile:
+    """Tests for config._parse_env_file — the .env key=value parser."""
+
+    def test_parses_simple_key_value(self, tmp_path: Path) -> None:
+        """KEY=value parses to {KEY: value}."""
+        from config import _parse_env_file
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=value\n")
+        assert _parse_env_file(env_file) == {"KEY": "value"}
+
+    def test_strips_inline_comment(self, tmp_path: Path) -> None:
+        """KEY=value # comment strips the comment from the value."""
+        from config import _parse_env_file
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=value # comment here\n")
+        assert _parse_env_file(env_file) == {"KEY": "value"}
+
+    def test_strips_inline_comment_without_space(self, tmp_path: Path) -> None:
+        """KEY=value#comment also strips the comment."""
+        from config import _parse_env_file
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=value#comment\n")
+        assert _parse_env_file(env_file) == {"KEY": "value"}
+
+    def test_quoted_value_keeps_hash(self, tmp_path: Path) -> None:
+        """A quoted value may contain a literal #."""
+        from config import _parse_env_file
+
+        env_file = tmp_path / ".env"
+        env_file.write_text('KEY="a#b"\n')
+        assert _parse_env_file(env_file) == {"KEY": "a#b"}
+
+    def test_quoted_value_with_inline_comment(self, tmp_path: Path) -> None:
+        """A quoted value followed by an inline comment strips the comment."""
+        from config import _parse_env_file
+
+        env_file = tmp_path / ".env"
+        env_file.write_text('KEY="x" # note\n')
+        assert _parse_env_file(env_file) == {"KEY": "x"}
+
+    def test_trims_surrounding_whitespace(self, tmp_path: Path) -> None:
+        """KEY =  value  parses with whitespace trimmed."""
+        from config import _parse_env_file
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY =  value  \n")
+        assert _parse_env_file(env_file) == {"KEY": "value"}
+
+    def test_empty_value(self, tmp_path: Path) -> None:
+        """KEY= parses to an empty string."""
+        from config import _parse_env_file
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=\n")
+        assert _parse_env_file(env_file) == {"KEY": ""}
+
+    def test_skips_comments_and_blanks(self, tmp_path: Path) -> None:
+        """Full-line comments and blank lines are skipped."""
+        from config import _parse_env_file
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("# comment\n\nKEY=value\n")
+        assert _parse_env_file(env_file) == {"KEY": "value"}
+
+
 # === reload_dotenv tests ===
 
 

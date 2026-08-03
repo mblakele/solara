@@ -51,3 +51,10 @@ MIN_SAMPLES_FOR_PREDICTION: int = 5
 reliable NBC prediction.  Below this threshold the pipeline returns
 ``no_incomplete_qh`` with a short sleep hint instead of acting on a
 wildly extrapolated single-sample prediction."""
+
+# ── Fetch drift observability ────────────────────────────────────────
+
+DRIFT_REJECTION_WARN_AFTER: int = 5
+"""Number of consecutive drift rejections for the same QH before the
+fetch path logs a warning that the window head appears permanently
+missing (see ``_drift_rejections`` in metrics.py)."""

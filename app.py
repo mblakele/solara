@@ -141,16 +141,24 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
     SSE clients see current lag and accumulated per-second samples.
 
     Args:
-        metrics_data: The metrics dict from a fetch or cache (may be modified).
+        metrics_data: The metrics dict from a fetch or cache. Device entries
+            are shallow-copied before enrichment, so the caller's dict is
+            never mutated (get_or_fetch may return the same dict stored as
+            full_metrics_dict — mutating it would inflate cached lag).
         now: Current time for lag calculation. Defaults to datetime.now(timezone.utc).
 
     Returns:
-        The enriched metrics dict (same object, modified in place).
+        The enriched metrics dict: the same top-level object, with device
+        entries replaced by enriched copies.
     """
     if metrics_data is None:
         metrics_data = {"devices": [], "api_response": {}, "instant": now}
     if now is None:
         now = datetime.now(timezone.utc)
+    # Shallow-copy device entries before mutating them: the source dict may
+    # be the cached full_metrics_dict, and in-place lag updates there would
+    # accumulate elapsed time on every enrich pass.
+    metrics_data["devices"] = [dict(d) for d in metrics_data.get("devices", [])]
     fetched_at = metrics_data.get("_fetched_at")
     if fetched_at is not None:
         elapsed = (now - fetched_at).total_seconds()
@@ -354,10 +362,23 @@ def index() -> ResponseReturnValue:
 
     # check for default html first, to handle missing Accept header.
     if request.accept_mimetypes.accept_html:
+        refresh_secs: int | None = None
+        if not metrics_data.get("devices"):
+            # First-boot API outage: the 500 retry page is dead for
+            # real-data paths (RetryableMetricsException is downgraded to a
+            # warning + stale-cache serve in _run_fetch_with_timeout), so an
+            # empty dashboard renders with a 200. Auto-refresh it so it
+            # self-heals when data arrives — no manual reload needed.
+            refresh_secs = 5
+            logger.warning(
+                "index: serving empty dashboard (no devices); auto-refreshing in %ds",
+                refresh_secs,
+            )
         return render_template(
             "index.html",
             metrics=metrics_data,
             load_management=load_management,
+            refresh_secs=refresh_secs,
         )
 
     if request.accept_mimetypes.accept_json:
@@ -735,24 +756,24 @@ def start_background_services() -> None:
         _start_load_manager_thread()
 
 
-def create_app(config: Config | None = None) -> Flask:
+def create_app() -> Flask:
     """Create and configure the Flask application.
 
-    Builds the app, registers routes, attaches the ``Config`` instance
-    (``_config`` by default) to ``app.config["SOLARA_CONFIG"]``, and wires
-    the JSON provider, error handler, and Jinja filter. Does NOT start
-    background threads — call :func:`start_background_services` explicitly
-    (see wsgi.py and the ``__main__`` block).
+    Builds the app, registers routes, attaches the module-level ``_config``
+    singleton to ``app.config["SOLARA_CONFIG"]``, and wires the JSON
+    provider, error handler, and Jinja filter. Does NOT start background
+    threads — call :func:`start_background_services` explicitly (see
+    wsgi.py and the ``__main__`` block).
 
-    Args:
-        config: Optional Config instance stored on the app. Views and
-            background services read the module-level ``_config`` singleton,
-            which remains the effective configuration for the process.
+    Note:
+        The ``config`` override parameter was removed: views and background
+        services read the module-level ``_config`` singleton, so a per-app
+        override was inert and misleading.
 
     Returns:
         A configured Flask application instance.
     """
-    cfg = config or _config
+    cfg = _config
     application = Flask(__name__)
     application.logger.handlers.clear()
     application.logger.propagate = True

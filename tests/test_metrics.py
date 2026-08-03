@@ -956,6 +956,150 @@ class TestFetchChannelDataErrors(unittest.TestCase):
         self.assertEqual(channel_num, 4)
 
 
+class TestDriftRejectionObservability(unittest.TestCase):
+    """Persistent head-of-window drift becomes observable after N rejections.
+
+    A fetch whose ``data_start != chart_start`` is rejected (strictly) so a
+    misaligned window never reaches the cache.  If the API permanently drops
+    the head sample of a QH, every fetch for that QH is rejected forever and
+    the QH stalls — this tracker makes that state observable with a warning
+    instead of a silent stall.
+    """
+
+    def setUp(self):
+        import metrics
+
+        self._metrics = metrics
+        self._metrics._drift_rejections.clear()
+        self.chan = MagicMock()
+        self.chan.channel_num = 5
+
+    def _make_hp(self):
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        hp.instant = now.replace(minute=30)
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+        hp.metrics = {"api_response": {}}
+        return hp, now
+
+    def _reject_drifted(self, hp, chart_start, now):
+        """Simulate one drifted fetch: data_start != chart_start."""
+        drifted = now.replace(minute=16)  # later start = missing head
+        hp.vue.get_chart_usage.return_value = ([0.1] * 60, drifted)
+        with self.assertRaises(RetryableMetricsException):
+            hp._fetch_channel_data(self.chan, chart_start, now)
+
+    def _accept_matching(self, hp, chart_start, now):
+        """Simulate one successful fetch: data_start == chart_start."""
+        hp.vue.get_chart_usage.return_value = ([0.1] * 60, chart_start)
+        hp._fetch_channel_data(self.chan, chart_start, now)
+
+    @staticmethod
+    def _persistent_warnings(hp):
+        """Return (format, *args) tuples of the persistent-drift warnings."""
+        return [
+            c.args
+            for c in hp.logger.warning.call_args_list
+            if c.args and "persistently rejected" in c.args[0]
+        ]
+
+    @staticmethod
+    def _warning_mentions(call, text):
+        """True when *text* appears in any positional arg of a log call."""
+        return any(text in str(arg) for arg in call)
+
+    def test_no_persistent_warning_before_threshold(self):
+        """Fewer than N rejections log only the transient warning."""
+        import metrics
+
+        hp, now = self._make_hp()
+        chart_start = now.replace(minute=0)
+        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER - 1):
+            self._reject_drifted(hp, chart_start, now)
+        self.assertEqual(self._persistent_warnings(hp), [])
+
+    def test_warns_after_threshold_rejections(self):
+        """N consecutive rejections for the same QH log a persistent warning."""
+        import metrics
+
+        hp, now = self._make_hp()
+        chart_start = now.replace(minute=0)
+        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER):
+            self._reject_drifted(hp, chart_start, now)
+        warnings = self._persistent_warnings(hp)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("persistently rejected", warnings[0][0])
+        self.assertTrue(self._warning_mentions(warnings[0], str(chart_start)))
+
+    def test_warns_again_after_second_threshold(self):
+        """A continuing stall re-warns every N rejections (no log spam)."""
+        import metrics
+
+        hp, now = self._make_hp()
+        chart_start = now.replace(minute=0)
+        for _ in range(2 * metrics.DRIFT_REJECTION_WARN_AFTER):
+            self._reject_drifted(hp, chart_start, now)
+        self.assertEqual(len(self._persistent_warnings(hp)), 2)
+
+    def test_success_resets_counter(self):
+        """A successful fetch resets the rejection counter for that QH."""
+        import metrics
+
+        hp, now = self._make_hp()
+        chart_start = now.replace(minute=0)
+        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER - 1):
+            self._reject_drifted(hp, chart_start, now)
+        self._accept_matching(hp, chart_start, now)
+        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER - 1):
+            self._reject_drifted(hp, chart_start, now)
+        # Counter reset by the success: no persistent warning yet.
+        self.assertEqual(self._persistent_warnings(hp), [])
+        # One more rejection crosses the fresh threshold.
+        self._reject_drifted(hp, chart_start, now)
+        self.assertEqual(len(self._persistent_warnings(hp)), 1)
+
+    def test_different_chart_start_has_independent_counter(self):
+        """Rejections for one QH do not affect another QH's counter."""
+        import metrics
+
+        hp, now = self._make_hp()
+        chart_start_a = now.replace(minute=0)
+        chart_start_b = now.replace(minute=45)
+        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER):
+            self._reject_drifted(hp, chart_start_a, now)
+        # A single rejection for a different QH must not warn.
+        self._reject_drifted(hp, chart_start_b, now)
+        warnings = self._persistent_warnings(hp)
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(self._warning_mentions(warnings[0], str(chart_start_a)))
+
+    def test_stale_rejection_keys_are_pruned(self):
+        """Rejections for long-past windows don't accumulate or trip the warning.
+
+        chart_start advances every QH, so a key older than the fetch window
+        can never be fetched again — keeping it would grow the tracker
+        unboundedly (one entry per drifted QH, forever).  Each rejection
+        prunes stale keys first, so a long-past entry is dropped and the
+        count restarts at 1 instead of carrying an old tally into the
+        persistent-warning check.
+        """
+        import metrics
+
+        hp, now = self._make_hp()
+        old_window = now - timedelta(hours=2)
+        key = (self.chan.channel_num, old_window)
+        # Simulate prior rejections for a window that has long since passed.
+        metrics._drift_rejections[key] = metrics.DRIFT_REJECTION_WARN_AFTER - 1
+
+        # The stale entry is pruned (older than MAX_FETCH_WINDOW), so this
+        # rejection restarts the count at 1 and never trips the warning.
+        self._reject_drifted(hp, old_window, now)
+
+        self.assertEqual(metrics._drift_rejections.get(key), 1)
+        self.assertEqual(self._persistent_warnings(hp), [])
+
+
 class TestComputeNBCEdgeCases(unittest.TestCase):
     """Tests for _compute_nbc edge cases."""
 
@@ -1597,23 +1741,25 @@ class TestEnergyCachePruningEdgeCases(unittest.TestCase):
         self.assertEqual(len(cache.samples), 0)
 
     def test_prune_one_sample_kept(self):
-        """3601-sample cache, empty fetch → truncate → prune → 1 kept.
+        """3601-sample cache, empty fetch → prune → 1 kept.
 
         Reproduces the production bug on 2026-05-21 where a production
         server hit an AssertionError in compute_nbc_quarters. When the
         cache held 3601 samples and the fetch returned empty data,
-        the old incremental-merge path truncated to 3600 but left data_start
-        pointing to the original time. This caused the pruning loop
-        to miscalculate sample timestamps and prune every sample,
+        the pre-fix store path truncated the samples to 3600 but left
+        data_start pointing to the original time. This caused the pruning
+        loop to miscalculate sample timestamps and prune every sample,
         leaving 0 instead of the expected 1 boundary sample.
         """
         import metrics
 
         fixed_now = datetime(2025, 6, 15, 15, 15, 0, tzinfo=timezone.utc)
         # 3601 samples from 13:15:00 to 14:15:00 (inclusive)
-        # merge(3601 + 0) → 3601 → truncate to 3600
-        # Without fix: data_start still 13:15:00 → all 3600 samples < 14:15:00 → 0 kept
-        # With fix: data_start becomes 13:15:01 → samples at 13:15:01–14:14:59 pruned → 1 kept
+        # Empty fetch → no replacement, only pruning.
+        # Pre-fix: truncate to 3600 with data_start still 13:15:00 →
+        #   all 3600 samples < 14:15:00 → 0 kept
+        # Post-fix: prune with data_start 13:15:00 → samples at
+        #   13:15:00–14:14:59 pruned, 14:15:00 kept → 1 kept
         cache_start = datetime(2025, 6, 15, 13, 15, 0, tzinfo=timezone.utc)
         cache = _make_cache_with_samples(3601, cache_start)
 
@@ -2044,6 +2190,31 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
                     "Third arg (energy_cache) must be the module-level _energy_cache",
                 )
                 self.assertEqual(call_args[1], {}, "No keyword args expected")
+
+    def test_create_metrics_stamps_fetched_at(self):
+        """create_metrics stamps _fetched_at so lag is computed from fetch time.
+
+        Production readers (app.py SSE lag recalculation, load_nbc.py
+        data_point_at) fall back to ``now`` when _fetched_at is absent —
+        only tests were setting it.  create_metrics must stamp it with the
+        ``now`` it was called with so the stored metrics carry their fetch
+        time.
+        """
+        import app as app_mod
+        from metrics import create_metrics
+
+        with mock_config():
+            cache = app_mod._state.energy_cache
+            with patch("metrics.HourlyProjection") as MockHP:
+                mock_instance = MockHP.return_value
+                mock_instance.metrics = {"devices": []}
+                now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+                result = create_metrics(
+                    cache, now, logging.getLogger("test")
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["_fetched_at"], now)
 
     def test_create_metrics_uses_data_start_for_chart_start(self):
         """create_metrics uses data_start (not last_sample_at) for incremental chart_start.

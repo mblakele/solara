@@ -16,7 +16,7 @@ from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 
 from clock import Clock, RealClock
-from constants import QUANTIZATION_CONFIDENCE_THRESHOLD
+from constants import DRIFT_REJECTION_WARN_AFTER, QUANTIZATION_CONFIDENCE_THRESHOLD
 from energy_cache import EnergyCache
 from energy_aggregator import EnergyDataAggregator, TOUBuckets
 from util import (
@@ -50,6 +50,15 @@ def set_clock(clock: Clock) -> None:
 
 
 MAX_FETCH_WINDOW = timedelta(hours=1)
+
+# Drift-rejection tracker keyed by ``(channel_num, chart_start)``.  A fetch
+# whose ``data_start`` drifts off the requested (QH-aligned) ``chart_start``
+# is rejected so a misaligned window never reaches the cache; if the API
+# permanently drops the head sample of a QH, every fetch for that QH is
+# rejected forever and the QH stalls silently.  This dict counts consecutive
+# rejections per QH so the stall becomes observable via a warning (see
+# ``_fetch_channel_data``) instead of an infinite silent retry loop.
+_drift_rejections: dict[tuple[int, datetime], int] = {}
 
 
 def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
@@ -162,6 +171,11 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
                 for d in hp.metrics.get("devices", [])
             ) if hp.metrics.get("devices") else 0,
         )
+        # Stamp the fetch time so consumers (SSE lag recalculation in
+        # app.py, data_point_at in load_nbc.py) compute elapsed time from
+        # when this data was actually fetched rather than falling back to
+        # "now" at read time.
+        hp.metrics["_fetched_at"] = now
         return hp.metrics
 
     except AssertionError as ae:
@@ -566,6 +580,28 @@ class HourlyProjection(MetricsBase):
             # data is missing at the head of the window.  Storing it would
             # leave a misaligned data_start in the cache — treat as a
             # transient condition and let the caller retry with stale data.
+            # If the same QH keeps being rejected, the head sample is
+            # likely permanently missing: warn (every N rejections) so the
+            # resulting stall is observable instead of silent.
+            # Stale entries for long-past windows are pruned first so the
+            # tracker stays bounded: chart_start advances every QH, so a key
+            # older than the fetch window can never be fetched again.
+            cutoff = instant - MAX_FETCH_WINDOW
+            for stale_key in list(_drift_rejections):
+                if stale_key[1] < cutoff:
+                    del _drift_rejections[stale_key]
+            key = (chan.channel_num, chart_start)
+            count = _drift_rejections.get(key, 0) + 1
+            _drift_rejections[key] = count
+            if count >= DRIFT_REJECTION_WARN_AFTER and count % DRIFT_REJECTION_WARN_AFTER == 0:
+                self.logger.warning(
+                    "get_chart_usage drift for QH starting %s: data_start "
+                    "%s persistently rejected %d consecutive fetches; the "
+                    "head of this window appears permanently missing",
+                    chart_start,
+                    usage_data_start_local,
+                    count,
+                )
             self.logger.warning(
                 "get_chart_usage returned data_start %s != requested "
                 "chart_start %s; treating as transient",
@@ -575,6 +611,7 @@ class HourlyProjection(MetricsBase):
             raise RetryableMetricsException(
                 f"data_start {usage_data_start_local} != chart_start {chart_start}"
             )
+        _drift_rejections.pop((chan.channel_num, chart_start), None)
         self.metrics["api_response"]["get_chart_usage/" + str(chan.channel_num)] = (
             _CLOCK.now() - chart_start
         )

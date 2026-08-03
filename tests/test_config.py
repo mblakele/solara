@@ -248,6 +248,19 @@ class TestConfigTeslaTelemetryProperties:
         cfg = Config()
         assert cfg.mqtt_topic_base == "vehicles/1"
 
+    def test_get_int_missing_key_returns_default_without_raising(self):
+        """_get_int returns the default for a missing key, never raising.
+
+        Pins the contract that a missing int key falls back to the default
+        (the old implementation wrapped the lookup in a try/except for
+        UndefinedValueError that could never fire because the lookup is
+        always called with a real default).
+        """
+        from config import Config
+
+        cfg = Config()
+        assert cfg._get_int("NONEXISTENT_CFG_KEY", default=42) == 42
+
     def test_tesla_telemetry_chargeamps_interval_default(self):
         """Returns 15 when TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC is not set."""
         from config import Config

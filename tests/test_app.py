@@ -1016,7 +1016,29 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
         data = json.loads(resp.data)
         self.assertIn("devices", data)
 
-    def test_enrich_metrics_for_sse_none_input(self):
+    def test_index_empty_dashboard_auto_refreshes(self):
+        """An empty dashboard (no devices) on the real-data path auto-refreshes.
+
+        On first boot during an API outage the fetch returns no devices and
+        index() renders an empty dashboard with a 200 — the 500 retry page is
+        dead for real-data paths. The empty dashboard must carry a meta
+        refresh so the browser self-heals without a manual refresh.
+        """
+        import app as app_mod
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.get_or_fetch.return_value = (
+                    {"devices": [], "api_response": {}, "instant": None},
+                    True,
+                )
+                mock_cache.samples = []
+                resp = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b'http-equiv="refresh"', resp.data.lower())
+
+    def test_index_enrich_metrics_for_sse_none_input(self):
         """_enrich_metrics_for_sse handles None input without crashing."""
         import app as app_mod
         from datetime import datetime, timezone

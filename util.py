@@ -315,6 +315,12 @@ def _completed_quarter(period: CompletedNBCPeriod) -> NBCQuarter:
 
     Returns:
         A complete NBCQuarter carrying the period's raw Wh.
+
+    Note:
+        ``raw_wh`` is the value reported to the UI and /api/v1/tou; it is
+        preserved unmodified (it may be negative, e.g. net export).  ``wh``
+        is clamped at zero purely as a display fallback for templates that
+        render a non-negative bar.
     """
     return NBCQuarter(
         complete=True,

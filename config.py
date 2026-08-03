@@ -533,7 +533,13 @@ def check_restart_required(changed_keys: list[str]) -> list[str]:
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
-    """Parse a .env file into a dict of key=value pairs."""
+    """Parse a .env file into a dict of key=value pairs.
+
+    Supports full-line comments, blank lines, optional surrounding
+    whitespace, single/double-quoted values, and inline comments on
+    unquoted values (``KEY=value # note`` → ``value``).  A ``#`` inside
+    a quoted value is kept (``KEY="a#b"`` → ``a#b``).
+    """
     data: dict[str, str] = {}
     try:
         text = path.read_text(encoding="utf-8")
@@ -549,11 +555,11 @@ def _parse_env_file(path: Path) -> dict[str, str]:
         if len(v) >= 2 and ((v[0] == "'" and v[-1] == "'") or (v[0] == '"' and v[-1] == '"')):
             v = v[1:-1]
         else:
-            # Strip inline comments from unquoted values: KEY=value # comment
-            # Only strip when " #" appears so a lone "#" in a value is kept.
-            comment_pos = v.find(" #")
-            if comment_pos != -1:
-                v = v[:comment_pos].rstrip()
+            # Unquoted value: strip an inline comment ("KEY=value # note").
+            # Re-check for quotes afterwards so "KEY=\"x\" # note" → "x".
+            v = v.split("#", 1)[0].rstrip()
+            if len(v) >= 2 and ((v[0] == "'" and v[-1] == "'") or (v[0] == '"' and v[-1] == '"')):
+                v = v[1:-1]
         data[k] = v
     return data
 

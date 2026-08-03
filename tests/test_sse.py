@@ -177,6 +177,35 @@ class TestMetricsEnrichment:
         expected_lag = 5.0 + 10.0  # cached + elapsed
         assert device["lag"].total_seconds() == pytest.approx(expected_lag, abs=0.001)
 
+    def test_enrich_does_not_mutate_source_device_lag(self) -> None:
+        """The source metrics dict's devices are not mutated in place.
+
+        get_or_fetch returns the same dict stored as full_metrics_dict; if
+        enrich updated lag in place, repeated SSE publishes would inflate
+        the cached lag cumulatively.  enrich must return an enriched copy
+        of the device entries, leaving the source untouched.
+        """
+        fetched_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+        source_device = self._make_device(lag_secs=5.0)
+        metrics_data: dict[str, Any] = {
+            "devices": [source_device],
+            "_fetched_at": fetched_at,
+        }
+        orig_data = _state.energy_cache._data
+        _state.energy_cache._data = MagicMock(samples=[])
+        try:
+            now = fetched_at + timedelta(seconds=10)
+            result = _enrich_metrics_for_sse(metrics_data, now=now)
+        finally:
+            _state.energy_cache._data = orig_data
+
+        # Source device untouched...
+        assert source_device["lag"].total_seconds() == pytest.approx(5.0, abs=0.001)
+        # ...while the returned device carries the elapsed-time-adjusted lag.
+        device = result["devices"][0]
+        assert device is not source_device
+        assert device["lag"].total_seconds() == pytest.approx(15.0, abs=0.001)
+
     def test_enrich_merges_samples(self) -> None:
         """Per-second samples from EnergyCache replace per_second_data."""
         fetched_at = datetime.now(timezone.utc) - timedelta(seconds=5)

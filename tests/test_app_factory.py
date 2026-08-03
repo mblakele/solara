@@ -11,6 +11,7 @@ from contextlib import contextmanager
 
 from unittest.mock import patch
 
+import pytest
 from flask import Flask
 
 import app as app_mod
@@ -44,10 +45,12 @@ class TestCreateApp:
         for route in ("/", "/health", "/api/v1/tou", "/api/v1/load/status", "/stream/status"):
             assert route in rules
 
-    def test_accepts_config_override(self):
-        custom = Config()
-        app = app_mod.create_app(config=custom)
-        assert app.config["SOLARA_CONFIG"] is custom
+    def test_rejects_config_override(self):
+        # The config parameter was removed: create_app() always binds the
+        # module-level _config singleton. Views and background services read
+        # that singleton, so a per-app override was inert and misleading.
+        with pytest.raises(TypeError):
+            app_mod.create_app(config=Config())
 
     def test_default_config_is_module_singleton(self):
         app = app_mod.create_app()
