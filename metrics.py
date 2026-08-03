@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import json
 import locale
 import logging
+import threading
 from typing import Any, ClassVar, Optional
 
 import requests
@@ -16,7 +17,10 @@ from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 
 from clock import Clock, RealClock
-from constants import DRIFT_REJECTION_WARN_AFTER, QUANTIZATION_CONFIDENCE_THRESHOLD
+from constants import (
+    DRIFT_REJECTION_ALERT_AFTER,
+    QUANTIZATION_CONFIDENCE_THRESHOLD,
+)
 from energy_cache import EnergyCache
 from energy_aggregator import EnergyDataAggregator, TOUBuckets
 from util import (
@@ -55,10 +59,54 @@ MAX_FETCH_WINDOW = timedelta(hours=1)
 # whose ``data_start`` drifts off the requested (QH-aligned) ``chart_start``
 # is rejected so a misaligned window never reaches the cache; if the API
 # permanently drops the head sample of a QH, every fetch for that QH is
-# rejected forever and the QH stalls silently.  This dict counts consecutive
-# rejections per QH so the stall becomes observable via a warning (see
-# ``_fetch_channel_data``) instead of an infinite silent retry loop.
+# rejected forever and the QH stalls.  This dict counts consecutive
+# rejections per QH so the stall becomes observable — an error log plus a
+# one-time Telegram alert per QH key (see ``_fetch_channel_data``) — instead
+# of an infinite silent retry loop.
 _drift_rejections: dict[tuple[int, datetime], int] = {}
+
+# One-time alert events queued when a QH key first crosses
+# ``DRIFT_REJECTION_ALERT_AFTER`` consecutive rejections.  Drained by
+# ``drain_drift_alerts()`` (the LoadManager cycle) so the caller can log at
+# ERROR level and surface the stall as a Telegram alert.
+_drift_alerts: list["DriftAlert"] = []
+
+# Serializes mutations of ``_drift_rejections``/``_drift_alerts``: fetches
+# run in EnergyCache worker threads while the LoadManager cycle drains from
+# its own thread.
+_drift_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class DriftAlert:
+    """A persistent data-start drift detected for one channel/QH key.
+
+    Attributes:
+        channel_num: The Emporia channel whose fetches are being rejected.
+        chart_start: The requested (QH-aligned) fetch window start.
+        data_start: The API-reported ``firstUsageInstant`` (drifted).
+        count: Consecutive rejections observed for this key at enqueue time.
+    """
+
+    channel_num: int
+    chart_start: datetime
+    data_start: datetime
+    count: int
+
+
+def drain_drift_alerts() -> list[DriftAlert]:
+    """Return and clear all pending drift alert events.
+
+    Safe to call from any thread; the fetch path and this drain serialize
+    on an internal lock.
+
+    Returns:
+        The list of ``DriftAlert`` events queued since the last drain.
+    """
+    with _drift_lock:
+        pending = list(_drift_alerts)
+        _drift_alerts.clear()
+        return pending
 
 
 def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
@@ -581,27 +629,45 @@ class HourlyProjection(MetricsBase):
             # leave a misaligned data_start in the cache — treat as a
             # transient condition and let the caller retry with stale data.
             # If the same QH keeps being rejected, the head sample is
-            # likely permanently missing: warn (every N rejections) so the
-            # resulting stall is observable instead of silent.
+            # likely permanently missing: log at ERROR level (every N
+            # rejections) and enqueue a one-time Telegram alert per QH key
+            # so the resulting stall is observable instead of silent.
             # Stale entries for long-past windows are pruned first so the
             # tracker stays bounded: chart_start advances every QH, so a key
             # older than the fetch window can never be fetched again.
             cutoff = instant - MAX_FETCH_WINDOW
-            for stale_key in list(_drift_rejections):
-                if stale_key[1] < cutoff:
-                    del _drift_rejections[stale_key]
-            key = (chan.channel_num, chart_start)
-            count = _drift_rejections.get(key, 0) + 1
-            _drift_rejections[key] = count
-            if count >= DRIFT_REJECTION_WARN_AFTER and count % DRIFT_REJECTION_WARN_AFTER == 0:
-                self.logger.warning(
-                    "get_chart_usage drift for QH starting %s: data_start "
-                    "%s persistently rejected %d consecutive fetches; the "
-                    "head of this window appears permanently missing",
-                    chart_start,
-                    usage_data_start_local,
-                    count,
+            with _drift_lock:
+                for stale_key in list(_drift_rejections):
+                    if stale_key[1] < cutoff:
+                        del _drift_rejections[stale_key]
+                key = (chan.channel_num, chart_start)
+                count = _drift_rejections.get(key, 0) + 1
+                _drift_rejections[key] = count
+                escalated = (
+                    count >= DRIFT_REJECTION_ALERT_AFTER
+                    and count % DRIFT_REJECTION_ALERT_AFTER == 0
                 )
+                if escalated:
+                    if count == DRIFT_REJECTION_ALERT_AFTER:
+                        # First crossing: queue a one-time alert for this QH
+                        # key (a (channel_num, chart_start) key is unique, so
+                        # this fires at most once per stalled window).
+                        _drift_alerts.append(
+                            DriftAlert(
+                                channel_num=chan.channel_num,
+                                chart_start=chart_start,
+                                data_start=usage_data_start_local,
+                                count=count,
+                            )
+                        )
+                    self.logger.error(
+                        "get_chart_usage drift for QH starting %s: data_start "
+                        "%s persistently rejected %d consecutive fetches; the "
+                        "head of this window appears permanently missing",
+                        chart_start,
+                        usage_data_start_local,
+                        count,
+                    )
             self.logger.warning(
                 "get_chart_usage returned data_start %s != requested "
                 "chart_start %s; treating as transient",
@@ -611,7 +677,8 @@ class HourlyProjection(MetricsBase):
             raise RetryableMetricsException(
                 f"data_start {usage_data_start_local} != chart_start {chart_start}"
             )
-        _drift_rejections.pop((chan.channel_num, chart_start), None)
+        with _drift_lock:
+            _drift_rejections.pop((chan.channel_num, chart_start), None)
         self.metrics["api_response"]["get_chart_usage/" + str(chan.channel_num)] = (
             _CLOCK.now() - chart_start
         )

@@ -120,6 +120,11 @@ def _lookup(key: str, default: Any = _UNDEFINED, cast: Any = None) -> Any:
 
 
 class Config:
+    # Too many public methods (47/20): Config is a typed facade over the
+    # env lookup chain — each accessor is a thin typed getter for one
+    # setting (or a small derived property).  Splitting it would scatter
+    # related settings across classes without reducing real complexity.
+    # pylint: disable=too-many-public-methods
     """Unified configuration accessor for all Solara settings.
 
     Reads from environment variables first, falls back to devices.json

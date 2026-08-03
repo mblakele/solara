@@ -54,7 +54,8 @@ wildly extrapolated single-sample prediction."""
 
 # ── Fetch drift observability ────────────────────────────────────────
 
-DRIFT_REJECTION_WARN_AFTER: int = 5
+DRIFT_REJECTION_ALERT_AFTER: int = 5
 """Number of consecutive drift rejections for the same QH before the
-fetch path logs a warning that the window head appears permanently
-missing (see ``_drift_rejections`` in metrics.py)."""
+fetch path logs an error that the window head appears permanently
+missing and queues a one-time Telegram alert (see ``_drift_rejections``
+and ``_drift_alerts`` in metrics.py)."""

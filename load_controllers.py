@@ -3,6 +3,12 @@ All controller implementations (stub + real), token/pairing persistence,
 and CLI helpers.
 """
 
+# pylint: disable=duplicate-code
+# The `build_tesla_state(...)` call block at the end of _init_from_rest
+# intentionally mirrors mqtt_telemetry.tesla_state_from_snapshot — both are
+# snapshot-to-model construction sites with the same kwargs.  Extracting a
+# shared helper would hide the two-step flow; the duplication is trivial.
+
 from __future__ import annotations
 
 import asyncio

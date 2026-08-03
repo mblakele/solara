@@ -82,6 +82,8 @@ from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder, DecideContex
 
 from energy_cache import EnergyCache
 
+from metrics import DriftAlert, drain_drift_alerts
+
 from telegram import (
     NotificationEvent,
     TelegramSender,
@@ -144,6 +146,11 @@ _NO_TELEMETRY_WARN_INTERVAL = 10
 
 
 class LoadManager:
+    # Too many instance attributes (24/17): LoadManager is the orchestrator
+    # that wires together the cache, NBC reader, state tracker, controllers,
+    # GapMinder, Telegram sender and runtime bookkeeping — the collaborators
+    # are inherent to its role, not a sign of hidden cohesion.
+    # pylint: disable=too-many-instance-attributes
     """Top-level orchestrator that runs the load management loop.
 
     Wires together NBCReader+Cache, StateTracker, controllers, and GapMinder
@@ -159,7 +166,7 @@ class LoadManager:
     """
 
     def __init__(self, config: LoadManagerConfig | None = None) -> None:
-
+        # pylint: disable=too-many-locals
         """Initialize LoadManager with dependency injection.
 
         Accepts a single `LoadManagerConfig` object containing all settings.
@@ -1531,6 +1538,62 @@ class LoadManager:
             error_msg,
         )
 
+    def _queue_drift_error_notification(self, alert: DriftAlert) -> None:
+        """Queue a Telegram alert for persistent Emporia data-start drift.
+
+        The Emporia API returning a ``data_start`` that drifts off the
+        requested (QH-aligned) ``chart_start`` means the head of the window
+        is missing; when the same QH key is rejected ``DRIFT_REJECTION_ALERT_AFTER``
+        consecutive times the fetch path queues a ``DriftAlert``.  This
+        method surfaces it as an error notification (bypassing the devices
+        whitelist, like auth-error alerts) via the deferred synchronous
+        send path after ``run_cycle()`` releases the lock.
+
+        Args:
+            alert: The drift alert event to surface.
+        """
+        if self.telegram_sender is None:
+            logger.info(
+                "Drift alert notification skipped: sender not configured",
+            )
+            return
+        if not self.telegram_sender.is_configured:
+            logger.info(
+                "Drift alert notification skipped: sender not configured (is_configured=False)",
+            )
+            return
+
+        now = self._clock.now()
+        message = (
+            f"Emporia VUE drift: channel {alert.channel_num} QH starting "
+            f"{alert.chart_start.isoformat()} rejected {alert.count} consecutive "
+            f"fetches (API data_start {alert.data_start.isoformat()}); head of "
+            "window appears permanently missing"
+        )
+        event = build_error_notification(message, now=now)
+        self._pending_notifications.append(event)
+        logger.error("Drift alert notification queued: %s", message)
+
+    def _drain_drift_alerts(self) -> None:
+        """Escalate persistent Emporia drift to ERROR + one-time Telegram alert.
+
+        Called by ``run_cycle()`` right after the NBC fetch stage.  Drains
+        any drift alerts queued by the fetch path, logs them at ERROR level,
+        and queues a Telegram notification per alert (delivered after the
+        cycle lock is released).
+        """
+        for alert in drain_drift_alerts():
+            logger.error(
+                "Persistent Emporia VUE drift: channel %s QH starting %s "
+                "rejected %d consecutive fetches (API data_start %s); head "
+                "of window appears permanently missing",
+                alert.channel_num,
+                alert.chart_start,
+                alert.count,
+                alert.data_start,
+            )
+            self._queue_drift_error_notification(alert)
+
     def _send_pending_notifications_sync(self) -> None:
         """Flush all queued Telegram notifications synchronously.
 
@@ -1604,6 +1667,7 @@ class LoadManager:
 
     async def _cycle_async_phase_body(
         self,
+        # pylint: disable=too-many-locals
         _gap_wh: float,
         adjusted_wh: float,
         now: datetime,
@@ -2035,14 +2099,19 @@ class LoadManager:
 
             _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=nbc_fetch")
-            if (result := self._stage_nbc_fetch(ctx)):
-                ctx.timings["nbc_fetch"] = _time_mod.perf_counter() - _t0
+            stage2_result = self._stage_nbc_fetch(ctx)
+            # Escalate any persistent Emporia drift detected during the fetch
+            # to ERROR + one-time Telegram alert, on both the success and
+            # early-exit paths.
+            self._drain_drift_alerts()
+            ctx.timings["nbc_fetch"] = _time_mod.perf_counter() - _t0
+            if stage2_result:
                 logger.info("cycle_early_exit stage=nbc_fetch status=%s reason=%s",
-                            result.status, result.diagnostics.reason if result.diagnostics else "none",
+                            stage2_result.status, stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "nbc_fetch",
-                                   "status": result.status,
-                                   "reason": result.diagnostics.reason if result.diagnostics else "none"})
-                return result
+                                   "status": stage2_result.status,
+                                   "reason": stage2_result.diagnostics.reason if stage2_result.diagnostics else "none"})
+                return stage2_result
             ctx.timings["nbc_fetch"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()

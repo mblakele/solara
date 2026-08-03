@@ -147,8 +147,8 @@ class TestLoadTelegramConfig:
     def test_mixed_env_and_env_file(self, monkeypatch, tmp_path):
         """Each key resolves independently through os.environ → .env.
 
-        Matches the pre-refactor decouple behavior where each key is
-        looked up individually (env vars first, then the .env file).
+        Each key is looked up individually through the Config chain
+        (env vars first, then the .env file).
         """
         import config as config_module
 

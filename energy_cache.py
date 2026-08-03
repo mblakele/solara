@@ -692,9 +692,8 @@ class EnergyCache:
                 logger.exception("EnergyCache fetch_func raised")
             pool.shutdown(wait=False, cancel_futures=True)
             return None
-        else:
-            pool.shutdown(wait=False)
-            return result
+        pool.shutdown(wait=False)
+        return result
 
     def get_or_fetch(
         self,

@@ -321,7 +321,13 @@ project-root
   `data_start` (`firstUsageInstant != requested chart_start`) by raising
   `RetryableMetricsException` before any misaligned data is stored; `_run_fetch_with_timeout`
   logs it as transient ("will retry"), `get_or_fetch` serves stale cache, and the next cycle
-  refetches (quiet self-heal, no invalidate/alert).
+  refetches (quiet self-heal).  Persistent drift — the same `(channel_num, chart_start)`
+  key rejected `DRIFT_REJECTION_ALERT_AFTER` (5) consecutive fetches — escalates: an
+  ERROR-level log plus a one-time `DriftAlert` event per QH key, drained by
+  `LoadManager._drain_drift_alerts()` (called by `run_cycle` after the NBC fetch stage)
+  which queues a Telegram error notification via `_queue_drift_error_notification()`
+  (bypasses the devices whitelist; fires whenever a `TelegramSender` is configured).
+  `metrics.drain_drift_alerts()` returns/clears the pending alert events.
 - `_merge_samples_replace(existing, new_data)`: replaces existing samples with new
   data (always-replace, no overlap merge), updating metadata.
 - `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent

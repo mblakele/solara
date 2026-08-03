@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import requests
+import metrics
 from energy_cache import EnergyCache, EnergyCacheData
 from metrics import (
     DevicePrediction,
@@ -962,15 +963,15 @@ class TestDriftRejectionObservability(unittest.TestCase):
     A fetch whose ``data_start != chart_start`` is rejected (strictly) so a
     misaligned window never reaches the cache.  If the API permanently drops
     the head sample of a QH, every fetch for that QH is rejected forever and
-    the QH stalls — this tracker makes that state observable with a warning
-    instead of a silent stall.
+    the QH stalls — this tracker makes that state observable with an
+    error-level log and a one-time Telegram alert (per QH key) instead of a
+    silent stall.
     """
 
     def setUp(self):
-        import metrics
-
         self._metrics = metrics
         self._metrics._drift_rejections.clear()
+        self._metrics._drift_alerts.clear()
         self.chan = MagicMock()
         self.chan.channel_num = 5
 
@@ -996,108 +997,144 @@ class TestDriftRejectionObservability(unittest.TestCase):
         hp._fetch_channel_data(self.chan, chart_start, now)
 
     @staticmethod
-    def _persistent_warnings(hp):
-        """Return (format, *args) tuples of the persistent-drift warnings."""
+    def _persistent_errors(hp):
+        """Return (format, *args) tuples of the persistent-drift errors."""
         return [
             c.args
-            for c in hp.logger.warning.call_args_list
+            for c in hp.logger.error.call_args_list
             if c.args and "persistently rejected" in c.args[0]
         ]
 
     @staticmethod
-    def _warning_mentions(call, text):
+    def _mentions(call, text):
         """True when *text* appears in any positional arg of a log call."""
         return any(text in str(arg) for arg in call)
 
-    def test_no_persistent_warning_before_threshold(self):
+    def test_no_persistent_error_before_threshold(self):
         """Fewer than N rejections log only the transient warning."""
-        import metrics
-
         hp, now = self._make_hp()
         chart_start = now.replace(minute=0)
-        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER - 1):
+        for _ in range(metrics.DRIFT_REJECTION_ALERT_AFTER - 1):
             self._reject_drifted(hp, chart_start, now)
-        self.assertEqual(self._persistent_warnings(hp), [])
+        self.assertEqual(self._persistent_errors(hp), [])
+        self.assertEqual(metrics._drift_alerts, [])
 
-    def test_warns_after_threshold_rejections(self):
-        """N consecutive rejections for the same QH log a persistent warning."""
-        import metrics
-
+    def test_errors_after_threshold_rejections(self):
+        """N consecutive rejections for the same QH log a persistent error."""
         hp, now = self._make_hp()
         chart_start = now.replace(minute=0)
-        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER):
+        for _ in range(metrics.DRIFT_REJECTION_ALERT_AFTER):
             self._reject_drifted(hp, chart_start, now)
-        warnings = self._persistent_warnings(hp)
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("persistently rejected", warnings[0][0])
-        self.assertTrue(self._warning_mentions(warnings[0], str(chart_start)))
+        errors = self._persistent_errors(hp)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("persistently rejected", errors[0][0])
+        self.assertTrue(self._mentions(errors[0], str(chart_start)))
+        self.assertEqual(len(metrics._drift_alerts), 1)
 
-    def test_warns_again_after_second_threshold(self):
-        """A continuing stall re-warns every N rejections (no log spam)."""
-        import metrics
-
+    def test_errors_again_after_second_threshold(self):
+        """A continuing stall re-logs every N rejections (no log spam)."""
         hp, now = self._make_hp()
         chart_start = now.replace(minute=0)
-        for _ in range(2 * metrics.DRIFT_REJECTION_WARN_AFTER):
+        for _ in range(2 * metrics.DRIFT_REJECTION_ALERT_AFTER):
             self._reject_drifted(hp, chart_start, now)
-        self.assertEqual(len(self._persistent_warnings(hp)), 2)
+        self.assertEqual(len(self._persistent_errors(hp)), 2)
+        # Still only one alert per key despite the continuing stall.
+        self.assertEqual(len(metrics._drift_alerts), 1)
 
     def test_success_resets_counter(self):
         """A successful fetch resets the rejection counter for that QH."""
-        import metrics
-
         hp, now = self._make_hp()
         chart_start = now.replace(minute=0)
-        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER - 1):
+        for _ in range(metrics.DRIFT_REJECTION_ALERT_AFTER - 1):
             self._reject_drifted(hp, chart_start, now)
         self._accept_matching(hp, chart_start, now)
-        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER - 1):
+        for _ in range(metrics.DRIFT_REJECTION_ALERT_AFTER - 1):
             self._reject_drifted(hp, chart_start, now)
-        # Counter reset by the success: no persistent warning yet.
-        self.assertEqual(self._persistent_warnings(hp), [])
+        # Counter reset by the success: no persistent error yet.
+        self.assertEqual(self._persistent_errors(hp), [])
         # One more rejection crosses the fresh threshold.
         self._reject_drifted(hp, chart_start, now)
-        self.assertEqual(len(self._persistent_warnings(hp)), 1)
+        self.assertEqual(len(self._persistent_errors(hp)), 1)
+        self.assertEqual(len(metrics._drift_alerts), 1)
 
     def test_different_chart_start_has_independent_counter(self):
         """Rejections for one QH do not affect another QH's counter."""
-        import metrics
-
         hp, now = self._make_hp()
         chart_start_a = now.replace(minute=0)
         chart_start_b = now.replace(minute=45)
-        for _ in range(metrics.DRIFT_REJECTION_WARN_AFTER):
+        for _ in range(metrics.DRIFT_REJECTION_ALERT_AFTER):
             self._reject_drifted(hp, chart_start_a, now)
-        # A single rejection for a different QH must not warn.
+        # A single rejection for a different QH must not error.
         self._reject_drifted(hp, chart_start_b, now)
-        warnings = self._persistent_warnings(hp)
-        self.assertEqual(len(warnings), 1)
-        self.assertTrue(self._warning_mentions(warnings[0], str(chart_start_a)))
+        errors = self._persistent_errors(hp)
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(self._mentions(errors[0], str(chart_start_a)))
+        self.assertEqual(len(metrics._drift_alerts), 1)
 
     def test_stale_rejection_keys_are_pruned(self):
-        """Rejections for long-past windows don't accumulate or trip the warning.
+        """Rejections for long-past windows don't accumulate or trip the error.
 
         chart_start advances every QH, so a key older than the fetch window
         can never be fetched again — keeping it would grow the tracker
         unboundedly (one entry per drifted QH, forever).  Each rejection
         prunes stale keys first, so a long-past entry is dropped and the
         count restarts at 1 instead of carrying an old tally into the
-        persistent-warning check.
+        persistent-error check.
         """
-        import metrics
-
         hp, now = self._make_hp()
         old_window = now - timedelta(hours=2)
         key = (self.chan.channel_num, old_window)
         # Simulate prior rejections for a window that has long since passed.
-        metrics._drift_rejections[key] = metrics.DRIFT_REJECTION_WARN_AFTER - 1
+        metrics._drift_rejections[key] = metrics.DRIFT_REJECTION_ALERT_AFTER - 1
 
         # The stale entry is pruned (older than MAX_FETCH_WINDOW), so this
-        # rejection restarts the count at 1 and never trips the warning.
+        # rejection restarts the count at 1 and never trips the error.
         self._reject_drifted(hp, old_window, now)
 
         self.assertEqual(metrics._drift_rejections.get(key), 1)
-        self.assertEqual(self._persistent_warnings(hp), [])
+        self.assertEqual(self._persistent_errors(hp), [])
+        self.assertEqual(metrics._drift_alerts, [])
+
+    def test_alert_event_enqueued_once_per_key(self):
+        """The first threshold crossing enqueues exactly one alert per QH key."""
+        hp, now = self._make_hp()
+        chart_start = now.replace(minute=0)
+        drifted = now.replace(minute=16)
+        for _ in range(metrics.DRIFT_REJECTION_ALERT_AFTER):
+            self._reject_drifted(hp, chart_start, now)
+        self.assertEqual(len(metrics._drift_alerts), 1)
+        alert = metrics._drift_alerts[0]
+        self.assertEqual(alert.channel_num, self.chan.channel_num)
+        self.assertEqual(alert.chart_start, chart_start)
+        self.assertEqual(alert.data_start, drifted)
+        self.assertEqual(alert.count, metrics.DRIFT_REJECTION_ALERT_AFTER)
+
+        # Further rejections for the same key do not re-enqueue.
+        for _ in range(2 * metrics.DRIFT_REJECTION_ALERT_AFTER):
+            self._reject_drifted(hp, chart_start, now)
+        self.assertEqual(len(metrics._drift_alerts), 1)
+
+        # A different channel with the same QH is a separate key.
+        other_chan = MagicMock()
+        other_chan.channel_num = 6
+        for _ in range(metrics.DRIFT_REJECTION_ALERT_AFTER):
+            hp.vue.get_chart_usage.return_value = ([0.1] * 60, drifted)
+            with self.assertRaises(RetryableMetricsException):
+                hp._fetch_channel_data(other_chan, chart_start, now)
+        self.assertEqual(len(metrics._drift_alerts), 2)
+
+    def test_drain_drift_alerts_returns_and_clears(self):
+        """drain_drift_alerts returns pending alerts and empties the queue."""
+        hp, now = self._make_hp()
+        chart_start = now.replace(minute=0)
+        for _ in range(metrics.DRIFT_REJECTION_ALERT_AFTER):
+            self._reject_drifted(hp, chart_start, now)
+        self.assertEqual(len(metrics._drift_alerts), 1)
+
+        drained = metrics.drain_drift_alerts()
+        self.assertEqual(len(drained), 1)
+        self.assertEqual(metrics._drift_alerts, [])
+        self.assertEqual(metrics.drain_drift_alerts(), [])
 
 
 class TestComputeNBCEdgeCases(unittest.TestCase):

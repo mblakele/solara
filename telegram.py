@@ -128,9 +128,8 @@ def load_telegram_config(config: Config | None = None) -> dict[str, str] | None:
     """
     # Priority 1: environment variables / .env file. Resolve through the
     # Config lookup chain (overrides → os.environ → .env file) so tokens
-    # kept in a .env file are found — matching the pre-refactor decouple
-    # behavior. Falls back to the module singleton when no Config is
-    # injected (the path used by TelegramSender.from_config()).
+    # kept in a .env file are found. Falls back to the module singleton when
+    # no Config is injected (the path used by TelegramSender.from_config()).
     cfg = config if config is not None else _config
     bot_token = cfg._get("TELEGRAM_BOT_TOKEN")  # pylint: disable=protected-access
     chat_id = cfg._get("TELEGRAM_CHAT_ID")  # pylint: disable=protected-access
