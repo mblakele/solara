@@ -112,6 +112,125 @@ class TestApp(unittest.TestCase):
         # Let's check for some characteristic HTML instead.
         self.assertIn(b"response time", response.data)
 
+    def test_index_real_mode_lm_disabled(self):
+        """Index returns 200 in real mode when load management is disabled.
+
+        Regression for the production 500 where a real-mode fetch through
+        EnergyCache._run_fetch_with_timeout crashed with
+        ``AttributeError: 'DaemonThreadPoolExecutor' object has no attribute
+        '_initializer'`` on Python 3.14 (ThreadPoolExecutor internals changed).
+        """
+        import app as app_mod
+
+        with self._real_mode_config():
+            with patch("app.create_metrics", return_value=self._realistic_metrics()):
+                response = self.app.get("/", headers={"Accept": "application/json"})
+        self.assertEqual(response.status_code, 200)
+
+    def test_index_real_mode_lm_out_of_time_range(self):
+        """Index returns 200 when LM is configured but outside its time range.
+
+        Same regression as test_index_real_mode_lm_disabled, but with the
+        load-manager background loop having run a disabled cycle first (the
+        exact production scenario from the outage logs).
+        """
+        import app as app_mod
+        import pytz
+        from config import Config
+
+        with self._real_mode_config():
+            now_utc = app_mod.datetime.now(app_mod.timezone.utc)
+            now_la = now_utc.astimezone(pytz.timezone("America/Los_Angeles"))
+            start_h = (now_la.hour + 1) % 24
+            end_h = (now_la.hour + 2) % 24
+            # A time range that excludes the current time so the cycle is
+            # "disabled" while load management is still configured.
+            Config().set("LOAD_MANAGE_ENABLED", f"{start_h:02d}:00-{end_h:02d}:00")
+            Config().set("LOAD_PLUG_SENTINEL", "1234:5:1")
+            Config().set("LOAD_PLUG_JACKERY", "5678:10:1")
+            Config().set("TESLA_CLIENT_ID", "client-id")
+            Config().set("TESLA_CLIENT_SECRET", "client-secret")
+            Config().set("TESLA_REGION", "na")
+            # Reinitialize the LoadManager singleton with the new config.
+            app_mod._state.load_manager = None
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = None
+            lm = app_mod._get_load_manager()
+            self.assertIsNotNone(lm)
+            result = lm.run_cycle()
+            self.assertEqual(result.status, "disabled")
+            with app_mod._state.load_manager_lock:
+                app_mod._state.last_cycle_result = result
+            with patch("app.create_metrics", return_value=self._realistic_metrics()):
+                response = self.app.get("/", headers={"Accept": "application/json"})
+        self.assertEqual(response.status_code, 200)
+
+    @contextlib.contextmanager
+    def _real_mode_config(self):
+        """Configure real (non-mock) mode and reset the LoadManager singleton.
+
+        The autouse clean_env fixture has already cleared config; this sets
+        real-mode values on top and resets the module-level singletons so the
+        test starts from a clean state. Restores on exit.
+        """
+        import app as app_mod
+        from config import Config
+
+        cfg = Config()
+        for key, value in {
+            "VUE_USERNAME": "",
+            "VUE_PASSWORD": "",
+            "MOCK": "False",
+            "MOCK_ERROR": "False",
+            "DEBUG": "False",
+            "LOAD_MANAGE_ENABLED": "False",
+            "LOAD_MANAGE_DRY_RUN": "True",
+            "LOAD_PLUG_CONTROLLER": "stub",
+            "LOAD_TESLA_CONTROLLER": "stub",
+        }.items():
+            cfg.set(key, value)
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = None
+        try:
+            yield
+        finally:
+            app_mod._state.load_manager = None
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = None
+
+    @staticmethod
+    def _realistic_metrics():
+        """Return a metrics dict shaped like real-mode HourlyProjection.metrics."""
+        from mockdata import _generate_hour_seconds
+        from util import compute_nbc_quarters
+
+        now = datetime.now(timezone.utc)
+        per_second = _generate_hour_seconds(12345, 42, sign=-1.0)
+        return {
+            "api_response": {"total": timedelta(microseconds=750072)},
+            "debug": True,
+            "devices": [
+                {
+                    "gid": 12345,
+                    "lag": timedelta(seconds=2),
+                    "name": "METER",
+                    "minute_predicted": -100.0,
+                    "minutes_remaining": 18.0,
+                    "per_second_data": per_second,
+                    "prediction": -1000.0,
+                    "prediction_min": -1100.0,
+                    "prediction_max": -900.0,
+                    "timezone": "America/Los_Angeles",
+                    "nbc": compute_nbc_quarters(per_second).to_dict(),
+                }
+            ],
+            "instant": now,
+            "data_start": now.replace(second=0, microsecond=0) - timedelta(minutes=42),
+            "_fetched_at": now,
+            "_data_lag_secs": 2.0,
+        }
+
     def test_tou_endpoint_missing_start_date(self):
         response = self.app.get("/api/v1/tou")
         self.assertEqual(response.status_code, 400)
