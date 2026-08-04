@@ -39,24 +39,51 @@ class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
     def _adjust_thread_count(self) -> None:  # type: ignore[override]
         # Create daemon thread instead of default non-daemon.
         # Based on CPython's own _adjust_thread_count in
-        # concurrent.futures.thread — the private _worker function and
-        # _threads_queues dict are stable across 3.x and are the same
-        # mechanism the stdlib uses internally.
-        if len(self._threads) < self._max_workers:
+        # concurrent.futures.thread. The stdlib's private internals differ
+        # across Python versions:
+        #   * 3.12/3.13 store initializer/initargs as instance attributes
+        #     and _worker takes (executor_reference, work_queue,
+        #     initializer, initargs).
+        #   * 3.14+ builds a per-executor worker context via
+        #     prepare_context() and _worker takes (executor_reference,
+        #     ctx, work_queue).
+        # Both shapes are supported so the daemon-thread fix keeps working
+        # on every supported Python.
+        #
+        # If idle threads are available, don't spin new threads. Mirrors the
+        # stdlib implementation. The semaphore is intentionally NOT released
+        # here: a spawned worker releases it when it goes idle, so a `with`
+        # block would be wrong.
+        if self._idle_semaphore.acquire(timeout=0):  # pylint: disable=consider-using-with
+            return
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
             # When the executor gets lost, the weakref callback will wake up
             # the worker threads.
             def weakref_cb(_, q=self._work_queue):
                 q.put(None)
 
-            t = threading.Thread(
-                name=f"{self._thread_name_prefix} (daemon)",
-                target=concurrent.futures.thread._worker,
-                args=(
+            create_worker_context = getattr(self, "_create_worker_context", None)
+            if create_worker_context is not None:
+                # Python 3.14+: worker receives a per-executor context.
+                worker_args: tuple[Any, ...] = (
+                    weakref.ref(self, weakref_cb),
+                    create_worker_context(),
+                    self._work_queue,
+                )
+            else:
+                # Python 3.12/3.13: worker receives initializer/initargs.
+                worker_args = (
                     weakref.ref(self, weakref_cb),
                     self._work_queue,
                     self._initializer,
                     self._initargs,
-                ),
+                )
+            t = threading.Thread(
+                name=f"{self._thread_name_prefix}_{num_threads}",
+                target=concurrent.futures.thread._worker,
+                args=worker_args,
                 daemon=True,  # Key: daemon=True
             )
             t.start()
