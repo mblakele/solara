@@ -27,6 +27,7 @@ dependencies = [
 # Coverage is opt-in to keep default runs fast: use `uv run pytest --cov=.`
 addopts = ""
 testpaths = ["tests"]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
 filterwarnings = [
     "ignore:module 'sre_parse' is deprecated:DeprecationWarning",
     "ignore:module 'sre_constants' is deprecated:DeprecationWarning",

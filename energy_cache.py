@@ -5,9 +5,11 @@ Data caching and management.
 from __future__ import annotations
 
 import concurrent.futures
+import concurrent.futures.thread
 import logging
 import threading
 import time as _time_mod
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -25,6 +27,41 @@ from util import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+    """ThreadPoolExecutor that spawns daemon worker threads.
+
+    Ensures worker threads don't block process exit when shutdown(wait=False)
+    is called while a worker is blocked in a system call.
+    """
+
+    def _adjust_thread_count(self) -> None:  # type: ignore[override]
+        # Create daemon thread instead of default non-daemon.
+        # Based on CPython's own _adjust_thread_count in
+        # concurrent.futures.thread — the private _worker function and
+        # _threads_queues dict are stable across 3.x and are the same
+        # mechanism the stdlib uses internally.
+        if len(self._threads) < self._max_workers:
+            # When the executor gets lost, the weakref callback will wake up
+            # the worker threads.
+            def weakref_cb(_, q=self._work_queue):
+                q.put(None)
+
+            t = threading.Thread(
+                name=f"{self._thread_name_prefix} (daemon)",
+                target=concurrent.futures.thread._worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,  # Key: daemon=True
+            )
+            t.start()
+            self._threads.add(t)  # type: ignore[attr-defined]
+            concurrent.futures.thread._threads_queues[t] = self._work_queue  # type: ignore[index]
 
 
 def _root_cause(exc: BaseException) -> BaseException:
@@ -643,10 +680,9 @@ class EnergyCache:
         details appear in logs even when the thread is still blocked in
         a system call (e.g. DNS resolution) at timeout time.
 
-        Note: known pre-existing thread leak — the executor's workers are
-        non-daemon, so a worker still blocked in a system call survives
-        ``shutdown(wait=False)`` until the call returns.  Deferred fix: a
-        daemon thread factory for the pool.
+        Note: fixed thread leak — the executor now uses DaemonThreadPoolExecutor
+        which spawns daemon workers, so a worker blocked in a system call
+        does not survive ``shutdown(wait=False)``.
         """
         timed_out = threading.Event()
 
@@ -664,7 +700,7 @@ class EnergyCache:
                     )
                 raise
 
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pool = DaemonThreadPoolExecutor(max_workers=1)
         future = pool.submit(_wrapped)
         try:
             result = future.result(timeout=self._fetch_timeout_secs)
