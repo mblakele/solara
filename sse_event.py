@@ -91,7 +91,7 @@ class SSEBroadcaster:
 
 def event_stream(
     broadcaster: SSEBroadcaster,
-    timeout: int = 60,
+    timeout: int = 30,
     initial_events: list[tuple[str, object]] | None = None,
     dumper: Any = json.dumps,
 ) -> Any:
@@ -100,8 +100,10 @@ def event_stream(
     Args:
         broadcaster: The SSEBroadcaster instance.
         timeout: Seconds before emitting a heartbeat when queue is idle.
-            Default 60s — a safety net for proxies that drop idle connections,
-            rarely fires in practice since load cycles run every ~15-30s.
+            Default 30s — deliberately below typical proxy read timeouts
+            (nginx default 60s). The heartbeat is the only traffic on
+            /stream/status when load management is disabled, so it must
+            arrive before a proxy would kill the idle connection.
         initial_events: List of (event_name, data) tuples to emit on connect
             before subscribing to the queue. Used for bootstrapping new clients
             with the current state.

@@ -4,14 +4,13 @@ import asyncio
 
 import pytest
 
-from load_manager import (
+from load_controllers import PlugController, TeslaController
+from load_models import (
     AbstractPlugController,
     AbstractTeslaController,
     PlugConfig,
     TeslaConfig,
     TeslaState,
-    PlugController,
-    TeslaController,
 )
 
 

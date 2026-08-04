@@ -39,8 +39,8 @@ class TestAppTelegramWiring:
         import app as app_mod
 
         # Reset the singleton so _get_load_manager runs fresh init logic.
-        app_mod._load_manager = None
-        app_mod._load_manager_init_failed = False
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
 
         created_config = None
 
@@ -68,7 +68,7 @@ class TestAppTelegramWiring:
         ):
             # Also need to suppress the background thread start.
             with patch.object(app_mod, "_load_management_loop"):
-                with patch.object(app_mod, "_lm_thread_started", False):
+                with patch.object(app_mod._state, "lm_thread_started", False):
                     lm = app_mod._get_load_manager()
 
         assert lm is not None
@@ -82,8 +82,8 @@ class TestAppTelegramWiring:
         """When no Telegram env vars or devices.json, telegram_sender should be None."""
         import app as app_mod
 
-        app_mod._load_manager = None
-        app_mod._load_manager_init_failed = False
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
 
         created_config = None
 
@@ -109,7 +109,7 @@ class TestAppTelegramWiring:
             autospec=False,
         ):
             with patch.object(app_mod, "_load_management_loop"):
-                with patch.object(app_mod, "_lm_thread_started", False):
+                with patch.object(app_mod._state, "lm_thread_started", False):
                     lm = app_mod._get_load_manager()
 
         assert lm is not None
@@ -301,3 +301,103 @@ class TestFireAuthErrorNotification:
         # Verify the notification contains the error text
         call_args = mock_sender.send_notification.call_args[0][0]
         assert "login_required" in call_args.description
+
+
+# =============================================================================
+# 5. LoadManager drift alerts (_queue_drift_error_notification / _drain_drift_alerts)
+# =============================================================================
+
+
+class TestDriftErrorAlerts:
+
+    @staticmethod
+    def _make_alert():
+        from datetime import datetime, timezone as tz
+
+        from metrics import DriftAlert
+
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=tz.utc)
+        return DriftAlert(
+            channel_num=5,
+            chart_start=now,
+            data_start=now.replace(minute=16),
+            count=5,
+        )
+
+    def test_queue_drift_notification_skipped_when_sender_none(self):
+        """With no TelegramSender, drift alerts are not queued."""
+        from load_manager import LoadManager, LoadManagerConfig
+
+        mgr = LoadManager(
+            LoadManagerConfig(telegram_sender=None, dry_run=True, config_interval_secs=30)
+        )
+        mgr._queue_drift_error_notification(self._make_alert())
+        assert mgr._pending_notifications == []
+
+    def test_queue_drift_notification_skipped_when_not_configured(self):
+        """With an unconfigured sender, drift alerts are not queued."""
+        from load_manager import LoadManager, LoadManagerConfig
+
+        mock_sender = MagicMock(is_configured=False)
+        mgr = LoadManager(
+            LoadManagerConfig(telegram_sender=mock_sender, dry_run=True, config_interval_secs=30)
+        )
+        mgr._queue_drift_error_notification(self._make_alert())
+        assert mgr._pending_notifications == []
+
+    def test_queue_drift_notification_appends_when_configured(self):
+        """With a configured sender, drift alerts queue an error event."""
+        from datetime import datetime, timezone as tz
+
+        from clock import FakeClock
+        from load_manager import LoadManager, LoadManagerConfig
+
+        mock_sender = MagicMock(is_configured=True)
+        clock = FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=tz.utc))
+        mgr = LoadManager(
+            LoadManagerConfig(
+                telegram_sender=mock_sender,
+                clock=clock,
+                dry_run=True,
+                config_interval_secs=30,
+            )
+        )
+        mgr._queue_drift_error_notification(self._make_alert())
+        assert len(mgr._pending_notifications) == 1
+        event = mgr._pending_notifications[0]
+        assert event.event_type == "error"
+        assert "Emporia VUE drift" in event.description
+        assert "channel 5" in event.description
+
+    def test_drain_drift_alerts_queues_each_alert(self):
+        """_drain_drift_alerts forwards drained alerts to the queue method."""
+        from load_manager import LoadManager, LoadManagerConfig
+
+        mgr = LoadManager(
+            LoadManagerConfig(telegram_sender=None, dry_run=True, config_interval_secs=30)
+        )
+        alert = self._make_alert()
+        with patch("load_manager.drain_drift_alerts", return_value=[alert]):
+            with patch.object(mgr, "_queue_drift_error_notification") as mock_queue:
+                mgr._drain_drift_alerts()
+        mock_queue.assert_called_once_with(alert)
+
+    def test_run_cycle_drains_drift_alerts_after_nbc_fetch(self, mock_config_env):
+        """run_cycle calls _drain_drift_alerts right after the NBC fetch stage."""
+        from config import Config
+        from load_manager import LoadManager, LoadManagerConfig
+        from load_models import CycleDiagnostics, CycleResult
+
+        Config().set("LOAD_MANAGE_ENABLED", "True")
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
+        early = CycleResult(
+            status="no_incomplete_qh",
+            diagnostics=CycleDiagnostics(reason="no_incomplete_qh"),
+            sleep_hint=30,
+            sleep_hint_at="2025-06-15T14:00:00+00:00",
+        )
+        with patch.object(mgr, "_stage_nbc_fetch", return_value=early):
+            with patch.object(mgr, "_drain_drift_alerts") as mock_drain:
+                result = mgr.run_cycle(force=True)
+        mock_drain.assert_called_once()
+        assert result is early

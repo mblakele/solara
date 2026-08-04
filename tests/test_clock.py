@@ -138,28 +138,16 @@ class TestEnergyCacheClockInjection:
         cache = EnergyCache()
         assert isinstance(cache._clock, RealClock)
 
-    def test_clock_used_through_merge(self):
-        """EnergyCache must use the injected clock for merge timing."""
-        from energy_cache import EnergyCache, EnergyCacheData
+    def test_clock_used_through_replace(self):
+        """EnergyCache must use the injected clock for replace timing."""
+        from energy_cache import EnergyCache
 
         clock = FakeClock(self.FIXED)
         cache = EnergyCache(clock=clock)
 
-        # Populate with initial samples via _merge_samples (full-fetch path)
-        existing = EnergyCacheData(
-            samples=[],
-            data_start=None,
-            last_sample_at=None,
-            last_fetch_at=None,
-            sample_count=None,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        data = cache._merge_samples(
-            existing=existing,
+        data = cache._merge_samples_replace(
             new_samples=[0.001] * 100,
-            result_data_start=self.FIXED - timedelta(seconds=100),
+            data_start=self.FIXED - timedelta(seconds=100),
             now=clock.now(),
         )
         assert data is not None
@@ -211,19 +199,19 @@ class TestLoadManagerClockInjection:
         lm = LoadManager(config)
         assert lm._clock is clock
 
-    def test_constructor_accepts_clock_via_kwargs(self):
-        """LoadManager must accept a Clock via legacy kwargs."""
-        from load_manager import LoadManager
+    def test_constructor_accepts_clock_via_config(self):
+        """LoadManager must accept a Clock via LoadManagerConfig."""
+        from load_manager import LoadManager, LoadManagerConfig
 
         clock = FakeClock(self.FIXED)
-        lm = LoadManager(clock=clock, enabled=False)
+        lm = LoadManager(LoadManagerConfig(clock=clock, enabled=False))
         assert lm._clock is clock
 
     def test_defaults_to_realclock(self):
         """LoadManager must use RealClock when no clock is provided."""
-        from load_manager import LoadManager
+        from load_manager import LoadManager, LoadManagerConfig
 
-        lm = LoadManager(enabled=False)
+        lm = LoadManager(LoadManagerConfig(enabled=False))
         assert isinstance(lm._clock, RealClock)
 
     def test_clock_propagates_to_run_cycle(self):

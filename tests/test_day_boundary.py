@@ -18,13 +18,12 @@ def test_48_hour_aggregation():
     local_tz = pytz.timezone(get_timezone())
     start_time = local_tz.localize(datetime.datetime(2024, 1, 1, 0, 0, 0))
 
-    # Generate one kwh per hour for 48 hours
-    data = []
-    for hour_offset in range(48):
-        timestamp = start_time + datetime.timedelta(hours=hour_offset)
-        data.append((timestamp, 1.0))
+    # One kWh per hour for 48 hours (values are kWh; _aggregate converts to Wh)
+    data = [1.0] * 48
 
-    result = EnergyDataAggregator.aggregate_from_hourly(data)
+    result = EnergyDataAggregator._aggregate(
+        start_time, data, datetime.timedelta(hours=1)
+    )
 
     # Expected values (1 kWh = 1000 Wh per hour)
     # 48 hours = 2 days worth of data

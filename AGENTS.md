@@ -118,7 +118,8 @@ Key capabilities:
 - `LOAD_TARGET_WH` — Target Wh per quarter-hour for load decisions (default: `-50`)
 - `LOAD_NBC_DEVICE` — Device name for NBC predictions
 - `LOAD_MANAGE_INTERVAL_SECS` — Seconds between load management cycles (default: 30)
-- `LOAD_TELEGRAM_DEVICES` — JSON string of device→actions whitelist for Telegram notifications.
+- Telegram device whitelist comes from the `telegram.devices` section of `devices.json`
+  (there is no env-var override; the old `LOAD_TELEGRAM_DEVICES` env var is gone).
   Notifications are **only sent** when this whitelist is configured AND at least one
   action matches. If omitted or empty, no Telegram notifications are sent.
   Example: `{"pool_pump": ["turn_on", "turn_off"], "jackery": ["turn_on"]}`
@@ -136,12 +137,16 @@ This is a flat-layout Python project. All source files live at the project root 
 
 ```
 project-root
-├── app.py                 # Flask application entrypoint & route definitions (/, /health,
-                           # /api/v1/tou, /api/v1/load/status, /api/tesla/callback)
+├── app.py                 # Flask app factory (create_app()), route definitions (/, /health,
+                           # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
+                           # _AppState runtime singletons, start_background_services()
+├── wsgi.py                # Gunicorn entry point: app = create_app(); start_background_services()
 ├── clock.py               # Clock protocol (now()) with FakeClock for tests
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
                            # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
-├── config_loader.py       # LazyConfig deferred env loading (config.get(), config.set())
+├── config_loader.py       # Config loading helpers (load_tesla_config,
+                           # load_plugs_from_file, load_vocolinc_*) reading
+                           # env via the Config class + devices.json
 ├── conftest.py            # Pytest shared fixtures & configuration
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS, etc.)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
@@ -181,8 +186,10 @@ project-root
 
 ### Key entry points
 
-- **Guard functions** `metrics.py`: `cap_chart_start()`, `cap_fetch_window()` —
-  prevent over-fetching when cache is stale; pure functions, independently tested
+- **Guard functions** `metrics.py`: `cap_chart_start()`,
+  `_chart_start_for()` — cap over-fetching when cache is stale and keep the
+  fetch window anchored to a stale QH-aligned `data_start` so a completed QH
+  is not lost at a boundary; pure functions, independently tested
 - `EnergyCache` in `energy_cache.py` with `get_or_fetch()`, `is_valid()`,
   `sleep_interval_adjust()`, and quantization detection
 - NBC calculation in `metrics.py` (`get_current_qh()` helper)
@@ -207,12 +214,25 @@ project-root
   `Location` is absent in the snapshot. Delegates to controller's `init_tesla_state()`
   (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
 - Data models in `load_models.py`
-- Routes in `app.py`
+- `create_app()` factory + routes in `app.py` (module-level `app` singleton; no
+  background threads start at import time)
+- `start_background_services()` in `app.py` — explicitly starts the MQTT subscriber
+  and load-management thread; called from `wsgi.py` and the `__main__` block, never
+  at import time (so tests can import the module safely)
 - `_setup_file_logging()` in `app.py` — creates `RotatingFileHandler` when `LOG_FILE` is configured
 - Test data generation in `mockdata.py`
 - Quantization detection in `quantization.py`
 - Timezones in `util.py`
-- Deferred config in `config_loader.py` (`LazyConfig`, `config.get()`, `config.set()`)
+- `CompletedNBCPeriod` in `util.py` — immutable record of a compacted QH period
+- `inject_completed_qh()` in `util.py` — fills QH2-QH4 from completed periods
+- `compact()` in `energy_cache.py` — compacts completed QH periods into `CompletedNBCPeriod` objects, called after every fetch in `get_or_fetch()`
+- `_merge_samples_replace()` in `energy_cache.py` — always-replace fetch path (no overlap merge)
+- `EnergyCacheAlignmentError` in `energy_cache.py` — raised by `get_current_qh()` when `data_start`
+  is missing or not QH-aligned; a plain `Exception` (asserts are stripped under `python -O`), kept as a
+  safety net since the fetch-site drift checks below reject misaligned data before it is stored
+- Deferred config in `config.py` (`Config.get()`, `Config.set()`, `_lookup` chain:
+  overrides -> os.environ -> .env); config loading helpers in `config_loader.py`
+  (`load_tesla_config`, `load_plugs_from_file`, `load_vocolinc_*`)
 - Tesla config in `config.py` (`TeslaConfig` dataclass, `load_tesla_config()`)
 - Tesla telemetry intervals in `config.py` (`tesla_telemetry_chargestate_interval`,
   `tesla_telemetry_location_interval`, `tesla_telemetry_chargeamps_interval`,
@@ -227,12 +247,12 @@ project-root
 - Telegram sender in `telegram.py` (`TelegramSender`, `NotificationEvent`)
 - SSE broadcaster and endpoint tests in `tests/test_sse.py` (`SSEBroadcaster`, `event_stream`)
 - Pipeline stage tests in `tests/test_pipeline_stages.py`
-- Pipeline stage tests in `tests/test_pipeline_stages.py`
 - CycleContext tests in `tests/test_cycle_context.py`
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 - Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
 - File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
+- Compaction tests in `tests/test_compaction.py` (`CompletedNBCPeriod`, `compact()`, `inject_completed_qh()`, replace-not-merge behavior)
 
 ### Actions Generation Flow
 - GapMinder.decide() generates actions as a list of PendingEffect objects
@@ -251,7 +271,7 @@ project-root
 - Returns "status": "dry-run" vs "status": "ok" depending on mode
 
 ### Index Endpoint
-- app.py / route (lines 171-195) serves HTML or JSON based on Accept header
+- `index()` in app.py serves HTML or JSON based on Accept header
 - Returns model.metrics which includes:
   - devices: list with gid, lag, name, prediction, nbc (clock-boundary quarter-hour data),
     prev_hour_data
@@ -282,8 +302,8 @@ project-root
 - `TelegramClient` (telegram_client.py) — async aiohttp client, fire-and-forget, returns `bool`, never raises
 - `TelegramSender` (telegram.py) — high-level sender with config loading from env vars and devices.json
 - `NotificationEvent` (telegram.py) — frozen dataclass for structured notifications with `format_message()`
-- `load_telegram_config()` (telegram.py) — loads config from env vars (priority) or devices.json
-- `load_telegram_devices()` (telegram.py) — loads device whitelist dict from `LOAD_TELEGRAM_DEVICES` env var or devices.json
+- `load_telegram_config()` (telegram.py) — loads config via the Config lookup chain (env vars → `.env` file) first, then devices.json
+- Telegram device whitelist: loaded from the `telegram.devices` section of devices.json in `LoadManager.__init__` / `reload_config()` (there is no env-var override; the old `LOAD_TELEGRAM_DEVICES` env var is gone)
 - `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`; "tesla" is accepted as a special device name for Tesla stop-charging alerts
 - Whitelist gate: Telegram notifications are only sent when a telegram.devices whitelist is explicitly configured AND at least one action matches it. Without a whitelist, notifications are blocked to prevent unintended messages to unconfigured devices.
 - Plug notifications use emoji format: `🟢 device → ON` / `🔘 device → OFF`
@@ -297,22 +317,30 @@ project-root
   - `sample_count`, `last_sample_at`: metadata for diagnostics
   - `full_metrics_dict`: dict[str, Any] | None — metrics dict refreshed on every fetch (not just the first),
     returned on cache hits to preserve keys like `devices`, `nbc`, `instant`
-- `_build_incremental_fetch(cache, vue_mock, gid, now)`: builds a fetcher that returns
-  only new samples since the last data point. Returns `None` on API error.
-- `_merge_samples(existing, new_data)`: merges new samples into existing cache, updating
-  metadata. Handles overlapping and non-overlapping data ranges.
+- `_fetch_channel_data()` in `metrics.py` (HourlyProjection) — rejects a drifted API
+  `data_start` (`firstUsageInstant != requested chart_start`) by raising
+  `RetryableMetricsException` before any misaligned data is stored; `_run_fetch_with_timeout`
+  logs it as transient ("will retry"), `get_or_fetch` serves stale cache, and the next cycle
+  refetches (quiet self-heal).  Persistent drift — the same `(channel_num, chart_start)`
+  key rejected `DRIFT_REJECTION_ALERT_AFTER` (5) consecutive fetches — escalates: an
+  ERROR-level log plus a one-time `DriftAlert` event per QH key, drained by
+  `LoadManager._drain_drift_alerts()` (called by `run_cycle` after the NBC fetch stage)
+  which queues a Telegram error notification via `_queue_drift_error_notification()`
+  (bypasses the devices whitelist; fires whenever a `TelegramSender` is configured).
+  `metrics.drain_drift_alerts()` returns/clears the pending alert events.
+- `_merge_samples_replace(existing, new_data)`: replaces existing samples with new
+  data (always-replace, no overlap merge), updating metadata.
 - `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent
   unbounded memory growth. Called automatically by `get_or_fetch()`.
 - `get_or_fetch(fetcher, force=False)`: returns cached data if valid (within TTL), otherwise
-  calls the fetcher. When an incremental fetcher is available, it merges new samples into
-  existing cache instead of replacing them entirely. On cache hits, returns the full metrics
-  dict (including `devices`) if stored from a prior fetch. Always updates `full_metrics_dict`
-  on every fetch to keep predictions current.
+  calls the fetcher. Fetch results replace the cached samples (no overlap merge). On cache
+  hits, returns the full metrics dict (including `devices`) if stored from a prior fetch.
+  Always updates `full_metrics_dict` on every fetch to keep predictions current.
 
 ### Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
   The optional `force=True` parameter bypasses the stale-data check and always fetches fresh NBC data from API.
-- EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`
+- EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`. After compaction, completed QH periods are stored as immutable `CompletedNBCPeriod` objects and per-second data only covers the current incomplete QH.
 - Controllers: PlugController (stub) / RealPlugController (aiohomekit), TeslaController (stub) / RealTeslaController (tesla-fleet-api)
 - Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>[:<priority>] env vars
 
@@ -375,8 +403,13 @@ to the next step if a prior step fails.
 ```bash
 uv run pylint *.py                     # 1. Style and bug checks
 uv run mypy                            # 2. Type correctness
-uv run pytest                          # 3. Full test suite
+uv run pytest                          # 3. Full test suite (fast, no coverage)
+uv run pytest --cov=.                  # 4. Coverage check (opt-in)
 ```
+
+Coverage is opt-in: `uv run pytest` runs without instrumentation for speed.
+Run `uv run pytest --cov=.` (or add `--cov=<module>`) when coverage validation
+is required (e.g. CI, or after changing test-relevant code).
 
 ### Individual Commands
 
@@ -387,7 +420,7 @@ uv run pytest                          # 3. Full test suite
 | Lint | `uv run pylint *.py` |
 | Type check | `uv run mypy` |
 | Dev server | `uv run python app.py` |
-| Production-like server | `gunicorn --reload --worker-class=gthread --threads=4 --timeout=0 --bind 127.0.0.1:8000 app:app` |
+| Production-like server | `gunicorn --reload --worker-class=gthread --threads=4 --timeout=31 --bind 127.0.0.1:8000 wsgi:app` |
 
 The dev server reads credentials from `.env` (`VUE_USERNAME`, `VUE_PASSWORD`).
 Ensure that file is present and sourced before running.
@@ -458,8 +491,8 @@ Ensure that file is present and sourced before running.
 ### 5. Security
 
 - **No hardcoded secrets.** Read all credentials and API keys from environment
-  variables via the local `decouple.py` library. If you find hardcoded secrets,
-  fix them immediately.
+  variables via the `config` module (`Config`/`Config.set`). If you find
+  hardcoded secrets, fix them immediately.
 - **Validate all user input** (URL params, form fields, query strings) before
   use or storage.
 
@@ -500,12 +533,12 @@ Ensure that file is present and sourced before running.
 
 **Write tests for all new functionality.** A PR with new behavior but no new
   tests is incomplete. This includes changes driven by pre-existing plans — a plan file is never a substitute for tests.
-- **Always guard against pollution from `devices.json` and `.env` files** The local `.env` (loaded by `decouple`) may conflict with your test. Consider that and guard against it. Use deferred config in app code, and monkeypatch.setenv in pytest fixtures.
+- **Always guard against pollution from `devices.json` and `.env` files** The local `.env` (read lazily by the `config` module) may conflict with your test. Consider that and guard against it. Use deferred config in app code, and monkeypatch.setenv in pytest fixtures.
 ```
 # ❌ Evaluated at import — hard to mock
 DATABASE_URL = config('DATABASE_URL')
 
-# ✅ Deferred — evaluated when called, so we can patch decouple's config before the values are ever resolved, giving tests full control.
+# ✅ Deferred — evaluated when called, so we can patch config's lookup before the values are ever resolved, giving tests full control.
 def get_database_url():
     return config('DATABASE_URL')
 

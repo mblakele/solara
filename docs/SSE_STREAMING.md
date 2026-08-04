@@ -233,20 +233,31 @@ task.resume()
 
 ## Gunicorn Configuration
 
-SSE connections are long-lived and require a threaded or async worker model.
+SSE connections are long-lived and require a threaded worker model.
 The production deployment uses:
 
 ```yaml
-startCommand: gunicorn app:app --worker-class=gthread --threads=4 --timeout=0
+startCommand: gunicorn wsgi:app --worker-class=gthread --threads=4 --timeout=31
 ```
 
-Each concurrent SSE client occupies one thread. Adjust `--threads` to match
-expected concurrency. The default `--timeout=0` disables the worker timeout,
-which is required because SSE connections are open indefinitely.
+With the gthread worker, each in-flight request — including each SSE
+client — runs in one of the `--threads` worker threads. Adjust
+`--threads` to match expected concurrency.
+
+`--timeout` is the worker heartbeat threshold (default 30 seconds), not
+a per-request deadline. Workers that stop updating their heartbeat for
+longer than `--timeout` seconds are restarted by the master. The gthread
+worker's main event loop updates the heartbeat continuously while SSE
+requests are open on pool threads, so an indefinite stream does not trip
+the timeout. `--timeout=31` in production is therefore a hung-worker
+guard, not a request limit, and `--timeout=0` (which disables the check)
+is only needed for the sync worker model, where each request blocks a
+whole worker.
 
 ## nginx Proxy Configuration
 
-If behind nginx, ensure buffering is disabled:
+If behind nginx, ensure buffering is disabled and the read timeout
+allows idle time between events:
 
 ```nginx
 location /stream/status {
@@ -256,11 +267,17 @@ location /stream/status {
     proxy_buffering off;
     proxy_cache off;
     chunked_transfer_encoding on;
+    proxy_read_timeout 3600s;
 }
 ```
 
 The endpoint already sets `X-Accel-Buffering: no` in its response headers,
-which nginx respects when proxying.
+which nginx respects when proxying. The SSE stream emits a heartbeat frame
+every 30 seconds when idle (`event_stream`), so traffic never stops
+entirely — but `proxy_read_timeout` must stay above the heartbeat
+interval. nginx's default is 60s, which leaves only one missed heartbeat
+of slack; setting it explicitly (e.g. 3600s) removes the dependency on
+that default.
 
 ## EventSource Auto-Reconnection
 

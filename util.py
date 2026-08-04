@@ -15,6 +15,16 @@ from config import Config, _config
 from constants import DEFAULT_PREDICTION_WINDOW_SECS
 
 
+class RetryableError(Exception):
+    """Base class for transient, retryable API errors.
+
+    Subclasses signal a known, temporary upstream condition (e.g. the
+    Emporia VUE API returned no data for the hour).  Callers handle
+    these by serving stale data and retrying on the next cycle, so they
+    are logged as warnings rather than errors.
+    """
+
+
 def get_timezone(config: Config | None = None) -> str:
     """Return the configured timezone, evaluated lazily for testability.
 
@@ -74,6 +84,18 @@ def ceil_to_qh(dt: datetime) -> datetime:
         return truncated
     minutes_to_next = (15 - remainder) % 15 or 15
     return truncated + timedelta(minutes=minutes_to_next)
+
+def floor_to_qh(dt: datetime) -> datetime:
+    """Return dt truncated to the most recent quarter-hour boundary.
+
+    Args:
+        dt: datetime to truncate.
+
+    Returns:
+        A datetime on a quarter-hour boundary no later than ``dt``.
+    """
+    truncated = dt.replace(second=0, microsecond=0)
+    return truncated - timedelta(minutes=truncated.minute % 15)
 
 def qh_seconds_remaining(dt: datetime) -> int:
     """Calculate seconds remaining in the QH period,
@@ -155,6 +177,23 @@ class NBCQuarterSet:
             "QH3": self.qh3.to_dict() if self.qh3 else None,
             "QH4": self.qh4.to_dict() if self.qh4 else None,
         }
+
+
+@dataclass(frozen=True)
+class CompletedNBCPeriod:
+    """Immutable record of a completed 15-minute QH period.
+
+    Stores the start timestamp and raw Wh sum.  Used by EnergyCache
+    compaction to preserve completed QH data after per-second samples
+    are purged.
+
+    Attributes:
+        start: QH boundary (start of the 15-min window).
+        raw_wh: Sum of per-second kWh * 1000.
+    """
+
+    start: datetime
+    raw_wh: float
 
 
 def compute_nbc_quarter(
@@ -266,6 +305,68 @@ def compute_nbc_quarters(
         quarters.append(None)
 
     return NBCQuarterSet(qh1=quarters[0], qh2=quarters[1], qh3=quarters[2], qh4=quarters[3])
+
+
+def _completed_quarter(period: CompletedNBCPeriod) -> NBCQuarter:
+    """Build a complete NBCQuarter from a completed period.
+
+    Args:
+        period: The completed period to convert.
+
+    Returns:
+        A complete NBCQuarter carrying the period's raw Wh.
+
+    Note:
+        ``raw_wh`` is the value reported to the UI and /api/v1/tou; it is
+        preserved unmodified (it may be negative, e.g. net export).  ``wh``
+        is clamped at zero purely as a display fallback for templates that
+        render a non-negative bar.
+    """
+    return NBCQuarter(
+        complete=True,
+        raw_wh=period.raw_wh,
+        wh=max(0.0, period.raw_wh),
+    )
+
+
+def inject_completed_qh(
+    nbc: NBCQuarterSet,
+    completed_periods: list[CompletedNBCPeriod],
+) -> NBCQuarterSet:
+    """Fill QH2-QH4 from completed periods into NBCQuarterSet.
+
+    QH1 is preserved as-is (computed from per-second data).
+    QH2-QH4 are reconstructed from CompletedNBCPeriod raw_wh values.
+
+    Slots are filled most-recent-first **without a contiguity check**: if a
+    QH is genuinely missing (e.g. a fetch outage), the periods shift up a
+    slot and an older period's Wh is displayed under a newer window's
+    label.  This is display-only and transient (the template labels rows by
+    slot name QH1-QH4), so it self-corrects once fresh data arrives.
+
+    Args:
+        nbc: The NBC quarter set (QH1 may be present, QH2-QH4 may be None).
+        completed_periods: Completed QH periods sorted by start time.
+
+    Returns:
+        New NBCQuarterSet with QH2-QH4 filled from completed periods.
+    """
+    # Stack of completed periods with the most recent on top; each vacant
+    # QH slot pops the next most recent period.
+    stack = sorted(completed_periods, key=lambda p: p.start)
+
+    qh2 = nbc.qh2
+    qh3 = nbc.qh3
+    qh4 = nbc.qh4
+
+    if qh2 is None and stack:
+        qh2 = _completed_quarter(stack.pop())
+    if qh3 is None and stack:
+        qh3 = _completed_quarter(stack.pop())
+    if qh4 is None and stack:
+        qh4 = _completed_quarter(stack.pop())
+
+    return NBCQuarterSet(qh1=nbc.qh1, qh2=qh2, qh3=qh3, qh4=qh4)
 
 
 def _clock_boundary_windows(now: datetime) -> list[tuple[datetime, datetime]]:

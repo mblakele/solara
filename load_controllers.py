@@ -3,6 +3,12 @@ All controller implementations (stub + real), token/pairing persistence,
 and CLI helpers.
 """
 
+# pylint: disable=duplicate-code
+# The `build_tesla_state(...)` call block at the end of _init_from_rest
+# intentionally mirrors mqtt_telemetry.tesla_state_from_snapshot — both are
+# snapshot-to-model construction sites with the same kwargs.  Extracting a
+# shared helper would hide the two-step flow; the duplication is trivial.
+
 from __future__ import annotations
 
 import asyncio
@@ -1246,20 +1252,12 @@ class VocolincPlugController(AbstractPlugController):
                 "and VOCOLINC_PASSWORD environment variables."
             )
 
-        # Look up VOCOlinc via load_manager so that patch("load_manager.VOCOlinc")
-        # intercepts it correctly in tests.  Also check sys.modules["vocolinc"]
-        # first so that monkeypatch.setitem(sys.modules, "vocolinc", mock) works.
+        # Check sys.modules["vocolinc"] first so that
+        # monkeypatch.setitem(sys.modules, "vocolinc", mock) works in tests.
         _sys_voc = sys.modules.get("vocolinc")
         if isinstance(_sys_voc, MagicMock):
             VOCOlinc = _sys_voc.VOCOlinc  # type: ignore[attr-defined]
         else:
-            _load_manager = sys.modules.get("load_manager")
-            VOCOlinc = (
-                getattr(_load_manager, "VOCOlinc", None)
-                if _load_manager is not None
-                else None
-            )
-        if VOCOlinc is None:
             from vocolinc import VOCOlinc  # type: ignore[assignment]
 
         assert VOCOlinc is not None, "VOCOlinc class could not be imported"

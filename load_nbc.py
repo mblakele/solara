@@ -2,33 +2,23 @@
 NBC reader, device state tracking, and the bin-packing decision engine.
 
 NBCReader reads current quarter-hour predictions from a shared EnergyCache
-instance instead of maintaining its own NBCCache layer. NBC quarters are
-computed on demand from raw per-second samples via util.compute_nbc_quarters().
+instance. NBC quarters are computed on demand from raw per-second samples
+via util.compute_nbc_quarters().
 """
 
 from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from energy_cache import EnergyCache
 from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
 
 from constants import DEFAULT_PREDICTION_WINDOW_SECS
-
-# Deferred import to avoid circular dependency with metrics module.
-_energy_cache_type: Any = None
-
-
-def _get_energy_cache_type() -> Any:
-    """Return the EnergyCache class, importing lazily to avoid circular deps."""
-    global _energy_cache_type
-    if _energy_cache_type is None:
-        from metrics import EnergyCache  # type: ignore[assignment]
-        _energy_cache_type = EnergyCache
-    return _energy_cache_type
 
 
 logger = logging.getLogger(__name__)
@@ -120,8 +110,8 @@ class NBCPeriod:
 class NBCReader:
     """Reads current QH predicted_wh from cached energy samples.
 
-    Reads directly from EnergyCache instead of wrapping a fetch callable
-    and using NBCCache. NBC quarters are computed on demand from raw samples.
+    Reads directly from EnergyCache. NBC quarters are computed on demand
+    from raw samples.
 
     Attributes:
         energy_cache: Shared EnergyCache instance for reading cached per-second data.
@@ -129,7 +119,10 @@ class NBCReader:
     """
 
     def __init__(
-        self, energy_cache: Any | None = None, device_name: str = ""
+        self,
+        energy_cache: EnergyCache | None = None,
+        device_name: str = "",
+        metrics_fetch: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         """Initialize NBCReader with an optional EnergyCache and device name.
 
@@ -137,12 +130,12 @@ class NBCReader:
             energy_cache: Shared EnergyCache instance for reading cached per-second data.
                 When None, creates a default EnergyCache(ttl_seconds=30).
             device_name: Name of the VUE device to query. Defaults to empty string.
+            metrics_fetch: Callable that fetches fresh raw metrics data. Used by
+                ``get_current_qh(force=True)`` to bypass the cache.
         """
-        EnergyCacheType = _get_energy_cache_type()
-        self.energy_cache: Any = energy_cache or EnergyCacheType(ttl_seconds=30)
+        self.energy_cache: EnergyCache = energy_cache or EnergyCache(ttl_seconds=30)
         self.device_name = device_name
-        # Callable injected by LoadManager to fetch raw metrics data.
-        self._metrics_fetch: Any | None = None
+        self._metrics_fetch: Callable[[], dict[str, Any] | None] | None = metrics_fetch
 
     def get_data_lag_secs(self) -> float:
         """Return the data lag in seconds from the underlying energy cache.
@@ -150,9 +143,7 @@ class NBCReader:
         Returns:
             The data lag in seconds (0.0 when unavailable).
         """
-        return getattr(
-            self.energy_cache, "_data_lag_secs", 0.0
-        )
+        return self.energy_cache.data_lag_secs
 
     def get_current_qh(
         self, now: datetime, force: bool = False
@@ -178,9 +169,7 @@ class NBCReader:
                 fetched_at = self.energy_cache.last_fetch_at
                 if fetched_at is None:
                     fetched_at = now
-                lag_secs = getattr(
-                    self.energy_cache, "_data_lag_secs", 0.0
-                )
+                lag_secs = self.energy_cache.data_lag_secs
                 data_point_at = fetched_at - timedelta(seconds=lag_secs)
                 return NBCFetchResult(
                     qh_name=qh_data["qh_name"],
@@ -196,7 +185,7 @@ class NBCReader:
 
         # Try to fetch fresh data via _metrics_fetch when the cache is not
         # valid, or when the cache is valid but has no incomplete QH.
-        if hasattr(self, "_metrics_fetch") and self._metrics_fetch is not None:
+        if self._metrics_fetch is not None:
             metrics_data = self._metrics_fetch()
             if metrics_data is None:
                 return None
@@ -225,9 +214,7 @@ class NBCReader:
             fetched_at = self.energy_cache.last_fetch_at
             if fetched_at is None:
                 fetched_at = now
-            lag_secs = getattr(
-                self.energy_cache, "_data_lag_secs", 0.0
-            )
+            lag_secs = self.energy_cache.data_lag_secs
             data_point_at = fetched_at - timedelta(seconds=lag_secs)
             return NBCFetchResult(
                 qh_name=qh_data["qh_name"],
@@ -238,26 +225,6 @@ class NBCReader:
             )
 
         return None
-
-    def get_current_qh_direct(
-        self, metrics_data: dict[str, Any] | None
-    ) -> tuple[str, float, int] | None:
-        """Parse metrics data directly without cache.
-
-        Useful for testing with injected mock data. Unchanged from current
-        implementation except device_name is no longer needed (first device found).
-
-        Args:
-            metrics_data: The raw metrics dict from HourlyProjection, or None.
-
-        Returns:
-            Tuple of (qh_name, predicted_wh in Wh, seconds remaining in QH),
-            or None if no incomplete QH available.
-        """
-        result = self._parse_metrics(self.device_name, metrics_data)
-        if result is None:
-            return None
-        return result.qh_name, result.predicted_wh, result.seconds_remaining
 
     def _parse_metrics(
         self, device_name: str, metrics_data: dict[str, Any] | None,
@@ -461,7 +428,7 @@ class StateTracker:
 
     def tesla_inflight_wh(
         self, reported_amps: int | None, seconds_remaining: int,
-        now: datetime | None = None,
+        now: datetime,
         data_point_at: datetime | None = None,
     ) -> float:
         """Compute the still-unconfirmed Tesla amp-change contribution.
@@ -482,8 +449,7 @@ class StateTracker:
         Args:
             reported_amps: current_amps from the vehicle API this cycle.
             seconds_remaining: Seconds left in the current quarter-hour.
-            now: Current wall-clock time.  Defaults to ``datetime.now(timezone.utc)``
-                when ``None``.
+            now: Current wall-clock time (injected so tests can pin it).
             data_point_at: Current NBC data-point-at timestamp.  When provided,
                 the data-point-at age is checked alongside wall-clock age for
                 the 1A stale-clearing gate.  ``None`` falls back to
@@ -494,7 +460,7 @@ class StateTracker:
         """
         if self.last_commanded_amps is None or reported_amps is None:
             return 0.0
-        resolve_now = now if now is not None else datetime.now(timezone.utc)
+        resolve_now = now
         # Car has stopped drawing power — clear the stale command state.
         # reported_amps == 0 means the car is idle or disconnected.
         if reported_amps == 0:

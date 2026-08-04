@@ -21,6 +21,10 @@ def _equal(a: float, b: float) -> bool:
 
 
 def detect_quantization(data: list[float]) -> tuple[int, int, float] | None:
+    # pylint: disable=too-many-locals
+    # The detector tracks window size, offset, per-second counts and the
+    # running confidence for every candidate N — dense but all required to
+    # score the repeating constant-value windows.
     """Detect quantization in per-second float data.
 
     Scans the data for repeating constant-value windows of N seconds.

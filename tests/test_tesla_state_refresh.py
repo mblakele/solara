@@ -10,8 +10,8 @@ import asyncio
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from load_manager import LoadManager, TeslaConfig
-from load_models import TeslaState
+from load_manager import LoadManager, LoadManagerConfig
+from load_models import TeslaState, TeslaConfig
 
 
 class TestFetchTeslaStateAsync:
@@ -29,7 +29,7 @@ class TestFetchTeslaStateAsync:
     def _make_lm(self) -> LoadManager:
         """Create a minimal LoadManager with a stub Tesla controller."""
         from load_controllers import TeslaController
-        from load_manager import TeslaConfig
+        from load_models import TeslaConfig
 
         # Minimal TeslaConfig so tesla_ctrl is initialized.
         config = TeslaConfig(
@@ -38,7 +38,7 @@ class TestFetchTeslaStateAsync:
             redirect_uri="http://localhost/callback",
             vehicle_id="v1",
         )
-        mgr = LoadManager(dry_run=True, config_interval_secs=30)
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
         mgr.tesla_config = config
         mgr.tesla_ctrl = TeslaController(config)
         return mgr

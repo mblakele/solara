@@ -425,10 +425,9 @@ class TestNBCIntegration(unittest.TestCase):
     def _get_mock_index(self, instant_minute: int = 42) -> tuple:
         """Hit the / endpoint in mock mode and return (status, data)."""
 
-        import decouple
         from unittest.mock import patch as _patch
 
-        def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+        def mock_lookup(key, default=None, cast=str):  # type: ignore[no-untyped-def]
             values = {
                 "MOCK": True,
                 "VUE_USERNAME": None,
@@ -440,7 +439,7 @@ class TestNBCIntegration(unittest.TestCase):
 
         import config as _cfg_mod  # noqa: F811
 
-        with _patch.object(_cfg_mod, "_decouple_config", side_effect=mock_decouple):
+        with _patch.object(_cfg_mod, "_lookup", side_effect=mock_lookup):
             response = self.app.get(
                 f"/?instant_minute={instant_minute}", headers={"Accept": "application/json"}
             )
@@ -558,10 +557,9 @@ class TestNBCIntegration(unittest.TestCase):
     def test_tou_endpoint_includes_nbc_via_mock(self):
         """TOU endpoint in mock mode also has NBC data on devices."""
 
-        import decouple
         from unittest.mock import patch as _patch
 
-        def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+        def mock_lookup(key, default=None, cast=str):  # type: ignore[no-untyped-def]
             values = {
                 "MOCK": True,
                 "VUE_USERNAME": None,
@@ -573,7 +571,7 @@ class TestNBCIntegration(unittest.TestCase):
 
         import config as _cfg_mod  # noqa: F811
 
-        with _patch.object(_cfg_mod, "_decouple_config", side_effect=mock_decouple):
+        with _patch.object(_cfg_mod, "_lookup", side_effect=mock_lookup):
             response = self.app.get(
                 "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-01T04:00:00"
             )

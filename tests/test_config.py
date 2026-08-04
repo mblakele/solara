@@ -1,9 +1,10 @@
 """Tests for centralized Config class and module-level helpers."""
 
+import os
 from unittest.mock import patch, PropertyMock
 
 import pytest
-from decouple import config as _decouple_config
+from config import Config as _Config
 
 
 class TestConfigClass:
@@ -12,7 +13,7 @@ class TestConfigClass:
     @pytest.fixture(autouse=True)
     def fresh_config(self):
         """Create a new Config instance for each test."""
-        _decouple_config.clear_all()
+        _Config().clear_all()
 
     def test_timezone_default(self):
         """Returns default timezone when env var is unset."""
@@ -23,7 +24,7 @@ class TestConfigClass:
 
     def test_timezone_from_env(self):
         """Returns timezone from TIMEZONE env var."""
-        _decouple_config.set("TIMEZONE", "America/New_York")
+        _Config().set("TIMEZONE", "America/New_York")
 
         from config import Config
 
@@ -32,7 +33,7 @@ class TestConfigClass:
 
     def test_is_not_mock_mode_no_credentials(self):
         """Returns True when VUE_USERNAME is not set."""
-        _decouple_config.set("VUE_USERNAME", "")
+        _Config().set("VUE_USERNAME", "")
 
         from config import Config
 
@@ -41,8 +42,8 @@ class TestConfigClass:
 
     def test_is_mock_mode_with_credentials(self):
         """Returns False when VUE_USERNAME is set and MOCK=False."""
-        _decouple_config.set("VUE_USERNAME", "user")
-        _decouple_config.set("MOCK", "False")
+        _Config().set("VUE_USERNAME", "user")
+        _Config().set("MOCK", "False")
 
         from config import Config
 
@@ -51,8 +52,8 @@ class TestConfigClass:
 
     def test_is_mock_mode_explicitly_enabled(self):
         """Returns True when MOCK=True even with credentials."""
-        _decouple_config.set("VUE_USERNAME", "user")
-        _decouple_config.set("MOCK", "True")
+        _Config().set("VUE_USERNAME", "user")
+        _Config().set("MOCK", "True")
 
         from config import Config
 
@@ -68,7 +69,7 @@ class TestConfigClass:
 
     def test_is_mock_error_enabled(self):
         """Returns True when MOCK_ERROR=True."""
-        _decouple_config.set("MOCK_ERROR", "True")
+        _Config().set("MOCK_ERROR", "True")
 
         from config import Config
 
@@ -84,7 +85,7 @@ class TestConfigClass:
 
     def test_debug_enabled(self):
         """Returns True when DEBUG=True."""
-        _decouple_config.set("DEBUG", "True")
+        _Config().set("DEBUG", "True")
 
         from config import Config
 
@@ -101,7 +102,7 @@ class TestConfigClass:
 
     def test_dry_run_disabled(self):
         """Returns False when LOAD_MANAGE_DRY_RUN=False."""
-        _decouple_config.set("LOAD_MANAGE_DRY_RUN", "False")
+        _Config().set("LOAD_MANAGE_DRY_RUN", "False")
 
         from config import Config
 
@@ -114,8 +115,8 @@ class TestConfigSingleton:
 
     @pytest.fixture(autouse=True)
     def fresh_config(self):
-        """Clear decouple config before each test."""
-        _decouple_config.clear_all()
+        """Reset config sources before each test."""
+        _Config().clear_all()
 
     def test_singleton_is_instance(self):
         """The cfg module-level variable is a Config instance."""
@@ -129,8 +130,8 @@ class TestBackwardCompatFunctions:
 
     @pytest.fixture(autouse=True)
     def fresh_config(self):
-        """Clear decouple config before each test."""
-        _decouple_config.clear_all()
+        """Reset config sources before each test."""
+        _Config().clear_all()
 
     def test_get_timezone_returns_cfg_timezone(self):
         """get_timezone() returns cfg.timezone."""
@@ -140,7 +141,7 @@ class TestBackwardCompatFunctions:
 
     def test_get_timezone_respects_env(self):
         """get_timezone() respects TIMEZONE env var."""
-        _decouple_config.set("TIMEZONE", "Europe/London")
+        _Config().set("TIMEZONE", "Europe/London")
 
         from config import get_timezone, Config
         import config as cfg_mod
@@ -156,7 +157,7 @@ class TestBackwardCompatFunctions:
 
     def test_get_timezone_lazy_eval(self):
         """get_timezone() picks up env changes without replacing singleton."""
-        _decouple_config.set("TIMEZONE", "Europe/London")
+        _Config().set("TIMEZONE", "Europe/London")
 
         from config import get_timezone, Config
         import config as cfg_mod
@@ -165,7 +166,7 @@ class TestBackwardCompatFunctions:
         assert get_timezone() == "Europe/London"
 
         # Restore default for other tests
-        _decouple_config.set("TIMEZONE", "America/Los_Angeles")
+        _Config().set("TIMEZONE", "America/Los_Angeles")
 
 
 class TestConfigTeslaProperties:
@@ -173,8 +174,8 @@ class TestConfigTeslaProperties:
 
     @pytest.fixture(autouse=True)
     def fresh_config(self):
-        """Clear decouple config before each test."""
-        _decouple_config.clear_all()
+        """Reset config sources before each test."""
+        _Config().clear_all()
 
     def test_tesla_client_id_default(self):
         """Returns None when TESLA_CLIENT_ID is not set."""
@@ -196,8 +197,8 @@ class TestConfigTeslaTelemetryProperties:
 
     @pytest.fixture(autouse=True)
     def fresh_config(self):
-        """Clear decouple config before each test."""
-        _decouple_config.clear_all()
+        """Reset config sources before each test."""
+        _Config().clear_all()
 
     def test_mqtt_host_default(self):
         """Returns 'localhost' when MQTT_HOST is not set."""
@@ -208,7 +209,7 @@ class TestConfigTeslaTelemetryProperties:
 
     def test_mqtt_host_from_env(self):
         """Returns host from MQTT_HOST env var."""
-        _decouple_config.set("MQTT_HOST", "192.168.1.50")
+        _Config().set("MQTT_HOST", "192.168.1.50")
 
         from config import Config
 
@@ -224,7 +225,7 @@ class TestConfigTeslaTelemetryProperties:
 
     def test_mqtt_port_from_env(self):
         """Returns port from MQTT_PORT env var."""
-        _decouple_config.set("MQTT_PORT", "8883")
+        _Config().set("MQTT_PORT", "8883")
 
         from config import Config
 
@@ -240,12 +241,25 @@ class TestConfigTeslaTelemetryProperties:
 
     def test_mqtt_topic_base_from_env(self):
         """Returns topic base from MQTT_TOPIC_BASE env var."""
-        _decouple_config.set("MQTT_TOPIC_BASE", "vehicles/1")
+        _Config().set("MQTT_TOPIC_BASE", "vehicles/1")
 
         from config import Config
 
         cfg = Config()
         assert cfg.mqtt_topic_base == "vehicles/1"
+
+    def test_get_int_missing_key_returns_default_without_raising(self):
+        """_get_int returns the default for a missing key, never raising.
+
+        Pins the contract that a missing int key falls back to the default
+        (the old implementation wrapped the lookup in a try/except for
+        UndefinedValueError that could never fire because the lookup is
+        always called with a real default).
+        """
+        from config import Config
+
+        cfg = Config()
+        assert cfg._get_int("NONEXISTENT_CFG_KEY", default=42) == 42
 
     def test_tesla_telemetry_chargeamps_interval_default(self):
         """Returns 15 when TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC is not set."""
@@ -256,7 +270,7 @@ class TestConfigTeslaTelemetryProperties:
 
     def test_tesla_telemetry_chargeamps_interval_from_env(self):
         """Returns value from TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC env var."""
-        _decouple_config.set("TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC", "30")
+        _Config().set("TESLA_TELEMETRY_CHARGEAMPS_INTERVAL_SEC", "30")
 
         from config import Config
 
@@ -272,7 +286,7 @@ class TestConfigTeslaTelemetryProperties:
 
     def test_tesla_telemetry_location_interval_from_env(self):
         """Returns value from TESLA_TELEMETRY_LOCATION_INTERVAL_SEC env var."""
-        _decouple_config.set("TESLA_TELEMETRY_LOCATION_INTERVAL_SEC", "60")
+        _Config().set("TESLA_TELEMETRY_LOCATION_INTERVAL_SEC", "60")
 
         from config import Config
 
@@ -288,7 +302,7 @@ class TestConfigTeslaTelemetryProperties:
 
     def test_tesla_telemetry_chargestate_interval_from_env(self):
         """Returns value from TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC env var."""
-        _decouple_config.set("TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC", "30")
+        _Config().set("TESLA_TELEMETRY_CHARGESTATE_INTERVAL_SEC", "30")
 
         from config import Config
 
@@ -304,7 +318,7 @@ class TestConfigTeslaTelemetryProperties:
 
     def test_tesla_telemetry_detailedchargestate_interval_from_env(self):
         """Returns value from TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC env var."""
-        _decouple_config.set("TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC", "30")
+        _Config().set("TESLA_TELEMETRY_DETAILEDCHARGESTATE_INTERVAL_SEC", "30")
 
         from config import Config
 
@@ -317,8 +331,8 @@ class TestConfigPlugControllerProperties:
 
     @pytest.fixture(autouse=True)
     def fresh_config(self):
-        """Clear decouple config before each test."""
-        _decouple_config.clear_all()
+        """Reset config sources before each test."""
+        _Config().clear_all()
 
     def test_load_plug_controller_default(self):
         """Returns 'stub' when LOAD_PLUG_CONTROLLER is not set."""
@@ -340,8 +354,8 @@ class TestConfigVocolincProperties:
 
     @pytest.fixture(autouse=True)
     def fresh_config(self):
-        """Clear decouple config before each test."""
-        _decouple_config.clear_all()
+        """Reset config sources before each test."""
+        _Config().clear_all()
 
     def test_vocolinc_credentials_empty_by_default(self):
         """Returns empty strings when VOCOlinc credentials are not set."""
@@ -350,3 +364,51 @@ class TestConfigVocolincProperties:
         cfg = Config()
         assert cfg.vocolinc_username == ""
         assert cfg.vocolinc_password == ""
+
+
+class TestConfigClearAll:
+    """clear_all() removes app-owned keys but leaves unrelated env vars."""
+
+    def test_clear_all_removes_app_owned_keys(self):
+        """App-owned keys (prefixes and exact names) are removed."""
+        _Config().set("MOCK", "True")
+        _Config().set("LOAD_MANAGE_ENABLED", "True")
+        _Config().set("TESLA_CLIENT_ID", "client-id")
+        _Config().set("VUE_USERNAME", "user")
+        _Config().set("TIMEZONE", "America/New_York")
+
+        _Config().clear_all()
+
+        for key in (
+            "MOCK", "LOAD_MANAGE_ENABLED",
+            "TESLA_CLIENT_ID", "VUE_USERNAME", "TIMEZONE",
+        ):
+            assert key not in os.environ, f"{key} should have been removed"
+
+    def test_clear_all_preserves_unrelated_env_vars(self, monkeypatch):
+        """Non-app env vars survive clear_all()."""
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("UNRELATED_VAR", "keep-me")
+
+        _Config().clear_all()
+
+        assert os.environ.get("UNRELATED_VAR") == "keep-me"
+        assert os.environ.get("PATH") == "/usr/bin:/bin"
+
+    def test_clear_all_blocks_env_file_repollution(self, tmp_path, monkeypatch):
+        """After clear_all(), .env values are not re-read into lookups."""
+        from config import Config
+        import config as config_module
+
+        monkeypatch.delenv("VUE_USERNAME", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("VUE_USERNAME=env-file-user\n")
+        # Ensure the lazy cache is empty so a lookup would parse the file.
+        monkeypatch.setattr(config_module, "_env_data", None)
+        assert Config().vue_username == "env-file-user"
+
+        _Config().clear_all()
+
+        # Cache is marked parsed-empty: the .env value must not reappear.
+        cfg = Config()
+        assert cfg.vue_username is None

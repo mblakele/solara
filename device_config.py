@@ -2,7 +2,7 @@
 
 Provides typed accessor functions for device-specific settings: smart meter,
 plugs, and Tesla vehicle config. Secrets (credentials, API keys) remain in
-environment variables via decouple.
+environment variables (via the config module).
 
 The file is cached on first load; call reload() to clear the cache.
 Returns sensible defaults when the file is missing.  Raises

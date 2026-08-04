@@ -5,18 +5,12 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from clock import FakeClock
-from decouple import config
+from config import Config
 
-from load_manager import (
-    AbstractPlugController,
-    CompositePlugController,
-    DeviceState,
-    PlugConfig,
-    LoadManager,
-    VocolincPlugController,
-    load_vocolinc_plugs_from_file,
-    load_vocolinc_credentials,
-)
+from config_loader import load_vocolinc_credentials, load_vocolinc_plugs_from_file
+from load_controllers import CompositePlugController, VocolincPlugController
+from load_manager import LoadManager, LoadManagerConfig
+from load_models import AbstractPlugController, DeviceState, PlugConfig
 import device_config
 
 from energy_cache import EnergyCache
@@ -25,6 +19,8 @@ fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 import pytest
 
 from tests.helpers import _make_metrics_with_wh
+
+config = Config()
 
 
 @pytest.fixture
@@ -206,7 +202,7 @@ def test_get_state_with_mock_client(vocolinc_ctrl_plugs):
     config.set("VOCOLINC_USERNAME", "test")
     config.set("VOCOLINC_PASSWORD", "test")
 
-    with patch("load_manager.VOCOlinc") as MockClient:
+    with patch("vocolinc.VOCOlinc") as MockClient:
         mock_instance = MockClient.return_value
         mock_instance.get_plug.return_value = True
         mock_instance.devices = {}
@@ -223,7 +219,7 @@ def test_set_state_with_mock_client(vocolinc_ctrl_plugs):
     config.set("VOCOLINC_USERNAME", "test")
     config.set("VOCOLINC_PASSWORD", "test")
 
-    with patch("load_manager.VOCOlinc") as MockClient:
+    with patch("vocolinc.VOCOlinc") as MockClient:
         mock_instance = MockClient.return_value
         mock_instance.set_plug.return_value = None
         mock_instance.devices = {}
@@ -257,14 +253,14 @@ def test_composite_turns_on_both_types():
     }):
         device_config.reload()
 
-        with patch("load_manager.VOCOlinc") as MockClient:
+        with patch("vocolinc.VOCOlinc") as MockClient:
             mock_instance = MockClient.return_value
             mock_instance.get_plug.return_value = False
             mock_instance.set_plug.return_value = None
             mock_instance.devices = {}
 
             fake_clock = FakeClock(fixed=fixed_now)
-            mgr = LoadManager(
+            mgr = LoadManager(LoadManagerConfig(
                 metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -8000.0),
                 energy_cache=EnergyCache(),
                 clock=fake_clock,
@@ -272,7 +268,7 @@ def test_composite_turns_on_both_types():
                 nbc_device="main_panel",
                 enabled=True,
                 dry_run=False,
-            )
+            ))
 
             assert isinstance(mgr.plug_ctrl, CompositePlugController)
 
@@ -301,14 +297,14 @@ def test_composite_over_target_turns_off_vocolinc():
     }):
         device_config.reload()
 
-        with patch("load_manager.VOCOlinc") as MockClient:
+        with patch("vocolinc.VOCOlinc") as MockClient:
             mock_instance = MockClient.return_value
             mock_instance.get_plug.return_value = True
             mock_instance.set_plug.return_value = None
             mock_instance.devices = {}
 
             fake_clock = FakeClock(fixed=fixed_now)
-            mgr = LoadManager(
+            mgr = LoadManager(LoadManagerConfig(
                 metrics_fetch=lambda: _make_metrics_with_wh("main_panel", 2000.0),
                 energy_cache=EnergyCache(),
                 clock=fake_clock,
@@ -316,7 +312,7 @@ def test_composite_over_target_turns_off_vocolinc():
                 nbc_device="main_panel",
                 enabled=True,
                 dry_run=False,
-            )
+            ))
 
             # Set both devices as ON in state tracker — use fixed timestamps
             mgr.state.devices["vc_alpha"] = DeviceState(

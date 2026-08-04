@@ -5,7 +5,7 @@ from load_manager import LoadManager, LoadManagerConfig
 
 
 class TestConfigOverrides:
-    """Config(overrides={...}) takes precedence over env/decouple."""
+    """Config(overrides={...}) takes precedence over env and the .env file."""
 
     def test_timezone_override(self):
         """Overrides TIMEZONE via dict."""
@@ -156,9 +156,11 @@ class TestLoadManagerDI:
         mgr = LoadManager(LoadManagerConfig(nbc_device="test_device"))
         assert mgr.nbc_device == "test_device"
 
-    def test_backward_compat_no_config(self):
-        """LoadManager() without LoadManagerConfig still works."""
-        mgr = LoadManager(dry_run=True, target_wh=-500, enabled=True)
+    def test_enabled_from_config_object(self):
+        """LoadManager(LoadManagerConfig(...)) passes settings through."""
+        mgr = LoadManager(
+            LoadManagerConfig(dry_run=True, target_wh=-500, enabled=True)
+        )
         assert mgr.dry_run is True
         assert mgr.target_wh == -500
         assert mgr.enabled is True

@@ -17,20 +17,16 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
-from decouple import UndefinedValueError, config
+from config import Config, UndefinedValueError
 
 import device_config
 
-from load_manager import (
-    GapMinder,
-    LoadManager,
-    PlugConfig,
-    StateTracker,
-    TeslaConfig,
-    TeslaState,
-    load_tesla_config,
-)
-from load_nbc import DecideContext
+from config_loader import load_tesla_config
+from load_manager import LoadManager, LoadManagerConfig
+from load_models import PlugConfig, TeslaConfig, TeslaState
+from load_nbc import DecideContext, GapMinder, StateTracker
+
+config = Config()
 
 
 # ---------------------------------------------------------------------------
@@ -124,14 +120,14 @@ def test_load_tesla_config_returns_none_without_vehicle():
     config.set("TESLA_CLIENT_ID", "client-id")
     config.set("TESLA_CLIENT_SECRET", "client-secret")
 
-    def mock_decouple(key, default=None, cast=str):  # type: ignore[no-untyped-def]
+    def mock_lookup(key, default=None, cast=str):  # type: ignore[no-untyped-def]
         if key == "TESLA_VEHICLE_ID":
             return ""
         if default is not None:
             return default
         raise UndefinedValueError(key)
 
-    with patch("config._decouple_config", side_effect=mock_decouple):
+    with patch("config._lookup", side_effect=mock_lookup):
         cfg = load_tesla_config()
 
     assert cfg is None
@@ -530,7 +526,7 @@ def _make_lm_with_tesla_config(
         home_lat=home_lat,
         home_lon=home_lon,
     )
-    mgr = LoadManager(dry_run=True, config_interval_secs=30)
+    mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
     mgr.tesla_config = config
     mgr.tesla_ctrl = None  # skip Tesla fetch, covered by mock below
     return mgr

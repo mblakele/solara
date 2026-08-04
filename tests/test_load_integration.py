@@ -9,23 +9,22 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from constants import DEFAULT_PREDICTION_WINDOW_SECS
-from load_manager import (
+from load_controllers import PlugController, TeslaController
+from load_manager import LoadManager, LoadManagerConfig
+from load_models import (
+    CandidateDetailPlug,
+    CycleDiagnostics,
+    CycleResult,
     DeviceState,
-    LoadManager,
     PendingEffect,
     PlugConfig,
-    PlugController,
-    StateTracker,
     TeslaConfig,
-    TeslaController,
     TeslaState,
-    GapMinder,
 )
-from load_models import CandidateDetailPlug, CycleDiagnostics, CycleResult
-from load_nbc import DecideContext, NBCFetchResult
+from load_nbc import DecideContext, GapMinder, NBCFetchResult, StateTracker
 from tests.helpers import _make_metrics_with_wh
 from energy_cache import EnergyCache
-from tests.helpers import FakeClock
+from clock import FakeClock
 
 
 # --- Excess solar helpers ---
@@ -47,7 +46,7 @@ def _make_energy_cache_with_prediction(
         predicted_wh: Target Wh prediction for the incomplete quarter.
         now: Current time for sample timestamps.
         data_lag_secs: Simulated API lag in seconds. The NBCReader computes
-            ``data_point_at = _last_fetch_at - timedelta(seconds=data_lag_secs)``.
+            ``data_point_at = last_fetch_at - timedelta(seconds=data_lag_secs)``.
         fetch_offset_secs: How many seconds ago the data was "fetched". Defaults to 0
             (fresh). Pass a positive value to simulate older fetch time.
 
@@ -66,13 +65,14 @@ def _make_energy_cache_with_prediction(
     cache = EnergyCache(ttl_seconds=30)
     samples = [sample_value] * sample_count
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = data_start
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = sample_count
-        cache._last_fetch_at = now - timedelta(seconds=fetch_offset_secs)
-    # Store _data_lag_secs on the cache so NBCReader picks it up.
-    cache._data_lag_secs = data_lag_secs  # type: ignore[attr-defined]
+        cache.samples = samples
+        cache.data_start = data_start
+        cache.last_sample_at = now - timedelta(seconds=1)
+        cache.sample_count = sample_count
+        cache.last_fetch_at = now - timedelta(seconds=fetch_offset_secs)
+        # Store the API data lag so NBCReader's stale-data detection measures
+        # data-point age correctly (data_point_at = last_fetch_at - lag).
+        cache._set_data_field(data_lag_secs=data_lag_secs)
     return cache
 
 
@@ -126,7 +126,7 @@ def _make_excess_manager(
     energy_cache = _make_energy_cache_with_prediction(predicted_wh, now=now)
     if clock is None:
         clock = FakeClock(now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -136,7 +136,7 @@ def _make_excess_manager(
         enabled=True,
         dry_run=False,
         clock=clock,
-    )
+    ))
     return mgr, plug_ctrl, tesla_ctrl
 
 
@@ -176,7 +176,7 @@ def _make_overn_target_manager(
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(predicted_wh, now=now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -186,7 +186,7 @@ def _make_overn_target_manager(
         enabled=True,
         dry_run=False,
         clock=clock,
-    )
+    ))
 
     mgr.state.devices["pool_pump"] = DeviceState(
         name="pool_pump", last_toggle=clock.now() - timedelta(seconds=120), desired_state=True
@@ -228,7 +228,7 @@ def _make_tesla_manager(
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(predicted_wh, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -238,7 +238,7 @@ def _make_tesla_manager(
         enabled=True,
         dry_run=False,
         clock=clock,
-    )
+    ))
     return mgr, tesla_ctrl
 
 
@@ -255,7 +255,7 @@ class TestLoadIntegration(unittest.TestCase):
       # p200 pool pump turns on
       # p100 water heater would fit gap without pool pump, but stays off
       mgr, plug_ctrl = _make_overn_target_manager(now=fixed_now, predicted_wh=-1000.0)
-      samples = mgr.nbc_reader.energy_cache._samples
+      samples = mgr.nbc_reader.energy_cache.samples
       assert len(samples) == 900 + 8 * 60
       asyncio.run(plug_ctrl.set_state("pool_pump", False))
       asyncio.run(plug_ctrl.set_state("water_heater", False))
@@ -407,7 +407,7 @@ def test_stale_data_skips_cycle():
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=130)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -417,7 +417,7 @@ def test_stale_data_skips_cycle():
         enabled=True,
         dry_run=False,
         clock=clock,
-    )
+    ))
 
     now = clock.now()
     mgr.state.pending_effects.append(
@@ -455,7 +455,7 @@ def test_stale_no_pending_effects_proceeds():
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -465,7 +465,7 @@ def test_stale_no_pending_effects_proceeds():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
     result = mgr.run_cycle()
 
 
@@ -506,7 +506,7 @@ def test_stale_data_from_previous_qh():
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -516,7 +516,7 @@ def test_stale_data_from_previous_qh():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     # Add a pending effect so the stale-check path is triggered.
     mgr.state.pending_effects.append(
@@ -563,7 +563,7 @@ def test_waits_for_fresh_data():
         return metrics_data
 
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -572,7 +572,7 @@ def test_waits_for_fresh_data():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
 
     mgr.state.last_data_point_at = fetched_at
     now = datetime.now(timezone.utc)
@@ -620,7 +620,7 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
     energy_cache = _make_energy_cache_with_prediction(
         -2000.0, fixed_now, data_lag_secs=130  # data_point_at = now - 140s → stale (>120s)
     )
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -629,7 +629,7 @@ def test_stale_detection_uses_data_point_age_not_fetch_time():
         nbc_device="main_panel",
         enabled=True,
         dry_run=False,
-    )
+    ))
 
     now = datetime.now(timezone.utc)
     mgr.state.pending_effects.append(
@@ -665,7 +665,7 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
     energy_cache = _make_energy_cache_with_prediction(
         -2000.0, now=fixed_now, data_lag_secs=50
     )
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -674,7 +674,7 @@ def test_waiting_detection_uses_data_point_age_not_fetch_time():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
@@ -711,7 +711,7 @@ def test_full_lifecycle_action_wait_resolve():
 
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     energy_cache = _make_energy_cache_with_prediction(-6000.0, now=fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -720,7 +720,7 @@ def test_full_lifecycle_action_wait_resolve():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     result_1 = mgr.run_cycle()
 
@@ -940,7 +940,7 @@ def test_adjusted_wh_in_response():
     plug_ctrl = PlugController(plugs)
 
     energy_cache = _make_energy_cache_with_prediction(-500.0, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -949,7 +949,7 @@ def test_adjusted_wh_in_response():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     result = mgr.run_cycle()
 
@@ -965,7 +965,7 @@ def test_stale_data_includes_pending_count():
     plug_ctrl = PlugController(plugs)
 
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=180)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -974,7 +974,7 @@ def test_stale_data_includes_pending_count():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     mgr.state.pending_effects.extend([
         PendingEffect(
@@ -1011,7 +1011,7 @@ def test_stale_data_prunes_old_effects():
 
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=180)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1020,7 +1020,7 @@ def test_stale_data_prunes_old_effects():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     # Cache created with data_lag_secs=180, fetch_offset_secs=0 (default).
     # data_point_at = cache_now - 180s, cutoff = data_point_at - 60s = cache_now - 240s.
@@ -1063,7 +1063,7 @@ def test_check_pending_state_prunes_in_waiting_path():
     fixed_now = datetime(2026, 5, 6, 7, 8, 0, tzinfo=timezone.utc)
     # Lag of 10s: data_point_at = now - 10s = well within 120s stale threshold.
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=10)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1072,7 +1072,7 @@ def test_check_pending_state_prunes_in_waiting_path():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     # data_point_at = fixed_now - 10s.
     # A recent effect (8s ago) is AFTER data_point_at → triggers waiting path.
@@ -1114,7 +1114,7 @@ def test_stale_data_includes_candidates():
 
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now, data_lag_secs=180)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1123,7 +1123,7 @@ def test_stale_data_includes_candidates():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     mgr.state.pending_effects.append(
         PendingEffect(
@@ -1154,7 +1154,7 @@ def test_waiting_for_fresh_data_includes_count():
     fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
     fetched_at = fixed_now - timedelta(seconds=10)
     energy_cache = _make_energy_cache_with_prediction(-2000.0, now=fixed_now, data_lag_secs=10)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1163,7 +1163,7 @@ def test_waiting_for_fresh_data_includes_count():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
@@ -1196,7 +1196,7 @@ def test_waiting_for_fresh_data_includes_candidates():
     fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
     fetched_at = fixed_now - timedelta(seconds=10)
     energy_cache = _make_energy_cache_with_prediction(-2000.0, now=fixed_now, data_lag_secs=10)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1205,7 +1205,7 @@ def test_waiting_for_fresh_data_includes_candidates():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     mgr.state.last_data_point_at = fetched_at
     mgr.state.pending_effects.append(
@@ -1238,7 +1238,7 @@ def test_cache_hits_within_ttl():
     plug_ctrl = PlugController(plugs)
     energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1247,7 +1247,7 @@ def test_cache_hits_within_ttl():
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     result_1 = mgr.run_cycle(force=True)
     result_2 = mgr.run_cycle(force=True)
@@ -1265,7 +1265,7 @@ def test_disabled_returns_early():
     metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
 
     energy_cache = EnergyCache()
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: metrics_data,
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
@@ -1274,7 +1274,7 @@ def test_disabled_returns_early():
         nbc_device="main_panel",
         enabled=False,
         dry_run=False,
-    )
+    ))
 
     result = mgr.run_cycle()
 
@@ -1298,7 +1298,7 @@ def test_dry_run_returns_dry_run_status():
     plug_ctrl = PlugController(plugs)
 
     energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1307,7 +1307,7 @@ def test_dry_run_returns_dry_run_status():
         enabled=True,
         dry_run=True,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     result = mgr.run_cycle()
 
@@ -1330,7 +1330,7 @@ def test_dry_run_does_not_execute():
     plug_ctrl = PlugController(plugs)
 
     energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1338,7 +1338,7 @@ def test_dry_run_does_not_execute():
         nbc_device="main_panel",
         enabled=True,
         dry_run=True,
-    )
+    ))
 
     result = mgr.run_cycle()
 
@@ -1362,7 +1362,7 @@ def test_dry_run_state_not_mutated():
     plug_ctrl = PlugController(plugs)
 
     energy_cache = _make_energy_cache_with_prediction(-6000.0, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=None,
@@ -1371,7 +1371,7 @@ def test_dry_run_state_not_mutated():
         enabled=True,
         dry_run=True,
         clock=FakeClock(fixed_now),
-    )
+    ))
 
     first_result = mgr.run_cycle()
 
@@ -1440,7 +1440,7 @@ def test_tesla_amp_adjustment(_mock_tesla_state, _mock_has_telemetry, _mock_load
     )
 
     energy_cache = _make_energy_cache_with_prediction(-3000.0, fixed_now)
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         energy_cache=energy_cache,
         plug_ctrl=plug_ctrl,
         tesla_ctrl=tesla_ctrl,
@@ -1449,7 +1449,7 @@ def test_tesla_amp_adjustment(_mock_tesla_state, _mock_has_telemetry, _mock_load
         enabled=True,
         dry_run=False,
         clock=FakeClock(fixed_now),
-    )
+    ))
     mgr.tesla_config = tesla_config
 
     result = mgr.run_cycle()
@@ -1541,7 +1541,7 @@ class TestAdaptiveSleep:
             return None  # no data → will hit early returns
 
         energy_cache = EnergyCache()
-        return LoadManager(
+        return LoadManager(LoadManagerConfig(
             metrics_fetch=metrics_fetch,
             energy_cache=energy_cache,
             plug_ctrl=plug_ctrl,
@@ -1550,7 +1550,7 @@ class TestAdaptiveSleep:
             config_interval_secs=interval,
             clock=clock,
             **kwargs,
-        )
+        ))
 
     def test_run_cycle_includes_sleep_hint(self):
         """run_cycle() returns sleep_hint in the result dict."""
@@ -1583,7 +1583,7 @@ class TestAdaptiveSleep:
             def get_data_lag_secs(self) -> int:
                 return 10
 
-        lm = LoadManager(
+        lm = LoadManager(LoadManagerConfig(
             metrics_fetch=lambda: None,
             plug_ctrl=PlugController({}),
             tesla_ctrl=TeslaController(
@@ -1599,7 +1599,7 @@ class TestAdaptiveSleep:
             ),
             target_wh=-500,
             config_interval_secs=30,
-        )
+        ))
         lm.nbc_reader = StaleQHReader()
         lm.enabled = True
 
@@ -1631,7 +1631,7 @@ class TestAdaptiveSleep:
             def get_data_lag_secs(self) -> int:
                 return 10
 
-        lm = LoadManager(
+        lm = LoadManager(LoadManagerConfig(
             metrics_fetch=lambda: None,
             plug_ctrl=PlugController({}),
             tesla_ctrl=TeslaController(
@@ -1648,7 +1648,7 @@ class TestAdaptiveSleep:
             target_wh=-500,
             config_interval_secs=30,
             clock=FakeClock(fixed_now),
-        )
+        ))
         lm.nbc_reader = FreshQHReader()
         lm.enabled = True
 
@@ -1694,13 +1694,13 @@ class TestAdaptiveSleep:
             def get_current_qh(self, force=False, now=None):
                 return None
 
-        lm = LoadManager(
+        lm = LoadManager(LoadManagerConfig(
             metrics_fetch=lambda: None,
             plug_ctrl=None,
             tesla_ctrl=None,
             target_wh=-500,
             config_interval_secs=30,
-        )
+        ))
         lm.nbc_reader = NoQHReader()
         lm.enabled = True
 
@@ -1743,7 +1743,7 @@ class TestAdaptiveSleep:
             def get_data_lag_secs(self) -> int:
                 return 10
 
-        lm = LoadManager(
+        lm = LoadManager(LoadManagerConfig(
             metrics_fetch=lambda: None,
             plug_ctrl=PlugController({}),
             tesla_ctrl=TeslaController(
@@ -1759,7 +1759,7 @@ class TestAdaptiveSleep:
             ),
             target_wh=-500,
             config_interval_secs=30,
-        )
+        ))
         lm.nbc_reader = StaleQHReader()
         lm.enabled = True
 
@@ -1800,7 +1800,7 @@ class TestAdaptiveSleep:
             def get_data_lag_secs(self) -> int:
                 return 10
 
-        lm = LoadManager(
+        lm = LoadManager(LoadManagerConfig(
             metrics_fetch=lambda: None,
             plug_ctrl=PlugController({}),
             tesla_ctrl=TeslaController(
@@ -1817,7 +1817,7 @@ class TestAdaptiveSleep:
             target_wh=-500,
             config_interval_secs=30,
             clock=FakeClock(fixed_now),
-        )
+        ))
         lm.nbc_reader = PendingQHReader()
         lm.enabled = True
 

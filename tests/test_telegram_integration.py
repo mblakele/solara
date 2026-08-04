@@ -41,11 +41,11 @@ def _make_energy_cache(predicted_wh: float = -2000.0, now: datetime | None = Non
     cache = EnergyCache(ttl_seconds=30)
     samples = [sample_value] * sample_count
     with cache._lock:
-        cache._samples = samples
-        cache._data_start = data_start
-        cache._last_sample_at = now - timedelta(seconds=1)
-        cache._sample_count = sample_count
-        cache._last_fetch_at = now - timedelta(seconds=0)
+        cache.samples = samples
+        cache.data_start = data_start
+        cache.last_sample_at = now - timedelta(seconds=1)
+        cache.sample_count = sample_count
+        cache.last_fetch_at = now - timedelta(seconds=0)
     return cache
 
 
@@ -104,7 +104,7 @@ def _make_manager(
         )
     )
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_nbc_metrics(predicted_wh),
         energy_cache=_make_energy_cache(predicted_wh, now),
         plug_ctrl=plug_ctrl,
@@ -114,7 +114,7 @@ def _make_manager(
         enabled=True,
         dry_run=dry_run,
         telegram_sender=telegram_sender,
-    )
+    ))
 
     return mgr
 
@@ -561,7 +561,7 @@ def _make_manager_with_telegram_devices(
         )
     )
 
-    mgr = LoadManager(
+    mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=lambda: _make_nbc_metrics(predicted_wh),
         energy_cache=_make_energy_cache(predicted_wh, now),
         plug_ctrl=plug_ctrl,
@@ -571,7 +571,7 @@ def _make_manager_with_telegram_devices(
         enabled=True,
         dry_run=dry_run,
         telegram_sender=telegram_sender,
-    )
+    ))
 
     # Override the whitelist loaded during __init__ so tests have full control.
     if telegram_devices is not None:

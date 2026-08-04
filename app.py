@@ -4,11 +4,19 @@ Flask application providing energy usage metrics and TOU reporting.
 Provides endpoints for real-time energy metrics and historical
 Time-of-Use aggregation from Emporia VUE API. Includes load management
 for solar self-consumption optimization.
+
+The application is built by the :func:`create_app` factory. Importing
+this module has no side effects beyond constructing the module-level
+``app`` singleton: background threads (MQTT subscriber, load-management
+loop) are only started by an explicit call to
+:func:`start_background_services` (see wsgi.py and the ``__main__``
+block), so tests and tooling can import the module safely.
 """
 
 import asyncio
 import atexit
 from collections import deque
+from dataclasses import dataclass, field
 
 import logging
 import logging.handlers
@@ -26,6 +34,7 @@ from flask import (
     Flask,
     Response,
     abort,
+    current_app,
     make_response,
     render_template,
     request,
@@ -49,15 +58,39 @@ from util import CustomJSONProvider, is_debug
 
 from tesla_oauth import bp
 
-app = Flask(__name__)
-app.logger.handlers.clear()
-app.logger.propagate = True
 
-# Register Tesla OAuth routes.
-app.register_blueprint(bp)
+@dataclass
+class _AppState:
+    """Mutable runtime state shared across views and background threads.
+
+    Holds the module-level singletons that used to be plain globals so
+    that ``create_app()`` can construct the app without side effects and
+    tests can reset state by assigning fields on the instance.
+    """
+
+    energy_cache: EnergyCache
+    sse_broadcaster: SSEBroadcaster
+    load_manager: Any = None
+    load_manager_lock: threading.Lock = field(default_factory=threading.Lock)
+    load_manager_init_failed: bool = False
+    last_cycle_result: CycleResult | None = None
+    recent_cycles: deque[dict[str, Any]] = field(
+        default_factory=lambda: deque(maxlen=10)
+    )
+    telegram_sender: Any = None
+    consecutive_error_count: int = 0
+    last_error_type: str | None = None
+    lm_thread_started: bool = False
+
 
 # Application-level configuration injected into all consumers.
 _config = Config()
+
+# Shared runtime state (cache, broadcaster, load-manager singleton, ...).
+_state = _AppState(
+    energy_cache=EnergyCache(ttl_seconds=60),
+    sse_broadcaster=SSEBroadcaster(),
+)
 
 
 def camelize(obj: object) -> object:
@@ -108,25 +141,33 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
     SSE clients see current lag and accumulated per-second samples.
 
     Args:
-        metrics_data: The metrics dict from a fetch or cache (may be modified).
+        metrics_data: The metrics dict from a fetch or cache. Device entries
+            are shallow-copied before enrichment, so the caller's dict is
+            never mutated (get_or_fetch may return the same dict stored as
+            full_metrics_dict — mutating it would inflate cached lag).
         now: Current time for lag calculation. Defaults to datetime.now(timezone.utc).
 
     Returns:
-        The enriched metrics dict (same object, modified in place).
+        The enriched metrics dict: the same top-level object, with device
+        entries replaced by enriched copies.
     """
     if metrics_data is None:
         metrics_data = {"devices": [], "api_response": {}, "instant": now}
     if now is None:
         now = datetime.now(timezone.utc)
+    # Shallow-copy device entries before mutating them: the source dict may
+    # be the cached full_metrics_dict, and in-place lag updates there would
+    # accumulate elapsed time on every enrich pass.
+    metrics_data["devices"] = [dict(d) for d in metrics_data.get("devices", [])]
     fetched_at = metrics_data.get("_fetched_at")
     if fetched_at is not None:
         elapsed = (now - fetched_at).total_seconds()
         for d in metrics_data.get("devices", []):
             cached_lag = d.get("lag", timedelta(0))
             d["lag"] = timedelta(seconds=cached_lag.total_seconds() + elapsed)
-    cache_data = _energy_cache._data
-    if cache_data is not None and cache_data.samples:
-        accumulated = list(cache_data.samples)
+    samples = _state.energy_cache.samples
+    if samples:
+        accumulated = list(samples)
         devices = metrics_data.get("devices", [])
         if len(devices) == 1:
             devices[0]["per_second_data"] = accumulated
@@ -159,33 +200,12 @@ def _setup_file_logging(config: Config) -> logging.Handler | None:
     return handler
 
 
-logger = app.logger
-if __name__ != "__main__":
-    gunicorn_logger = logging.getLogger("gunicorn.error")
-    root_logger = logging.getLogger()
-    root_logger.handlers = gunicorn_logger.handlers
-    root_logger.setLevel(logging.DEBUG if is_debug() else logging.INFO)
-    file_handler = _setup_file_logging(_config)
-    if file_handler:
-        root_logger.addHandler(file_handler)
-        gunicorn_logger.addHandler(file_handler)
-else:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S %z",
-    ))
-    logging.basicConfig(handlers=[handler],
-                        level=logging.DEBUG if is_debug() else logging.INFO)
-    file_handler = _setup_file_logging(_config)
-    if file_handler:
-        logging.getLogger().addHandler(file_handler)
-
 # squelch internal log messages
 for noisy in (
         "asyncio", "boto3", "botocore", "gunicorn.access",
         "urllib3", "requests"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 def astimezone_filter(dt: datetime, tz_str: str) -> datetime:
     """Convert datetime to specified timezone for Jinja2 template filter."""
@@ -204,12 +224,6 @@ def parse_date_to_utc(date_str: str) -> datetime:
         dt = tz.localize(dt)
 
     return dt.astimezone(pytz.utc)
-
-
-app.jinja_env.filters["astimezonestr"] = astimezone_filter
-
-
-app.json = CustomJSONProvider(app)
 
 
 def _get_model(
@@ -290,12 +304,11 @@ def _validate_dates(start_date_str: str | None, end_date_str: str | None):
 
 def _json_response(payload: Any) -> Response:
     """Create a JSON response with proper content type header."""
-    resp = Response(app.json.dumps(payload))
+    resp = Response(current_app.json.dumps(payload))
     resp.headers["Content-Type"] = "application/json"
     return resp
 
 
-@app.errorhandler(RetryableMetricsException)
 def error_retryable(e: RetryableMetricsException) -> Response:
     """Handle retryable metrics exceptions with 5 second refresh."""
     resp = make_response(render_template("error_retryable.html", exception=e), 500)
@@ -303,7 +316,6 @@ def error_retryable(e: RetryableMetricsException) -> Response:
     return resp
 
 
-@app.route("/")
 def index() -> ResponseReturnValue:
     """Main index endpoint serving HTML or JSON based on Accept header.
 
@@ -333,8 +345,8 @@ def index() -> ResponseReturnValue:
         metrics_data = model.metrics
     else:
         # Real mode: use cached metrics to avoid hammering the API
-        metrics_data, was_fresh = _energy_cache.get_or_fetch(
-            lambda: create_metrics(_energy_cache, datetime.now(pytz.timezone(_config.timezone)), logger),
+        metrics_data, was_fresh = _state.energy_cache.get_or_fetch(
+            lambda: create_metrics(_state.energy_cache, datetime.now(pytz.timezone(_config.timezone)), logger),
             now
         )
         if was_fresh:
@@ -350,10 +362,23 @@ def index() -> ResponseReturnValue:
 
     # check for default html first, to handle missing Accept header.
     if request.accept_mimetypes.accept_html:
+        refresh_secs: int | None = None
+        if not metrics_data.get("devices"):
+            # First-boot API outage: the 500 retry page is dead for
+            # real-data paths (RetryableMetricsException is downgraded to a
+            # warning + stale-cache serve in _run_fetch_with_timeout), so an
+            # empty dashboard renders with a 200. Auto-refresh it so it
+            # self-heals when data arrives — no manual reload needed.
+            refresh_secs = 5
+            logger.warning(
+                "index: serving empty dashboard (no devices); auto-refreshing in %ds",
+                refresh_secs,
+            )
         return render_template(
             "index.html",
             metrics=metrics_data,
             load_management=load_management,
+            refresh_secs=refresh_secs,
         )
 
     if request.accept_mimetypes.accept_json:
@@ -364,7 +389,6 @@ def index() -> ResponseReturnValue:
     return abort(406)
 
 
-@app.route("/health")
 def health() -> Response:
     """Health check endpoint returning 'ok'."""
     logger.debug("health")
@@ -373,7 +397,6 @@ def health() -> Response:
     return resp
 
 
-@app.route("/api/v1/tou")
 def tou() -> ResponseReturnValue:
     """Time-of-Use API endpoint for energy consumption data."""
     logger.debug("tou")
@@ -422,20 +445,6 @@ def tou() -> ResponseReturnValue:
 
 # === Load Management State ===
 
-# Shared cache to avoid hammering the pyemvue API.
-# TTL is long by design: refreshes mostly happen in load management run_cycle.
-_energy_cache = EnergyCache(ttl_seconds=60)
-_sse_broadcaster = SSEBroadcaster()
-
-_load_manager = None
-_load_manager_lock = threading.Lock()
-_load_manager_init_failed = False
-_last_cycle_result: CycleResult | None = None
-_recent_cycles: deque[dict[str, Any]] = deque(maxlen=10)
-_telegram_sender = None
-_consecutive_error_count = 0
-_last_error_type: str | None = None
-
 
 def _cycle_result_to_dict(result: CycleResult | dict | None) -> dict:
     """Convert a CycleResult to a plain dict for JSON serialization.
@@ -457,21 +466,32 @@ def _cycle_result_to_dict(result: CycleResult | dict | None) -> dict:
     return result.to_dict()
 
 
-def _build_load_management_payload() -> dict:
+def _build_load_management_payload(lm: Any = None) -> dict:
     """Build a load management state payload for the index endpoint.
 
-    Returns a dict with enabled flag, device states, pending effects,
-    and the last cycle result. Returns an empty dict if LoadManager
-    is not initialized or load management is disabled.
-    """
-    if _config.load_manage_enabled is False:
-        return {}
-    lm = _get_load_manager()
-    if lm is None:
-        return {}
+    Args:
+        lm: Optional LoadManager instance.  When provided, the caller
+            already holds ``_state.load_manager_lock`` (e.g. the background
+            loop) and the payload is built from this instance without
+            re-acquiring the lock or calling ``_get_load_manager()``.
+            When omitted, the load manager is resolved under the lock;
+            an empty dict is returned if load management is disabled or
+            the manager is unavailable.
 
-    with _load_manager_lock:
-        last_result = _cycle_result_to_dict(_last_cycle_result) if _last_cycle_result else {}
+    Returns:
+        Dict with enabled flag, device states, pending effects, and the
+        last cycle result; an empty dict when unavailable.
+    """
+    if lm is None:
+        if _config.load_manage_enabled is False:
+            return {}
+        lm = _get_load_manager()
+        if lm is None:
+            return {}
+        with _state.load_manager_lock:
+            last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
+    else:
+        last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
 
     payload: dict = {
         "enabled": lm.enabled,
@@ -487,45 +507,21 @@ def _build_load_management_payload() -> dict:
     return payload
 
 
-def _build_load_management_payload_locked() -> dict:
-    """Same as _build_load_management_payload() but assumes _load_manager_lock is held.
-
-    Caller must hold _load_manager_lock. Used inside _load_management_loop()
-    to avoid double-acquire.  Reads ``_load_manager`` directly instead of
-    calling ``_get_load_manager()`` (which also tries to acquire the lock).
-    """
-    lm = _load_manager
-    if lm is None:
-        return {}
-    last_result = _cycle_result_to_dict(_last_cycle_result) if _last_cycle_result else {}
-    return {
-        "enabled": lm.enabled,
-        "dry_run": lm.dry_run,
-        "target_wh": lm.target_wh,
-        "nbc_device": lm.nbc_device,
-        "state": lm.state.to_dict(),
-        "last_cycle_result": last_result,
-        "sleep_hint": last_result.get("sleep_hint", lm.config_interval_secs),
-        "sleep_hint_at": last_result.get("sleep_hint_at"),
-    }
-
-
 def _get_load_manager():
     """Get or create the singleton LoadManager instance.
 
     If initialization has previously failed, returns None without retrying
     to avoid generating warnings on every call.
     """
-    global _load_manager, _load_manager_init_failed
-    with _load_manager_lock:
-        if _load_manager is None and not _load_manager_init_failed:
+    with _state.load_manager_lock:
+        if _state.load_manager is None and not _state.load_manager_init_failed:
             try:
                 from load_manager import LoadManager, LoadManagerConfig
 
                 def metrics_fetch():
                     now = datetime.now(timezone.utc)
-                    return _energy_cache.get_or_fetch(
-                        lambda: create_metrics(_energy_cache, datetime.now(pytz.timezone(_config.timezone)), logger),
+                    return _state.energy_cache.get_or_fetch(
+                        lambda: create_metrics(_state.energy_cache, datetime.now(pytz.timezone(_config.timezone)), logger),
                         now,
                         force=True
                     )[0]
@@ -543,10 +539,9 @@ def _get_load_manager():
                 else:
                     logger.info("Telegram notifications disabled (no config)")
 
-                global _telegram_sender  # pylint: disable=W0603
-                _telegram_sender = telegram_sender
+                _state.telegram_sender = telegram_sender
 
-                _load_manager = LoadManager(
+                _state.load_manager = LoadManager(
                     LoadManagerConfig(
                         config=_config,
                         metrics_fetch=metrics_fetch,
@@ -559,8 +554,8 @@ def _get_load_manager():
 
             except Exception as e:
                 logger.warning("Failed to initialize LoadManager: %s", e)
-                _load_manager_init_failed = True
-        return _load_manager
+                _state.load_manager_init_failed = True
+        return _state.load_manager
 
 
 def _send_error_alert(exc: Exception) -> None:
@@ -571,18 +566,17 @@ def _send_error_alert(exc: Exception) -> None:
     """
     from telegram import build_error_notification
 
-    if _telegram_sender is None or not _telegram_sender.is_configured:
+    if _state.telegram_sender is None or not _state.telegram_sender.is_configured:
         return
     event = build_error_notification(f"{type(exc).__name__}: {exc}")
     try:
-        _telegram_sender.send_notification_sync(event)
+        _state.telegram_sender.send_notification_sync(event)
     except Exception:  # pylint: disable=broad-exception-caught
         logger.debug("Failed to send error alert", exc_info=True)
 
 
 def _load_management_loop() -> None:
     """Background thread that runs load management cycle with adaptive sleep."""
-    global _last_cycle_result, _consecutive_error_count, _last_error_type  # pylint: disable=W0603
     interval_secs_config = _config.load_manage_interval_secs
     logger.info(
         "Load management background loop started: dry-run=%s, mock=%s, interval=%d",
@@ -595,9 +589,9 @@ def _load_management_loop() -> None:
             if lm is not None:
                 result = lm.run_cycle()
                 lm._send_pending_notifications_sync()  # flush Telegram sends outside lock
-                with _load_manager_lock:
-                    _last_cycle_result = result
-                    _recent_cycles.append({
+                with _state.load_manager_lock:
+                    _state.last_cycle_result = result
+                    _state.recent_cycles.append({
                         "status": result.status,
                         "reason": result.diagnostics.reason if result.diagnostics else None,
                         "actions_count": len(result.actions),
@@ -605,21 +599,21 @@ def _load_management_loop() -> None:
                         "gap_wh": result.gap_wh,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
-                    lm_payload = _build_load_management_payload_locked()
+                    lm_payload = _build_load_management_payload(lm)
                 logger.debug("Load management cycle result: %s", result)
                 if (
                     result.status == "no_incomplete_qh"
-                    and _energy_cache._data is None
+                    and _state.energy_cache.data is None
                 ):
                     logger.warning(
                         "Load management: no data available (possible network issue)"
                     )
-                _sse_broadcaster.publish("load_cycle", camelize(lm_payload))
-                cache_data = _energy_cache._data
-                if cache_data is not None and cache_data.full_metrics_dict is not None:
-                    _sse_broadcaster.publish(
+                _state.sse_broadcaster.publish("load_cycle", camelize(lm_payload))
+                full_metrics_dict = _state.energy_cache.full_metrics_dict
+                if full_metrics_dict is not None:
+                    _state.sse_broadcaster.publish(
                         "metrics_update",
-                        camelize(_enrich_metrics_for_sse(dict(cache_data.full_metrics_dict))),
+                        camelize(_enrich_metrics_for_sse(dict(full_metrics_dict))),
                     )
             interval_secs = interval_secs_config
         except RetryableMetricsException as e:
@@ -627,28 +621,27 @@ def _load_management_loop() -> None:
             logger.warning("Load management cycle retryable: %s", e)
         except Exception as e:
             interval_secs = interval_secs_config
-            _consecutive_error_count += 1
-            _last_error_type = type(e).__name__
+            _state.consecutive_error_count += 1
+            _state.last_error_type = type(e).__name__
             logger.error("Error in load management loop: %s", e)
-            _energy_cache.invalidate()
-            if _consecutive_error_count == 1 or _consecutive_error_count % 10 == 0:
+            _state.energy_cache.invalidate()
+            if _state.consecutive_error_count == 1 or _state.consecutive_error_count % 10 == 0:
                 _send_error_alert(e)
         else:
             if result is not None:
                 interval_secs = result.sleep_hint
-            _consecutive_error_count = 0
-            _last_error_type = None
+            _state.consecutive_error_count = 0
+            _state.last_error_type = None
 
         if result is not None and result.status == "disabled":
             interval_secs_adjusted: float = interval_secs
         else:
-            interval_secs_adjusted = _energy_cache.sleep_interval_adjust(
+            interval_secs_adjusted = _state.energy_cache.sleep_interval_adjust(
                 interval_secs, datetime.now(pytz.timezone(_config.timezone)))
         logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
         time.sleep(interval_secs_adjusted)
 
 
-@app.route("/api/v1/load/status")
 def load_status() -> Response:
     """Read-only endpoint returning current load management state.
 
@@ -659,8 +652,8 @@ def load_status() -> Response:
     if lm is None:
         return abort(503, "LoadManager not initialized")
 
-    with _load_manager_lock:
-        last_result = _cycle_result_to_dict(_last_cycle_result) if _last_cycle_result else {}
+    with _state.load_manager_lock:
+        last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
 
     payload = {
         "enabled": lm.enabled,
@@ -669,7 +662,7 @@ def load_status() -> Response:
         "devices": {},
         "pending_effects": [],
         "last_cycle_result": last_result,
-        "recent_cycles": list(_recent_cycles),
+        "recent_cycles": list(_state.recent_cycles),
     }
 
     for name, device_state in lm.state.devices.items():
@@ -695,7 +688,6 @@ def load_status() -> Response:
     return _json_response(camelize(payload))
 
 
-@app.route("/stream/status")
 def stream_status():
     """SSE endpoint streaming load management state and metrics updates.
 
@@ -707,13 +699,13 @@ def stream_status():
     initial: list[tuple[str, object]] = [
         ("initial_load_state", camelize(_build_load_management_payload())),
     ]
-    cache_data = _energy_cache._data
-    if cache_data is not None and cache_data.full_metrics_dict is not None:
+    full_metrics_dict = _state.energy_cache.full_metrics_dict
+    if full_metrics_dict is not None:
         initial.append(
-            ("initial_metrics", camelize(_enrich_metrics_for_sse(dict(cache_data.full_metrics_dict))))
+            ("initial_metrics", camelize(_enrich_metrics_for_sse(dict(full_metrics_dict))))
         )
     return Response(
-        event_stream(_sse_broadcaster, initial_events=initial, dumper=app.json.dumps),
+        event_stream(_state.sse_broadcaster, initial_events=initial, dumper=current_app.json.dumps),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -721,6 +713,111 @@ def stream_status():
             "X-Accel-Buffering": "no",
         }
     )
+
+
+def _start_mqtt_subscriber() -> None:
+    """Start the MQTT subscriber thread for Tesla fleet-telemetry events."""
+    from mqtt_telemetry import start_mqtt_subscriber as _start
+    _start(_config)
+    logger.info("MQTT subscriber started")
+
+
+def _start_load_manager_thread():
+    """Start the load management background thread (called once per process)."""
+    if _state.lm_thread_started:
+        return
+    _state.lm_thread_started = True
+    lm_thread = threading.Thread(target=_load_management_loop, daemon=True)
+    lm_thread.start()
+
+
+def _shutdown_load_manager():
+    """Clean up LoadManager resources on process exit."""
+    with _state.load_manager_lock:
+        if _state.load_manager is not None:
+            try:
+                _state.load_manager.close()
+                logger.info("LoadManager shut down cleanly")
+            except Exception as e:
+                logger.warning("Error during LoadManager shutdown: %s", e)
+
+
+def start_background_services() -> None:
+    """Start MQTT subscriber and load-management background threads.
+
+    Intentionally NOT called at import time: importing the module must be
+    side-effect free so tests and tooling can import it safely. The gunicorn
+    entry point (wsgi.py) and the ``__main__`` block call this explicitly
+    after the app is constructed.
+    """
+    if _config.load_tesla_controller == "real":
+        _start_mqtt_subscriber()
+    if _config.load_manage_enabled is not False:
+        _start_load_manager_thread()
+
+
+def create_app() -> Flask:
+    """Create and configure the Flask application.
+
+    Builds the app, registers routes, attaches the module-level ``_config``
+    singleton to ``app.config["SOLARA_CONFIG"]``, and wires the JSON
+    provider, error handler, and Jinja filter. Does NOT start background
+    threads — call :func:`start_background_services` explicitly (see
+    wsgi.py and the ``__main__`` block).
+
+    Note:
+        The ``config`` override parameter was removed: views and background
+        services read the module-level ``_config`` singleton, so a per-app
+        override was inert and misleading.
+
+    Returns:
+        A configured Flask application instance.
+    """
+    cfg = _config
+    application = Flask(__name__)
+    application.logger.handlers.clear()
+    application.logger.propagate = True
+    application.config["SOLARA_CONFIG"] = cfg
+    # Register Tesla OAuth routes.
+    application.register_blueprint(bp)
+    application.jinja_env.filters["astimezonestr"] = astimezone_filter
+    application.json = CustomJSONProvider(application)
+    application.register_error_handler(RetryableMetricsException, error_retryable)
+    application.add_url_rule("/", "index", index)
+    application.add_url_rule("/health", "health", health)
+    application.add_url_rule("/api/v1/tou", "tou", tou)
+    application.add_url_rule("/api/v1/load/status", "load_status", load_status)
+    application.add_url_rule("/stream/status", "stream_status", stream_status)
+    return application
+
+
+app = create_app()
+
+
+logger = app.logger
+if __name__ != "__main__":
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    root_logger = logging.getLogger()
+    root_logger.handlers = gunicorn_logger.handlers
+    root_logger.setLevel(logging.DEBUG if is_debug() else logging.INFO)
+    file_handler = _setup_file_logging(_config)
+    if file_handler:
+        root_logger.addHandler(file_handler)
+        gunicorn_logger.addHandler(file_handler)
+else:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S %z",
+    ))
+    logging.basicConfig(handlers=[handler],
+                        level=logging.DEBUG if is_debug() else logging.INFO)
+    file_handler = _setup_file_logging(_config)
+    if file_handler:
+        logging.getLogger().addHandler(file_handler)
+
+
+atexit.register(_shutdown_load_manager)
 
 
 if __name__ == "__main__":
@@ -731,7 +828,7 @@ if __name__ == "__main__":
             )
             sys.exit(1)
 
-        from load_manager import pair_homekit_accessory
+        from load_controllers import pair_homekit_accessory
 
         plug_name = sys.argv[2]
         address = sys.argv[3]
@@ -747,7 +844,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--tesla-auth":
-        from load_manager import tesla_auth_cli
+        from load_controllers import tesla_auth_cli
 
         success = asyncio.run(tesla_auth_cli())
         if success:
@@ -791,48 +888,5 @@ if __name__ == "__main__":
             print("Fleet telemetry provisioning failed. Check logs for detail.")
             sys.exit(1)
 
-
-_lm_thread_started = False
-
-
-def _start_mqtt_subscriber() -> None:
-    """Start the MQTT subscriber thread for Tesla fleet-telemetry events."""
-    from mqtt_telemetry import start_mqtt_subscriber as _start
-    _start(_config)
-    logger.info("MQTT subscriber started")
-
-
-def _start_load_manager_thread():
-    """Start the load management background thread (called once per process)."""
-    global _lm_thread_started
-    if _lm_thread_started:
-        return
-    _lm_thread_started = True
-    lm_thread = threading.Thread(target=_load_management_loop, daemon=True)
-    lm_thread.start()
-
-
-def _shutdown_load_manager():
-    """Clean up LoadManager resources on process exit."""
-    with _load_manager_lock:
-        if _load_manager is not None:
-            try:
-                _load_manager.close()
-                logger.info("LoadManager shut down cleanly")
-            except Exception as e:
-                logger.warning("Error during LoadManager shutdown: %s", e)
-
-
-atexit.register(_shutdown_load_manager)
-
-
-# Start at module import time — runs once per gunicorn worker (forked after import)
-# Skip during pytest to avoid background thread + unclosed aiohttp sessions
-if "pytest" not in sys.modules:
-    if _config.load_tesla_controller == "real":
-        _start_mqtt_subscriber()
-    if _config.load_manage_enabled is not False:
-        _start_load_manager_thread()
-
-if __name__ == "__main__":
+    start_background_services()
     app.run(host="0.0.0.0", port=8000)

@@ -13,7 +13,7 @@ __pycache__/
 .vue-keys.json
 bin/
 bugs
-devices.json
+devices*.json
 pyvenv.cfg
 solara.log
 solara.log.*

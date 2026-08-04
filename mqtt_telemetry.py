@@ -12,6 +12,12 @@ Topics follow the pattern ``{topic_base}/{field}``, where field is one of:
 Single-vehicle assumed — no per-VIN storage.
 """
 
+# pylint: disable=duplicate-code
+# The `build_tesla_state(...)` call block at the end of tesla_state_from_snapshot
+# intentionally mirrors load_controllers._init_from_rest — both are
+# snapshot-to-model construction sites with the same kwargs.  Extracting a
+# shared helper would hide the two-step flow; the duplication is trivial.
+
 from __future__ import annotations
 
 import json

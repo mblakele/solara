@@ -16,19 +16,6 @@ import datetime
 from energy_aggregator import EnergyDataAggregator
 
 
-def test_misaligned_start_time():
-    """
-    Data should start at hour 0 (off_peak) but start_time is set to hour 23.
-    The first second should be hour 0, but we classify it as hour 23.
-    This is the "off" case.
-    """
-    start_time = datetime.datetime(2024, 1, 1, 23, 0, 0)
-
-    _data = [(start_time, 1.0)]
-
-    print("Test complete")
-
-
 def test_cross_midnight_aggregation():
     """Test cross-midnight aggregation with local timezone."""
     from util import get_timezone
@@ -37,10 +24,11 @@ def test_cross_midnight_aggregation():
     local_tz = pytz.timezone(get_timezone())
     start_time = local_tz.localize(datetime.datetime(2024, 1, 1, 10, 0, 0))
 
-    data = [(start_time + datetime.timedelta(seconds=idx), 0.01) for idx in range(1000)]
+    # 1000 per-second steps of 0.01 kWh each (values are kWh)
+    data = [0.01] * 1000
 
-    result = EnergyDataAggregator.aggregate_from_seconds(
-        start_time, [x[1] for x in data]
+    result = EnergyDataAggregator._aggregate(
+        start_time, data, datetime.timedelta(seconds=1)
     )
 
     expected = {

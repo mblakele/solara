@@ -9,22 +9,29 @@ from datetime import datetime, timedelta
 import json
 import locale
 import logging
-from typing import Any, Callable, ClassVar, Optional
+import threading
+from typing import Any, ClassVar, Optional
 
 import requests
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 
 from clock import Clock, RealClock
-from constants import QUANTIZATION_CONFIDENCE_THRESHOLD
+from constants import (
+    DRIFT_REJECTION_ALERT_AFTER,
+    QUANTIZATION_CONFIDENCE_THRESHOLD,
+)
 from energy_cache import EnergyCache
 from energy_aggregator import EnergyDataAggregator, TOUBuckets
 from util import (
     CustomJSONProvider,
     NBCQuarterSet,
+    RetryableError,
     ceil_to_qh,
     compute_nbc_quarters,
     custom_json_default,
+    floor_to_qh,
+    inject_completed_qh,
     is_debug,
 )
 
@@ -47,6 +54,59 @@ def set_clock(clock: Clock) -> None:
 
 
 MAX_FETCH_WINDOW = timedelta(hours=1)
+
+# Drift-rejection tracker keyed by ``(channel_num, chart_start)``.  A fetch
+# whose ``data_start`` drifts off the requested (QH-aligned) ``chart_start``
+# is rejected so a misaligned window never reaches the cache; if the API
+# permanently drops the head sample of a QH, every fetch for that QH is
+# rejected forever and the QH stalls.  This dict counts consecutive
+# rejections per QH so the stall becomes observable — an error log plus a
+# one-time Telegram alert per QH key (see ``_fetch_channel_data``) — instead
+# of an infinite silent retry loop.
+_drift_rejections: dict[tuple[int, datetime], int] = {}
+
+# One-time alert events queued when a QH key first crosses
+# ``DRIFT_REJECTION_ALERT_AFTER`` consecutive rejections.  Drained by
+# ``drain_drift_alerts()`` (the LoadManager cycle) so the caller can log at
+# ERROR level and surface the stall as a Telegram alert.
+_drift_alerts: list["DriftAlert"] = []
+
+# Serializes mutations of ``_drift_rejections``/``_drift_alerts``: fetches
+# run in EnergyCache worker threads while the LoadManager cycle drains from
+# its own thread.
+_drift_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class DriftAlert:
+    """A persistent data-start drift detected for one channel/QH key.
+
+    Attributes:
+        channel_num: The Emporia channel whose fetches are being rejected.
+        chart_start: The requested (QH-aligned) fetch window start.
+        data_start: The API-reported ``firstUsageInstant`` (drifted).
+        count: Consecutive rejections observed for this key at enqueue time.
+    """
+
+    channel_num: int
+    chart_start: datetime
+    data_start: datetime
+    count: int
+
+
+def drain_drift_alerts() -> list[DriftAlert]:
+    """Return and clear all pending drift alert events.
+
+    Safe to call from any thread; the fetch path and this drain serialize
+    on an internal lock.
+
+    Returns:
+        The list of ``DriftAlert`` events queued since the last drain.
+    """
+    with _drift_lock:
+        pending = list(_drift_alerts)
+        _drift_alerts.clear()
+        return pending
 
 
 def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
@@ -80,36 +140,55 @@ def cap_chart_start(chart_start: datetime, now: datetime) -> datetime:
     return ceil_to_qh(now - MAX_FETCH_WINDOW)
 
 
-def cap_fetch_window(start_time: datetime, now: datetime) -> datetime:
-    """Cap a fetch start_time to prevent over-fetching after stale cache.
+def _chart_start_for(energy_cache: EnergyCache, now: datetime) -> datetime:
+    """Pick the fetch window start for the current cycle.
 
-    If *start_time* is more than 1 hour before *now*, return the earliest
-    appropriate quarter-hour boundary.  Otherwise return start_time unchanged.
+    On the first call (``data_start`` is None) the full hour up to *now* is
+    fetched.  In steady state the window starts at the current QH boundary
+    so replace semantics need no overlap/merge logic.  When the cached
+    window still starts in an already-completed QH (QH-aligned
+    ``data_start`` older than the current QH), the window stays anchored to
+    that older boundary so the completed QH reaches 900 samples and is
+    compacted into a ``CompletedNBCPeriod`` on the first fetch after the
+    boundary — otherwise ``EnergyCache`` replace semantics would discard
+    the un-compacted window and lose the QH.
 
-    Used by the incremental fetch builder to guard against stale
-    EnergyCache state that would otherwise request hours of 1-second
-    data.
+    The anchor is intentionally QH-aligned-only: a stale *misaligned*
+    ``data_start`` (e.g. ``13:45:31`` when ``now`` is ``14:00:10``) falls
+    through to ``current_qh_start``, so its partially-filled QH is
+    discarded by the next replace.  That is correct — the head of that QH
+    genuinely is missing (the misalignment itself means the API never
+    returned those samples).
 
     Args:
-        start_time: The proposed fetch window start time.
-        now: The current time.
+        energy_cache: The EnergyCache instance storing per-second samples.
+        now: Current time.
 
     Returns:
-        A datetime no more than 1 hour before *now*, or *start_time*
-        unchanged if it is already within the 1-hour window.
+        A QH-aligned fetch window start time.
     """
-    if now - start_time <= MAX_FETCH_WINDOW:
-        return start_time
-
-    return ceil_to_qh(now - MAX_FETCH_WINDOW)
+    data_start = energy_cache.data_start
+    if data_start is None:
+        return ceil_to_qh(now - MAX_FETCH_WINDOW)
+    current_qh_start = floor_to_qh(now)
+    if data_start < current_qh_start and data_start == ceil_to_qh(data_start):
+        # Anchor to the stale QH-aligned data_start so samples accumulate to
+        # 900 and compact() materialises a CompletedNBCPeriod.  This applies
+        # to any number of QHs back — compact() processes all complete chunks
+        # in one pass, so a two-QH gap is handled correctly as well.
+        return data_start
+    return current_qh_start
 
 
 def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Logger) -> dict[str, Any] | None:
-    """Fetch metrics with incremental chart_start tracking via EnergyCache.
+    """Fetch metrics with QH-window chart_start tracking via EnergyCache.
 
     On the first call, EnergyCache has no samples, so chart_start is set to
     3600 seconds ago (full hour of historical data). After that, chart_start
-    advances to the most recent sample timestamp from the cache.
+    is floored to the current QH boundary so the full quarter-hour is
+    refetched on every cycle regardless of the API's data_start alignment;
+    a stale QH-aligned data_start keeps the window anchored so a completed
+    QH is not lost (see ``_chart_start_for``).
 
     Args:
         energy_cache: instance of EnergyCache.
@@ -120,18 +199,14 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         Metrics dict from HourlyProjection, or None on failure.
     """
     # First call: fetch up to four QH periods.
-    # Subsequent calls: fetch incremental data from the last sample timestamp.
+    # Subsequent calls: QH-window fetch anchored at a QH boundary.
     logger.debug(
         "create_metrics: len %d, last_sample_at %s",
-        len(energy_cache._samples or []),
+        len(energy_cache.samples or []),
         energy_cache.last_sample_at
     )
     try:
-        chart_start = (
-            ceil_to_qh(now - MAX_FETCH_WINDOW)
-            if energy_cache.last_sample_at is None
-            else cap_chart_start(energy_cache.last_sample_at, now)
-        )
+        chart_start = cap_chart_start(_chart_start_for(energy_cache, now), now)
         hp = HourlyProjection(now, logger, energy_cache)
         hp.populate(chart_start)
         logger.debug(
@@ -144,6 +219,11 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
                 for d in hp.metrics.get("devices", [])
             ) if hp.metrics.get("devices") else 0,
         )
+        # Stamp the fetch time so consumers (SSE lag recalculation in
+        # app.py, data_point_at in load_nbc.py) compute elapsed time from
+        # when this data was actually fetched rather than falling back to
+        # "now" at read time.
+        hp.metrics["_fetched_at"] = now
         return hp.metrics
 
     except AssertionError as ae:
@@ -273,84 +353,11 @@ class TOUResult:
         }
 
 
-def _build_incremental_fetch(
-    energy_cache: "EnergyCache",
-    vue: PyEmVue,
-    device_gid: int,
-    now: datetime,
-) -> Callable[[], dict[str, Any] | None]:
-    """Build a callable for incremental partial-range API fetches.
-
-    Returns a zero-argument function that can be passed to
-    ``energy_cache.get_or_fetch()``. The callable checks whether the cache
-    already has samples and, if so, computes a partial-range API call that
-    fetches only new data since the last sample. Old samples (older than
-    3600s) are pruned after merging.
-
-    On the first call (no existing samples), a full-range fetch is performed
-    covering the current hour up to ``now``.
-
-    Args:
-        energy_cache: The EnergyCache instance storing per-second samples.
-        vue: A PyEmVue client instance for API calls.
-        device_gid: The group ID (device identifier) to fetch data for.
-        now: Current time. Required.
-
-    Returns:
-        A callable that returns a dict with ``per_second_data`` and
-        ``data_start``, or None on API error.
-    """
-
-    def fetcher() -> dict[str, Any] | None:
-        if energy_cache.data_start is None or energy_cache.samples is None or len(
-            energy_cache.samples
-        ) == 0:
-            start_time = ceil_to_qh(now - MAX_FETCH_WINDOW)
-        else:
-            last_sample_idx = len(energy_cache.samples)
-            quant = energy_cache.quantization_seconds or 0
-            start_time = energy_cache.data_start + timedelta(
-                seconds=max(0, last_sample_idx - quant)
-            )
-
-        # Guard against stale cache: if the incremental window would be >1h,
-        # fall back to a full-hour fetch to avoid API rejection.
-        capped = cap_fetch_window(start_time, now)
-        if capped != start_time:
-            logger.debug(
-                "[_build_incremental_fetch] incremental window %s-%s >1h, "
-                "falling back to full-hour fetch",
-                start_time,
-                now,
-            )
-            start_time = capped
-
-        # pyemvue throws error if start_time is earlier than end_time (now)
-        assert start_time <= now, f"start_time {start_time} is after now {now}"
-
-        try:
-            usage_data, data_start = vue.get_chart_usage(
-                device_gid,
-                start_time,
-                now,
-                scale=Scale.SECOND.value,
-                unit=Unit.KWH.value,
-            )
-            if not usage_data:
-                return None
-            return {"per_second_data": list(usage_data), "data_start": data_start}
-        except (requests.exceptions.RequestException, IOError):
-            logger.exception("error fetching incremental data for device %d", device_gid)
-            return None
-
-    return fetcher
-
-
 class VueAuthenticationError(Exception):
     """Raised when Vue authentication fails."""
 
 
-class RetryableMetricsException(Exception):
+class RetryableMetricsException(RetryableError):
     """Signal that the Emporia VUE API responded with a server error and the caller should retry."""
 
     def __init__(self, message, *args):
@@ -520,8 +527,8 @@ class HourlyProjection(MetricsBase):
 
         The caller must compute chart_start. On the first call, use
         now - 3600 seconds, aligned to QH boundary, for up to a full hour
-        of historical data. On subsequent calls, use the most recent sample
-        timestamp from EnergyCache to fetch only incremental new data.
+        of historical data. On subsequent calls, use the current QH
+        boundary (floor_to_qh(now)) so the full quarter-hour is refetched.
 
         Evict older data so that the cache contains at most 3600 samples.
 
@@ -573,8 +580,8 @@ class HourlyProjection(MetricsBase):
         )
 
         # Expose the actual API-reported data start so that EnergyCache can
-        # update _data_start and _last_sample_at.  Without this key the
-        # get_or_fetch merge block silently skips the _last_sample_at update,
+        # update data_start and last_sample_at.  Without this key the
+        # get_or_fetch merge block silently skips the last_sample_at update,
         # leaving it permanently None and causing every call to create_metrics
         # to request a full-hour fetch instead of an incremental one.
         if population:
@@ -615,6 +622,63 @@ class HourlyProjection(MetricsBase):
         ):
             self.logger.debug({"usage_data": usage_data_local})
             raise RetryableMetricsException("No data for hour")
+        if usage_data_start_local != chart_start:
+            # pyemvue returns the API's ``firstUsageInstant`` as the start,
+            # which drifts off the requested (QH-aligned) chart_start when
+            # data is missing at the head of the window.  Storing it would
+            # leave a misaligned data_start in the cache — treat as a
+            # transient condition and let the caller retry with stale data.
+            # If the same QH keeps being rejected, the head sample is
+            # likely permanently missing: log at ERROR level (every N
+            # rejections) and enqueue a one-time Telegram alert per QH key
+            # so the resulting stall is observable instead of silent.
+            # Stale entries for long-past windows are pruned first so the
+            # tracker stays bounded: chart_start advances every QH, so a key
+            # older than the fetch window can never be fetched again.
+            cutoff = instant - MAX_FETCH_WINDOW
+            with _drift_lock:
+                for stale_key in list(_drift_rejections):
+                    if stale_key[1] < cutoff:
+                        del _drift_rejections[stale_key]
+                key = (chan.channel_num, chart_start)
+                count = _drift_rejections.get(key, 0) + 1
+                _drift_rejections[key] = count
+                escalated = (
+                    count >= DRIFT_REJECTION_ALERT_AFTER
+                    and count % DRIFT_REJECTION_ALERT_AFTER == 0
+                )
+                if escalated:
+                    if count == DRIFT_REJECTION_ALERT_AFTER:
+                        # First crossing: queue a one-time alert for this QH
+                        # key (a (channel_num, chart_start) key is unique, so
+                        # this fires at most once per stalled window).
+                        _drift_alerts.append(
+                            DriftAlert(
+                                channel_num=chan.channel_num,
+                                chart_start=chart_start,
+                                data_start=usage_data_start_local,
+                                count=count,
+                            )
+                        )
+                    self.logger.error(
+                        "get_chart_usage drift for QH starting %s: data_start "
+                        "%s persistently rejected %d consecutive fetches; the "
+                        "head of this window appears permanently missing",
+                        chart_start,
+                        usage_data_start_local,
+                        count,
+                    )
+            self.logger.warning(
+                "get_chart_usage returned data_start %s != requested "
+                "chart_start %s; treating as transient",
+                usage_data_start_local,
+                chart_start,
+            )
+            raise RetryableMetricsException(
+                f"data_start {usage_data_start_local} != chart_start {chart_start}"
+            )
+        with _drift_lock:
+            _drift_rejections.pop((chan.channel_num, chart_start), None)
         self.metrics["api_response"]["get_chart_usage/" + str(chan.channel_num)] = (
             _CLOCK.now() - chart_start
         )
@@ -806,45 +870,9 @@ class HourlyProjection(MetricsBase):
         Returns:
             DeviceMetrics instance with all derived fields.
         """
-        pop_data_start = pop_result.nbc_data_start
         energy_cache = self.energy_cache
 
-        def _maybe_merge_with_cache(raw_data: list[float] | None) -> list[float]:
-            """Merge raw incremental data with cached samples when available.
-
-            When the cache holds a previous fetch (e.g. a full hour) and the
-            API returns only an incremental delta (~60 samples), this produces
-            a complete, gapless time series by appending the delta to the
-            cached data.
-
-            Args:
-                raw_data: Per-second data from the API (incremental delta).
-
-            Returns:
-                Merged data list, or the original input when no cache is
-                available or merge yields nothing.
-            """
-            if raw_data is None:
-                return raw_data or []
-            if energy_cache is None or energy_cache._data is None:
-                return raw_data
-            merged = energy_cache.merge_incremental(
-                energy_cache._data,
-                raw_data,
-                pop_data_start,
-            )
-            if merged is not None and merged.samples is not None:
-                return merged.samples
-            return raw_data
-
-        nbc_seconds = _maybe_merge_with_cache(pop_result.nbc_seconds)
-        # Use raw API samples for per_second_data so that the EnergyCache
-        # re-ingests only genuinely new points.  _maybe_merge_with_cache
-        # returns the full merged cache (old + new), which EnergyCache then
-        # re-extracts and mis-labels with the incremental data_start.  That
-        # mismatch inflates merged_last_sample_at into the future, which
-        # causes the next call to send start > end to the Emporia API (400).
-        # NBC still uses nbc_seconds (merged) for prediction accuracy.
+        nbc_seconds = list(pop_result.nbc_seconds) if pop_result.nbc_seconds is not None else []
         per_second_data = list(pop_result.per_second_data) if pop_result.per_second_data is not None else []
 
         # Determine the prediction window from quantization data, if available.
@@ -856,6 +884,13 @@ class HourlyProjection(MetricsBase):
                 prediction_window_seconds = qs
 
         nbc_result = self._compute_nbc(nbc_seconds, prediction_window_seconds)
+
+        # If cache has completed periods, inject QH2-QH4 from them.
+        completed_periods = (
+            energy_cache.completed_periods if energy_cache is not None else None
+        )
+        if completed_periods:
+            nbc_result = inject_completed_qh(nbc_result, completed_periods)
 
         return DeviceMetrics(
             gid=vdi.device_gid,

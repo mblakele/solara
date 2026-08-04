@@ -967,7 +967,6 @@ class TestProvisionFleetTelemetryPreFlight:
         monkeypatch.setattr(
             "load_controllers.TESLA_TOKENS_FILE", tmp_tokens
         )
-        monkeypatch.setattr("load_manager.TESLA_TOKENS_FILE", tmp_tokens)
 
         # Ensure the file doesn't exist
         assert not tmp_tokens.exists()
@@ -1035,7 +1034,6 @@ class TestProvisionFleetTelemetryProxyUrlCheck:
 
         tmp_tokens = tmp_path / "tokens.json"
         monkeypatch.setattr("load_controllers.TESLA_TOKENS_FILE", tmp_tokens)
-        monkeypatch.setattr("load_manager.TESLA_TOKENS_FILE", tmp_tokens)
 
         # Write valid JSON but missing required keys
         tmp_tokens.write_text('{"refresh_token": "rt"}')

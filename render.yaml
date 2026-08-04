@@ -4,7 +4,7 @@ services:
     name: solara
     env: python
     buildCommand: uv sync
-    startCommand: gunicorn app:app --worker-class=gthread --threads=4 --timeout=0
+    startCommand: gunicorn wsgi:app --worker-class=gthread --threads=4 --timeout=31
     plan: free
     numInstances: 1
     envVars:
