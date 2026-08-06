@@ -13,10 +13,11 @@ Single-vehicle assumed — no per-VIN storage.
 """
 
 # pylint: disable=duplicate-code
-# The `build_tesla_state(...)` call block at the end of tesla_state_from_snapshot
-# intentionally mirrors load_controllers._init_from_rest — both are
-# snapshot-to-model construction sites with the same kwargs.  Extracting a
-# shared helper would hide the two-step flow; the duplication is trivial.
+# The `build_tesla_state(...)` call at the end of tesla_state_from_snapshot
+# mirrors load_controllers._init_from_rest — both construct the same model
+# from independently-derived fields.  The shared unwrap/parse helpers
+# (unwrap_telemetry_value, parse_charge_amps) live in load_models; this
+# final construction call is intentionally duplicated for readability.
 
 from __future__ import annotations
 
@@ -29,7 +30,9 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 
-from load_models import TeslaState, build_tesla_state
+from constants import TESLA_HOME_RADIUS_M_DEFAULT
+
+from load_models import TeslaState, build_tesla_state, parse_charge_amps, unwrap_telemetry_value
 from util import _haversine_distance
 
 # Deferred import to avoid circular import with config_loader → device_config
@@ -117,10 +120,7 @@ def on_message(_client: Any, _userdata: Any, msg: Any) -> None:  # noqa: ARG001
             return
 
         # Unwrap fleet-telemetry's {"value": ..., "createdAt": ...} envelope.
-        if isinstance(payload, dict) and "value" in payload:
-            value = payload["value"]
-        else:
-            value = payload
+        value = unwrap_telemetry_value(payload)
 
         with _telemetry_lock:
             is_new = field not in _telemetry_state
@@ -265,31 +265,21 @@ def tesla_state_from_snapshot(
         )
     else:
         # DetailedChargeState not yet received — try to infer from ChargeAmps.
-        charge_amps_raw = snapshot.get("ChargeAmps")
-        if charge_amps_raw is not None:
-            try:
-                raw_val = (
-                    charge_amps_raw.get("value", charge_amps_raw)
-                    if isinstance(charge_amps_raw, dict)
-                    else charge_amps_raw
-                )
-                charge_val = round(float(raw_val))
-            except (ValueError, TypeError):
-                charge_val = None
-            if charge_val is not None and charge_val > 0:
-                # Amps > 0 means charging is active — infer state from
-                # partial snapshot and skip remaining parsing.
-                logger.info(
-                    "mqtt_telemetry: inferred charging from ChargeAmps=%s "
-                    "(DetailedChargeState not yet received)",
-                    charge_val,
-                )
-                return build_tesla_state(
-                    is_charging=True,
-                    current_amps=charge_val,
-                    plugged_in=True,
-                    at_home=_compute_at_home_from_location(snapshot),
-                )
+        charge_val = parse_charge_amps(snapshot.get("ChargeAmps"))
+        if charge_val is not None and charge_val > 0:
+            # Amps > 0 means charging is active — infer state from
+            # partial snapshot and skip remaining parsing.
+            logger.info(
+                "mqtt_telemetry: inferred charging from ChargeAmps=%s "
+                "(DetailedChargeState not yet received)",
+                charge_val,
+            )
+            return build_tesla_state(
+                is_charging=True,
+                current_amps=charge_val,
+                plugged_in=True,
+                at_home=_compute_at_home_from_location(snapshot),
+            )
         logger.warning(
             "mqtt_telemetry: tesla_state_from_snapshot returning None — "
             "DetailedChargeState not yet received (snapshot keys: %s)",
@@ -298,19 +288,7 @@ def tesla_state_from_snapshot(
         return None
 
     # ChargeAmps
-    current_amps: int | None = None
-    charge_amps_raw = snapshot.get("ChargeAmps")
-    if charge_amps_raw is not None:
-        raw_val = (
-            charge_amps_raw.get("value", None)
-            if isinstance(charge_amps_raw, dict)
-            else charge_amps_raw
-        )
-        if raw_val is not None:
-            try:
-                current_amps = round(float(raw_val))
-            except (ValueError, TypeError):
-                pass
+    current_amps = parse_charge_amps(snapshot.get("ChargeAmps"))
 
     at_home = _compute_at_home_from_location(snapshot)
     return build_tesla_state(
@@ -333,11 +311,7 @@ def _compute_at_home_from_location(snapshot: dict[str, Any]) -> bool:
     location_raw = snapshot.get("Location")
     if location_raw is None:
         return False
-    loc = (
-        location_raw.get("value", location_raw)
-        if isinstance(location_raw, dict)
-        else None
-    )
+    loc = unwrap_telemetry_value(location_raw)
     if not isinstance(loc, dict):
         return False
     lat_raw = loc.get("latitude")
@@ -373,7 +347,7 @@ def _compute_at_home(
     home_lon = cfg.tesla_home_lon
     if home_lat is None or home_lon is None:
         return False
-    home_radius_m: float = 500.0
+    home_radius_m: float = TESLA_HOME_RADIUS_M_DEFAULT
     dc = _dc.get_tesla_config()
     if dc is not None and "home_radius_m" in dc:
         home_radius_m = float(dc["home_radius_m"])

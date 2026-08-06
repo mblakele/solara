@@ -148,7 +148,8 @@ project-root
                            # load_plugs_from_file, load_vocolinc_*) reading
                            # env via the Config class + devices.json
 ├── conftest.py            # Pytest shared fixtures & configuration
-├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS, etc.)
+├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS,
+                           # Tesla charging constants TESLA_HARD_MAX_AMPS, etc.)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
@@ -164,7 +165,9 @@ project-root
                             # TeslaChargeState, TeslaDriveState, TeslaLocation, TeslaCallbackPayload,
                             # TeslaEvent, TeslaEventKind, TeslaVehicleTelemetry,
                             # parse_tesla_event_payload, update_tesla_telemetry,
-                            # get_active_tesla_telemetry, FleetTelemetryProvisionConfig)
+                            # get_active_tesla_telemetry, FleetTelemetryProvisionConfig) plus
+                            # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
+                            # parse_charge_amps) used by mqtt_telemetry and load_controllers
 ├── load_nbc.py            # NBCReader, StateTracker, GapMinder bin-packing, Tesla decisions
  ├── mockdata.py            # Test data generation utilities
  ├── mqtt_telemetry.py      # Tesla MQTT message parsing (on_message, tesla_state_from_snapshot)
@@ -214,6 +217,13 @@ project-root
   `Location` is absent in the snapshot. Delegates to controller's `init_tesla_state()`
   (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
 - Data models in `load_models.py`
+- Shared fleet-telemetry parsing helpers in `load_models.py` (`unwrap_telemetry_value`,
+  `parse_charge_amps`) — single home for the `{"value": ...}` envelope unwrap + amps
+  rounding, used by `mqtt_telemetry.py` (`on_message`, `tesla_state_from_snapshot`,
+  `_compute_at_home_from_location`) and `load_controllers.py` (`_init_from_rest`)
+- `_reset_runtime_state()` / `_apply_persisted_tokens()` in `load_controllers.py` —
+  shared init paths for `RealTeslaController` (`__init__`/`reset_session` and the
+  `_ensure_api` create/update branches respectively)
 - `create_app()` factory + routes in `app.py` (module-level `app` singleton; no
   background threads start at import time)
 - `start_background_services()` in `app.py` — explicitly starts the MQTT subscriber

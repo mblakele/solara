@@ -1,7 +1,9 @@
 """
-Data classes and abstract interfaces for load management.
+Data classes and abstract interfaces for load management, plus small
+shared parsing helpers (unwrap_telemetry_value, parse_charge_amps) used by
+both mqtt_telemetry and load_controllers.
 
-Pure data structures and ABCs — no business logic, no I/O.
+Pure data structures, ABCs, and pure functions — no business logic, no I/O.
 """
 
 from __future__ import annotations
@@ -12,6 +14,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Literal
+
+from constants import (
+    TESLA_CHARGE_AMPS_MAX_DEFAULT,
+    TESLA_CHARGE_AMPS_MIN_DEFAULT,
+    TESLA_HOME_RADIUS_M_DEFAULT,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -60,32 +68,18 @@ class AbstractTeslaController(ABC):
     Implementations may use tesla-fleet-api or a mock for testing.
     All methods are async to allow non-blocking API calls.
 
-    Note: REST-based status polling (get_charging_state, is_at_home,
-    is_plugged_in, start_charging) is deprecated.  The load manager now relies
-    exclusively on Tesla fleet-telemetry MQTT for vehicle state.
-    Only ``stop_charging`` and ``set_charge_amps`` remain active
-    command methods.
+    This interface is command-only.  Vehicle state comes exclusively from
+    Tesla fleet-telemetry MQTT (see ``mqtt_telemetry.py``), so REST-based
+    status polling (``get_charging_state``, ``is_at_home``,
+    ``is_plugged_in``, ``start_charging``) is intentionally absent.  Active
+    commands are ``stop_charging`` and ``set_charge_amps``; lifecycle is
+    covered by ``authenticate``, ``reset_session``, ``get_login_url`` and
+    ``close``.
     """
 
     @abstractmethod
     async def authenticate(self) -> None:
         """Perform OAuth flow or load cached token."""
-
-    @abstractmethod
-    async def is_at_home(self) -> bool:
-        """Check vehicle GPS against home lat/lon using haversine distance."""
-
-    @abstractmethod
-    async def is_plugged_in(self) -> bool:
-        """Check chargeState indicates plugged in (Charging or Connected)."""
-
-    @abstractmethod
-    async def start_charging(self) -> bool:
-        """Send charge_start command.
-
-        Returns:
-            True on success, False on failure.
-        """
 
     @abstractmethod
     async def stop_charging(self) -> bool:
@@ -105,10 +99,6 @@ class AbstractTeslaController(ABC):
         Returns:
             True on success, False on failure.
         """
-
-    @abstractmethod
-    async def get_charging_state(self) -> TeslaState | None:
-        """Return full state: charging_bool, current_amps, soc_pct, plugged_in."""
 
     _last_command_vehicle_offline: bool = False
     """True when the last command failed with VehicleOffline."""
@@ -137,10 +127,13 @@ class AbstractTeslaController(ABC):
             f"?response_type=code&prompt=consent&state={state}"
         )
 
+    @abstractmethod
     async def close(self) -> None:
         """Release resources held by this controller.
 
-        Override in subclasses that hold resources (e.g., aiohttp sessions).
+        Called at the end of every load-management cycle while the event loop
+        is still alive so aiohttp does not leak connectors. Override in
+        subclasses that hold resources (e.g., aiohttp sessions).
         """
 
 
@@ -193,11 +186,11 @@ class TeslaConfig:
     client_secret: str
     redirect_uri: str
     vehicle_id: str
-    home_radius_m: float = 500.0
+    home_radius_m: float = TESLA_HOME_RADIUS_M_DEFAULT
     home_lat: float | None = None
     home_lon: float | None = None
-    charge_amps_min: int = 5
-    charge_amps_max: int = 48
+    charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT
+    charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT
     private_key_path: str | None = None
     time_range: tuple[time, time] | None = None
     vehicle_command_proxy_url: str | None = None
@@ -269,6 +262,50 @@ def build_tesla_state(
         plugged_in=plugged_in,
         at_home=at_home,
     )
+
+
+def unwrap_telemetry_value(raw: Any) -> Any:
+    """Unwrap a fleet-telemetry payload envelope.
+
+    Fleet-telemetry publishes per-field payloads in one of two formats:
+
+    * Wrapped: ``{"value": <raw>, "createdAt": "..."}``
+    * Raw: the value directly (string, number, or dict)
+
+    Args:
+        raw: The parsed MQTT payload.
+
+    Returns:
+        The unwrapped value, or ``raw`` unchanged when it is not an envelope.
+    """
+    if isinstance(raw, dict) and "value" in raw:
+        return raw["value"]
+    return raw
+
+
+def parse_charge_amps(raw: Any) -> int | None:
+    """Parse a ChargeAmps telemetry value to integer amps.
+
+    Handles both wrapped (``{"value": ...}``) and raw numeric formats.
+    Shared by the MQTT snapshot parser and the REST-init fallback so the
+    envelope-unwrap + rounding logic lives in exactly one place.
+
+    Args:
+        raw: Raw ChargeAmps telemetry value.
+
+    Returns:
+        Rounded integer amps, or None when the value is missing or
+        not numeric.
+    """
+    if raw is None:
+        return None
+    raw_val = unwrap_telemetry_value(raw)
+    if raw_val is None:
+        return None
+    try:
+        return round(float(raw_val))
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass(frozen=True)

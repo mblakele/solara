@@ -57,10 +57,16 @@ class TestCycleContextTimings:
 class TestCycleBoundaryLogging:
     """INFO-level structured logging at cycle boundaries (F2)."""
 
-    def test_cycle_start_logged_at_info(self, lm: LoadManager, caplog):
-        """cycle_start event appears at INFO level with force field."""
+    def test_cycle_start_logged_at_debug(self, lm: LoadManager, caplog):
+        """cycle_start event appears at DEBUG level with force field.
+
+        cycle_start fires every cycle (~30 s) even when a
+        cycle_early_exit/cycle_complete event immediately follows; the
+        boundary events carry the signal, so the start marker is logged at
+        DEBUG to keep INFO output focused on cycle outcomes.
+        """
         lm.enabled = True
-        caplog.set_level(logging.INFO)
+        caplog.set_level(logging.DEBUG)
         now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         data_point = now - timedelta(seconds=10)
         qh_result = NBCFetchResult(qh_name="QH2", predicted_wh=750.0, seconds_remaining=450, data_point_at=data_point, samples_used=300)
@@ -74,7 +80,7 @@ class TestCycleBoundaryLogging:
         matched = [r for r in caplog.records if getattr(r, "event", None) == "cycle_start"]
         assert len(matched) == 1, "cycle_start event not found"
         record = matched[0]
-        assert record.levelname == "INFO"
+        assert record.levelname == "DEBUG"
         assert record.force is False
 
     def test_cycle_early_exit_when_disabled(self, lm: LoadManager, caplog):

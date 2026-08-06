@@ -182,6 +182,31 @@ def test_inherits_abstract_interface_tesla(stub_tesla_config):
     assert isinstance(ctrl, AbstractTeslaController)
 
 
+def test_abstract_tesla_interface_is_command_only():
+    """The abstract Tesla interface no longer exposes status-polling methods.
+
+    REST-based status polling (is_at_home, is_plugged_in, start_charging,
+    get_charging_state) is deprecated: vehicle state comes from
+    fleet-telemetry MQTT, not REST.  The interface is command-only
+    (stop_charging, set_charge_amps, authenticate) plus lifecycle methods.
+    """
+    for method in ("is_at_home", "is_plugged_in", "start_charging", "get_charging_state"):
+        assert not hasattr(AbstractTeslaController, method), (
+            f"AbstractTeslaController.{method} must be removed (deprecated REST polling)"
+        )
+
+
+def test_real_tesla_controller_no_charge_limit_pct():
+    """RealTeslaController no longer exposes get_charge_limit_pct.
+
+    The method was fully dead: no callers, no tests, and no entry in the
+    abstract interface.
+    """
+    from load_controllers import RealTeslaController
+
+    assert not hasattr(RealTeslaController, "get_charge_limit_pct")
+
+
 def test_set_charge_amps_clamps_to_range(stub_tesla_config):
     """set_charge_amps clamps to [min, max] range."""
     ctrl = TeslaController(stub_tesla_config)

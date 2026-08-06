@@ -1050,60 +1050,6 @@ class TestProvisionFleetTelemetryProxyUrlCheck:
         assert result is False
 
 
-class TestRealTeslaControllerDeprecatedStatus:
-    """Verify that deprecated status and start_charging methods
-    return defaults without making REST calls.
-
-    After disabling REST-based Tesla status polling, these methods
-    must return sentinel defaults (None/False) without calling
-    _fetch_vehicle_data(). The REST API is only used for commands
-    (stop_charging, set_charge_amps) and telemetry provisioning.
-    """
-
-    def test_get_charging_state_returns_none(self, tesla_config):
-        """get_charging_state() returns None without calling _fetch_vehicle_data()."""
-        from load_controllers import RealTeslaController
-
-        ctrl = RealTeslaController(tesla_config)
-        with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
-            state = asyncio.run(ctrl.get_charging_state())
-            assert state is None
-            mock_fetch.assert_not_called()
-
-    def test_is_at_home_returns_false(self, tesla_config):
-        """is_at_home() returns False without calling _fetch_vehicle_data()."""
-        from load_controllers import RealTeslaController
-
-        ctrl = RealTeslaController(tesla_config)
-        with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
-            result = asyncio.run(ctrl.is_at_home())
-            assert result is False
-            mock_fetch.assert_not_called()
-
-    def test_is_plugged_in_returns_false(self, tesla_config):
-        """is_plugged_in() returns False without calling _fetch_vehicle_data()."""
-        from load_controllers import RealTeslaController
-
-        ctrl = RealTeslaController(tesla_config)
-        with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
-            result = asyncio.run(ctrl.is_plugged_in())
-            assert result is False
-            mock_fetch.assert_not_called()
-
-    def test_start_charging_is_noop(self, tesla_config):
-        """start_charging() returns False without calling _get_vehicle().
-
-        The load manager must not start charging; this method is a no-op.
-        """
-        from load_controllers import RealTeslaController
-
-        ctrl = RealTeslaController(tesla_config)
-        with patch.object(ctrl, "_get_vehicle") as mock_vehicle:
-            result = asyncio.run(ctrl.start_charging())
-            assert result is False
-            mock_vehicle.assert_not_called()
-
-
 # =============================================================================
 # 10. RealTeslaController.init_tesla_state() — REST fallback on startup
 # =============================================================================

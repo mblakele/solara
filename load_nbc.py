@@ -18,7 +18,13 @@ from typing import Any
 from energy_cache import EnergyCache
 from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
 
-from constants import DEFAULT_PREDICTION_WINDOW_SECS
+from constants import (
+    DEFAULT_PREDICTION_WINDOW_SECS,
+    TESLA_CHARGE_AMPS_MAX_DEFAULT,
+    TESLA_CHARGE_AMPS_MIN_DEFAULT,
+    TESLA_HARD_MAX_AMPS,
+    TESLA_NOMINAL_VOLTAGE,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -313,7 +319,7 @@ class StateTracker:
     MIN_TOGGLE_ON_SECS = 60
     MIN_TOGGLE_OFF_SECS = 20
     STALE_THRESHOLD_SECS = 61
-    VOLTAGE = 240
+    VOLTAGE = TESLA_NOMINAL_VOLTAGE
 
     # The settle window duration is now derived dynamically from the
     # quantization-based prediction window via effective_settle_secs.
@@ -832,9 +838,11 @@ class GapMinder:
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
     MIN_SECONDS_TO_ACT = 31
-    CAR_POWER_WATTS_5A = 5 * 240  # 1200W at Tesla's minimum charge rate
+    CAR_POWER_WATTS_5A = TESLA_CHARGE_AMPS_MIN_DEFAULT * TESLA_NOMINAL_VOLTAGE
+    """1200W at Tesla's minimum charge rate (5A * 240V)."""
     MAX_DEFER_SECS = 120          # cap on the safe defer window
-    HARD_MAX_AMPS = 48            # absolute max — never exceed, regardless of config
+    HARD_MAX_AMPS = TESLA_HARD_MAX_AMPS
+    """Absolute max — never exceed, regardless of config."""
     # During the post-amp-increase settle window, suppress turn-off decisions
     # only if the apparent deficit is below this threshold.  Deficits larger
     # than this are treated as genuine even during the settle period (e.g. a
@@ -845,8 +853,8 @@ class GapMinder:
     def __init__(
         self,
         hysteresis_wh: int | None = None,
-        charge_amps_min: int = 5,
-        charge_amps_max: int = 48,
+        charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT,
+        charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
     ) -> None:
         """Initialize the GapMinder.
 
@@ -858,6 +866,8 @@ class GapMinder:
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
                 to 48.
         """
+        # Backward-compat default hysteresis of 1000 Wh; the load manager
+        # passes a config-derived value (abs(target_wh) * 1/3) in production.
         self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else 1000
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)

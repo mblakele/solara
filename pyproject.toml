@@ -80,6 +80,17 @@ max-positional-arguments = 7
 max-attributes = 17
 max-locals = 21
 
+[tool.pylint.classes]
+# RealTeslaController initializes _session/_api/last_error in
+# _reset_runtime_state(), shared by __init__ and reset_session().
+defining-attr-methods = [
+    "__init__",
+    "__new__",
+    "setUp",
+    "asyncSetUp",
+    "_reset_runtime_state",
+]
+
 [tool.pylint.format]
 max-line-length = 100
 
