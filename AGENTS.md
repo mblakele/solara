@@ -118,6 +118,13 @@ Key capabilities:
 - `LOAD_TARGET_WH` — Target Wh per quarter-hour for load decisions (default: `-50`)
 - `LOAD_NBC_DEVICE` — Device name for NBC predictions
 - `LOAD_MANAGE_INTERVAL_SECS` — Seconds between load management cycles (default: 30)
+- `LOAD_FAST_DECIDE_ENABLED` — Enables the fast decision loop (default: `True`).
+  When enabled, load management runs as two threads: a fetch-only metrics loop
+  (quantization-aligned) and a fast decision loop that re-evaluates cached metrics
+  every `LOAD_DECIDE_INTERVAL_SECS` so loads fit and gates clear faster as the
+  quarter-hour shrinks. When `False`, the metrics loop falls back to the legacy
+  single-loop behavior (`run_cycle()` — fetch and decide together). Restart required.
+- `LOAD_DECIDE_INTERVAL_SECS` — Seconds between fast decision loop cycles (default: 5)
 - Telegram device whitelist comes from the `telegram.devices` section of `devices.json`
   (there is no env-var override; the old `LOAD_TELEGRAM_DEVICES` env var is gone).
   Notifications are **only sent** when this whitelist is configured AND at least one
@@ -211,6 +218,25 @@ project-root
 - Pipeline orchestration in `load_manager.py` (`_stage_enabled_check`, `_stage_nbc_fetch`,
   `_stage_pending_check`, `_stage_compute_gap`, `_stage_async_phase`, `_stage_commit`,
   `_stage_build_result`) — each independently testable
+- `run_decision_cycle()` in `load_manager.py` — the fast decision loop's cache-only
+  decision pipeline (`_stage_enabled_check` → `_stage_nbc_read_cache` → `_stage_pending_check`
+  → `_stage_compute_gap` → `_stage_async_phase` → `_stage_commit` → `_stage_build_result`);
+  the sole decision authority in production. Never fetches metrics and never reloads
+  config — those stay in the slow loop. Returns None ("hold") when the cache has no
+  usable data.
+- `fetch_cycle()` in `load_manager.py` — fetch-only cycle (config check, enabled check,
+  NBC fetch, drift-alert drain) used by `_metrics_loop`; the only fetcher when the fast
+  decision loop is enabled. Returns None on success so the caller can publish
+  metrics_update and set the data-ready event.
+- `NBCReader.get_current_qh_cached()` in `load_nbc.py` — cache-only QH read that never
+  triggers a metrics fetch; backs `_stage_nbc_read_cache` and the fast decision loop.
+- `_metrics_loop()` / `_decision_loop()` in `app.py` — the split background loops: the
+  metrics loop is fetch-only (quantization-aligned sleep, publishes `metrics_update`,
+  sets `_state.data_ready_event`; falls back to `run_cycle()` when
+  `LOAD_FAST_DECIDE_ENABLED=False`), and the decision loop waits on the data-ready event
+  (timeout `LOAD_DECIDE_INTERVAL_SECS`), runs `run_decision_cycle()`, flushes pending
+  notifications, records cycle results, and publishes `load_cycle` SSE only on change
+  (`_publish_load_cycle_if_changed`).
 - `_fetch_tesla_state_async()` in `load_manager.py` — fetches Tesla state from MQTT
   telemetry with a fast path; returns telemetry state as long as `ChargeAmts` is present
   (does NOT require `Location`). Preserves `at_home` from `_last_tesla_at_home` when
@@ -227,7 +253,8 @@ project-root
 - `create_app()` factory + routes in `app.py` (module-level `app` singleton; no
   background threads start at import time)
 - `start_background_services()` in `app.py` — explicitly starts the MQTT subscriber
-  and load-management thread; called from `wsgi.py` and the `__main__` block, never
+  and load-management background threads (metrics loop, plus the decision loop when
+  `LOAD_FAST_DECIDE_ENABLED`); called from `wsgi.py` and the `__main__` block, never
   at import time (so tests can import the module safely)
 - `_setup_file_logging()` in `app.py` — creates `RotatingFileHandler` when `LOG_FILE` is configured
 - Test data generation in `mockdata.py`
@@ -348,8 +375,14 @@ project-root
   Always updates `full_metrics_dict` on every fetch to keep predictions current.
 
 ### Key Architecture
-- LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
-  The optional `force=True` parameter bypasses the stale-data check and always fetches fresh NBC data from API.
+- With `LOAD_FAST_DECIDE_ENABLED` (default True), LoadManager runs as two background
+  threads: `_metrics_loop` fetches every 30 seconds (quantization-aligned) and wakes
+  `_decision_loop` via `_state.data_ready_event`; `_decision_loop` re-evaluates the
+  frozen cached metrics every `LOAD_DECIDE_INTERVAL_SECS` (default 5 s) via
+  `run_decision_cycle()` and is the sole decision authority. With the flag off, the
+  metrics loop falls back to `run_cycle(force=False)` (fetch + decide together).
+  The optional `force=True` parameter bypasses the stale-data check and always fetches
+  fresh NBC data from API.
 - EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`. After compaction, completed QH periods are stored as immutable `CompletedNBCPeriod` objects and per-second data only covers the current incomplete QH.
 - Controllers: PlugController (stub) / RealPlugController (aiohomekit), TeslaController (stub) / RealTeslaController (tesla-fleet-api)
 - Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>[:<priority>] env vars

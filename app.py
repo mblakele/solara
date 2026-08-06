@@ -81,6 +81,8 @@ class _AppState:
     consecutive_error_count: int = 0
     last_error_type: str | None = None
     lm_thread_started: bool = False
+    data_ready_event: threading.Event = field(default_factory=threading.Event)
+    last_load_cycle_key: tuple | None = None
 
 
 # Application-level configuration injected into all consumers.
@@ -575,46 +577,136 @@ def _send_error_alert(exc: Exception) -> None:
         logger.debug("Failed to send error alert", exc_info=True)
 
 
-def _load_management_loop() -> None:
-    """Background thread that runs load management cycle with adaptive sleep."""
+def _log_metrics_loop_early_exit(result: CycleResult) -> None:
+    """Log when the metrics loop exits early without refreshed predictions.
+
+    Args:
+        result: The early-exit CycleResult from the fetch cycle.
+    """
+    if (
+        result.status == "no_incomplete_qh"
+        and _state.energy_cache.data is None
+    ):
+        logger.warning(
+            "Load management: no data available (possible network issue)"
+        )
+
+
+def _publish_metrics_update() -> None:
+    """Publish a metrics_update SSE event from the cached full metrics dict."""
+    full_metrics_dict = _state.energy_cache.full_metrics_dict
+    if full_metrics_dict is not None:
+        _state.sse_broadcaster.publish(
+            "metrics_update",
+            camelize(_enrich_metrics_for_sse(dict(full_metrics_dict))),
+        )
+
+
+def _record_cycle_result(result: CycleResult, lm: Any) -> dict:
+    """Record a cycle result and build the load management SSE payload.
+
+    Caller must hold ``_state.load_manager_lock``.
+
+    Args:
+        result: The CycleResult to record.
+        lm: The LoadManager instance the result came from.
+
+    Returns:
+        The load management payload for SSE publishing.
+    """
+    _state.last_cycle_result = result
+    _state.recent_cycles.append({
+        "status": result.status,
+        "reason": result.diagnostics.reason if result.diagnostics else None,
+        "actions_count": len(result.actions),
+        "sleep_hint": result.sleep_hint,
+        "gap_wh": result.gap_wh,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return _build_load_management_payload(lm)
+
+
+def _load_cycle_key(result: CycleResult) -> tuple:
+    """Return a comparable key for load_cycle publish-on-change dedup.
+
+    Args:
+        result: The CycleResult to key on.
+
+    Returns:
+        A tuple of (status, reason, sorted actions, data_point_at) that
+        changes only when the observable cycle state changes.
+    """
+    diag = result.diagnostics
+    actions = tuple(sorted((a.device_name, a.action) for a in result.actions))
+    return (
+        result.status,
+        diag.reason if diag else None,
+        actions,
+        diag.data_point_at.isoformat() if diag and diag.data_point_at else None,
+    )
+
+
+def _publish_load_cycle_if_changed(result: CycleResult, payload: dict) -> None:
+    """Publish a load_cycle SSE event only when the cycle state changed.
+
+    The fast decision loop repeats every ~5 s; steady-state cycles
+    (same status, reason, actions, and data point) would otherwise spam
+    SSE clients. Real transitions, new actions, and QH boundaries publish
+    immediately.
+
+    Args:
+        result: The CycleResult that produced the payload.
+        payload: The load management payload to publish (already recorded
+            under _state.load_manager_lock by the caller).
+    """
+    key = _load_cycle_key(result)
+    if key != _state.last_load_cycle_key:
+        _state.last_load_cycle_key = key
+        _state.sse_broadcaster.publish("load_cycle", camelize(payload))
+
+
+def _metrics_loop() -> None:
+    """Background thread that refreshes cached metrics.
+
+    With the fast decision loop enabled (default), this thread is the only
+    fetcher: it runs LoadManager.fetch_cycle() to refresh the EnergyCache,
+    publishes metrics_update via SSE, and wakes the decision loop through
+    _state.data_ready_event. Load decisions are made by the decision loop.
+
+    With LOAD_FAST_DECIDE_ENABLED=False, this thread falls back to the
+    legacy combined behavior: LoadManager.run_cycle() fetches AND decides,
+    publishes load_cycle, and flushes notifications.
+    """
     interval_secs_config = _config.load_manage_interval_secs
+    fast_decide = _config.load_fast_decide_enabled
     logger.info(
-        "Load management background loop started: dry-run=%s, mock=%s, interval=%d",
-        _config.dry_run, _config.is_mock_mode, interval_secs_config
+        "Load management background loop started: dry-run=%s, mock=%s, "
+        "interval=%d, fast_decide=%s",
+        _config.dry_run, _config.is_mock_mode, interval_secs_config, fast_decide,
     )
     while True:
         result = None
         try:
             lm = _get_load_manager()
             if lm is not None:
-                result = lm.run_cycle()
-                lm._send_pending_notifications_sync()  # flush Telegram sends outside lock
-                with _state.load_manager_lock:
-                    _state.last_cycle_result = result
-                    _state.recent_cycles.append({
-                        "status": result.status,
-                        "reason": result.diagnostics.reason if result.diagnostics else None,
-                        "actions_count": len(result.actions),
-                        "sleep_hint": result.sleep_hint,
-                        "gap_wh": result.gap_wh,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    lm_payload = _build_load_management_payload(lm)
-                logger.debug("Load management cycle result: %s", result)
-                if (
-                    result.status == "no_incomplete_qh"
-                    and _state.energy_cache.data is None
-                ):
-                    logger.warning(
-                        "Load management: no data available (possible network issue)"
-                    )
-                _state.sse_broadcaster.publish("load_cycle", camelize(lm_payload))
-                full_metrics_dict = _state.energy_cache.full_metrics_dict
-                if full_metrics_dict is not None:
-                    _state.sse_broadcaster.publish(
-                        "metrics_update",
-                        camelize(_enrich_metrics_for_sse(dict(full_metrics_dict))),
-                    )
+                if fast_decide:
+                    result = lm.fetch_cycle()
+                    if result is None:
+                        # Fetch succeeded — wake the decision loop and
+                        # broadcast the refreshed metrics.
+                        _state.data_ready_event.set()
+                        _publish_metrics_update()
+                    else:
+                        _log_metrics_loop_early_exit(result)
+                else:
+                    result = lm.run_cycle()
+                    lm._send_pending_notifications_sync()  # flush Telegram sends outside lock
+                    with _state.load_manager_lock:
+                        lm_payload = _record_cycle_result(result, lm)
+                    logger.debug("Load management cycle result: %s", result)
+                    _log_metrics_loop_early_exit(result)
+                    _state.sse_broadcaster.publish("load_cycle", camelize(lm_payload))
+                    _publish_metrics_update()
             interval_secs = interval_secs_config
         except RetryableMetricsException as e:
             interval_secs = interval_secs_config
@@ -623,7 +715,7 @@ def _load_management_loop() -> None:
             interval_secs = interval_secs_config
             _state.consecutive_error_count += 1
             _state.last_error_type = type(e).__name__
-            logger.error("Error in load management loop: %s", e)
+            logger.error("Error in metrics loop: %s", e)
             _state.energy_cache.invalidate()
             if _state.consecutive_error_count == 1 or _state.consecutive_error_count % 10 == 0:
                 _send_error_alert(e)
@@ -638,8 +730,48 @@ def _load_management_loop() -> None:
         else:
             interval_secs_adjusted = _state.energy_cache.sleep_interval_adjust(
                 interval_secs, datetime.now(pytz.timezone(_config.timezone)))
-        logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
+        logger.debug("Metrics loop sleeping %.1f", interval_secs_adjusted)
         time.sleep(interval_secs_adjusted)
+
+
+def _decision_loop() -> None:
+    """Background thread that makes load decisions on a fast cadence.
+
+    Sole decision authority when LOAD_FAST_DECIDE_ENABLED is on: it waits
+    on _state.data_ready_event (set by the metrics loop after each fetch)
+    with a timeout of LOAD_DECIDE_INTERVAL_SECS, then re-evaluates the
+    frozen cached metrics via LoadManager.run_decision_cycle(). It never
+    fetches metrics and never invalidates the EnergyCache — the metrics
+    loop owns the cache.
+    """
+    decide_interval = _config.load_decide_interval_secs
+    logger.info("Fast decision loop started: interval=%d", decide_interval)
+    while True:
+        # Wait for fresh data (or the decide interval) OUTSIDE the try so an
+        # interrupt propagates, mirroring how the metrics loop sleeps outside
+        # its try block. The event is also set after a fetch, so a decision
+        # runs as soon as fresh data arrives.
+        _state.data_ready_event.wait(timeout=decide_interval)
+        _state.data_ready_event.clear()
+        try:
+            lm = _get_load_manager()
+            if lm is not None:
+                result = lm.run_decision_cycle()
+                lm._send_pending_notifications_sync()  # flush Telegram sends outside lock
+                if result is not None:
+                    with _state.load_manager_lock:
+                        lm_payload = _record_cycle_result(result, lm)
+                    logger.debug("Decision cycle result: %s", result)
+                    _publish_load_cycle_if_changed(result, lm_payload)
+        except Exception as e:
+            _state.consecutive_error_count += 1
+            _state.last_error_type = type(e).__name__
+            logger.error("Error in decision loop: %s", e)
+            if _state.consecutive_error_count == 1 or _state.consecutive_error_count % 10 == 0:
+                _send_error_alert(e)
+        else:
+            _state.consecutive_error_count = 0
+            _state.last_error_type = None
 
 
 def load_status() -> Response:
@@ -665,7 +797,8 @@ def load_status() -> Response:
         "recent_cycles": list(_state.recent_cycles),
     }
 
-    for name, device_state in lm.state.devices.items():
+    devices_snapshot = lm.state.snapshot_devices()
+    for name, device_state in devices_snapshot.items():
         payload["devices"][name] = {
             "desired_state": device_state.desired_state,
             "actual_state": device_state.actual_state,
@@ -677,7 +810,7 @@ def load_status() -> Response:
             ),
         }
 
-    for effect in lm.state.pending_effects:
+    for effect in lm.state.snapshot_pending_effects():
         payload["pending_effects"].append(
             {
                 "device_name": effect.device_name,
@@ -723,12 +856,19 @@ def _start_mqtt_subscriber() -> None:
 
 
 def _start_load_manager_thread():
-    """Start the load management background thread (called once per process)."""
+    """Start the load management background threads (called once per process).
+
+    Always starts the metrics loop; when the fast decision loop is enabled
+    (default), also starts the decision loop. Both threads are daemonized.
+    """
     if _state.lm_thread_started:
         return
     _state.lm_thread_started = True
-    lm_thread = threading.Thread(target=_load_management_loop, daemon=True)
-    lm_thread.start()
+    metrics_thread = threading.Thread(target=_metrics_loop, daemon=True)
+    metrics_thread.start()
+    if _config.load_fast_decide_enabled:
+        decision_thread = threading.Thread(target=_decision_loop, daemon=True)
+        decision_thread.start()
 
 
 def _shutdown_load_manager():

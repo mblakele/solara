@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -151,6 +152,39 @@ class NBCReader:
         """
         return self.energy_cache.data_lag_secs
 
+    def get_current_qh_cached(self, now: datetime) -> NBCFetchResult | None:
+        """Return the QH prediction from cached samples only, or None.
+
+        Cache-only read used by the fast decision loop: never triggers a
+        metrics fetch. Returns None when the cache is invalid (TTL expired)
+        or holds no incomplete QH. Mirrors the cache-hit branch of
+        ``get_current_qh(force=False)``.
+
+        Args:
+            now: Current time for TTL check.
+
+        Returns:
+            NBCFetchResult or None if the cache is invalid or has no
+            incomplete QH.
+        """
+        if not self.energy_cache.is_valid(now=now):
+            return None
+        qh_data = self.energy_cache.get_current_qh(now=now)
+        if qh_data is None:
+            return None
+        fetched_at = self.energy_cache.last_fetch_at
+        if fetched_at is None:
+            fetched_at = now
+        lag_secs = self.energy_cache.data_lag_secs
+        data_point_at = fetched_at - timedelta(seconds=lag_secs)
+        return NBCFetchResult(
+            qh_name=qh_data["qh_name"],
+            predicted_wh=qh_data.get("predicted_wh", 0),
+            seconds_remaining=qh_data.get("seconds_remaining", 0),
+            data_point_at=data_point_at,
+            samples_used=qh_data.get("samples_used"),
+        )
+
     def get_current_qh(
         self, now: datetime, force: bool = False
     ) -> NBCFetchResult | None:
@@ -169,21 +203,9 @@ class NBCReader:
         """
         # Fast path: cache is valid — read directly from it.
         if not force and self.energy_cache.is_valid(now=now):
-            qh_data = self.energy_cache.get_current_qh(now=now)
-            if qh_data is not None:
-                # Cache hit with incomplete QH — return it.
-                fetched_at = self.energy_cache.last_fetch_at
-                if fetched_at is None:
-                    fetched_at = now
-                lag_secs = self.energy_cache.data_lag_secs
-                data_point_at = fetched_at - timedelta(seconds=lag_secs)
-                return NBCFetchResult(
-                    qh_name=qh_data["qh_name"],
-                    predicted_wh=qh_data.get("predicted_wh", 0),
-                    seconds_remaining=qh_data.get("seconds_remaining", 0),
-                    data_point_at=data_point_at,
-                    samples_used=qh_data.get("samples_used"),
-                )
+            cached_result = self.get_current_qh_cached(now=now)
+            if cached_result is not None:
+                return cached_result
             # Cache is valid but no incomplete QH (QH1 is complete) — fall
             # through to the fetch path below so we can check for a newer
             # incomplete quarter that may have started since the cache was
@@ -214,21 +236,7 @@ class NBCReader:
 
         # force=True but no fetch callable: fall back to reading from cache.
         if force:
-            qh_data = self.energy_cache.get_current_qh(now=now)
-            if qh_data is None:
-                return None
-            fetched_at = self.energy_cache.last_fetch_at
-            if fetched_at is None:
-                fetched_at = now
-            lag_secs = self.energy_cache.data_lag_secs
-            data_point_at = fetched_at - timedelta(seconds=lag_secs)
-            return NBCFetchResult(
-                qh_name=qh_data["qh_name"],
-                predicted_wh=qh_data.get("predicted_wh", 0),
-                seconds_remaining=qh_data.get("seconds_remaining", 0),
-                data_point_at=data_point_at,
-                samples_used=qh_data.get("samples_used"),
-            )
+            return self.get_current_qh_cached(now=now)
 
         return None
 
@@ -394,6 +402,10 @@ class StateTracker:
 
     def __init__(self, prediction_window_seconds: int = DEFAULT_PREDICTION_WINDOW_SECS) -> None:
         self._pending_effect_min_secs = prediction_window_seconds
+        # Guards structural mutation of `devices` (and list rebinds of
+        # `pending_effects`) so Flask read paths can take consistent
+        # snapshots while the background load-management thread runs.
+        self._lock = threading.Lock()
         self.devices: dict[str, DeviceState] = {}
         self.pending_effects: list[PendingEffect] = []
         self.last_data_point_at: datetime | None = None
@@ -404,6 +416,47 @@ class StateTracker:
         self.has_fresh_telemetry: bool = False
         # Whether fleet-telemetry push has been registered via the callback API.
         self.registered: bool = False
+
+    def set_device(self, name: str, dev_state: DeviceState) -> None:
+        """Insert or replace a device entry under the structural lock.
+
+        Args:
+            name: Device name (the dict key).
+            dev_state: DeviceState to store.
+        """
+        with self._lock:
+            self.devices[name] = dev_state
+
+    def pop_device(self, name: str) -> None:
+        """Remove a device entry under the structural lock, if present.
+
+        Args:
+            name: Device name (the dict key).
+        """
+        with self._lock:
+            self.devices.pop(name, None)
+
+    def snapshot_devices(self) -> dict[str, DeviceState]:
+        """Return a consistent copy of the device dict.
+
+        Shallow copy under the structural lock: readers (Flask endpoints,
+        payload builders) iterate the copy while the background thread
+        inserts/deletes keys without raising RuntimeError.
+
+        Returns:
+            Copy of ``self.devices``.
+        """
+        with self._lock:
+            return dict(self.devices)
+
+    def snapshot_pending_effects(self) -> list[PendingEffect]:
+        """Return a consistent copy of the pending-effects list.
+
+        Returns:
+            Copy of ``self.pending_effects``.
+        """
+        with self._lock:
+            return list(self.pending_effects)
 
     def estimated_current_wh(self, nbc_predicted_wh: float, seconds_remaining:
   int) -> float:
@@ -535,15 +588,18 @@ class StateTracker:
         """
         if tesla_state is not None:
             latest_cmd = self._latest_tesla_command()
-            self.devices["tesla"] = DeviceState(
-                name="tesla",
-                actual_state=tesla_state.is_charging,
-                current_amps=tesla_state.current_amps,
-                desired_state=self.last_commanded_amps is not None,
-                last_toggle=latest_cmd.timestamp if latest_cmd else None,
+            self.set_device(
+                "tesla",
+                DeviceState(
+                    name="tesla",
+                    actual_state=tesla_state.is_charging,
+                    current_amps=tesla_state.current_amps,
+                    desired_state=self.last_commanded_amps is not None,
+                    last_toggle=latest_cmd.timestamp if latest_cmd else None,
+                ),
             )
         else:
-            self.devices.pop("tesla", None)
+            self.pop_device("tesla")
 
     def _latest_tesla_command(self) -> PendingEffect | None:
         """Return the most recent Tesla effect (set_amps, turn_on, or turn_off).
@@ -783,14 +839,14 @@ class StateTracker:
                 "current_amps": ds.current_amps,
                 "last_toggle": ds.last_toggle.isoformat()
                 if ds.last_toggle else None,
-            } for name, ds in self.devices.items()},
+            } for name, ds in self.snapshot_devices().items()},
             "pending_effects": [{
                 "device_name": eff.device_name,
                 "action": eff.action,
                 "timestamp": eff.timestamp.isoformat(),
                 "data_point_at": eff.data_point_at.isoformat(),
                 "power_watts": eff.power_watts,
-            } for eff in self.pending_effects],
+            } for eff in self.snapshot_pending_effects()],
             "last_data_point_at": (self.last_data_point_at.isoformat()
                                    if self.last_data_point_at else None),
             "last_commanded_amps": self.last_commanded_amps,
@@ -1008,8 +1064,11 @@ class GapMinder:
                 )
                 remaining_gap -= capacity
                 if not ctx.dry_run:
-                    ctx.state.devices[name] = DeviceState(
-                        name=name, last_toggle=ctx.now, desired_state=True
+                    ctx.state.set_device(
+                        name,
+                        DeviceState(
+                            name=name, last_toggle=ctx.now, desired_state=True
+                        ),
                     )
 
             else:
@@ -1151,8 +1210,11 @@ class GapMinder:
             )
             remaining_reduction -= savings
             if not ctx.dry_run:
-                ctx.state.devices[name] = DeviceState(
-                    name=name, last_toggle=ctx.now, desired_state=False
+                ctx.state.set_device(
+                    name,
+                    DeviceState(
+                        name=name, last_toggle=ctx.now, desired_state=False
+                    ),
                 )
             if remaining_reduction <= 0:
                 break

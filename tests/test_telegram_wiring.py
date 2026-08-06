@@ -66,10 +66,7 @@ class TestAppTelegramWiring:
             side_effect=capture_config,
             autospec=False,
         ):
-            # Also need to suppress the background thread start.
-            with patch.object(app_mod, "_load_management_loop"):
-                with patch.object(app_mod._state, "lm_thread_started", False):
-                    lm = app_mod._get_load_manager()
+            lm = app_mod._get_load_manager()
 
         assert lm is not None
         assert created_config is not None
@@ -108,9 +105,7 @@ class TestAppTelegramWiring:
             side_effect=capture_config,
             autospec=False,
         ):
-            with patch.object(app_mod, "_load_management_loop"):
-                with patch.object(app_mod._state, "lm_thread_started", False):
-                    lm = app_mod._get_load_manager()
+            lm = app_mod._get_load_manager()
 
         assert lm is not None
         assert created_config is not None

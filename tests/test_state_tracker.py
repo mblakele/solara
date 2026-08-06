@@ -1,5 +1,6 @@
 """Tests for StateTracker."""
 
+import threading
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -1020,3 +1021,96 @@ class TestPendingEffectDirection:
         assert eff.direction == "decrease"
         assert eff.suppress_action == "turn_on"
         assert eff.qh_name == "QH1"
+
+
+# --- Concurrent access tests ---
+# The Flask read path (load_status, payload builder) iterates device state
+# while the background load-management thread inserts/deletes device keys.
+# Unlocked structural mutation raises
+# ``RuntimeError: dictionary changed size during iteration``. The locked
+# set_device/pop_device/snapshot_devices helpers make that safe.
+
+
+def test_concurrent_mutation_and_snapshot_no_runtime_error():
+    """Concurrent device mutations + snapshot reads must not raise.
+
+    Writer threads insert and delete device keys via the locked helpers
+    while reader threads take consistent snapshots. No RuntimeError may
+    escape and every snapshot must be a plain dict of DeviceState values.
+    """
+    tracker = StateTracker()
+    errors: list[str] = []
+
+    def writer(seed: int) -> None:
+        try:
+            for i in range(300):
+                name = f"plug_{(i + seed) % 7}"
+                tracker.set_device(
+                    name,
+                    DeviceState(
+                        name=name,
+                        desired_state=(i % 2 == 0),
+                        actual_state=(i % 2 == 0),
+                    ),
+                )
+                if i % 3 == 0:
+                    tracker.pop_device(name)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"writer {seed}: {exc!r}")
+
+    def reader() -> None:
+        try:
+            for _ in range(300):
+                snapshot = tracker.snapshot_devices()
+                assert isinstance(snapshot, dict)
+                for name, dev_state in snapshot.items():
+                    assert isinstance(dev_state, DeviceState)
+                    assert dev_state.name == name
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"reader: {exc!r}")
+
+    threads = [
+        threading.Thread(target=writer, args=(0,)),
+        threading.Thread(target=writer, args=(1,)),
+    ] + [threading.Thread(target=reader) for _ in range(4)]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == [], f"Thread errors: {errors}"
+
+
+def test_snapshot_devices_is_a_copy():
+    """snapshot_devices returns a copy — later mutations don't affect it."""
+    tracker = StateTracker()
+    tracker.set_device("plug_a", DeviceState(name="plug_a", desired_state=True))
+
+    snapshot = tracker.snapshot_devices()
+    assert snapshot == {"plug_a": tracker.devices["plug_a"]}
+
+    tracker.pop_device("plug_a")
+    assert "plug_a" not in tracker.devices
+    assert "plug_a" in snapshot, "snapshot must be independent of later mutations"
+
+
+def test_snapshot_pending_effects_is_a_copy():
+    """snapshot_pending_effects returns a copy — later appends don't affect it."""
+    tracker = StateTracker()
+    now = datetime.now(timezone.utc)
+    effect = PendingEffect(
+        device_name="plug_a",
+        action="turn_on",
+        timestamp=now,
+        data_point_at=now,
+        power_watts=100.0,
+    )
+    tracker.pending_effects.append(effect)
+
+    snapshot = tracker.snapshot_pending_effects()
+    assert snapshot == [effect]
+
+    tracker.pending_effects.clear()
+    assert tracker.pending_effects == []
+    assert snapshot == [effect], "snapshot must be independent of later changes"

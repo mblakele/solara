@@ -281,6 +281,19 @@ class TestCheckRestartRequired:
         result = check_restart_required(["LOAD_PLUG_CONTROLLER"])
         assert result == ["LOAD_PLUG_CONTROLLER"]
 
+    def test_restart_for_fast_decide_settings(self) -> None:
+        """LOAD_FAST_DECIDE_ENABLED / LOAD_DECIDE_INTERVAL_SECS require restart.
+
+        Thread-start decisions are made once at startup, so toggling the
+        fast decision loop requires a process restart to take effect.
+        """
+        result = check_restart_required([
+            "LOAD_FAST_DECIDE_ENABLED", "LOAD_DECIDE_INTERVAL_SECS"
+        ])
+        assert sorted(result) == [
+            "LOAD_DECIDE_INTERVAL_SECS", "LOAD_FAST_DECIDE_ENABLED"
+        ]
+
     def test_mixed_keys(self) -> None:
         """Mix of safe and restart-required keys."""
         result = check_restart_required([

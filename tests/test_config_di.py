@@ -112,6 +112,26 @@ class TestConfigOverrides:
         cfg = Config(overrides={"DEBUG": "True"})
         assert cfg.debug is True
 
+    def test_fast_decide_defaults(self):
+        """LOAD_FAST_DECIDE_ENABLED defaults True, interval defaults 5."""
+        cfg = Config()
+        assert cfg.load_fast_decide_enabled is True
+        assert cfg.load_decide_interval_secs == 5
+
+    def test_fast_decide_override(self):
+        """Overrides LOAD_FAST_DECIDE_ENABLED and LOAD_DECIDE_INTERVAL_SECS."""
+        cfg = Config(overrides={
+            "LOAD_FAST_DECIDE_ENABLED": "False",
+            "LOAD_DECIDE_INTERVAL_SECS": "10",
+        })
+        assert cfg.load_fast_decide_enabled is False
+        assert cfg.load_decide_interval_secs == 10
+
+    def test_fast_decide_enabled_override_true(self):
+        """Explicit True override for LOAD_FAST_DECIDE_ENABLED."""
+        cfg = Config(overrides={"LOAD_FAST_DECIDE_ENABLED": "True"})
+        assert cfg.load_fast_decide_enabled is True
+
 
 class TestLoadManagerDI:
     """LoadManager accepts injected Config via LoadManagerConfig."""

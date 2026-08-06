@@ -339,6 +339,8 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         mock_state = unittest.mock.MagicMock()
         mock_state.devices = {}
         mock_state.pending_effects = []
+        mock_state.snapshot_devices.return_value = {}
+        mock_state.snapshot_pending_effects.return_value = []
         mock_lm.state = mock_state
 
         with patch("app._get_load_manager", return_value=mock_lm):
@@ -347,6 +349,60 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         data = json.loads(response.data)
         self.assertTrue(data["enabled"])
         self.assertEqual(data["targetWh"], -500)
+
+    def test_load_status_snapshot_safe_under_concurrent_mutation(self):
+        """load_status stays consistent while the background thread mutates state.
+
+        Regression guard for ``RuntimeError: dictionary changed size during
+        iteration``: the background load-management thread inserts/deletes
+        device keys (e.g. a new "tesla" entry) while the Flask read path
+        iterates device state. The read path must use locked snapshots.
+        """
+        import threading
+
+        import app as app_mod
+        from load_models import DeviceState
+        from load_nbc import StateTracker
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        tracker = StateTracker()
+        mock_lm.state = tracker
+
+        app_mod._state.load_manager = mock_lm
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = None
+
+        errors: list[str] = []
+
+        def writer() -> None:
+            try:
+                for i in range(200):
+                    name = f"plug_{i % 5}"
+                    tracker.set_device(
+                        name,
+                        DeviceState(name=name, desired_state=(i % 2 == 0)),
+                    )
+                    if i % 4 == 0:
+                        tracker.pop_device(name)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"writer: {exc!r}")
+
+        writer_thread = threading.Thread(target=writer)
+        writer_thread.start()
+        try:
+            for _ in range(50):
+                response = self.app.get("/api/v1/load/status")
+                self.assertEqual(response.status_code, 200)
+                data = json.loads(response.data)
+                self.assertIn("devices", data)
+                self.assertIn("pendingEffects", data)
+        finally:
+            writer_thread.join(timeout=10)
+
+        self.assertEqual(errors, [], f"Thread errors: {errors}")
 
     def test_index_html_includes_sleep_hint_meta(self):
         """Index HTML includes a meta tag with the sleep_hint value for JS."""
@@ -1333,11 +1389,15 @@ class TestSendErrorAlert(unittest.TestCase):
             app_mod._state.telegram_sender = None
 
 
-class TestLoadManagementLoopErrorHandling(unittest.TestCase):
-    """Tests for _load_management_loop error handling."""
+class TestMetricsLoopErrorHandling(unittest.TestCase):
+    """Tests for _metrics_loop error handling.
+
+    The metrics loop is fetch-only by default (fast decision loop on):
+    it calls LoadManager.fetch_cycle() and owns the EnergyCache.
+    """
 
     def test_cache_invalidated_on_error(self):
-        """When run_cycle raises, energy cache is invalidated."""
+        """When fetch_cycle raises, energy cache is invalidated."""
         import app as app_mod
         from energy_cache import EnergyCacheData
 
@@ -1354,7 +1414,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         )
 
         mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.side_effect = RuntimeError("test crash")
+        mock_lm.fetch_cycle.side_effect = RuntimeError("test crash")
 
         app_mod._state.telegram_sender = None
         app_mod._state.consecutive_error_count = 0
@@ -1363,7 +1423,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=InterruptedError("stop")):
                 with self.assertRaises(InterruptedError):
-                    app_mod._load_management_loop()
+                    app_mod._metrics_loop()
 
         assert app_mod._state.energy_cache._data is None
         app_mod._state.consecutive_error_count = 0
@@ -1374,7 +1434,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         import app as app_mod
 
         mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.side_effect = RuntimeError("test crash")
+        mock_lm.fetch_cycle.side_effect = RuntimeError("test crash")
 
         app_mod._state.telegram_sender = None
         app_mod._state.consecutive_error_count = 0
@@ -1382,43 +1442,32 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=InterruptedError("stop")):
                 with self.assertRaises(InterruptedError):
-                    app_mod._load_management_loop()
+                    app_mod._metrics_loop()
 
         assert app_mod._state.consecutive_error_count == 1
         app_mod._state.consecutive_error_count = 0
         app_mod._state.last_error_type = None
 
     def test_error_counter_resets_on_success(self):
-        """Error counter resets when cycle succeeds."""
+        """Error counter resets when fetch cycle succeeds."""
         import app as app_mod
-        from load_models import CycleResult, CycleDiagnostics
 
         app_mod._state.consecutive_error_count = 5
 
         mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.return_value = CycleResult(
-            status="ok",
-            sleep_hint=30.0,
-            sleep_hint_at="2026-01-01T12:00:00",
-            diagnostics=CycleDiagnostics(
-                gap_wh=0.0,
-                hysteresis_wh=3.0,
-                seconds_remaining=300,
-                data_point_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-                reason="none",
-            ),
-        )
-        mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
+        mock_lm.fetch_cycle.return_value = None
 
         app_mod._state.telegram_sender = None
+        app_mod._state.data_ready_event.clear()
 
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=InterruptedError("stop")):
                 with self.assertRaises(InterruptedError):
-                    app_mod._load_management_loop()
+                    app_mod._metrics_loop()
 
         assert app_mod._state.consecutive_error_count == 0
         assert app_mod._state.last_error_type is None
+        assert app_mod._state.data_ready_event.is_set()
 
     def test_rate_limited_telegram_alert(self):
         """Telegram alert sent on first error, then every 10th."""
@@ -1429,7 +1478,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         mock_sender.send_notification_sync = unittest.mock.MagicMock(return_value=True)
 
         mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.side_effect = RuntimeError("crash")
+        mock_lm.fetch_cycle.side_effect = RuntimeError("crash")
 
         app_mod._state.telegram_sender = mock_sender
         app_mod._state.consecutive_error_count = 0
@@ -1445,7 +1494,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=stop_after_n_sleeps):
                 with self.assertRaises(InterruptedError):
-                    app_mod._load_management_loop()
+                    app_mod._metrics_loop()
 
         # First error (count=1) triggers alert, second (count=2) doesn't
         assert mock_sender.send_notification_sync.call_count == 1
@@ -1479,7 +1528,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         )
 
         mock_lm = unittest.mock.MagicMock()
-        mock_lm.run_cycle.return_value = CycleResult(
+        mock_lm.fetch_cycle.return_value = CycleResult(
             status="disabled",
             sleep_hint=30.0,
             sleep_hint_at=base.isoformat(),
@@ -1507,7 +1556,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=capture_sleep):
                 with self.assertRaises(InterruptedError):
-                    app_mod._load_management_loop()
+                    app_mod._metrics_loop()
 
         assert captured_sleep_values[0] == 30.0, (
             f"Expected 30.0 for disabled cycle, got {captured_sleep_values[0]}"
@@ -1515,6 +1564,127 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
 
         app_mod._state.consecutive_error_count = 0
         app_mod._state.last_error_type = None
+
+
+class TestLoadCyclePublishOnChange(unittest.TestCase):
+    """load_cycle SSE publishing dedupes steady-state decision cycles."""
+
+    BASE = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _make_result(self, status="ok", reason="none", actions=None, data_point_at=None):
+        """Build a minimal CycleResult for publish-key tests."""
+        from load_models import CycleDiagnostics, CycleResult
+
+        return CycleResult(
+            status=status,
+            sleep_hint=5.0,
+            sleep_hint_at=self.BASE.isoformat(),
+            diagnostics=CycleDiagnostics(
+                gap_wh=0.0,
+                hysteresis_wh=3.0,
+                seconds_remaining=300,
+                data_point_at=data_point_at or self.BASE,
+                reason=reason,
+            ),
+            actions=actions or [],
+        )
+
+    def test_stable_cycles_publish_once(self):
+        """Identical steady-state cycles publish exactly one load_cycle event."""
+        import app as app_mod
+
+        app_mod._state.last_load_cycle_key = None
+        result = self._make_result()
+        with patch.object(app_mod._state.sse_broadcaster, "publish") as mock_publish:
+            app_mod._publish_load_cycle_if_changed(result, {"payload": 1})
+            app_mod._publish_load_cycle_if_changed(result, {"payload": 1})
+            app_mod._publish_load_cycle_if_changed(result, {"payload": 1})
+        mock_publish.assert_called_once()
+
+    def test_action_transition_publishes(self):
+        """A new action publishes; repeating it stays silent."""
+        import app as app_mod
+        from load_models import PendingEffect
+
+        effect = PendingEffect(
+            device_name="pool_pump",
+            action="turn_on",
+            timestamp=self.BASE,
+            data_point_at=self.BASE,
+            power_watts=1500.0,
+        )
+        app_mod._state.last_load_cycle_key = None
+        with patch.object(app_mod._state.sse_broadcaster, "publish") as mock_publish:
+            app_mod._publish_load_cycle_if_changed(self._make_result(), {"payload": 1})
+            app_mod._publish_load_cycle_if_changed(
+                self._make_result(actions=[effect]), {"payload": 2}
+            )
+            app_mod._publish_load_cycle_if_changed(
+                self._make_result(actions=[effect]), {"payload": 3}
+            )
+            app_mod._publish_load_cycle_if_changed(
+                self._make_result(actions=[effect], reason="no_action_needed"),
+                {"payload": 4},
+            )
+        # 1st (initial), action, reason-change — but not the repeated action cycle.
+        assert mock_publish.call_count == 3
+
+    def test_qh_boundary_publishes(self):
+        """A new data point (QH boundary) publishes even with same status."""
+        import app as app_mod
+
+        next_qh = self.BASE + timedelta(minutes=15)
+        app_mod._state.last_load_cycle_key = None
+        with patch.object(app_mod._state.sse_broadcaster, "publish") as mock_publish:
+            app_mod._publish_load_cycle_if_changed(
+                self._make_result(data_point_at=self.BASE), {"payload": 1}
+            )
+            app_mod._publish_load_cycle_if_changed(
+                self._make_result(data_point_at=self.BASE), {"payload": 2}
+            )
+            app_mod._publish_load_cycle_if_changed(
+                self._make_result(data_point_at=next_qh), {"payload": 3}
+            )
+        # base (initial) and next_qh — the repeated base stays silent.
+        assert mock_publish.call_count == 2
+
+    def test_decision_loop_publishes_once_for_stable_cycles(self):
+        """The decision loop publishes load_cycle once for stable steady state."""
+        import threading
+
+        import app as app_mod
+
+        result = self._make_result()
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.run_decision_cycle.return_value = result
+        mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
+
+        real_event = app_mod._state.data_ready_event
+        fake_event = unittest.mock.MagicMock()
+        waits = 0
+
+        def wait_and_stop(timeout=None):
+            nonlocal waits
+            waits += 1
+            if waits >= 3:
+                raise InterruptedError("stop")
+
+        fake_event.wait.side_effect = wait_and_stop
+        app_mod._state.data_ready_event = fake_event
+        app_mod._state.last_load_cycle_key = None
+
+        try:
+            with patch("app._get_load_manager", return_value=mock_lm), \
+                 patch.object(app_mod._state.sse_broadcaster, "publish") as mock_publish:
+                with self.assertRaises(InterruptedError):
+                    app_mod._decision_loop()
+        finally:
+            app_mod._state.data_ready_event = real_event
+
+        load_cycle_calls = [
+            c for c in mock_publish.call_args_list if c.args[0] == "load_cycle"
+        ]
+        assert len(load_cycle_calls) == 1
 
 
 if __name__ == "__main__":

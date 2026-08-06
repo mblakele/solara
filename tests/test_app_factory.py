@@ -92,6 +92,59 @@ class TestBackgroundServices:
         mock_lm.assert_called_once_with()
 
 
+class TestFastDecideThreading:
+    """_start_load_manager_thread starts metrics + decision loops per config."""
+
+    @staticmethod
+    def _capture_thread_starts(app_mod):
+        """Replace threading.Thread with a recorder that never starts threads.
+
+        Returns:
+            (patcher, started) where started is the list of targets passed
+            to each Thread(...).start() call.
+        """
+        started: list = []
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=None, **kwargs):
+                self.target = target
+
+            def start(self):
+                started.append(self.target)
+
+        return patch.object(app_mod.threading, "Thread", FakeThread), started
+
+    def test_fast_decide_enabled_starts_both_threads(self):
+        """With fast decide on, both metrics and decision loops start."""
+        app_mod._state.lm_thread_started = False
+        patcher, started = self._capture_thread_starts(app_mod)
+        with patcher, patch.object(app_mod, "_config") as mock_config:
+            mock_config.load_fast_decide_enabled = True
+            app_mod._start_load_manager_thread()
+        assert len(started) == 2, f"expected 2 threads, started {started}"
+        assert app_mod._metrics_loop in started
+        assert app_mod._decision_loop in started
+
+    def test_fast_decide_disabled_starts_only_metrics_thread(self):
+        """With fast decide off, only the metrics loop starts."""
+        app_mod._state.lm_thread_started = False
+        patcher, started = self._capture_thread_starts(app_mod)
+        with patcher, patch.object(app_mod, "_config") as mock_config:
+            mock_config.load_fast_decide_enabled = False
+            app_mod._start_load_manager_thread()
+        assert len(started) == 1, f"expected 1 thread, started {started}"
+        assert app_mod._metrics_loop in started
+        assert app_mod._decision_loop not in started
+
+    def test_start_guard_prevents_duplicate_threads(self):
+        """lm_thread_started flag prevents starting threads twice."""
+        app_mod._state.lm_thread_started = True
+        patcher, started = self._capture_thread_starts(app_mod)
+        with patcher:
+            app_mod._start_load_manager_thread()
+        assert started == []
+
+
 class TestWsgiEntrypoint:
     """wsgi.py exposes a fully constructed app for gunicorn."""
 

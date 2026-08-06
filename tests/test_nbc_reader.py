@@ -423,3 +423,155 @@ def test_get_current_qh_still_returns_from_cache_when_incomplete_qh_present():
     assert result.qh_name == "QH1"
     # Should be from cache (predicted_wh from cache samples), not from fetch.
     assert result.predicted_wh != -999.0
+
+
+# --- NBCReader.get_current_qh_cached() tests ---
+# The fast decision loop reads predictions from the cache only — it must
+# never trigger a metrics fetch. get_current_qh_cached() implements that
+# read-only contract: returns the same NBCFetchResult as the cache-hit
+# branch of get_current_qh(force=False), or None when the cache is invalid
+# or holds no incomplete QH. The injected metrics_fetch callable must never
+# be invoked.
+
+
+def test_get_current_qh_cached_returns_same_as_cache_hit_branch():
+    """Cache-only read matches get_current_qh(force=False) when cache is valid."""
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 1200
+        cache.last_fetch_at = fixed_now
+
+    reader = NBCReader(energy_cache=cache)
+    fetch_called = False
+
+    def mock_fetch():
+        nonlocal fetch_called
+        fetch_called = True
+        return None
+
+    reader._metrics_fetch = mock_fetch
+
+    via_full = reader.get_current_qh(now=fixed_now)
+    via_cached = reader.get_current_qh_cached(now=fixed_now)
+
+    assert fetch_called is False, "cache-only read must never call metrics_fetch"
+    assert via_full is not None
+    assert via_cached is not None
+    assert isinstance(via_cached, NBCFetchResult)
+    assert via_cached.qh_name == via_full.qh_name
+    assert via_cached.predicted_wh == via_full.predicted_wh
+    assert via_cached.seconds_remaining == via_full.seconds_remaining
+    assert via_cached.data_point_at == via_full.data_point_at
+    assert via_cached.samples_used == via_full.samples_used
+
+
+def test_get_current_qh_cached_skips_when_cache_invalid():
+    """Cache-only read returns None on expired cache without invoking fetch."""
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    # TTL is 30s; last_fetch_at is 300s in the past → is_valid() is False.
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=301)
+        cache.sample_count = 1200
+        cache.last_fetch_at = fixed_now - timedelta(seconds=300)
+
+    reader = NBCReader(energy_cache=cache)
+    fetch_called = False
+
+    def mock_fetch():
+        nonlocal fetch_called
+        fetch_called = True
+        return {
+            "devices": [
+                {
+                    "nbc": {
+                        "QH1": {
+                            "complete": False,
+                            "predicted_wh": -1500.0,
+                            "remaining_seconds": 600,
+                        }
+                    },
+                    "name": "test-device",
+                }
+            ]
+        }
+
+    reader._metrics_fetch = mock_fetch
+
+    assert cache.is_valid(now=fixed_now) is False
+    result = reader.get_current_qh_cached(now=fixed_now)
+
+    assert result is None
+    assert fetch_called is False, "cache-only read must never call metrics_fetch"
+
+
+def test_get_current_qh_cached_empty_cache_returns_none():
+    """Cache-only read returns None when the cache holds no samples."""
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    reader = NBCReader(energy_cache=EnergyCache(ttl_seconds=30))
+
+    result = reader.get_current_qh_cached(now=fixed_now)
+
+    assert result is None
+
+
+def test_get_current_qh_cached_no_incomplete_qh_returns_none():
+    """Cache-only read returns None when QH1 is complete (no incomplete QH)."""
+    fixed_now = datetime(2026, 5, 7, 15, 35, 30, tzinfo=timezone.utc)
+    # 3600 samples = 4 full quarters; QH1 is complete → cache.get_current_qh
+    # returns None and the cache-only read must not fall through to a fetch.
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 3600
+    with cache._lock:
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 0, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 3600
+        cache.last_fetch_at = fixed_now
+
+    reader = NBCReader(energy_cache=cache)
+    fetch_called = False
+
+    def mock_fetch():
+        nonlocal fetch_called
+        fetch_called = True
+        return None
+
+    reader._metrics_fetch = mock_fetch
+
+    assert cache.is_valid(now=fixed_now) is True
+    assert cache.get_current_qh(now=fixed_now) is None
+
+    result = reader.get_current_qh_cached(now=fixed_now)
+
+    assert result is None
+    assert fetch_called is False, "cache-only read must never call metrics_fetch"
+
+
+def test_get_current_qh_cached_data_point_at_accounts_for_lag():
+    """Cache-only read reports data_point_at == last_fetch_at - data_lag_secs."""
+    fixed_now = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+    cache = EnergyCache(ttl_seconds=30)
+    samples = [-0.001] * 1200
+    with cache._lock:
+        cache.samples = samples
+        cache.data_start = datetime(2026, 5, 7, 15, 15, 0, tzinfo=timezone.utc)
+        cache.last_sample_at = fixed_now - timedelta(seconds=1)
+        cache.sample_count = 1200
+        cache.last_fetch_at = fixed_now
+        cache._set_data_field(data_lag_secs=130.0)
+
+    reader = NBCReader(energy_cache=cache)
+
+    result = reader.get_current_qh_cached(now=fixed_now)
+
+    assert result is not None
+    assert result.data_point_at == fixed_now - timedelta(seconds=130.0)

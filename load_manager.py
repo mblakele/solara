@@ -521,6 +521,33 @@ class LoadManager:
         ctx.now_postfetch = ctx.now + timedelta(seconds=fetch_end - fetch_start)
         return None
 
+    def _stage_nbc_read_cache(self, ctx: CycleContext) -> bool:
+        """Stage 2 (decision loop): read the NBC prediction from cache only.
+
+        Used by ``run_decision_cycle()`` — never triggers a metrics fetch.
+        When the cache holds a valid incomplete QH, populates
+        ``ctx.qh_name`` / ``predicted_wh`` / ``seconds_remaining`` /
+        ``data_point_at`` / ``now_postfetch`` and returns True. Returns
+        False when the cache is invalid (TTL expired) or holds no
+        incomplete QH — the fast decision loop treats that as "hold" (no
+        decision this cycle) and returns None.
+
+        Args:
+            ctx: Pipeline context to populate.
+
+        Returns:
+            True when a cached prediction was read, False otherwise.
+        """
+        qh_result = self.nbc_reader.get_current_qh_cached(now=ctx.now)
+        if qh_result is None:
+            return False
+        ctx.qh_name = qh_result.qh_name
+        ctx.predicted_wh = qh_result.predicted_wh
+        ctx.seconds_remaining = qh_result.seconds_remaining
+        ctx.data_point_at = qh_result.data_point_at
+        ctx.now_postfetch = ctx.now
+        return True
+
     def _stage_compute_gap(self, ctx: CycleContext) -> None:
         """Stage 4: Accept fresh data and compute the Wh gap.
 
@@ -1270,8 +1297,11 @@ class LoadManager:
             dev_state = self.state.devices.get(name)
             if dev_state is None:
                 # First time seeing this plug's state
-                self.state.devices[name] = DeviceState(
-                    name=name, actual_state=actual, desired_state=actual
+                self.state.set_device(
+                    name,
+                    DeviceState(
+                        name=name, actual_state=actual, desired_state=actual
+                    ),
                 )
             else:
                 dev_state.actual_state = actual
@@ -2168,9 +2198,100 @@ class LoadManager:
                         extra={"event": "cycle_complete", "status": result.status,
                                "reason": reason, "actions_count": len(result.actions),
                                "sleep_hint": result.sleep_hint, "timings": ctx.timings,
-                               "gap_wh": ctx.gap_wh, "adjusted_wh": ctx.adjusted_wh,
-                               "predicted_wh": ctx.predicted_wh, "qh_name": ctx.qh_name})
+                                "gap_wh": ctx.gap_wh, "adjusted_wh": ctx.adjusted_wh,
+                                "predicted_wh": ctx.predicted_wh, "qh_name": ctx.qh_name})
             return result
+
+    def fetch_cycle(self, force: bool = False) -> CycleResult | None:
+        """Run a fetch-only cycle: refresh cached NBC metrics.
+
+        The slow (metrics) background loop calls this instead of
+        ``run_cycle()`` when the fast decision loop is enabled: fetching
+        and deciding are decoupled. This method is the only fetcher in
+        that configuration; the decision loop (``run_decision_cycle``)
+        never fetches.
+
+        Stages run under ``self._lock``:
+            0. Config check — detect .env / devices.json changes.
+            1. Enabled check — bail early if disabled or outside time window.
+            2. NBC fetch — refresh the EnergyCache; drift alerts drained.
+
+        Args:
+            force: If True, bypass stale-data check (debug only).
+
+        Returns:
+            The early-exit CycleResult when a stage short-circuits
+            (``disabled`` / ``no_incomplete_qh``), or None when the fetch
+            succeeded so the caller can publish metrics_update and wake
+            the decision loop via the data-ready event.
+        """
+        with self._lock:
+            self._check_config_changes()
+            ctx = CycleContext(now=self._clock.now(), force=force)
+            if (result := self._stage_enabled_check(ctx)):
+                return result
+            stage2_result = self._stage_nbc_fetch(ctx)
+            # Escalate any persistent Emporia drift detected during the fetch
+            # to ERROR + one-time Telegram alert (same as run_cycle).
+            self._drain_drift_alerts()
+            if stage2_result:
+                return stage2_result
+            return None
+
+    def run_decision_cycle(self, now: datetime | None = None) -> CycleResult | None:
+        """Run one fast decision cycle against cached metrics only.
+
+        The fast decision loop (default ~5 s cadence) is the sole decision
+        authority in production: it re-evaluates the frozen cached NBC
+        prediction as the quarter-hour shrinks, so loads fit and gates
+        clear faster than the slow fetch loop. The slow loop is fetch-only
+        and stays quantization-aligned.
+
+        Contract:
+          - Never fetches metrics; reads via ``_stage_nbc_read_cache``.
+          - Returns None ("hold") when the cache is invalid or holds no
+            incomplete QH, or when load management is disabled.
+          - Reuses the full decision pipeline: enabled check, pending/stale
+            gate, gap compute, async phase (plug-state sync + decide +
+            execute), commit, build result.
+          - Does NOT reload config or drain drift alerts — those stay in
+            the slow (metrics) loop.
+
+        Thread-safe: acquires ``self._lock`` for the whole cycle, same as
+        ``run_cycle``.
+
+        Args:
+            now: Current time. Defaults to ``self._clock.now()``.
+
+        Returns:
+            CycleResult, or None when the fast loop should hold.
+        """
+        with self._lock:
+            if now is None:
+                now = self._clock.now()
+            ctx = CycleContext(now=now, force=False)
+            logger.debug(
+                "decision_cycle_start",
+                extra={"event": "decision_cycle_start"},
+            )
+
+            if (result := self._stage_enabled_check(ctx)):
+                return result
+
+            if not self._stage_nbc_read_cache(ctx):
+                # No usable cached data — hold without a decision.
+                return None
+
+            if (result := self._stage_pending_check(ctx)):
+                return result
+
+            self._stage_compute_gap(ctx)
+            self._stage_async_phase(ctx)
+
+            if (result := self._stage_commit(ctx)):
+                return result
+
+            return self._stage_build_result(ctx)
 
     async def _execute_action(self, action: PendingEffect) -> bool:
         """Execute a single pending action against the appropriate controller.

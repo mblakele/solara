@@ -102,6 +102,10 @@ disable = [
     "too-many-branches",
     "too-many-statements",
     "too-many-arguments",
+    # StateTracker is a state container whose accessor surface legitimately
+    # grows (per-device getters/setters plus thread-safe snapshot helpers);
+    # see the sibling too-many-* design checks disabled above.
+    "too-many-public-methods",
     "import-outside-toplevel",
     "broad-exception-caught",
     "no-value-for-parameter",

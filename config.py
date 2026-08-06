@@ -300,6 +300,23 @@ class Config:
         return self._get_int("LOAD_MANAGE_INTERVAL_SECS", default=30)
 
     @property
+    def load_fast_decide_enabled(self) -> bool:
+        """Return True when the fast decision loop is enabled (default).
+
+        When enabled, the background load management runs as two threads:
+        a fetch-only metrics loop (quantization-aligned) and a fast decision
+        loop (default ~5 s cadence) that re-evaluates cached metrics. When
+        disabled, the metrics loop falls back to the legacy run_cycle()
+        behavior. Restart required for changes (see RESTART_REQUIRED_KEYS).
+        """
+        return self._get_bool("LOAD_FAST_DECIDE_ENABLED", default="True")
+
+    @property
+    def load_decide_interval_secs(self) -> int:
+        """Return seconds between fast decision loop cycles."""
+        return self._get_int("LOAD_DECIDE_INTERVAL_SECS", default=5)
+
+    @property
     def load_manage_api_key(self) -> str:
         """Return API key for manual load management endpoint."""
         return self._get("LOAD_MANAGE_API_KEY", "") or ""
@@ -529,6 +546,7 @@ RESTART_REQUIRED_KEYS = frozenset({
     "VOCOLINC_USERNAME", "VOCOLINC_PASSWORD",
     "VUE_USERNAME", "VUE_PASSWORD",
     "LOAD_MANAGE_INTERVAL_SECS",
+    "LOAD_FAST_DECIDE_ENABLED", "LOAD_DECIDE_INTERVAL_SECS",
 })
 
 
