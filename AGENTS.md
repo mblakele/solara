@@ -156,6 +156,8 @@ project-root
                            # env via the Config class + devices.json
 ├── conftest.py            # Pytest shared fixtures & configuration
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS,
+                           # ASYNC_PHASE_TIMEOUT_SECS bounds the decision pipeline's
+                           # async phase so a stuck controller cannot stall the fetch,
                            # Tesla charging constants TESLA_HARD_MAX_AMPS, etc.)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
@@ -217,13 +219,17 @@ project-root
 - Tesla callback config dotfile: `.tesla-callback-config` (auto-created, auto-updated)
 - Pipeline orchestration in `load_manager.py` (`_stage_enabled_check`, `_stage_nbc_fetch`,
   `_stage_pending_check`, `_stage_compute_gap`, `_stage_async_phase`, `_stage_commit`,
-  `_stage_build_result`) — each independently testable
+  `_stage_build_result`) — each independently testable. `_stage_async_phase` is timeboxed
+  by `ASYNC_PHASE_TIMEOUT_SECS` (`asyncio.wait_for`): on timeout it returns an early-exit
+  `CycleResult(status="async_phase_timeout")` (no commit — outcomes are unknown), bounding
+  the `self._lock` hold so a stuck controller cannot stall `fetch_cycle`
 - `run_decision_cycle()` in `load_manager.py` — the fast decision loop's cache-only
   decision pipeline (`_stage_enabled_check` → `_stage_nbc_read_cache` → `_stage_pending_check`
   → `_stage_compute_gap` → `_stage_async_phase` → `_stage_commit` → `_stage_build_result`);
   the sole decision authority in production. Never fetches metrics and never reloads
   config — those stay in the slow loop. Returns None ("hold") when the cache has no
-  usable data.
+  usable data, and propagates the `async_phase_timeout` early exit from the timeboxed
+  async phase.
 - `fetch_cycle()` in `load_manager.py` — fetch-only cycle (config check, enabled check,
   NBC fetch, drift-alert drain) used by `_metrics_loop`; the only fetcher when the fast
   decision loop is enabled. Returns None on success so the caller can publish
@@ -236,7 +242,10 @@ project-root
   `LOAD_FAST_DECIDE_ENABLED=False`), and the decision loop waits on the data-ready event
   (timeout `LOAD_DECIDE_INTERVAL_SECS`), runs `run_decision_cycle()`, flushes pending
   notifications, records cycle results, and publishes `load_cycle` SSE only on change
-  (`_publish_load_cycle_if_changed`).
+  (`_publish_load_cycle_if_changed`). Each loop keeps its own consecutive-error counter
+  (`metrics_loop_error_count` / `decision_loop_error_count`) so a fast decision-loop
+  success cadence cannot suppress the metrics loop's Telegram alerts (1st + every 10th,
+  via `_should_send_error_alert`).
 - `_fetch_tesla_state_async()` in `load_manager.py` — fetches Tesla state from MQTT
   telemetry with a fast path; returns telemetry state as long as `ChargeAmts` is present
   (does NOT require `Location`). Preserves `at_home` from `_last_tesla_at_home` when

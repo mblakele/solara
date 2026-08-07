@@ -25,6 +25,17 @@ HYSTERESIS_PROPORTION: float = 1.0 / 3.0
 
 # ── Sleep / cycle timing ─────────────────────────────────────────────
 
+ASYNC_PHASE_TIMEOUT_SECS: float = 10.0
+"""Maximum seconds the decision pipeline's async phase may run.
+
+The async phase (plug-state sync, Tesla calls, action execution) runs
+under ``LoadManager._lock``, so an unbounded phase stalls the metrics
+loop's ``fetch_cycle`` on the same lock. Bounding it caps the worst-case
+lock hold well below the EnergyCache TTL (60 s) and the 30 s fetch
+interval; a timed-out phase returns the ``async_phase_timeout`` early
+exit and the next cycle's plug-state sync converges from actual state.
+"""
+
 SLEEP_PROPORTION: float = 0.0833
 """Proportion of config interval used for adaptive sleep
 (time_to_close / seconds_remaining)."""

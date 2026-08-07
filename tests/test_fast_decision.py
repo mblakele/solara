@@ -10,6 +10,7 @@ otherwise produces the same actions as the full ``run_cycle`` path.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, time, timedelta, timezone
 from unittest.mock import patch
 
@@ -429,4 +430,146 @@ def test_fast_cycle_parity_with_run_cycle_outside_range(mock_tz):
     assert fast_result.status == "disabled"
     assert fast_result.status == slow_result.status
     assert fast_result.diagnostics.reason == slow_result.diagnostics.reason
+    _assert_never_fetched(fetch_count)
+
+
+# --- Async-phase timeout (head-of-line blocking fix) ---
+
+
+async def _hang_async_phase(*args, **kwargs):
+    """Async phase that never completes — simulates a stuck controller.
+
+    The real ``_cycle_async_phase`` can stall on plug/Tesla network calls;
+    this stands in for that so tests can exercise the timeout bound without
+    real hardware.
+    """
+    _ = (args, kwargs)  # accept any _cycle_async_phase call shape
+    await asyncio.sleep(30)
+
+
+def _make_stuck_plug_manager(now: datetime) -> tuple[LoadManager, PlugController, list[int]]:
+    """Create a LoadManager whose async phase hangs indefinitely.
+
+    Args:
+        now: Fixed time for the cache and clock.
+
+    Returns:
+        Tuple of (LoadManager, PlugController, fetch_count list).
+    """
+    mgr, plug_ctrl, fetch_count = _make_plug_manager(now, predicted_wh=-2000.0)
+    mgr._cycle_async_phase = _hang_async_phase
+    return mgr, plug_ctrl, fetch_count
+
+
+@patch("load_manager.ASYNC_PHASE_TIMEOUT_SECS", 0.1)
+def test_fast_cycle_async_phase_timeout_returns_early_exit():
+    """A stuck async phase returns async_phase_timeout instead of blocking.
+
+    The head-of-line blocking fix bounds the lock hold: when controller
+    calls hang, the decision cycle must return an early-exit status within
+    the timeout instead of stalling the metrics loop's fetch.
+    """
+    import time as time_mod
+
+    now = FIXED_NOW
+    mgr, _plug_ctrl, fetch_count = _make_stuck_plug_manager(now)
+
+    t0 = time_mod.perf_counter()
+    result = mgr.run_decision_cycle(now=now)
+    elapsed = time_mod.perf_counter() - t0
+
+    assert result is not None
+    assert result.status == "async_phase_timeout"
+    assert result.actions == []
+    assert elapsed < 2.0, f"async phase must be timeboxed, took {elapsed:.1f}s"
+    _assert_never_fetched(fetch_count)
+
+
+@patch("load_manager.ASYNC_PHASE_TIMEOUT_SECS", 0.1)
+def test_async_phase_timeout_skips_commit():
+    """A timed-out async phase records no pending effects.
+
+    The outcome of a cancelled async phase is unknown, so the pipeline
+    must not commit effects or mutate device state; the next cycle's
+    plug-state sync converges from actual device state instead.
+    """
+    now = FIXED_NOW
+    mgr, _plug_ctrl, fetch_count = _make_stuck_plug_manager(now)
+    assert mgr.state.pending_effects == []
+
+    result = mgr.run_decision_cycle(now=now)
+
+    assert result is not None
+    assert result.status == "async_phase_timeout"
+    assert mgr.state.pending_effects == [], (
+        "timeout must not commit effects for unknown outcomes"
+    )
+    _assert_never_fetched(fetch_count)
+
+
+@patch("load_manager.ASYNC_PHASE_TIMEOUT_SECS", 0.1)
+def test_run_cycle_async_phase_timeout_returns_early_exit():
+    """Legacy run_cycle also returns async_phase_timeout on a stuck async phase.
+
+    The slow loop falls back to run_cycle when LOAD_FAST_DECIDE_ENABLED is
+    off; the same timeout bound must protect it.
+    """
+    import time as time_mod
+
+    now = FIXED_NOW
+    mgr, _plug_ctrl, fetch_count = _make_stuck_plug_manager(now)
+
+    t0 = time_mod.perf_counter()
+    result = mgr.run_cycle(force=False)
+    elapsed = time_mod.perf_counter() - t0
+
+    assert result is not None
+    assert result.status == "async_phase_timeout"
+    assert elapsed < 2.0, f"run_cycle async phase must be timeboxed, took {elapsed:.1f}s"
+    _assert_never_fetched(fetch_count)
+
+
+@patch("load_manager.ASYNC_PHASE_TIMEOUT_SECS", 0.2)
+def test_fetch_cycle_not_stalled_by_stuck_decision():
+    """fetch_cycle completes promptly while a decision cycle's async phase hangs.
+
+    The decision loop holds the LoadManager lock through its async phase;
+    the timebox bounds that hold so the metrics loop's fetch_cycle is not
+    starved past the timeout.
+    """
+    import threading
+    import time as time_mod
+
+    now = FIXED_NOW
+    mgr, _plug_ctrl, fetch_count = _make_plug_manager(now, predicted_wh=-2000.0)
+
+    hang_started = threading.Event()
+
+    async def hang_async_phase(*args, **kwargs):
+        _ = (args, kwargs)  # accept any _cycle_async_phase call shape
+        hang_started.set()
+        await asyncio.sleep(30)
+
+    mgr._cycle_async_phase = hang_async_phase
+
+    results: dict[str, object] = {}
+
+    def worker():
+        results["decision"] = mgr.run_decision_cycle(now=now)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert hang_started.wait(timeout=2.0), "decision cycle never reached async phase"
+
+    t0 = time_mod.perf_counter()
+    fetch_result = mgr.fetch_cycle()
+    elapsed = time_mod.perf_counter() - t0
+    thread.join(timeout=5)
+
+    assert not thread.is_alive(), "decision cycle must not outlive the timeout bound"
+    assert elapsed < 2.0, (
+        f"fetch_cycle stalled {elapsed:.1f}s behind a hung async phase"
+    )
+    assert fetch_result is None, "cache hit — fetch must succeed without stalling"
+    assert results["decision"].status == "async_phase_timeout"
     _assert_never_fetched(fetch_count)

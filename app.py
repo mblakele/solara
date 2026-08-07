@@ -78,8 +78,10 @@ class _AppState:
         default_factory=lambda: deque(maxlen=10)
     )
     telegram_sender: Any = None
-    consecutive_error_count: int = 0
-    last_error_type: str | None = None
+    metrics_loop_error_count: int = 0
+    metrics_loop_last_error_type: str | None = None
+    decision_loop_error_count: int = 0
+    decision_loop_last_error_type: str | None = None
     lm_thread_started: bool = False
     data_ready_event: threading.Event = field(default_factory=threading.Event)
     last_load_cycle_key: tuple | None = None
@@ -577,6 +579,21 @@ def _send_error_alert(exc: Exception) -> None:
         logger.debug("Failed to send error alert", exc_info=True)
 
 
+def _should_send_error_alert(error_count: int) -> bool:
+    """Decide whether an error alert fires for a consecutive error count.
+
+    Alerts on the first error and then on every 10th consecutive error so
+    a persistent outage does not spam Telegram every cycle.
+
+    Args:
+        error_count: The loop's consecutive error count after incrementing.
+
+    Returns:
+        True when an alert should be sent.
+    """
+    return error_count == 1 or error_count % 10 == 0
+
+
 def _log_metrics_loop_early_exit(result: CycleResult) -> None:
     """Log when the metrics loop exits early without refreshed predictions.
 
@@ -713,17 +730,17 @@ def _metrics_loop() -> None:
             logger.warning("Load management cycle retryable: %s", e)
         except Exception as e:
             interval_secs = interval_secs_config
-            _state.consecutive_error_count += 1
-            _state.last_error_type = type(e).__name__
+            _state.metrics_loop_error_count += 1
+            _state.metrics_loop_last_error_type = type(e).__name__
             logger.error("Error in metrics loop: %s", e)
             _state.energy_cache.invalidate()
-            if _state.consecutive_error_count == 1 or _state.consecutive_error_count % 10 == 0:
+            if _should_send_error_alert(_state.metrics_loop_error_count):
                 _send_error_alert(e)
         else:
             if result is not None:
                 interval_secs = result.sleep_hint
-            _state.consecutive_error_count = 0
-            _state.last_error_type = None
+            _state.metrics_loop_error_count = 0
+            _state.metrics_loop_last_error_type = None
 
         if result is not None and result.status == "disabled":
             interval_secs_adjusted: float = interval_secs
@@ -764,14 +781,14 @@ def _decision_loop() -> None:
                     logger.debug("Decision cycle result: %s", result)
                     _publish_load_cycle_if_changed(result, lm_payload)
         except Exception as e:
-            _state.consecutive_error_count += 1
-            _state.last_error_type = type(e).__name__
+            _state.decision_loop_error_count += 1
+            _state.decision_loop_last_error_type = type(e).__name__
             logger.error("Error in decision loop: %s", e)
-            if _state.consecutive_error_count == 1 or _state.consecutive_error_count % 10 == 0:
+            if _should_send_error_alert(_state.decision_loop_error_count):
                 _send_error_alert(e)
         else:
-            _state.consecutive_error_count = 0
-            _state.last_error_type = None
+            _state.decision_loop_error_count = 0
+            _state.decision_loop_last_error_type = None
 
 
 def load_status() -> Response:

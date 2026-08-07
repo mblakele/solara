@@ -27,6 +27,7 @@ import device_config
 from clock import Clock, RealClock
 from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
+    ASYNC_PHASE_TIMEOUT_SECS,
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
@@ -755,13 +756,26 @@ class LoadManager:
             ),
         )
 
-    def _stage_async_phase(self, ctx: CycleContext) -> None:
+    def _stage_async_phase(self, ctx: CycleContext) -> CycleResult | None:
         """Stage 5: Run the async portion of the cycle.
 
         Resets the Tesla controller session, then runs _cycle_async_phase
-        via asyncio.run(). Unpacks the 8-tuple result into ctx fields,
-        overwriting ctx.gap_wh and ctx.adjusted_wh with corrected values
-        from the async phase. Always returns None.
+        via asyncio.run() under ``ASYNC_PHASE_TIMEOUT_SECS``. Unpacks the
+        8-tuple result into ctx fields, overwriting ctx.gap_wh and
+        ctx.adjusted_wh with corrected values from the async phase.
+
+        The async phase runs under ``self._lock`` (held by the caller for
+        the whole cycle), so an unbounded phase would stall the metrics
+        loop's ``fetch_cycle`` on the same lock. When the phase does not
+        complete within the timeout, this returns an early-exit
+        ``async_phase_timeout`` CycleResult instead of blocking; the
+        cancelled coroutine's outcomes are unknown, so nothing is
+        committed and the next cycle's plug-state sync converges from
+        actual device state.
+
+        Returns:
+            An early-exit CycleResult when the async phase timed out,
+            or None on success.
         """
         gap_wh = ctx.gap_wh
         adjusted_wh = ctx.adjusted_wh
@@ -779,21 +793,48 @@ class LoadManager:
 
         if self.telegram_sender is not None:
             self.telegram_sender.reset_session()
-        (
-            ctx.tesla_state,
-            ctx.tesla_error,
-            ctx.tesla_login_url,
-            ctx.succeeded_effects,
-            ctx.actions,
-            ctx.gap_wh,
-            ctx.adjusted_wh,
-            ctx.sentinel_on,
-        ) = asyncio.run(
-            self._cycle_async_phase(
-                gap_wh, adjusted_wh, now_postfetch, seconds_remaining,
-                self.dry_run, qh_name, data_point_at=data_point_at,
+        try:
+            (
+                ctx.tesla_state,
+                ctx.tesla_error,
+                ctx.tesla_login_url,
+                ctx.succeeded_effects,
+                ctx.actions,
+                ctx.gap_wh,
+                ctx.adjusted_wh,
+                ctx.sentinel_on,
+            ) = asyncio.run(
+                asyncio.wait_for(
+                    self._cycle_async_phase(
+                        gap_wh, adjusted_wh, now_postfetch, seconds_remaining,
+                        self.dry_run, qh_name, data_point_at=data_point_at,
+                    ),
+                    timeout=ASYNC_PHASE_TIMEOUT_SECS,
+                )
             )
-        )
+        except asyncio.TimeoutError:
+            logger.info(
+                "cycle_early_exit stage=async_phase status=%s reason=%s",
+                "async_phase_timeout", "async_phase_timeout",
+                extra={"event": "cycle_early_exit", "stage": "async_phase",
+                       "status": "async_phase_timeout"},
+            )
+            return CycleResult(
+                status="async_phase_timeout",
+                diagnostics=CycleDiagnostics(
+                    gap_wh=ctx.gap_wh,
+                    hysteresis_wh=self.engine.HYSTERESIS_WH,
+                    seconds_remaining=ctx.seconds_remaining,
+                    data_point_at=ctx.data_point_at,
+                    reason="async_phase_timeout",
+                    pending_effects_count=len(self.state.pending_effects),
+                    tesla_configured=self.tesla_ctrl is not None,
+                    plugs_configured=list(self.plugs.keys()),
+                ),
+                sleep_hint=DEFAULT_SLEEP_HINT_SECS,
+                sleep_hint_at=ctx.now.isoformat(),
+            )
+        return None
 
     def _stage_pending_check(
         self, ctx: CycleContext
@@ -2172,7 +2213,8 @@ class LoadManager:
 
             _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=async_phase")
-            self._stage_async_phase(ctx)
+            if (result := self._stage_async_phase(ctx)):
+                return result
             ctx.timings["async_phase"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2286,7 +2328,8 @@ class LoadManager:
                 return result
 
             self._stage_compute_gap(ctx)
-            self._stage_async_phase(ctx)
+            if (result := self._stage_async_phase(ctx)):
+                return result
 
             if (result := self._stage_commit(ctx)):
                 return result

@@ -399,6 +399,7 @@ CycleStatus = Literal[
     "stale_data",
     "previous_qh",
     "waiting_for_fresh_data",
+    "async_phase_timeout",
 ]
 
 

@@ -1417,8 +1417,8 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
         mock_lm.fetch_cycle.side_effect = RuntimeError("test crash")
 
         app_mod._state.telegram_sender = None
-        app_mod._state.consecutive_error_count = 0
-        app_mod._state.last_error_type = None
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
 
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=InterruptedError("stop")):
@@ -1426,8 +1426,8 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
                     app_mod._metrics_loop()
 
         assert app_mod._state.energy_cache._data is None
-        app_mod._state.consecutive_error_count = 0
-        app_mod._state.last_error_type = None
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
 
     def test_error_counter_increments_on_error(self):
         """Error counter increments on each error."""
@@ -1437,22 +1437,23 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
         mock_lm.fetch_cycle.side_effect = RuntimeError("test crash")
 
         app_mod._state.telegram_sender = None
-        app_mod._state.consecutive_error_count = 0
+        app_mod._state.metrics_loop_error_count = 0
 
         with patch("app._get_load_manager", return_value=mock_lm):
             with patch("app.time.sleep", side_effect=InterruptedError("stop")):
                 with self.assertRaises(InterruptedError):
                     app_mod._metrics_loop()
 
-        assert app_mod._state.consecutive_error_count == 1
-        app_mod._state.consecutive_error_count = 0
-        app_mod._state.last_error_type = None
+        assert app_mod._state.metrics_loop_error_count == 1
+        assert app_mod._state.metrics_loop_last_error_type == "RuntimeError"
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
 
     def test_error_counter_resets_on_success(self):
         """Error counter resets when fetch cycle succeeds."""
         import app as app_mod
 
-        app_mod._state.consecutive_error_count = 5
+        app_mod._state.metrics_loop_error_count = 5
 
         mock_lm = unittest.mock.MagicMock()
         mock_lm.fetch_cycle.return_value = None
@@ -1465,8 +1466,8 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
                 with self.assertRaises(InterruptedError):
                     app_mod._metrics_loop()
 
-        assert app_mod._state.consecutive_error_count == 0
-        assert app_mod._state.last_error_type is None
+        assert app_mod._state.metrics_loop_error_count == 0
+        assert app_mod._state.metrics_loop_last_error_type is None
         assert app_mod._state.data_ready_event.is_set()
 
     def test_rate_limited_telegram_alert(self):
@@ -1481,7 +1482,7 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
         mock_lm.fetch_cycle.side_effect = RuntimeError("crash")
 
         app_mod._state.telegram_sender = mock_sender
-        app_mod._state.consecutive_error_count = 0
+        app_mod._state.metrics_loop_error_count = 0
 
         call_count = 0
 
@@ -1498,8 +1499,8 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
 
         # First error (count=1) triggers alert, second (count=2) doesn't
         assert mock_sender.send_notification_sync.call_count == 1
-        app_mod._state.consecutive_error_count = 0
-        app_mod._state.last_error_type = None
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
         app_mod._state.telegram_sender = None
 
     def test_disabled_cycle_skips_sleep_interval_adjust(self):
@@ -1542,8 +1543,8 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
         )
         mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
 
-        app_mod._state.consecutive_error_count = 0
-        app_mod._state.last_error_type = None
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
         app_mod._state.telegram_sender = None
 
         captured_sleep_values: list[float] = []
@@ -1562,8 +1563,216 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
             f"Expected 30.0 for disabled cycle, got {captured_sleep_values[0]}"
         )
 
-        app_mod._state.consecutive_error_count = 0
-        app_mod._state.last_error_type = None
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
+
+
+class TestDecisionLoopErrorHandling(unittest.TestCase):
+    """Tests for _decision_loop error handling.
+
+    The decision loop is cache-only: it calls run_decision_cycle() and
+    never fetches. Its error counter must be independent of the metrics
+    loop's counter so a fast success cadence cannot suppress alerts for
+    the other loop.
+    """
+
+    def _fake_event_stop_after(self, iterations: int):
+        """Return a fake data_ready_event that raises after N waits."""
+        fake_event = unittest.mock.MagicMock()
+        # The first (iterations - 1) waits return normally; the next raises
+        # to stop the loop. MagicMock raises exception instances from a
+        # side_effect list.
+        fake_event.wait.side_effect = [None] * (iterations - 1) + [
+            InterruptedError("stop")
+        ]
+        return fake_event
+
+    def test_error_counter_increments_on_error(self):
+        """Decision-loop error counter increments on each error."""
+        import app as app_mod
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.run_decision_cycle.side_effect = RuntimeError("test crash")
+
+        app_mod._state.telegram_sender = None
+        app_mod._state.decision_loop_error_count = 0
+        app_mod._state.decision_loop_last_error_type = None
+        app_mod._state.metrics_loop_error_count = 0
+        real_event = app_mod._state.data_ready_event
+        app_mod._state.data_ready_event = self._fake_event_stop_after(2)
+
+        try:
+            with patch("app._get_load_manager", return_value=mock_lm):
+                with self.assertRaises(InterruptedError):
+                    app_mod._decision_loop()
+        finally:
+            app_mod._state.data_ready_event = real_event
+
+        assert app_mod._state.decision_loop_error_count == 1
+        assert app_mod._state.decision_loop_last_error_type == "RuntimeError"
+        app_mod._state.decision_loop_error_count = 0
+        app_mod._state.decision_loop_last_error_type = None
+        app_mod._state.metrics_loop_error_count = 0
+
+    def test_error_counter_resets_on_success(self):
+        """Decision-loop error counter resets when a decision succeeds."""
+        import app as app_mod
+
+        app_mod._state.decision_loop_error_count = 5
+        app_mod._state.decision_loop_last_error_type = "RuntimeError"
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.run_decision_cycle.return_value = None
+        mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
+
+        app_mod._state.telegram_sender = None
+        real_event = app_mod._state.data_ready_event
+        app_mod._state.data_ready_event = self._fake_event_stop_after(2)
+
+        try:
+            with patch("app._get_load_manager", return_value=mock_lm):
+                with self.assertRaises(InterruptedError):
+                    app_mod._decision_loop()
+        finally:
+            app_mod._state.data_ready_event = real_event
+
+        assert app_mod._state.decision_loop_error_count == 0
+        assert app_mod._state.decision_loop_last_error_type is None
+        app_mod._state.decision_loop_error_count = 0
+        app_mod._state.decision_loop_last_error_type = None
+
+    def test_rate_limited_telegram_alert(self):
+        """Decision-loop alerts on first error, then every 10th."""
+        import app as app_mod
+
+        mock_sender = unittest.mock.MagicMock()
+        mock_sender.is_configured = True
+        mock_sender.send_notification_sync = unittest.mock.MagicMock(return_value=True)
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.run_decision_cycle.side_effect = RuntimeError("crash")
+
+        app_mod._state.telegram_sender = mock_sender
+        app_mod._state.decision_loop_error_count = 0
+        app_mod._state.metrics_loop_error_count = 0
+        real_event = app_mod._state.data_ready_event
+        app_mod._state.data_ready_event = self._fake_event_stop_after(4)
+
+        try:
+            with patch("app._get_load_manager", return_value=mock_lm):
+                with self.assertRaises(InterruptedError):
+                    app_mod._decision_loop()
+        finally:
+            app_mod._state.data_ready_event = real_event
+
+        # First error (count=1) triggers alert, 2nd/3rd (count=2/3) don't.
+        assert mock_sender.send_notification_sync.call_count == 1
+        app_mod._state.decision_loop_error_count = 0
+        app_mod._state.decision_loop_last_error_type = None
+        app_mod._state.telegram_sender = None
+        app_mod._state.metrics_loop_error_count = 0
+
+    def test_error_does_not_touch_metrics_loop_counter(self):
+        """A decision-loop error leaves the metrics-loop counter alone."""
+        import app as app_mod
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.run_decision_cycle.side_effect = RuntimeError("crash")
+
+        app_mod._state.telegram_sender = None
+        app_mod._state.decision_loop_error_count = 0
+        app_mod._state.metrics_loop_error_count = 3
+        real_event = app_mod._state.data_ready_event
+        app_mod._state.data_ready_event = self._fake_event_stop_after(2)
+
+        try:
+            with patch("app._get_load_manager", return_value=mock_lm):
+                with self.assertRaises(InterruptedError):
+                    app_mod._decision_loop()
+        finally:
+            app_mod._state.data_ready_event = real_event
+
+        assert app_mod._state.metrics_loop_error_count == 3
+        assert app_mod._state.decision_loop_error_count == 1
+        app_mod._state.decision_loop_error_count = 0
+        app_mod._state.decision_loop_last_error_type = None
+        app_mod._state.metrics_loop_error_count = 0
+
+
+class TestErrorCountersIndependentAcrossLoops(unittest.TestCase):
+    """The metrics loop's error counter must not be reset by decision-loop
+    successes (the twin-cycles alert-spam bug).
+
+    When the Emporia API is down, the metrics loop errors on every fetch
+    while the decision loop keeps succeeding on cached data. The shared
+    counter used to be reset by each decision-loop success, so every
+    metrics error fired a Telegram alert instead of only the 1st + every
+    10th.
+    """
+
+    def test_metrics_alerts_not_suppressed_by_decision_successes(self):
+        """Interleaved metrics errors and decision successes alert once."""
+        import app as app_mod
+
+        mock_sender = unittest.mock.MagicMock()
+        mock_sender.is_configured = True
+        mock_sender.send_notification_sync = unittest.mock.MagicMock(return_value=True)
+
+        mock_lm_fail = unittest.mock.MagicMock()
+        mock_lm_fail.fetch_cycle.side_effect = RuntimeError("emporia down")
+
+        mock_lm_ok = unittest.mock.MagicMock()
+        mock_lm_ok.run_decision_cycle.return_value = None
+        mock_lm_ok._send_pending_notifications_sync = unittest.mock.MagicMock()
+
+        app_mod._state.telegram_sender = mock_sender
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
+        app_mod._state.decision_loop_error_count = 0
+        app_mod._state.decision_loop_last_error_type = None
+
+        try:
+            # Iteration 1: metrics loop errors once -> alert, count 1.
+            with patch("app._get_load_manager", return_value=mock_lm_fail):
+                with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+                    with self.assertRaises(InterruptedError):
+                        app_mod._metrics_loop()
+            assert app_mod._state.metrics_loop_error_count == 1
+            assert mock_sender.send_notification_sync.call_count == 1
+
+            # Iteration 2: decision loop succeeds -> must NOT reset the
+            # metrics-loop counter.
+            real_event = app_mod._state.data_ready_event
+            fake_event = unittest.mock.MagicMock()
+            # One normal wait runs a decision cycle; the next raises to stop.
+            fake_event.wait.side_effect = [None, InterruptedError("stop")]
+            app_mod._state.data_ready_event = fake_event
+            try:
+                with patch("app._get_load_manager", return_value=mock_lm_ok):
+                    with self.assertRaises(InterruptedError):
+                        app_mod._decision_loop()
+            finally:
+                app_mod._state.data_ready_event = real_event
+
+            assert app_mod._state.metrics_loop_error_count == 1, (
+                "decision-loop success must not reset the metrics-loop counter"
+            )
+            assert app_mod._state.decision_loop_error_count == 0
+
+            # Iteration 3: metrics loop errors again -> count 2, still only
+            # one alert (alerts fire on 1st and every 10th).
+            with patch("app._get_load_manager", return_value=mock_lm_fail):
+                with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+                    with self.assertRaises(InterruptedError):
+                        app_mod._metrics_loop()
+            assert app_mod._state.metrics_loop_error_count == 2
+            assert mock_sender.send_notification_sync.call_count == 1
+        finally:
+            app_mod._state.telegram_sender = None
+            app_mod._state.metrics_loop_error_count = 0
+            app_mod._state.metrics_loop_last_error_type = None
+            app_mod._state.decision_loop_error_count = 0
+            app_mod._state.decision_loop_last_error_type = None
 
 
 class TestLoadCyclePublishOnChange(unittest.TestCase):
