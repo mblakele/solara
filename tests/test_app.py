@@ -1566,6 +1566,171 @@ class TestMetricsLoopErrorHandling(unittest.TestCase):
         app_mod._state.metrics_loop_error_count = 0
         app_mod._state.metrics_loop_last_error_type = None
 
+    def test_fast_cycle_records_early_exit(self):
+        """Metrics-loop early exits are recorded for observability.
+
+        With the fast decision loop enabled, fetch_cycle() returns an
+        early-exit CycleResult (e.g. no_incomplete_qh) instead of None on
+        cycles that produce no fresh predictions. The metrics loop must
+        record those exits into last_cycle_result / recent_cycles so the
+        load_status endpoint shows why the loop isn't producing fresh data.
+        """
+        import app as app_mod
+        from load_models import CycleResult, CycleDiagnostics
+
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        early_exit = CycleResult(
+            status="no_incomplete_qh",
+            sleep_hint=5.0,
+            sleep_hint_at=base.isoformat(),
+            diagnostics=CycleDiagnostics(
+                gap_wh=None,
+                hysteresis_wh=3.0,
+                seconds_remaining=None,
+                data_point_at=None,
+                reason="no_incomplete_qh",
+            ),
+        )
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.fetch_cycle.return_value = early_exit
+        mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
+
+        app_mod._state.telegram_sender = None
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
+        app_mod._state.last_cycle_result = None
+        app_mod._state.recent_cycles.clear()
+        app_mod._state.energy_cache.invalidate()
+
+        with patch("app._get_load_manager", return_value=mock_lm):
+            with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+                with self.assertRaises(InterruptedError):
+                    app_mod._metrics_loop()
+
+        assert app_mod._state.last_cycle_result is early_exit, (
+            "early exit must be recorded as last_cycle_result"
+        )
+        assert len(app_mod._state.recent_cycles) == 1
+        assert app_mod._state.recent_cycles[0]["status"] == "no_incomplete_qh"
+        assert app_mod._state.recent_cycles[0]["reason"] == "no_incomplete_qh"
+
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
+        app_mod._state.last_cycle_result = None
+        app_mod._state.recent_cycles.clear()
+
+    def test_fast_cycle_early_exit_does_not_publish_load_cycle(self):
+        """The metrics loop never publishes load_cycle SSE on early exits.
+
+        The decision loop is the sole load_cycle publisher when fast
+        decide is enabled; the metrics loop must only record the early
+        exit, never publish a load_cycle event for it.
+        """
+        import app as app_mod
+        from load_models import CycleResult, CycleDiagnostics
+
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        early_exit = CycleResult(
+            status="no_incomplete_qh",
+            sleep_hint=5.0,
+            sleep_hint_at=base.isoformat(),
+            diagnostics=CycleDiagnostics(
+                gap_wh=None,
+                hysteresis_wh=3.0,
+                seconds_remaining=None,
+                data_point_at=None,
+                reason="no_incomplete_qh",
+            ),
+        )
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.fetch_cycle.return_value = early_exit
+        mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
+
+        app_mod._state.telegram_sender = None
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
+        app_mod._state.last_cycle_result = None
+        app_mod._state.recent_cycles.clear()
+        app_mod._state.energy_cache.invalidate()
+
+        with patch("app._get_load_manager", return_value=mock_lm):
+            with patch.object(
+                app_mod._state.sse_broadcaster, "publish"
+            ) as mock_publish:
+                with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+                    with self.assertRaises(InterruptedError):
+                        app_mod._metrics_loop()
+
+        published_kinds = [call.args[0] for call in mock_publish.call_args_list]
+        assert "load_cycle" not in published_kinds, (
+            f"metrics loop must not publish load_cycle, got {published_kinds}"
+        )
+
+        app_mod._state.metrics_loop_error_count = 0
+        app_mod._state.metrics_loop_last_error_type = None
+        app_mod._state.last_cycle_result = None
+        app_mod._state.recent_cycles.clear()
+
+    def test_early_exit_logging_levels(self):
+        """Early exits log at INFO; the empty-cache case stays WARNING.
+
+        A no_incomplete_qh exit with a populated cache is a normal
+        settling cycle (waiting for the QH boundary) — INFO. The same
+        exit with an empty cache indicates a possible network problem —
+        WARNING.
+        """
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+        from load_models import CycleResult, CycleDiagnostics
+
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        def make_exit() -> CycleResult:
+            return CycleResult(
+                status="no_incomplete_qh",
+                sleep_hint=5.0,
+                sleep_hint_at=base.isoformat(),
+                diagnostics=CycleDiagnostics(
+                    gap_wh=None,
+                    hysteresis_wh=3.0,
+                    seconds_remaining=None,
+                    data_point_at=None,
+                    reason="no_incomplete_qh",
+                ),
+            )
+
+        # Case 1: cache populated (healthy settling cycle) → INFO, no warning.
+        app_mod._state.energy_cache._data = EnergyCacheData(
+            samples=[0.1] * 100,
+            data_start=base - timedelta(minutes=1),
+            last_sample_at=base - timedelta(seconds=30),
+            last_fetch_at=base - timedelta(seconds=30),
+            sample_count=100,
+            quantization_seconds=30,
+            quantization_offset=0,
+            quantization_confidence=0.9,
+        )
+        with self.assertLogs("app", level="INFO") as captured:
+            app_mod._log_metrics_loop_early_exit(make_exit())
+        info_messages = " ".join(r.getMessage() for r in captured.records)
+        assert "early exit" in info_messages
+        assert all(r.levelno < 30 for r in captured.records), (
+            "populated-cache early exit must not warn"
+        )
+
+        # Case 2: empty cache (possible network issue) → WARNING.
+        app_mod._state.energy_cache.invalidate()
+        with self.assertLogs("app", level="INFO") as captured:
+            app_mod._log_metrics_loop_early_exit(make_exit())
+        assert any(
+            r.levelno == 30 and "no data available" in r.getMessage()
+            for r in captured.records
+        ), "empty-cache early exit must warn about missing data"
+
+        app_mod._state.energy_cache.invalidate()
+
 
 class TestDecisionLoopErrorHandling(unittest.TestCase):
     """Tests for _decision_loop error handling.

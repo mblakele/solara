@@ -4,6 +4,11 @@ services:
     name: solara
     env: python
     buildCommand: uv sync
+    # Load management assumes exactly ONE process: keep the default single
+    # gunicorn worker (no -w/--workers) and numInstances: 1. A second
+    # process would run duplicate decision loops against the same physical
+    # devices (guarded by the .load-manager.lock flock; see wsgi.py).
+    # Do NOT add --preload: background threads would be lost at fork.
     startCommand: gunicorn wsgi:app --worker-class=gthread --threads=4 --timeout=31
     plan: free
     numInstances: 1

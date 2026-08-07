@@ -21,12 +21,18 @@ from dataclasses import dataclass, field
 import logging
 import logging.handlers
 
+import os
 import sys
 import threading
 import time
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 import pytz
 import requests
@@ -597,6 +603,11 @@ def _should_send_error_alert(error_count: int) -> bool:
 def _log_metrics_loop_early_exit(result: CycleResult) -> None:
     """Log when the metrics loop exits early without refreshed predictions.
 
+    Most early exits are expected settling cycles (e.g. waiting for the
+    next QH boundary after compaction) — those log at INFO so the steady
+    state is visible without noise. The empty-cache case (no data at all)
+    is a possible network problem and stays at WARNING.
+
     Args:
         result: The early-exit CycleResult from the fetch cycle.
     """
@@ -607,6 +618,12 @@ def _log_metrics_loop_early_exit(result: CycleResult) -> None:
         logger.warning(
             "Load management: no data available (possible network issue)"
         )
+        return
+    logger.info(
+        "Load management: metrics loop early exit (%s): %s",
+        result.status,
+        result.diagnostics.reason if result.diagnostics else "no reason",
+    )
 
 
 def _publish_metrics_update() -> None:
@@ -714,6 +731,13 @@ def _metrics_loop() -> None:
                         _state.data_ready_event.set()
                         _publish_metrics_update()
                     else:
+                        # Record the early exit so load_status shows why
+                        # the loop is not producing fresh predictions. Do
+                        # NOT publish load_cycle SSE here — the decision
+                        # loop is the sole load_cycle publisher and the
+                        # sole writer of _state.last_load_cycle_key.
+                        with _state.load_manager_lock:
+                            _record_cycle_result(result, lm)
                         _log_metrics_loop_early_exit(result)
                 else:
                     result = lm.run_cycle()
@@ -899,6 +923,67 @@ def _shutdown_load_manager():
                 logger.warning("Error during LoadManager shutdown: %s", e)
 
 
+# Sentinel returned by _acquire_instance_lock when fcntl is unavailable:
+# the single-instance guard no-ops (no lock file) but services still start.
+_NO_LOCK_FD = -1
+
+
+def _instance_lock_path() -> str:
+    """Return the filesystem path of the single-instance lock file.
+
+    The lock file lives at the project root and is git-ignored
+    (``.load-manager.lock``); it is created on first boot and its content
+    is never used — the advisory ``flock`` is what matters.
+
+    Returns:
+        Absolute path to the lock file.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".load-manager.lock")
+
+
+def _acquire_instance_lock(lock_path: str | None = None) -> int | None:
+    """Acquire the single-instance advisory lock, or return None.
+
+    Load management controls physical devices (plugs, EV charger), so a
+    second gunicorn worker or duplicate app process must NOT run its own
+    metrics + decision loops: the two loops would reconcile each other's
+    commands as "external changes" and fight over the devices. The first
+    process to acquire the flock owns the background services; later
+    processes fail loud (ERROR log) and serve HTTP without them.
+
+    The lock is released automatically by the OS when the holding process
+    exits, so there is no stale-lock cleanup. The returned fd must be kept
+    open for the process lifetime (``start_background_services`` holds it).
+
+    Args:
+        lock_path: Override the lock file path (tests use tmp_path).
+            Defaults to ``_instance_lock_path()``.
+
+    Returns:
+        An open fd holding the lock, ``_NO_LOCK_FD`` (-1) on platforms
+        without ``fcntl`` (guard disabled), or None when another process
+        already holds the lock.
+    """
+    if fcntl is None:
+        logger.warning(
+            "fcntl unavailable — single-instance lock disabled; "
+            "do not run multiple app processes against the same devices"
+        )
+        return _NO_LOCK_FD
+    path = lock_path if lock_path is not None else _instance_lock_path()
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        logger.error("Failed to open instance lock file %s: %s", path, exc)
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def start_background_services() -> None:
     """Start MQTT subscriber and load-management background threads.
 
@@ -906,7 +991,24 @@ def start_background_services() -> None:
     side-effect free so tests and tooling can import it safely. The gunicorn
     entry point (wsgi.py) and the ``__main__`` block call this explicitly
     after the app is constructed.
+
+    Deployment constraint: background services (and therefore load
+    management) assume exactly one app process. The single-instance lock
+    guards this — a second process logs an ERROR and skips background
+    services instead of running duplicate decision loops against the same
+    physical devices. Keep gunicorn at one worker (no ``-w/--workers``,
+    no Render ``numInstances`` > 1) and never add ``--preload`` (threads
+    started in the master before fork would be silently lost).
     """
+    if _acquire_instance_lock() is None:
+        logger.error(
+            "Another instance holds the single-instance lock (%s); "
+            "background services (MQTT subscriber + load management) will "
+            "NOT run in this process. Running duplicate load-management "
+            "loops against the same devices is unsafe.",
+            _instance_lock_path(),
+        )
+        return
     if _config.load_tesla_controller == "real":
         _start_mqtt_subscriber()
     if _config.load_manage_enabled is not False:

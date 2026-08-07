@@ -230,9 +230,10 @@ class EnergyCache:
         Returns:
             List of float Wh values, or ``None``.
         """
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.samples
+        return data.samples
 
     @samples.setter
     def samples(self, value: list[float] | None) -> None:
@@ -242,9 +243,10 @@ class EnergyCache:
     @property
     def data_start(self) -> datetime | None:
         """Timestamp of the first sample, or ``None`` if empty."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.data_start
+        return data.data_start
 
     @data_start.setter
     def data_start(self, value: datetime | None) -> None:
@@ -254,9 +256,10 @@ class EnergyCache:
     @property
     def last_sample_at(self) -> datetime | None:
         """Timestamp of the most recent sample, or ``None`` if empty."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.last_sample_at
+        return data.last_sample_at
 
     @last_sample_at.setter
     def last_sample_at(self, value: datetime | None) -> None:
@@ -266,9 +269,10 @@ class EnergyCache:
     @property
     def last_fetch_at(self) -> datetime | None:
         """Timestamp of the last API fetch, or ``None`` if no fetch yet."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.last_fetch_at
+        return data.last_fetch_at
 
     @last_fetch_at.setter
     def last_fetch_at(self, value: datetime | None) -> None:
@@ -278,9 +282,10 @@ class EnergyCache:
     @property
     def sample_count(self) -> int | None:
         """Number of samples, or ``None`` if empty."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.sample_count
+        return data.sample_count
 
     @sample_count.setter
     def sample_count(self, value: int | None) -> None:
@@ -290,9 +295,10 @@ class EnergyCache:
     @property
     def quantization_seconds(self) -> int | None:
         """Detected quantization interval in seconds, or ``None``."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.quantization_seconds
+        return data.quantization_seconds
 
     @quantization_seconds.setter
     def quantization_seconds(self, value: int | None) -> None:
@@ -302,9 +308,10 @@ class EnergyCache:
     @property
     def quantization_offset(self) -> int | None:
         """Offset within the quantization period, or ``None``."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.quantization_offset
+        return data.quantization_offset
 
     @quantization_offset.setter
     def quantization_offset(self, value: int | None) -> None:
@@ -314,9 +321,10 @@ class EnergyCache:
     @property
     def quantization_confidence(self) -> float | None:
         """Confidence in quantization detection (0–1), or ``None``."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.quantization_confidence
+        return data.quantization_confidence
 
     @quantization_confidence.setter
     def quantization_confidence(self, value: float | None) -> None:
@@ -352,23 +360,26 @@ class EnergyCache:
     @property
     def full_metrics_dict(self) -> dict[str, Any] | None:
         """Full metrics dict from the last fetch, or ``None`` if empty."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.full_metrics_dict
+        return data.full_metrics_dict
 
     @property
     def completed_periods(self) -> list[CompletedNBCPeriod] | None:
         """Completed NBC periods preserved by compaction, or ``None``."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return None
-        return self._data.completed_periods
+        return data.completed_periods
 
     @property
     def data_lag_secs(self) -> float:
         """Seconds of API data lag captured from the last fetch, or ``0.0``."""
-        if self._data is None:
+        data = self._data
+        if data is None:
             return 0.0
-        return self._data.data_lag_secs
+        return data.data_lag_secs
 
     @data_lag_secs.setter
     def data_lag_secs(self, value: float) -> None:
@@ -1010,32 +1021,30 @@ class EnergyCache:
             Adjusted sleep seconds. These may be the same or shorter than
             input, but not longer.
         """
-        if self._data is None:
+        data = self._data
+        if data is None:
             return interval_seconds
-        if self._data.quantization_confidence is None or self._data.quantization_confidence < QUANTIZATION_CONFIDENCE_THRESHOLD:
+        if data.quantization_confidence is None or data.quantization_confidence < QUANTIZATION_CONFIDENCE_THRESHOLD:
             return interval_seconds
 
         # Early-exit: data older than 2× quantum → sleep minimum.
-        if (
-            self._data.last_sample_at is not None
-            and self._data.quantization_seconds is not None
-        ):
-            data_age = (now - self._data.last_sample_at).total_seconds()
-            if data_age > 2 * self._data.quantization_seconds:
+        if data.last_sample_at is not None and data.quantization_seconds is not None:
+            data_age = (now - data.last_sample_at).total_seconds()
+            if data_age > 2 * data.quantization_seconds:
                 return MIN_SLEEP_SECS
 
         # At this point quantization fields are guaranteed to be set.
-        assert self._data.data_start is not None
-        assert self._data.quantization_seconds is not None
-        assert self._data.quantization_offset is not None
+        assert data.data_start is not None
+        assert data.quantization_seconds is not None
+        assert data.quantization_offset is not None
 
         # quantization offset is relative to data_start.
-        offset_start = self._data.data_start + timedelta(seconds=self._data.quantization_offset)
+        offset_start = data.data_start + timedelta(seconds=data.quantization_offset)
         seconds_from_start = (now - offset_start).total_seconds()
-        seconds_in_period = seconds_from_start % self._data.quantization_seconds
+        seconds_in_period = seconds_from_start % data.quantization_seconds
         seconds_remaining = (
-            self._data.quantization_seconds - seconds_in_period
-        ) % self._data.quantization_seconds
+            data.quantization_seconds - seconds_in_period
+        ) % data.quantization_seconds
         logger.debug(
             "EnergyCache.sleep_interval_adjust: %.1f > %.1f",
             interval_seconds,

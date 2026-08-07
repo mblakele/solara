@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
@@ -523,3 +524,115 @@ class TestPruneOldSamplesLastSampleAt:
         assert pruned.last_sample_at >= pruned.data_start, (
             f"last_sample_at {pruned.last_sample_at} < data_start {pruned.data_start}"
         )
+
+
+class TestGettersRaceWithInvalidate:
+    """Lock-free members must never tear when invalidate() runs concurrently.
+
+    ``invalidate()`` sets ``_data = None`` (metrics loop error path). A
+    member that loads ``self._data`` twice — once for the None check, once
+    for the attribute access — can see ``None`` on the second load and raise
+    ``AttributeError``. Each member must bind the snapshot to a local once.
+
+    The race window is a couple of bytecode ops, so a probabilistic hammer
+    test is useless. Instead we reproduce the interleaving deterministically:
+    the reader's FIRST ``_data`` load is paused (patched
+    ``__getattribute__``) after the value is captured; the main thread then
+    runs ``invalidate()``; the reader continues to its second load and tears.
+    A single-load implementation returns the pre-invalidate snapshot cleanly.
+    """
+
+    def _run_torn_read(
+        self, read_fn: Callable[[EnergyCache, datetime], object]
+    ) -> object:
+        """Run *read_fn* while invalidate() lands between two _data loads.
+
+        Args:
+            read_fn: Callable invoked by the reader thread with the cache
+                and a reference ``now``.
+
+        Returns:
+            Whatever *read_fn* returned, or ``None`` on error paths.
+
+        Raises:
+            AssertionError: If the reader raised (i.e. the member tore).
+        """
+        import threading
+
+        cache = EnergyCache()
+        now = datetime(2026, 5, 7, 15, 20, 0, tzinfo=timezone.utc)
+        cache._data = EnergyCacheData(
+            samples=[0.1, 0.2, 0.3],
+            data_start=now,
+            last_sample_at=now,
+            last_fetch_at=now,
+            sample_count=3,
+            quantization_seconds=30,
+            quantization_offset=0,
+            quantization_confidence=0.9,
+            data_lag_secs=5.0,
+            full_metrics_dict={"devices": []},
+            completed_periods=[],
+        )
+
+        original_getattribute = EnergyCache.__getattribute__
+        first_load = threading.Event()
+        proceed = threading.Event()
+        result: dict[str, object] = {}
+        reader_errors: list[BaseException] = []
+
+        def racy_getattribute(self: object, name: str) -> object:
+            value = original_getattribute(self, name)
+            if name == "_data" and not first_load.is_set():
+                first_load.set()
+                if not proceed.wait(timeout=5):
+                    raise TimeoutError("writer never invalidated")
+            return value
+
+        def reader() -> None:
+            try:
+                result["value"] = read_fn(cache, now)
+            except BaseException as exc:  # pragma: no cover - failure path
+                reader_errors.append(exc)
+
+        EnergyCache.__getattribute__ = racy_getattribute  # type: ignore[method-assign]
+        try:
+            reader_thread = threading.Thread(target=reader)
+            reader_thread.start()
+            assert first_load.wait(timeout=5), "reader never started"
+            # invalidate() lands between the reader's two _data loads.
+            cache.invalidate()
+            proceed.set()
+            reader_thread.join(timeout=5)
+        finally:
+            EnergyCache.__getattribute__ = original_getattribute  # type: ignore[method-assign]
+
+        assert reader_errors == [], f"member tore under invalidate: {reader_errors}"
+        return result.get("value")
+
+    @pytest.mark.parametrize(
+        "member",
+        [
+            pytest.param(lambda c, n: c.samples, id="samples"),
+            pytest.param(lambda c, n: c.data_start, id="data_start"),
+            pytest.param(lambda c, n: c.last_sample_at, id="last_sample_at"),
+            pytest.param(lambda c, n: c.last_fetch_at, id="last_fetch_at"),
+            pytest.param(lambda c, n: c.sample_count, id="sample_count"),
+            pytest.param(lambda c, n: c.quantization_seconds, id="quantization_seconds"),
+            pytest.param(lambda c, n: c.quantization_offset, id="quantization_offset"),
+            pytest.param(lambda c, n: c.quantization_confidence, id="quantization_confidence"),
+            pytest.param(lambda c, n: c.full_metrics_dict, id="full_metrics_dict"),
+            pytest.param(lambda c, n: c.completed_periods, id="completed_periods"),
+            pytest.param(lambda c, n: c.data_lag_secs, id="data_lag_secs"),
+            pytest.param(
+                lambda c, n: c.sleep_interval_adjust(30.0, n),
+                id="sleep_interval_adjust",
+            ),
+        ],
+    )
+    def test_member_never_tears_against_invalidate(
+        self, member: Callable[[EnergyCache, datetime], object]
+    ) -> None:
+        """Member never raises when invalidate() lands between its loads."""
+        value = self._run_torn_read(member)
+        assert value is not None

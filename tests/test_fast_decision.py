@@ -390,11 +390,11 @@ def test_fast_cycle_disabled_outside_time_range(mock_tz):
 def test_fast_cycle_proceeds_inside_time_range(mock_tz):
     """run_decision_cycle decides normally inside the window.
 
-    At 12:00 device-local the fast loop proceeds past the enabled check
+    At 12:05 device-local the fast loop proceeds past the enabled check
     and evaluates the cached prediction (here a no-candidate hold), never
     fetching metrics.
     """
-    inside = _la_time(12, 0)
+    inside = _la_time(12, 5)
     clock = FakeClock(inside)
     mgr, _plug_ctrl, fetch_count = _make_plug_manager(
         inside, predicted_wh=-2000.0, clock=clock,
@@ -572,4 +572,63 @@ def test_fetch_cycle_not_stalled_by_stuck_decision():
     )
     assert fetch_result is None, "cache hit — fetch must succeed without stalling"
     assert results["decision"].status == "async_phase_timeout"
+    _assert_never_fetched(fetch_count)
+
+
+def test_fast_cycle_holds_on_insufficient_samples():
+    """Cached QH with < MIN_SAMPLES_FOR_PREDICTION samples → hold.
+
+    The fetch path (``_stage_nbc_fetch``) refuses to act on predictions
+    built from fewer than ``MIN_SAMPLES_FOR_PREDICTION`` samples
+    (reason="insufficient_samples"). The decision loop must apply the same
+    gate to its cache-only read (``_stage_nbc_read_cache``) so a
+    nearly-empty cache cannot fire actions on unreliable data: hold (None)
+    and never fetch.
+    """
+    now = datetime(2026, 5, 7, 15, 2, 2, tzinfo=timezone.utc)
+    clock = FakeClock(now)
+
+    # Cache with only 2 samples in the incomplete QH (well below
+    # MIN_SAMPLES_FOR_PREDICTION). _make_energy_cache_with_prediction
+    # derives its sample count from the wall clock, so build the tiny
+    # cache directly.
+    qh_minute = (now.minute // 15) * 15
+    data_start = now.replace(minute=qh_minute, second=0, microsecond=0)
+    sample_value = -2000.0 / 900_000.0
+    cache = EnergyCache(ttl_seconds=30)
+    with cache._lock:
+        cache.samples = [sample_value, sample_value]
+        cache.data_start = data_start
+        cache.last_sample_at = now
+        cache.sample_count = 2
+        cache.last_fetch_at = now
+
+    fetch_count: list[int] = []
+
+    def metrics_fetch() -> dict | None:
+        fetch_count.append(1)
+        return None
+
+    mgr = LoadManager(LoadManagerConfig(
+        metrics_fetch=metrics_fetch,
+        energy_cache=cache,
+        plug_ctrl=PlugController({
+            "pool_pump": PlugConfig(
+                name="pool_pump",
+                accessory_id="xyz789",
+                power_watts=2400.0,
+                priority=10,
+            ),
+        }),
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=False,
+        clock=clock,
+    ))
+
+    result = mgr.run_decision_cycle(now=now)
+
+    assert result is None, f"expected hold (None), got {result}"
     _assert_never_fetched(fetch_count)

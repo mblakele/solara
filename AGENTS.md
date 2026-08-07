@@ -236,16 +236,25 @@ project-root
   metrics_update and set the data-ready event.
 - `NBCReader.get_current_qh_cached()` in `load_nbc.py` — cache-only QH read that never
   triggers a metrics fetch; backs `_stage_nbc_read_cache` and the fast decision loop.
+- `_stage_nbc_read_cache()` in `load_manager.py` — the decision loop's cache-only NBC
+  read; returns False ("hold") when the cache is invalid, has no incomplete QH, or
+  when `samples_used < MIN_SAMPLES_FOR_PREDICTION` (mirrors the fetch path's
+  `insufficient_samples` gate so a nearly-empty cache cannot fire actions).
 - `_metrics_loop()` / `_decision_loop()` in `app.py` — the split background loops: the
   metrics loop is fetch-only (quantization-aligned sleep, publishes `metrics_update`,
   sets `_state.data_ready_event`; falls back to `run_cycle()` when
-  `LOAD_FAST_DECIDE_ENABLED=False`), and the decision loop waits on the data-ready event
-  (timeout `LOAD_DECIDE_INTERVAL_SECS`), runs `run_decision_cycle()`, flushes pending
-  notifications, records cycle results, and publishes `load_cycle` SSE only on change
-  (`_publish_load_cycle_if_changed`). Each loop keeps its own consecutive-error counter
-  (`metrics_loop_error_count` / `decision_loop_error_count`) so a fast decision-loop
-  success cadence cannot suppress the metrics loop's Telegram alerts (1st + every 10th,
-  via `_should_send_error_alert`).
+  `LOAD_FAST_DECIDE_ENABLED=False`). Early-exit `fetch_cycle()` results are recorded
+  into `last_cycle_result`/`recent_cycles` (under `_state.load_manager_lock`, via
+  `_record_cycle_result`) but NEVER published as `load_cycle` SSE — the decision loop
+  is the sole load_cycle publisher and sole writer of `_state.last_load_cycle_key`.
+  `_log_metrics_loop_early_exit` logs all early exits at INFO, WARNING only for the
+  empty-cache "possible network issue" case. The decision loop waits on the data-ready
+  event (timeout `LOAD_DECIDE_INTERVAL_SECS`), runs `run_decision_cycle()`, flushes
+  pending notifications, records cycle results, and publishes `load_cycle` SSE only on
+  change (`_publish_load_cycle_if_changed`). Each loop keeps its own consecutive-error
+  counter (`metrics_loop_error_count` / `decision_loop_error_count`) so a fast
+  decision-loop success cadence cannot suppress the metrics loop's Telegram alerts
+  (1st + every 10th, via `_should_send_error_alert`).
 - `_fetch_tesla_state_async()` in `load_manager.py` — fetches Tesla state from MQTT
   telemetry with a fast path; returns telemetry state as long as `ChargeAmts` is present
   (does NOT require `Location`). Preserves `at_home` from `_last_tesla_at_home` when
@@ -264,7 +273,18 @@ project-root
 - `start_background_services()` in `app.py` — explicitly starts the MQTT subscriber
   and load-management background threads (metrics loop, plus the decision loop when
   `LOAD_FAST_DECIDE_ENABLED`); called from `wsgi.py` and the `__main__` block, never
-  at import time (so tests can import the module safely)
+  at import time (so tests can import the module safely). Guards against duplicate
+  processes via `_acquire_instance_lock()` (advisory `flock` on the git-ignored
+  `.load-manager.lock`): a second process logs an ERROR and skips background
+  services — running two decision loops against the same physical devices is unsafe.
+  Deployment constraint: exactly one gunicorn worker / one instance (no
+  `-w/--workers`, no Render `numInstances` > 1), and never `--preload` (background
+  threads would be silently lost at fork)
+- `_acquire_instance_lock()` / `_instance_lock_path()` in `app.py` — the
+  single-instance guard behind `start_background_services()`: advisory `flock`
+  (`LOCK_EX | LOCK_NB`) on the git-ignored `.load-manager.lock`; returns the open
+  fd (held for the process lifetime), `_NO_LOCK_FD` (-1) when `fcntl` is
+  unavailable (guard no-ops), or None when another process holds the lock
 - `_setup_file_logging()` in `app.py` — creates `RotatingFileHandler` when `LOG_FILE` is configured
 - Test data generation in `mockdata.py`
 - Quantization detection in `quantization.py`
@@ -378,6 +398,11 @@ project-root
   data (always-replace, no overlap merge), updating metadata.
 - `_prune_old_samples()`: removes samples older than 3600 seconds from `now` to prevent
   unbounded memory growth. Called automatically by `get_or_fetch()`.
+- Lock-free snapshot getters (`samples`, `data_start`, `last_sample_at`, `last_fetch_at`,
+  `sample_count`, `quantization_*`, `full_metrics_dict`, `completed_periods`,
+  `data_lag_secs`, `sleep_interval_adjust`) each bind `self._data` to a local exactly
+  once: `invalidate()` writes `_data = None` from the metrics-loop error path, so a
+  double-load would tear (AttributeError) between the None check and the field access.
 - `get_or_fetch(fetcher, force=False)`: returns cached data if valid (within TTL), otherwise
   calls the fetcher. Fetch results replace the cached samples (no overlap merge). On cache
   hits, returns the full metrics dict (including `devices`) if stored from a prior fetch.

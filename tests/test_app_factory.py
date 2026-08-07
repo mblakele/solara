@@ -76,20 +76,65 @@ class TestBackgroundServices:
         assert app_mod._state.lm_thread_started is False
 
     def test_start_background_services_noop_when_disabled(self):
-        with patch.object(app_mod, "_start_mqtt_subscriber") as mock_mqtt, \
+        with patch.object(app_mod, "_acquire_instance_lock", return_value=-1), \
+             patch.object(app_mod, "_start_mqtt_subscriber") as mock_mqtt, \
              patch.object(app_mod, "_start_load_manager_thread") as mock_lm:
             app_mod.start_background_services()
         mock_mqtt.assert_not_called()
         mock_lm.assert_not_called()
 
     def test_start_background_services_starts_threads_when_enabled(self):
-        with patch.object(app_mod, "_start_mqtt_subscriber") as mock_mqtt, \
+        with patch.object(app_mod, "_acquire_instance_lock", return_value=-1), \
+             patch.object(app_mod, "_start_mqtt_subscriber") as mock_mqtt, \
              patch.object(app_mod, "_start_load_manager_thread") as mock_lm:
             Config().set("LOAD_TESLA_CONTROLLER", "real")
             Config().set("LOAD_MANAGE_ENABLED", "True")
             app_mod.start_background_services()
         mock_mqtt.assert_called_once_with()
         mock_lm.assert_called_once_with()
+
+
+class TestInstanceLock:
+    """Single-instance advisory lock guarding background services.
+
+    Duplicate gunicorn workers (or duplicate app processes) must not each
+    run their own metrics + decision loops against the same physical
+    plugs: the loops would fight each other via plug-state reconciliation.
+    The flock guard makes the second process fail loud (ERROR log) and
+    serve HTTP without background services instead.
+    """
+
+    def test_lock_excludes_second_acquire(self, tmp_path):
+        """Second acquire returns None while the first holder lives."""
+        lock_path = str(tmp_path / ".load-manager.lock")
+        first = app_mod._acquire_instance_lock(lock_path)
+        assert first is not None, "first acquire should succeed"
+        try:
+            second = app_mod._acquire_instance_lock(lock_path)
+            assert second is None, "second acquire must be refused"
+        finally:
+            os.close(first)
+        # Lock released with the fd — re-acquire succeeds.
+        third = app_mod._acquire_instance_lock(lock_path)
+        assert third is not None, "re-acquire after release should succeed"
+        os.close(third)
+
+    def test_start_background_services_skips_when_lock_held(self, tmp_path):
+        """start_background_services starts nothing when another instance holds the lock."""
+        lock_path = str(tmp_path / ".load-manager.lock")
+        held = app_mod._acquire_instance_lock(lock_path)
+        assert held is not None
+        try:
+            with patch.object(app_mod, "_instance_lock_path", return_value=lock_path), \
+                 patch.object(app_mod, "_start_mqtt_subscriber") as mock_mqtt, \
+                 patch.object(app_mod, "_start_load_manager_thread") as mock_lm:
+                Config().set("LOAD_TESLA_CONTROLLER", "real")
+                Config().set("LOAD_MANAGE_ENABLED", "True")
+                app_mod.start_background_services()
+            mock_mqtt.assert_not_called()
+            mock_lm.assert_not_called()
+        finally:
+            os.close(held)
 
 
 class TestFastDecideThreading:

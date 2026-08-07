@@ -542,6 +542,14 @@ class LoadManager:
         qh_result = self.nbc_reader.get_current_qh_cached(now=ctx.now)
         if qh_result is None:
             return False
+        # Mirror the fetch path (_stage_nbc_fetch): refuse to act on
+        # predictions built from too few samples. The metrics loop normally
+        # gates on this before storing, but the decision loop can read a
+        # nearly-empty cache (e.g. right after a QH boundary compaction), so
+        # the same insufficient_samples hold must apply here.
+        if (qh_result.samples_used is not None
+                and qh_result.samples_used < MIN_SAMPLES_FOR_PREDICTION):
+            return False
         ctx.qh_name = qh_result.qh_name
         ctx.predicted_wh = qh_result.predicted_wh
         ctx.seconds_remaining = qh_result.seconds_remaining
