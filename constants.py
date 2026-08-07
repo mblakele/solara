@@ -59,3 +59,28 @@ DRIFT_REJECTION_ALERT_AFTER: int = 5
 fetch path logs an error that the window head appears permanently
 missing and queues a one-time Telegram alert (see ``_drift_rejections``
 and ``_drift_alerts`` in metrics.py)."""
+
+# ── Tesla charging / telemetry ───────────────────────────────────────
+
+TESLA_HARD_MAX_AMPS: int = 48
+"""Hard absolute ceiling on commanded charge amps regardless of config
+(safety cap — never exceed this value)."""
+
+TESLA_CHARGE_AMPS_MIN_DEFAULT: int = 5
+"""Default minimum charge amps before the load manager stops charging
+instead of reducing further."""
+
+TESLA_CHARGE_AMPS_MAX_DEFAULT: int = 48
+"""Default maximum charge amps to command."""
+
+TESLA_NOMINAL_VOLTAGE: int = 240
+"""Nominal mains voltage (V) used for watts/amps conversions."""
+
+TESLA_TOKEN_REFRESH_INTERVAL_SECS: int = 7 * 3600
+"""Proactive Tesla token-refresh window in seconds.
+
+Deliberately shorter than the 8-hour access-token lifetime so the
+refresh always happens before the access token expires server-side."""
+
+TESLA_HOME_RADIUS_M_DEFAULT: float = 500.0
+"""Default radius in metres around home used for at-home detection."""

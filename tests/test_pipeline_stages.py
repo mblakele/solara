@@ -762,6 +762,27 @@ class TestStageAsyncPhase:
         asyncio.run(_run())
         mock_session.close.assert_awaited_once()
 
+    def test_cleanup_sessions_closes_tesla_controller(
+        self, lm: LoadManager
+    ):
+        """_cleanup_sessions closes the Tesla controller via close().
+
+        Session cleanup must go through the controller's own close() method
+        rather than reaching into private attributes, so the controller stays
+        the single owner of its session lifecycle.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from load_controllers import TeslaController
+
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        with patch.object(
+            lm.tesla_ctrl, "close", new_callable=AsyncMock
+        ) as mock_close:
+            asyncio.run(lm._cleanup_sessions())
+        mock_close.assert_awaited_once()
+
 
 class TestStageComputeGap:
     """_stage_compute_gap() — Stage 4 of the pipeline.
@@ -1149,6 +1170,113 @@ class TestTeslaAuthErrorNotification:
 
         assert result is False
         lm_with_auth_failing_ctrl._queue_auth_error_notification.assert_not_called()  # type: ignore[attr-defined]
+
+
+class TestTeslaStopPathParity:
+    """The two stop-charging entry points behave identically.
+
+    ``turn_off`` and ``set_amps`` with ``target_amps`` below the minimum
+    both route through ``stop_charging``.  These parametrized tests pin the
+    shared behavior (success, auth error, VehicleOffline flag) so a future
+    dedup of the two blocks cannot drift them apart.
+    """
+
+    LOGIN_URL = "https://auth.tesla.com/oauth2/v3/authorize?client_id=test"
+
+    def _make_action(self, kind: str) -> PendingEffect:
+        """Build a turn_off or below-min set_amps action."""
+        ts = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        if kind == "turn_off":
+            return PendingEffect(
+                device_name="tesla",
+                action="turn_off",
+                timestamp=ts,
+                data_point_at=ts,
+                power_watts=0.0,
+            )
+        return PendingEffect(
+            device_name="tesla",
+            action="set_amps",
+            timestamp=ts,
+            data_point_at=ts,
+            power_watts=0.0,
+            target_amps=3,  # below the 5 A minimum → stop
+        )
+
+    def _make_mgr(self, ctrl: MagicMock) -> LoadManager:
+        """LoadManager with the given mock controller wired in."""
+        from unittest.mock import MagicMock
+
+        from load_controllers import PlugController
+        from load_models import TeslaConfig
+
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
+        mgr.tesla_config = TeslaConfig(
+            client_id="test",
+            client_secret="test",
+            redirect_uri="http://localhost/callback",
+            vehicle_id="v1",
+            charge_amps_min=5,
+            charge_amps_max=48,
+        )
+        mgr.plug_ctrl = PlugController({})
+        mgr.plugs = {}
+        mgr.tesla_ctrl = ctrl  # type: ignore[assignment]
+        mgr._queue_auth_error_notification = MagicMock(return_value=True)  # type: ignore[assignment]
+        return mgr
+
+    @pytest.mark.parametrize("action_kind", ["turn_off", "set_amps_below_min"])
+    def test_stop_success_returns_true(self, action_kind: str):
+        """A successful stop_charging returns True through both entry points."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        ctrl = MagicMock()
+        ctrl.stop_charging = AsyncMock(return_value=True)
+        ctrl._last_command_vehicle_offline = False
+        mgr = self._make_mgr(ctrl)
+
+        result = asyncio.run(mgr._execute_tesla_action(self._make_action(action_kind)))
+
+        assert result is True
+        ctrl.stop_charging.assert_awaited_once()
+
+    @pytest.mark.parametrize("action_kind", ["turn_off", "set_amps_below_min"])
+    def test_stop_auth_error_queues_notification(self, action_kind: str):
+        """A TeslaAuthError queues the auth notification and returns False."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        ctrl = MagicMock()
+        ctrl.stop_charging = AsyncMock(
+            side_effect=TeslaAuthError("login_required")
+        )
+        ctrl.get_login_url.return_value = self.LOGIN_URL
+        ctrl._last_command_vehicle_offline = False
+        mgr = self._make_mgr(ctrl)
+
+        result = asyncio.run(mgr._execute_tesla_action(self._make_action(action_kind)))
+
+        assert result is False
+        mgr._queue_auth_error_notification.assert_called_once_with(  # type: ignore[attr-defined]
+            "login_required", self.LOGIN_URL
+        )
+
+    @pytest.mark.parametrize("action_kind", ["turn_off", "set_amps_below_min"])
+    def test_stop_vehicle_offline_sets_cycle_flag(self, action_kind: str):
+        """VehicleOffline after stop_charging is propagated to the cycle flag."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        ctrl = MagicMock()
+        ctrl.stop_charging = AsyncMock(return_value=True)
+        ctrl._last_command_vehicle_offline = True
+        mgr = self._make_mgr(ctrl)
+
+        result = asyncio.run(mgr._execute_tesla_action(self._make_action(action_kind)))
+
+        assert result is True
+        assert mgr._vehicle_offline_this_cycle is True
 
 
 # --- Auth error from init_tesla_state (not action execution) ---

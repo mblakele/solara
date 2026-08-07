@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from datetime import datetime, timezone
 
-from load_models import PendingEffect, TeslaVehicleTelemetry
+from load_models import (
+    PendingEffect,
+    TeslaVehicleTelemetry,
+    parse_charge_amps,
+    unwrap_telemetry_value,
+)
 
 
 class TestPendingEffect:
@@ -95,3 +100,52 @@ class TestTeslaVehicleTelemetry:
         assert state.is_charging is None
         assert state.plugged_in is None
         assert state.at_home is None
+
+
+class TestUnwrapTelemetryValue:
+    """unwrap_telemetry_value() strips the fleet-telemetry envelope."""
+
+    def test_wrapped_envelope(self) -> None:
+        """A {"value": ..., "createdAt": ...} envelope is unwrapped."""
+        assert unwrap_telemetry_value({"value": 32.0, "createdAt": "now"}) == 32.0
+
+    def test_raw_scalar(self) -> None:
+        """Raw scalar payloads pass through unchanged."""
+        assert unwrap_telemetry_value(16.0) == 16.0
+
+    def test_raw_dict_without_value_key(self) -> None:
+        """Dicts without a "value" key are returned as-is (same object)."""
+        raw = {"latitude": 37.0, "longitude": -122.0}
+        assert unwrap_telemetry_value(raw) is raw
+
+    def test_none_passthrough(self) -> None:
+        """None passes through unchanged."""
+        assert unwrap_telemetry_value(None) is None
+
+
+class TestParseChargeAmps:
+    """parse_charge_amps() converts a ChargeAmps telemetry value to int amps."""
+
+    def test_raw_float(self) -> None:
+        """A raw float is rounded to an int."""
+        assert parse_charge_amps(16.0) == 16
+
+    def test_wrapped_value(self) -> None:
+        """An enveloped value is unwrapped then rounded."""
+        assert parse_charge_amps({"value": 32.0}) == 32
+
+    def test_none_returns_none(self) -> None:
+        """None (missing value) returns None."""
+        assert parse_charge_amps(None) is None
+
+    def test_wrapped_none_returns_none(self) -> None:
+        """An envelope wrapping None returns None."""
+        assert parse_charge_amps({"value": None}) is None
+
+    def test_non_numeric_returns_none(self) -> None:
+        """Non-numeric payloads return None instead of raising."""
+        assert parse_charge_amps("abc") is None
+
+    def test_zero_rounds_to_zero(self) -> None:
+        """Zero amps parses to 0 (callers treat it as not charging)."""
+        assert parse_charge_amps(0.0) == 0

@@ -32,6 +32,8 @@ from constants import (
     MIN_SAMPLES_FOR_PREDICTION,
     QUANTIZATION_CONFIDENCE_THRESHOLD,
     STALE_DATA_THRESHOLD_SECS,
+    TESLA_CHARGE_AMPS_MAX_DEFAULT,
+    TESLA_CHARGE_AMPS_MIN_DEFAULT,
 )
 
 from config_loader import (
@@ -243,8 +245,14 @@ class LoadManager:
         else:
             self.engine = GapMinder(
                 hysteresis_wh=hysteresis_wh,
-                charge_amps_min=tesla_config.charge_amps_min if tesla_config else 5,
-                charge_amps_max=tesla_config.charge_amps_max if tesla_config else 48,
+                charge_amps_min=(
+                    tesla_config.charge_amps_min
+                    if tesla_config else TESLA_CHARGE_AMPS_MIN_DEFAULT
+                ),
+                charge_amps_max=(
+                    tesla_config.charge_amps_max
+                    if tesla_config else TESLA_CHARGE_AMPS_MAX_DEFAULT
+                ),
             )
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
@@ -1921,13 +1929,10 @@ class LoadManager:
         afterward so reset_session() is a no-op on the next cycle.
         """
         if self.tesla_ctrl is not None:
-            session = getattr(self.tesla_ctrl, "_session", None)
-            if session is not None:
-                try:
-                    await session.close()
-                except Exception:  # pylint: disable=broad-exception-caught
-                    pass
-                self.tesla_ctrl._session = None  # type: ignore[attr-defined]
+            try:
+                await self.tesla_ctrl.close()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
         if self.telegram_sender is not None:
             client = getattr(self.telegram_sender, "_telegram_client", None)
             if client is not None:
@@ -2081,9 +2086,12 @@ class LoadManager:
             self._check_config_changes()
 
             ctx = CycleContext(now=self._clock.now(), force=force)
-            logger.info("cycle_start force=%s",
-                        force,
-                        extra={"event": "cycle_start", "force": force})
+            # DEBUG: fires every ~30 s even when a cycle_early_exit /
+            # cycle_complete event immediately follows; the boundary events
+            # carry the signal, so the start marker stays at DEBUG.
+            logger.debug("cycle_start force=%s",
+                         force,
+                         extra={"event": "cycle_start", "force": force})
 
             _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=enabled_check force=%s", force)
@@ -2216,30 +2224,12 @@ class LoadManager:
             return False
 
         if action.action == "turn_off":
-            try:
-                result = await self.tesla_ctrl.stop_charging()
-                if self.tesla_ctrl._last_command_vehicle_offline:
-                    self._vehicle_offline_this_cycle = True
-                return result
-            except TeslaAuthError as e:
-                self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
-                return False
-            except Exception as e:
-                logger.error("Failed to stop Tesla charging: %s", e)
-                return False
+            return await self._execute_tesla_stop()
         if action.action == "set_amps":
-            if action.target_amps is None or action.target_amps < 5:
-                try:
-                    result = await self.tesla_ctrl.stop_charging()
-                    if self.tesla_ctrl._last_command_vehicle_offline:
-                        self._vehicle_offline_this_cycle = True
-                    return result
-                except TeslaAuthError as e:
-                    self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
-                    return False
-                except Exception as e:
-                    logger.error("Failed to stop Tesla charging: %s", e)
-                    return False
+            # Below the minimum charge rate the vehicle cannot reduce further —
+            # stop charging instead.
+            if action.target_amps is None or action.target_amps < TESLA_CHARGE_AMPS_MIN_DEFAULT:
+                return await self._execute_tesla_stop()
             clamped_amps = min(action.target_amps, self.tesla_config.charge_amps_max)
             clamped_amps = min(clamped_amps, GapMinder.HARD_MAX_AMPS)
             try:
@@ -2255,6 +2245,29 @@ class LoadManager:
                 return False
         logger.warning("Unknown Tesla action: %s", action.action)
         return False
+
+    async def _execute_tesla_stop(self) -> bool:
+        """Stop Tesla charging via the controller.
+
+        Shared by the ``turn_off`` path and the ``set_amps``-below-minimum
+        path of ``_execute_tesla_action`` so both entry points handle the
+        VehicleOffline flag, auth errors, and generic failures identically.
+
+        Returns:
+            True on success, False on failure.
+        """
+        assert self.tesla_ctrl is not None
+        try:
+            result = await self.tesla_ctrl.stop_charging()
+            if self.tesla_ctrl._last_command_vehicle_offline:
+                self._vehicle_offline_this_cycle = True
+            return result
+        except TeslaAuthError as e:
+            self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
+            return False
+        except Exception as e:
+            logger.error("Failed to stop Tesla charging: %s", e)
+            return False
 
     def close(self) -> None:
         """Close the LoadManager and release resources.

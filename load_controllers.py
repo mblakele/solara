@@ -4,10 +4,11 @@ and CLI helpers.
 """
 
 # pylint: disable=duplicate-code
-# The `build_tesla_state(...)` call block at the end of _init_from_rest
-# intentionally mirrors mqtt_telemetry.tesla_state_from_snapshot — both are
-# snapshot-to-model construction sites with the same kwargs.  Extracting a
-# shared helper would hide the two-step flow; the duplication is trivial.
+# The `build_tesla_state(...)` call at the end of _init_from_rest mirrors
+# mqtt_telemetry.tesla_state_from_snapshot — both construct the same model
+# from independently-derived fields.  The shared unwrap/parse helpers
+# (unwrap_telemetry_value, parse_charge_amps) live in load_models; this
+# final construction call is intentionally duplicated for readability.
 
 from __future__ import annotations
 
@@ -26,6 +27,8 @@ from unittest.mock import MagicMock
 import aiohttp
 from aiohomekit.controller.abstract import AbstractPairing
 
+from constants import TESLA_HARD_MAX_AMPS, TESLA_TOKEN_REFRESH_INTERVAL_SECS
+
 import config as _cfg_mod
 from config import Config
 
@@ -40,6 +43,7 @@ from load_models import (
     TeslaConfig,
     TeslaState,
     build_tesla_state,
+    parse_charge_amps,
 )
 from util import _haversine_distance
 
@@ -145,7 +149,7 @@ class TeslaController(AbstractTeslaController):
 
     async def authenticate(self) -> None:
         """No-op authentication stub."""
-        logger.info("TeslaController.authenticate() [stub]")
+        logger.debug("TeslaController.authenticate() [stub]")
 
     async def is_at_home(self) -> bool:
         """Return stored at_home flag."""
@@ -157,7 +161,7 @@ class TeslaController(AbstractTeslaController):
 
     async def start_charging(self) -> bool:
         """Set charging state to True and log the action."""
-        logger.info("TeslaController.start_charging() [stub]")
+        logger.debug("TeslaController.start_charging() [stub]")
         self._state.is_charging = True
         if self._state.current_amps is None:
             self._state.current_amps = self.config.charge_amps_min
@@ -165,7 +169,7 @@ class TeslaController(AbstractTeslaController):
 
     async def stop_charging(self) -> bool:
         """Set charging state to False and log the action."""
-        logger.info("TeslaController.stop_charging() [stub]")
+        logger.debug("TeslaController.stop_charging() [stub]")
         self._state.is_charging = False
         self._state.current_amps = None
         return True
@@ -176,9 +180,8 @@ class TeslaController(AbstractTeslaController):
             self.config.charge_amps_min, min(self.config.charge_amps_max, amps)
         )
         # Belt-and-suspenders: hard absolute max regardless of config.
-        HARD_MAX_AMPS = 48
-        clamped = min(clamped, HARD_MAX_AMPS)
-        logger.info("TeslaController.set_charge_amps(%d) [stub]", clamped)
+        clamped = min(clamped, TESLA_HARD_MAX_AMPS)
+        logger.debug("TeslaController.set_charge_amps(%d) [stub]", clamped)
         self._state.current_amps = clamped
         if not self._state.is_charging:
             self._state.is_charging = True
@@ -192,6 +195,10 @@ class TeslaController(AbstractTeslaController):
             plugged_in=self._state.plugged_in,
             at_home=self._state.at_home,
         )
+
+    async def close(self) -> None:
+        """No-op session close for the in-memory stub."""
+        return None
 
 
 def load_tesla_tokens(tokens_path: Path = TESLA_TOKENS_FILE) -> dict[str, Any] | None:
@@ -273,9 +280,7 @@ class RealTeslaController(AbstractTeslaController):
     def __init__(self, tesla_config: TeslaConfig, config: Config | None = None) -> None:
         self.config = tesla_config
         self._cfg = config if config is not None else _cfg_mod._config
-        self.last_error: str | None = None
-        self._session: aiohttp.ClientSession | None = None
-        self._api: Any | None = None  # TeslaFleetOAuth instance
+        self._reset_runtime_state()
         self._vin: str = ""
         self._init_state: TeslaState | None = None
         self._last_init_attempt: float = 0.0
@@ -286,6 +291,18 @@ class RealTeslaController(AbstractTeslaController):
         """Monotonic time of the last save_tokens() call (0 = never saved)."""
         self._last_command_vehicle_offline: bool = False
         """True when the last command failed with VehicleOffline."""
+
+    def _reset_runtime_state(self) -> None:
+        """Reset cached session, API client, and last error.
+
+        Shared by ``__init__`` (fresh instance) and ``reset_session()``
+        (before each ``asyncio.run()`` invocation) so the two start from the
+        same baseline.  Does not touch Tesla init/backoff state, which must
+        survive across cycles.
+        """
+        self._session: aiohttp.ClientSession | None = None
+        self._api: Any | None = None  # TeslaFleetOAuth instance
+        self.last_error: str | None = None
 
     async def _get_session(self, ssl: bool = True) -> aiohttp.ClientSession:
         """Get or create the aiohttp session.
@@ -330,10 +347,8 @@ class RealTeslaController(AbstractTeslaController):
                 client_id=self.config.client_id,
                 client_secret=self.config.client_secret,
                 redirect_uri=self.config.redirect_uri,
-                access_token=tokens.get("access_token") if tokens else None,
-                refresh_token=tokens.get("refresh_token") if tokens else None,
-                expires=tokens.get("expires", 0) if tokens else 0,
             )
+            self._apply_persisted_tokens(tokens)
             if not self.config.private_key_path:
                 logger.warning(
                     "TESLA_PRIVATE_KEY_PATH not set; vehicle commands (set_amps, "
@@ -362,13 +377,24 @@ class RealTeslaController(AbstractTeslaController):
             # API already exists — update the session in case the previous one
             # was closed between calls, then refresh tokens from disk.
             self._api.session = session
-            if tokens is not None:
-                # pylint: disable=protected-access
-                # TeslaFleetOAuth exposes no public API to update tokens;
-                # we must mutate internals to pick up externally-saved tokens.
-                self._api._access_token = tokens.get("access_token")
-                self._api.refresh_token = tokens.get("refresh_token")
-                self._api.expires = tokens.get("expires", 0)
+            self._apply_persisted_tokens(tokens)
+
+    def _apply_persisted_tokens(self, tokens: dict[str, Any] | None) -> None:
+        """Apply persisted OAuth tokens to the API client.
+
+        Shared by the create and update branches of ``_ensure_api()`` so that
+        tokens written by an external OAuth callback are picked up without
+        restarting gunicorn.
+        """
+        if tokens is None:
+            return
+        assert self._api is not None
+        # pylint: disable=protected-access
+        # TeslaFleetOAuth exposes no public API to update tokens;
+        # we must mutate internals to pick up externally-saved tokens.
+        self._api._access_token = tokens.get("access_token")
+        self._api.refresh_token = tokens.get("refresh_token")
+        self._api.expires = tokens.get("expires", 0)
 
     async def authenticate(self) -> None:
         """Load cached token or refresh to obtain a valid access token.
@@ -386,9 +412,7 @@ class RealTeslaController(AbstractTeslaController):
         # expiry check in check_access_token() misses.
         try:
             await self._api.access_token()
-        except (ValueError, Exception) as e:
-            if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                raise
+        except Exception as e:
             logger.warning("Tesla access token refresh failed: %s", e)
             raise RuntimeError(
                 "Tesla OAuth not configured. Visit /api/v1/tesla/auth/initiate "
@@ -455,8 +479,6 @@ class RealTeslaController(AbstractTeslaController):
             await self._api.get_refresh_token(code)
             logger.info("Tesla OAuth token exchange successful")
         except BaseException as e:
-            if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                raise
             logger.error("Tesla OAuth token exchange failed: %s", e)
             raise
 
@@ -503,68 +525,6 @@ class RealTeslaController(AbstractTeslaController):
         """
         vehicle = await self._get_vehicle()
         return await vehicle.vehicle_data(endpoints=endpoints)
-
-    async def is_at_home(self) -> bool:
-        """Check vehicle GPS against home lat/lon (deprecated).
-
-        Deprecated: REST-based status polling is no longer used.
-        The load manager does not require GPS proximity checks.
-        This method always returns False.
-
-        Returns:
-            Always False.
-        """
-        logger.warning(
-            "is_at_home() is deprecated; returning False. "
-            "Use MQTT telemetry for GPS proximity."
-        )
-        return False
-
-    async def is_plugged_in(self) -> bool:
-        """Check if vehicle is plugged in (deprecated).
-
-        Deprecated: REST-based status polling is no longer used.
-        The load manager relies on MQTT telemetry for vehicle state.
-        This method always returns False.
-
-        Returns:
-            Always False.
-        """
-        logger.warning(
-            "is_plugged_in() is deprecated; returning False. "
-            "Use MQTT telemetry for plugged-in state."
-        )
-        return False
-
-    async def get_charge_limit_pct(self) -> float | None:
-        """Get target SOC percentage (deprecated).
-
-        Deprecated: REST-based status polling is no longer used.
-        The load manager does not read charge limits via REST.
-        This method always returns None.
-
-        Returns:
-            Always None.
-        """
-        logger.warning(
-            "get_charge_limit_pct() is deprecated; returning None. "
-            "The load manager does not use charge limits."
-        )
-        return None
-
-    async def start_charging(self) -> bool:
-        """Start charging (deprecated — no-op).
-
-        Deprecated: The load manager must not start charging vehicles.
-        This method is a no-op that returns False and logs a warning.
-        Charging must be initiated manually or via separate automation.
-        """
-        logger.warning(
-            "start_charging() is disabled: the load manager must not "
-            "start charging. Please start the car manually or via "
-            "separate automation."
-        )
-        return False
 
     async def stop_charging(self) -> bool:
         """Send charge_stop command."""
@@ -620,8 +580,7 @@ class RealTeslaController(AbstractTeslaController):
             self.config.charge_amps_min, min(self.config.charge_amps_max, amps)
         )
         # Belt-and-suspenders: hard absolute max regardless of config.
-        HARD_MAX_AMPS = 48
-        clamped = min(clamped, HARD_MAX_AMPS)
+        clamped = min(clamped, TESLA_HARD_MAX_AMPS)
         try:
             vehicle = await self._get_vehicle()
             await vehicle.set_charging_amps(clamped)
@@ -643,22 +602,6 @@ class RealTeslaController(AbstractTeslaController):
             return False
         finally:
             await self.close()
-
-    async def get_charging_state(self) -> TeslaState | None:
-        """Return full state from MQTT telemetry (deprecated).
-
-        Deprecated: REST-based status polling is no longer used.
-        The load manager relies solely on Tesla fleet-telemetry MQTT
-        for vehicle state. This method always returns None.
-
-        Returns:
-            Always None.
-        """
-        logger.warning(
-            "get_charging_state() is deprecated; returning None. "
-            "Use MQTT telemetry for Tesla state."
-        )
-        return None
 
     async def init_tesla_state(self, timeout: int = 60) -> TeslaState | None:
         """Initialize Tesla state from telemetry or REST API fallback.
@@ -774,16 +717,7 @@ class RealTeslaController(AbstractTeslaController):
             if snapshot and snapshot.get("ChargeAmps") is not None:
                 # Telemetry snapshot has ChargeAmps — we already know the
                 # vehicle is charging.  Skip the charge_state REST call.
-                charge_amps_raw = snapshot["ChargeAmps"]
-                raw_val = (
-                    charge_amps_raw.get("value", charge_amps_raw)
-                    if isinstance(charge_amps_raw, dict)
-                    else charge_amps_raw
-                )
-                if raw_val is not None:
-                    current_amps = round(float(raw_val))
-                else:
-                    current_amps = None
+                current_amps = parse_charge_amps(snapshot["ChargeAmps"])
                 is_charging = current_amps is not None and current_amps > 0
                 plugged_in = is_charging
                 logger.debug(
@@ -869,7 +803,7 @@ class RealTeslaController(AbstractTeslaController):
         the refresh always happens before the access token expires server-side.
         """
         elapsed = _time.monotonic() - self._last_saved_tokens_at
-        if elapsed < 7 * 3600:
+        if elapsed < TESLA_TOKEN_REFRESH_INTERVAL_SECS:
             return  # recently refreshed, nothing to do
 
         await self._ensure_api()
@@ -907,9 +841,7 @@ class RealTeslaController(AbstractTeslaController):
         unusable once that loop is closed. We discard the old session; Python's
         GC will clean it up.
         """
-        self._session = None
-        self._api = None
-        self.last_error = None
+        self._reset_runtime_state()
 
 
 async def tesla_auth_cli(config: Config | None = None) -> bool:
