@@ -60,11 +60,18 @@ class TestStageNBCFetch:
         assert ctx.seconds_remaining == 450
         assert ctx.data_point_at == data_point
 
+    @pytest.mark.parametrize("ctx_force", [False, True])
     def test_fetch_passes_force_flag(
-        self, lm: LoadManager, ctx: CycleContext
+        self, lm: LoadManager, ctx: CycleContext, ctx_force: bool
     ):
-        """The force flag from ctx is passed to get_current_qh."""
-        ctx.force = True
+        """_stage_nbc_fetch always fetches fresh data (force=True).
+
+        The LoadManager shares the app-level EnergyCache (see
+        app._get_load_manager), so a TTL-paced read would cache-hit and
+        skip the fetch, letting data age toward the stale-data threshold.
+        The stage must force a refresh on every cycle regardless of ctx.force.
+        """
+        ctx.force = ctx_force
         data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         qh_result = NBCFetchResult(
             qh_name="QH1", predicted_wh=500.0, seconds_remaining=900,

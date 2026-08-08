@@ -557,6 +557,13 @@ def _get_load_manager():
                         metrics_fetch=metrics_fetch,
                         config_interval_secs=_config.load_manage_interval_secs,
                         telegram_sender=telegram_sender,
+                        # Share the app-level EnergyCache so the metrics loop
+                        # (which fetches into _state.energy_cache) and the
+                        # decision loop (which reads nbc_reader.energy_cache
+                        # cache-only) observe the same data. Without this,
+                        # NBCReader fell back to a private, never-populated
+                        # cache and the fast decision loop held every cycle.
+                        energy_cache=_state.energy_cache,
                     ),
                 )
                 logger.info("LoadManager initialized")

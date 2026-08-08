@@ -234,6 +234,16 @@ project-root
   NBC fetch, drift-alert drain) used by `_metrics_loop`; the only fetcher when the fast
   decision loop is enabled. Returns None on success so the caller can publish
   metrics_update and set the data-ready event.
+- `_stage_nbc_fetch()` in `load_manager.py` — always calls
+  `nbc_reader.get_current_qh(force=True)` so every cycle refreshes from the API: the
+  LoadManager shares the app-level EnergyCache (see `_get_load_manager()` below), so a
+  TTL-paced read would cache-hit and skip the fetch, letting data age toward the
+  stale-data threshold and breaking the fetch cadence.
+- `_get_load_manager()` in `app.py` — builds `LoadManagerConfig` with
+  `energy_cache=_state.energy_cache` (the same cache the `metrics_fetch` closure and the
+  web UI read). Without this wiring, `NBCReader` fell back to a private, never-populated
+  cache: the metrics loop fetched into `_state.energy_cache` while the decision loop read
+  the private cache and silently held every cycle (no gap calc, no decisions).
 - `NBCReader.get_current_qh_cached()` in `load_nbc.py` — cache-only QH read that never
   triggers a metrics fetch; backs `_stage_nbc_read_cache` and the fast decision loop.
 - `_stage_nbc_read_cache()` in `load_manager.py` — the decision loop's cache-only NBC

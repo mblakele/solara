@@ -470,7 +470,11 @@ class LoadManager:
     ) -> CycleResult | None:
         """Stage 2: Fetch NBC data for the current quarter-hour.
 
-        Calls get_current_qh on the NBC reader. If the fetch returns None
+        Calls get_current_qh on the NBC reader with force=True so every
+        cycle refreshes from the API: the LoadManager shares the app-level
+        EnergyCache (see app._get_load_manager), so a TTL-paced read would
+        cache-hit and skip the fetch, letting data age toward the stale-data
+        threshold and breaking the fetch cadence. If the fetch returns None
         (no incomplete quarter-hour), returns CycleResult(status='no_incomplete_qh').
         If samples_used < MIN_SAMPLES_FOR_PREDICTION, returns early with a short
         sleep hint instead of acting on unreliable data.  Otherwise populates
@@ -478,7 +482,7 @@ class LoadManager:
         and ctx.now_postfetch, then returns None.
         """
         fetch_start = _time_mod.perf_counter()
-        qh_result = self.nbc_reader.get_current_qh(force=ctx.force, now=ctx.now)
+        qh_result = self.nbc_reader.get_current_qh(force=True, now=ctx.now)
         if qh_result is None:
             return CycleResult(
                 status="no_incomplete_qh",

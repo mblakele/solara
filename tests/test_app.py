@@ -2061,5 +2061,167 @@ class TestLoadCyclePublishOnChange(unittest.TestCase):
         assert len(load_cycle_calls) == 1
 
 
+class TestLoadManagerSharedCache(unittest.TestCase):
+    """Production wiring: LoadManager must share the app-level EnergyCache.
+
+    Regression for bugs/2026-08-07-decision-cycle-missing-gap-calc.log:
+    _get_load_manager() built LoadManagerConfig without energy_cache, so
+    NBCReader fell back to a private, never-populated cache. The metrics loop
+    populated _state.energy_cache while the decision loop read the private
+    (always empty) cache and silently held every cycle.
+    """
+
+    @contextlib.contextmanager
+    def _real_mode_config(self):
+        """Configure real (non-mock) mode and reset the LoadManager singleton.
+
+        Mirrors TestApp._real_mode_config so this class is self-contained.
+        """
+        import app as app_mod
+        from config import Config
+
+        cfg = Config()
+        for key, value in {
+            "VUE_USERNAME": "",
+            "VUE_PASSWORD": "",
+            "MOCK": "False",
+            "MOCK_ERROR": "False",
+            "DEBUG": "False",
+            "LOAD_MANAGE_ENABLED": "False",
+            "LOAD_MANAGE_DRY_RUN": "True",
+            "LOAD_PLUG_CONTROLLER": "stub",
+            "LOAD_TESLA_CONTROLLER": "stub",
+        }.items():
+            cfg.set(key, value)
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = None
+        try:
+            yield
+        finally:
+            app_mod._state.load_manager = None
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = None
+
+    @staticmethod
+    def _mid_qh_now() -> datetime:
+        """Return a fake "now" 30 s into the current QH.
+
+        Anchors the pipeline clock just after a QH boundary so that
+        ``fake_now - real_fetch_time`` is always < TTL (cache stays valid)
+        and fetch + decision always land in the same quarter-hour. Real
+        now() would race QH boundaries at 15-minute marks.
+        """
+        from util import floor_to_qh
+
+        return floor_to_qh(datetime.now(timezone.utc)) + timedelta(seconds=30)
+
+    @staticmethod
+    def _aligned_metrics(now: datetime):
+        """Return a metrics dict with QH-aligned data_start and an incomplete QH1."""
+        from util import compute_nbc_quarters, floor_to_qh
+
+        data_start = floor_to_qh(now)
+        # ~4 minutes of per-second data in the current (incomplete) QH.
+        per_second = [-0.0008] * 241
+        return {
+            "api_response": {"total": timedelta(microseconds=750072)},
+            "debug": True,
+            "devices": [
+                {
+                    "gid": 12345,
+                    "lag": timedelta(seconds=2),
+                    "name": "METER",
+                    "minute_predicted": -100.0,
+                    "minutes_remaining": 18.0,
+                    "per_second_data": per_second,
+                    "prediction": -1000.0,
+                    "prediction_min": -1100.0,
+                    "prediction_max": -900.0,
+                    "timezone": "America/Los_Angeles",
+                    "nbc": compute_nbc_quarters(per_second).to_dict(),
+                }
+            ],
+            "instant": now,
+            "data_start": data_start,
+            "_fetched_at": now,
+            "_data_lag_secs": 2.0,
+        }
+
+    def _init_lm_with_lm_enabled(self):
+        """Reset the LoadManager singleton with load management enabled."""
+        import app as app_mod
+        from config import Config
+
+        Config().set("LOAD_MANAGE_ENABLED", "00:00-23:59")
+        Config().set("LOAD_PLUG_SENTINEL", "1234:5:1")
+        Config().set("LOAD_PLUG_JACKERY", "5678:10:1")
+        Config().set("TESLA_CLIENT_ID", "client-id")
+        Config().set("TESLA_CLIENT_SECRET", "client-secret")
+        Config().set("TESLA_REGION", "na")
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = None
+        return app_mod._get_load_manager()
+
+    def test_load_manager_shares_app_energy_cache(self):
+        """The production LoadManager must use the app-level EnergyCache."""
+        import app as app_mod
+
+        with self._real_mode_config():
+            lm = app_mod._get_load_manager()
+            self.assertIsNotNone(lm)
+            self.assertIs(lm.nbc_reader.energy_cache, app_mod._state.energy_cache)
+
+    def test_fetch_cycle_then_decision_cycle_produces_result(self):
+        """fetch_cycle() must populate the cache that run_decision_cycle() reads.
+
+        End-to-end reproduction of the bug: the metrics loop fetched
+        successfully every cycle while the decision loop held forever because
+        it read a different (never-populated) cache.
+        """
+        import app as app_mod
+        from clock import FakeClock
+
+        with self._real_mode_config():
+            lm = self._init_lm_with_lm_enabled()
+            self.assertIsNotNone(lm)
+            now = self._mid_qh_now()
+            lm._clock = FakeClock(now)
+            with patch(
+                "app.create_metrics",
+                side_effect=lambda *args, **kwargs: self._aligned_metrics(now),
+            ):
+                self.assertIsNone(lm.fetch_cycle())
+                decision = lm.run_decision_cycle()
+            self.assertIsNotNone(decision)
+            self.assertIn(decision.status, ("ok", "dry-run"))
+            self.assertIsNotNone(decision.diagnostics.gap_wh)
+
+    def test_fetch_cycle_refetches_each_cycle(self):
+        """fetch_cycle() must refresh API data every cycle, not TTL-paced.
+
+        Guards the always-force fetch in _stage_nbc_fetch: with the shared
+        cache wired but the force removed, the second fetch_cycle() would
+        cache-hit and skip the fetch, letting data age toward the stale-data
+        threshold (the 30 s fetch cadence must be preserved).
+        """
+        import app as app_mod
+        from clock import FakeClock
+
+        with self._real_mode_config():
+            lm = self._init_lm_with_lm_enabled()
+            self.assertIsNotNone(lm)
+            now = self._mid_qh_now()
+            lm._clock = FakeClock(now)
+            with patch(
+                "app.create_metrics",
+                side_effect=lambda *args, **kwargs: self._aligned_metrics(now),
+            ) as mock_create:
+                self.assertIsNone(lm.fetch_cycle())
+                self.assertIsNone(lm.fetch_cycle())
+            self.assertEqual(mock_create.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

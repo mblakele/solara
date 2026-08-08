@@ -21,8 +21,39 @@ from energy_cache import EnergyCache
 from load_controllers import PlugController
 from load_manager import LoadManager, LoadManagerConfig
 from load_models import DeviceState, PendingEffect, PlugConfig
+from util import compute_nbc_quarters
 
 FIXED_NOW = datetime(2026, 5, 7, 15, 20, 30, tzinfo=timezone.utc)
+
+
+def _make_metrics(
+    predicted_wh: float,
+    now: datetime,
+    data_lag_secs: float = 0.0,
+) -> dict:
+    """Build a metrics dict producing the same prediction as the cache.
+
+    _stage_nbc_fetch always forces a fetch (the shared-cache wiring), so
+    the stub metrics_fetch must return real API-shaped metrics: the fetch
+    path runs compute_nbc_quarters just like the cache-read path, and both
+    must extrapolate to ``predicted_wh`` for parity tests.
+    """
+    sample_value = predicted_wh / 900_000.0
+    qh_minute = (now.minute // 15) * 15
+    data_start = now.replace(minute=qh_minute, second=0, microsecond=0)
+    sample_count = max(1, int((now - data_start).total_seconds()))
+    samples = [sample_value] * sample_count
+    return {
+        "devices": [
+            {
+                "name": "main_panel",
+                "nbc": compute_nbc_quarters(samples).to_dict(),
+            }
+        ],
+        "_now": now,
+        "_fetched_at": now,
+        "_data_lag_secs": data_lag_secs,
+    }
 
 
 def _make_energy_cache_with_prediction(
@@ -113,7 +144,7 @@ def _make_plug_manager(
 
     def metrics_fetch() -> dict | None:
         fetch_count.append(1)
-        return None
+        return _make_metrics(predicted_wh, now, data_lag_secs)
 
     mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
@@ -284,8 +315,9 @@ def test_fast_cycle_parity_with_run_cycle():
     """run_decision_cycle matches run_cycle actions on identical inputs.
 
     With a valid cache and no pending effects, both paths run the same
-    decision stages on the same prediction; run_cycle(force=False) reads
-    the cache via the same cache-hit branch (get_current_qh_cached).
+    decision stages on the same prediction; run_cycle(force=False) always
+    fetches via metrics_fetch (the shared-cache wiring forces every fetch
+    stage), while run_decision_cycle reads the cache via get_current_qh_cached.
     """
     now = FIXED_NOW
     mgr_a, _plug_ctrl, _fetch_a = _make_plug_manager(now, predicted_wh=-2000.0)
@@ -526,7 +558,8 @@ def test_run_cycle_async_phase_timeout_returns_early_exit():
     assert result is not None
     assert result.status == "async_phase_timeout"
     assert elapsed < 2.0, f"run_cycle async phase must be timeboxed, took {elapsed:.1f}s"
-    _assert_never_fetched(fetch_count)
+    # run_cycle fetches exactly once (stage 2 always forces a fetch).
+    assert fetch_count == [1]
 
 
 @patch("load_manager.ASYNC_PHASE_TIMEOUT_SECS", 0.2)
@@ -570,9 +603,10 @@ def test_fetch_cycle_not_stalled_by_stuck_decision():
     assert elapsed < 2.0, (
         f"fetch_cycle stalled {elapsed:.1f}s behind a hung async phase"
     )
-    assert fetch_result is None, "cache hit — fetch must succeed without stalling"
+    assert fetch_result is None, "fetch must succeed without stalling"
     assert results["decision"].status == "async_phase_timeout"
-    _assert_never_fetched(fetch_count)
+    # The decision cycle never fetches; only fetch_cycle's stage 2 did.
+    assert fetch_count == [1]
 
 
 def test_fast_cycle_holds_on_insufficient_samples():
