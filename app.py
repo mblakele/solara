@@ -547,6 +547,7 @@ def _get_load_manager():
                         metrics_fetch=metrics_fetch,
                         config_interval_secs=_config.load_manage_interval_secs,
                         telegram_sender=telegram_sender,
+                        energy_cache=_state.energy_cache,
                     ),
                 )
                 logger.info("LoadManager initialized")

@@ -60,11 +60,19 @@ class TestStageNBCFetch:
         assert ctx.seconds_remaining == 450
         assert ctx.data_point_at == data_point
 
+    @pytest.mark.parametrize("ctx_force", [False, True])
     def test_fetch_passes_force_flag(
-        self, lm: LoadManager, ctx: CycleContext
+        self, lm: LoadManager, ctx: CycleContext, ctx_force: bool
     ):
-        """The force flag from ctx is passed to get_current_qh."""
-        ctx.force = True
+        """_stage_nbc_fetch always fetches fresh data (force=True).
+
+        The LoadManager shares the app-level EnergyCache (see
+        app._get_load_manager), so a TTL-paced read would cache-hit and
+        skip the fetch, letting data age toward the stale-data threshold
+        and breaking the fetch cadence.  The stage must force a refresh on
+        every cycle regardless of ctx.force.
+        """
+        ctx.force = ctx_force
         data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         qh_result = NBCFetchResult(
             qh_name="QH1", predicted_wh=500.0, seconds_remaining=900,
@@ -849,6 +857,101 @@ class TestStageComputeGap:
         # Adjusted_wh should account for the pending effect
         assert ctx.adjusted_wh is not None
         assert ctx.adjusted_wh != ctx.predicted_wh
+
+    def test_effective_settle_resolves_after_confirmation(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """effective_settle_secs resolves from cache quantization after the
+        candidate window is confirmed across two consecutive cycles.
+
+        The shared cache only has quantization data after the first fetch
+        (which happens earlier in the same cycle), so the settle window is
+        resolved lazily; a single-cycle value is treated as an unconfirmed
+        candidate.
+        """
+        ec = lm.nbc_reader.energy_cache
+        ec.quantization_seconds = 120
+        ec.quantization_confidence = 1.0
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.data_point_at = data_point
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        ctx.predicted_wh = 500.0
+        ctx.seconds_remaining = 450
+        # First cycle: candidate seeded, not yet confirmed.
+        lm._stage_compute_gap(ctx)
+        assert lm.state.effective_settle_secs == 30
+        # Second cycle with the same value: confirmed.
+        ctx.data_point_at = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
+        lm._stage_compute_gap(ctx)
+        assert lm.state.effective_settle_secs == 120
+
+    def test_effective_settle_follows_confirmed_change(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A genuine, sustained quantization change moves the settle window."""
+        ec = lm.nbc_reader.energy_cache
+        ec.quantization_seconds = 120
+        ec.quantization_confidence = 1.0
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.data_point_at = data_point
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        ctx.predicted_wh = 500.0
+        ctx.seconds_remaining = 450
+        lm._stage_compute_gap(ctx)
+        lm._stage_compute_gap(ctx)
+        assert lm.state.effective_settle_secs == 120
+
+        # Quantization shifts to 60 and stays: one cycle seeds, next confirms.
+        ec.quantization_seconds = 60
+        ctx.data_point_at = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
+        lm._stage_compute_gap(ctx)
+        assert lm.state.effective_settle_secs == 120
+        ctx.data_point_at = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 1, 30, tzinfo=timezone.utc)
+        lm._stage_compute_gap(ctx)
+        assert lm.state.effective_settle_secs == 60
+
+    def test_effective_settle_ignores_deadband_jitter(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Detector jitter within the dead-band never churns the window."""
+        ec = lm.nbc_reader.energy_cache
+        ec.quantization_seconds = 120
+        ec.quantization_confidence = 1.0
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.data_point_at = data_point
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        ctx.predicted_wh = 500.0
+        ctx.seconds_remaining = 450
+        lm._stage_compute_gap(ctx)
+        lm._stage_compute_gap(ctx)
+        assert lm.state.effective_settle_secs == 120
+
+        # +1 s and -1 s jitter around the confirmed window are ignored.
+        for jittered in (121, 119):
+            ec.quantization_seconds = jittered
+            ctx.data_point_at = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+            ctx.now_postfetch = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
+            lm._stage_compute_gap(ctx)
+            assert lm.state.effective_settle_secs == 120
+
+    def test_effective_settle_ignores_subfloor_quantization(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Sub-floor quantization (e.g. the flat-data N=2 artifact) is ignored."""
+        ec = lm.nbc_reader.energy_cache
+        ec.quantization_seconds = 2
+        ec.quantization_confidence = 1.0
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.data_point_at = data_point
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        ctx.predicted_wh = 500.0
+        ctx.seconds_remaining = 450
+        lm._stage_compute_gap(ctx)
+        lm._stage_compute_gap(ctx)
+        assert lm.state.effective_settle_secs == 30
 
 
 class TestStageEnabledCheck:

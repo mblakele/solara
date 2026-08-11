@@ -1517,5 +1517,131 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         app_mod._state.last_error_type = None
 
 
+class TestLoadManagerSharedCache(unittest.TestCase):
+    """LoadManager shares the app-level EnergyCache (twin-cycles bug fix).
+
+    Before the fix, app._get_load_manager() did not pass
+    energy_cache=_state.energy_cache, so NBCReader built a private,
+    never-populated cache: is_valid() was always False (which masked the
+    force bug) and _resolve_prediction_window() could never see the
+    quantization data that HourlyProjection writes to the shared cache
+    after every fetch.
+    """
+
+    @contextlib.contextmanager
+    def _enabled_real_mode(self):
+        """Real-mode config with load management enabled; reset singletons."""
+        import app as app_mod
+        from config import Config
+
+        cfg = Config()
+        for key, value in {
+            "VUE_USERNAME": "",
+            "VUE_PASSWORD": "",
+            "MOCK": "False",
+            "MOCK_ERROR": "False",
+            "DEBUG": "False",
+            "LOAD_MANAGE_ENABLED": "True",
+            "LOAD_MANAGE_DRY_RUN": "True",
+            "LOAD_PLUG_CONTROLLER": "stub",
+            "LOAD_TESLA_CONTROLLER": "stub",
+            "LOAD_NBC_DEVICE": "METER",
+        }.items():
+            cfg.set(key, value)
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = None
+        try:
+            yield
+        finally:
+            app_mod._state.load_manager = None
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = None
+
+    @staticmethod
+    def _realistic_metrics():
+        """Return a metrics dict shaped like real-mode HourlyProjection.metrics."""
+        from mockdata import _generate_hour_seconds
+        from util import compute_nbc_quarters
+
+        now = datetime.now(timezone.utc)
+        per_second = _generate_hour_seconds(12345, 42, sign=-1.0)
+        return {
+            "api_response": {"total": timedelta(microseconds=750072)},
+            "debug": True,
+            "devices": [
+                {
+                    "gid": 12345,
+                    "lag": timedelta(seconds=2),
+                    "name": "METER",
+                    "minute_predicted": -100.0,
+                    "minutes_remaining": 18.0,
+                    "per_second_data": per_second,
+                    "prediction": -1000.0,
+                    "prediction_min": -1100.0,
+                    "prediction_max": -900.0,
+                    "timezone": "America/Los_Angeles",
+                    "nbc": compute_nbc_quarters(per_second).to_dict(),
+                }
+            ],
+            "instant": now,
+            "data_start": now.replace(second=0, microsecond=0) - timedelta(minutes=42),
+            "_fetched_at": now,
+            "_data_lag_secs": 2.0,
+        }
+
+    def test_reader_uses_app_energy_cache(self):
+        """NBCReader reads from the shared app-level EnergyCache, not a private one."""
+        import app as app_mod
+
+        with self._enabled_real_mode():
+            lm = app_mod._get_load_manager()
+            self.assertIsNotNone(lm)
+            self.assertIs(
+                lm.nbc_reader.energy_cache,
+                app_mod._state.energy_cache,
+            )
+
+    def test_quantization_on_shared_cache_feeds_prediction_window(self):
+        """Prediction window resolves from quantization on the shared cache.
+
+        HourlyProjection writes quantization data to the shared cache after
+        every fetch; the LoadManager must see it (via its reader's shared
+        cache) when resolving the prediction window.  The settle-window
+        side of this chain (effective_settle_secs) is covered by
+        TestStageComputeGap in tests/test_pipeline_stages.py, since it
+        resolves lazily on the first cycle.
+        """
+        import app as app_mod
+
+        with self._enabled_real_mode():
+            app_mod._state.energy_cache.quantization_seconds = 120
+            app_mod._state.energy_cache.quantization_confidence = 1.0
+            lm = app_mod._get_load_manager()
+            self.assertIsNotNone(lm)
+            self.assertEqual(lm._resolve_prediction_window(), 120)
+
+    def test_run_cycle_refetches_every_cycle(self):
+        """Every run_cycle fetches fresh NBC data (no cache-hit skipping).
+
+        Regression guard for the force=True path: with the shared cache, a
+        TTL-paced read would cache-hit and skip the fetch, letting data age
+        toward the stale-data threshold and breaking the fetch cadence.
+        """
+        import app as app_mod
+
+        with self._enabled_real_mode():
+            with patch(
+                "app.create_metrics",
+                return_value=self._realistic_metrics(),
+            ) as mock_metrics:
+                lm = app_mod._get_load_manager()
+                self.assertIsNotNone(lm)
+                result = lm.run_cycle()
+                self.assertNotEqual(result.status, "disabled")
+                lm.run_cycle()
+                self.assertEqual(mock_metrics.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

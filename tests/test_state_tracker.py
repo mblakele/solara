@@ -626,6 +626,53 @@ class TestEffectiveSettleSecs:
         assert tracker.effective_settle_secs == 10
 
 
+class TestApplyPredictionWindow:
+    """Tests for StateTracker.apply_prediction_window() hysteresis.
+
+    A candidate window is committed only when the same value appears on two
+    consecutive calls; values within the dead-band of the committed window
+    are treated as detector jitter and never even seed a candidate.
+    """
+
+    def test_commits_after_two_consecutive_calls(self) -> None:
+        """A candidate window commits only after two consecutive calls."""
+        tracker = StateTracker(prediction_window_seconds=30)
+        tracker.apply_prediction_window(120)
+        assert tracker.effective_settle_secs == 30  # candidate, not committed
+        tracker.apply_prediction_window(120)
+        assert tracker.effective_settle_secs == 120
+
+    def test_interleaved_values_never_commit(self) -> None:
+        """Alternating candidates never accumulate confirmations."""
+        tracker = StateTracker(prediction_window_seconds=30)
+        tracker.apply_prediction_window(120)
+        tracker.apply_prediction_window(60)
+        tracker.apply_prediction_window(120)
+        tracker.apply_prediction_window(60)
+        assert tracker.effective_settle_secs == 30
+
+    def test_deadband_jitter_around_committed_window_ignored(self) -> None:
+        """±1 s detector jitter never churns the committed window."""
+        tracker = StateTracker(prediction_window_seconds=30)
+        tracker.apply_prediction_window(120)
+        tracker.apply_prediction_window(120)
+        assert tracker.effective_settle_secs == 120
+        tracker.apply_prediction_window(121)
+        assert tracker.effective_settle_secs == 120
+        tracker.apply_prediction_window(119)
+        assert tracker.effective_settle_secs == 120
+
+    def test_committed_window_can_shrink_back_toward_default(self) -> None:
+        """When quantization disappears, the window reverts toward default."""
+        tracker = StateTracker(prediction_window_seconds=30)
+        tracker.apply_prediction_window(120)
+        tracker.apply_prediction_window(120)
+        assert tracker.effective_settle_secs == 120
+        tracker.apply_prediction_window(30)
+        tracker.apply_prediction_window(30)
+        assert tracker.effective_settle_secs == 30
+
+
 class TestSyncTeslaDeviceState:
     """Tests for StateTracker.sync_tesla_device_state()."""
 

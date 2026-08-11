@@ -29,6 +29,7 @@ from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
+    MIN_QUANTIZATION_WINDOW_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
     QUANTIZATION_CONFIDENCE_THRESHOLD,
     STALE_DATA_THRESHOLD_SECS,
@@ -383,9 +384,12 @@ class LoadManager:
         """Return the prediction window in seconds, derived from EnergyCache quantization.
 
         When the energy cache has quantization data with confidence at or
-        above ``QUANTIZATION_CONFIDENCE_THRESHOLD``, returns
-        ``quantization_seconds``.  Otherwise falls back to 60 seconds
-        (the classic default pre-quantization prediction window).
+        above ``QUANTIZATION_CONFIDENCE_THRESHOLD`` and a period at or
+        above ``MIN_QUANTIZATION_WINDOW_SECS``, returns
+        ``quantization_seconds``.  Shorter periods are almost always
+        detection artifacts (e.g. the flat-data N=2 case), so they fall
+        back to ``DEFAULT_PREDICTION_WINDOW_SECS`` (30 seconds, the
+        classic default pre-quantization prediction window).
 
         Safe to call before ``nbc_reader`` is initialized (returns default), and
         when ``nbc_reader`` is replaced with a mock that doesn't expose
@@ -401,7 +405,12 @@ class LoadManager:
         if ec is not None and ec.data is not None:
             qs = ec.quantization_seconds
             qc = ec.quantization_confidence
-            if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
+            if (
+                qs is not None
+                and qs >= MIN_QUANTIZATION_WINDOW_SECS
+                and qc is not None
+                and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD
+            ):
                 return qs
         return DEFAULT_PREDICTION_WINDOW_SECS
 
@@ -469,7 +478,11 @@ class LoadManager:
     ) -> CycleResult | None:
         """Stage 2: Fetch NBC data for the current quarter-hour.
 
-        Calls get_current_qh on the NBC reader. If the fetch returns None
+        Calls get_current_qh on the NBC reader. Always fetches fresh data
+        (force=True) regardless of ctx.force: the reader shares the
+        app-level EnergyCache whose TTL outlives the 30 s cycle, so a
+        TTL-paced read would cache-hit and skip the fetch, letting data
+        age toward the stale-data threshold. If the fetch returns None
         (no incomplete quarter-hour), returns CycleResult(status='no_incomplete_qh').
         If samples_used < MIN_SAMPLES_FOR_PREDICTION, returns early with a short
         sleep hint instead of acting on unreliable data.  Otherwise populates
@@ -477,7 +490,7 @@ class LoadManager:
         and ctx.now_postfetch, then returns None.
         """
         fetch_start = _time_mod.perf_counter()
-        qh_result = self.nbc_reader.get_current_qh(force=ctx.force, now=ctx.now)
+        qh_result = self.nbc_reader.get_current_qh(force=True, now=ctx.now)
         if qh_result is None:
             return CycleResult(
                 status="no_incomplete_qh",
@@ -529,6 +542,10 @@ class LoadManager:
         gap_wh (target - adjusted). Mutates ctx in place. Always returns
         None (continue pipeline).
         """
+        # Resolve the prediction/settle window now that this cycle's fetch
+        # has populated the shared energy cache with quantization data
+        # (first resolution wins for the session).
+        self.state.apply_prediction_window(self._resolve_prediction_window())
         data_point_at = ctx.data_point_at
         now_postfetch = ctx.now_postfetch
         predicted_wh = ctx.predicted_wh

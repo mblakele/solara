@@ -46,6 +46,26 @@ DEFAULT_PREDICTION_WINDOW_SECS: int = 30
 """Fallback prediction window in seconds when no quantization data is
 available (previously hardcoded as 60)."""
 
+MIN_QUANTIZATION_WINDOW_SECS: int = 15
+"""Minimum detected quantization period (seconds) accepted for the
+prediction/settle window mapping.
+
+Shorter detections are almost always artifacts — e.g. the flat-data
+case where ``detect_quantization`` reports N=2 with confidence 1.0 for
+an all-identical array — so they fall back to
+``DEFAULT_PREDICTION_WINDOW_SECS`` instead of collapsing the settle
+window to a nonsense value.
+"""
+
+SETTLE_WINDOW_DEADBAND_SECS: int = 5
+"""Minimal |candidate - committed| difference (seconds) for a candidate
+settle window to be considered a real change.
+
+Detector jitter typically reports the true period ±1 s (e.g. 29/30/31
+around 30 s); values inside this dead-band are treated as noise and
+never seed a change candidate.  Used by
+``StateTracker.apply_prediction_window``."""
+
 MIN_SAMPLES_FOR_PREDICTION: int = 5
 """Minimum per-second samples in the current QH required to produce a
 reliable NBC prediction.  Below this threshold the pipeline returns

@@ -211,6 +211,21 @@ project-root
 - Pipeline orchestration in `load_manager.py` (`_stage_enabled_check`, `_stage_nbc_fetch`,
   `_stage_pending_check`, `_stage_compute_gap`, `_stage_async_phase`, `_stage_commit`,
   `_stage_build_result`) — each independently testable
+- `_stage_nbc_fetch` in `load_manager.py` — always fetches fresh NBC data
+  (`get_current_qh(force=True, ...)` regardless of `ctx.force`). The NBC reader shares the
+  app-level `EnergyCache` (wired in `app._get_load_manager()`), whose TTL outlives the
+  30 s cycle; a TTL-paced read would cache-hit and skip the fetch, letting data age toward
+  the stale-data threshold. The reader's fast path (`get_current_qh` with `force=False`)
+  remains for other callers (e.g. `metrics.py`)
+- `_resolve_prediction_window()` / `StateTracker.apply_prediction_window()` — the
+  prediction/settle window is adaptive: it resolves lazily from shared-cache
+  quantization (quantization data only exists after the first fetch of a cycle) and
+  tracks sustained meter-behavior changes. A new window is committed only after two
+  consecutive `_stage_compute_gap` calls, and detections within
+  `SETTLE_WINDOW_DEADBAND_SECS` (5 s) of the committed window are treated as detector
+  jitter (e.g. 29/30/31 s around a true 30 s period). Periods below
+  `MIN_QUANTIZATION_WINDOW_SECS` (15 s) — e.g. the flat-data N=2 artifact — are
+  rejected by `_resolve_prediction_window` and fall back to the default
 - `_fetch_tesla_state_async()` in `load_manager.py` — fetches Tesla state from MQTT
   telemetry with a fast path; returns telemetry state as long as `ChargeAmts` is present
   (does NOT require `Location`). Preserves `at_home` from `_last_tesla_at_home` when
@@ -302,10 +317,13 @@ project-root
   - `has_pending_effect_since()`: checks if any action was taken after given timestamp
   - `pending_since_count()`: counts effects after a given timestamp (for diagnostics)
   - `prune_old_effects()`: removes effects older than cutoff to prevent unbounded growth
+  - `apply_prediction_window()`: resolves the prediction/settle window from shared-cache
+    quantization; commits a new window only after two consecutive cycles and ignores
+    dead-band jitter (see `_resolve_prediction_window`)
 - DeviceState dataclass tracks per-device runtime state
 - Stale detection uses **data-point age** (not fetch time): `data_point_at = fetched_at - timedelta(seconds=data_lag_secs)`.
-  The threshold is 120 seconds from the most recent per-second data point, accounting for
-  Emporia API lag. Min toggle interval: 60 seconds.
+  The threshold is `STALE_DATA_THRESHOLD_SECS` (80 seconds, constants.py) from the most
+  recent per-second data point, accounting for Emporia API lag. Min toggle interval: 60 seconds.
 
 ### Telegram Notifications
 - `TelegramConfig` (telegram_client.py) — frozen config dataclass with bot_token and chat_id
