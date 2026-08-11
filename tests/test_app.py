@@ -348,6 +348,55 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         self.assertTrue(data["enabled"])
         self.assertEqual(data["targetWh"], -500)
 
+    def test_load_status_includes_quantization_diagnostics(self):
+        """GET /load/status diagnostics carry the current quantization state."""
+        from load_models import CycleDiagnostics, CycleResult
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_state = unittest.mock.MagicMock()
+        mock_state.devices = {}
+        mock_state.pending_effects = []
+        mock_lm.state = mock_state
+
+        import app as app_mod
+
+        app_mod._state.last_cycle_result = CycleResult(
+            status="ok",
+            qh="QH1",
+            predicted_wh=-800.0,
+            adjusted_wh=-750.0,
+            target_wh=-500,
+            actions=[],
+            diagnostics=CycleDiagnostics(
+                gap_wh=-300.0,
+                hysteresis_wh=50,
+                seconds_remaining=45,
+                data_point_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                reason="ok",
+                pending_effects_count=0,
+                tesla_configured=False,
+                quantization_seconds=60,
+                quantization_offset=5,
+                quantization_confidence=0.9,
+                settle_window_secs=60,
+            ),
+            sleep_hint=30.0,
+            sleep_hint_at="2026-01-01T12:00:00+00:00",
+        )
+
+        with patch("app._get_load_manager", return_value=mock_lm):
+            response = self.app.get("/api/v1/load/status")
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        diag = data["lastCycleResult"]["diagnostics"]
+        self.assertEqual(diag["quantizationSeconds"], 60)
+        self.assertEqual(diag["quantizationOffset"], 5)
+        self.assertEqual(diag["quantizationConfidence"], 0.9)
+        self.assertEqual(diag["settleWindowSecs"], 60)
+
     def test_index_html_includes_sleep_hint_meta(self):
         """Index HTML includes a meta tag with the sleep_hint value for JS."""
         from config import Config

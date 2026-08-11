@@ -226,6 +226,15 @@ project-root
   jitter (e.g. 29/30/31 s around a true 30 s period). Periods below
   `MIN_QUANTIZATION_WINDOW_SECS` (15 s) — e.g. the flat-data N=2 artifact — are
   rejected by `_resolve_prediction_window` and fall back to the default
+- `_quantization_diagnostics()` in `load_manager.py` — snapshots the current
+  quantization state (from the shared `EnergyCache`, refreshed every fetch) plus the
+  derived settle window (`StateTracker.effective_settle_secs`); every
+  `CycleDiagnostics` construction site folds this in, so each cycle result exposes
+  `quantization_seconds`/`quantization_offset`/`quantization_confidence`/
+  `settle_window_secs` in the DEBUG cycle-result log (default dataclass repr at
+  `app.py` `_load_management_loop`) and the JSON/SSE payloads
+  (`/api/v1/load/status`, index, SSE `load_cycle`). None-guarded for stub
+  `nbc_reader`s that lack `energy_cache`
 - `_fetch_tesla_state_async()` in `load_manager.py` — fetches Tesla state from MQTT
   telemetry with a fast path; returns telemetry state as long as `ChargeAmts` is present
   (does NOT require `Location`). Preserves `at_home` from `_last_tesla_at_home` when

@@ -134,6 +134,69 @@ class TestCycleDiagnostics(unittest.TestCase):
         # Should not raise
         json.dumps(diag.to_dict())
 
+    def test_quantization_fields_default_none(self):
+        """Quantization fields default to None."""
+        diag = CycleDiagnostics(
+            gap_wh=-300.0,
+            hysteresis_wh=50,
+            reason="ok",
+        )
+        self.assertIsNone(diag.quantization_seconds)
+        self.assertIsNone(diag.quantization_offset)
+        self.assertIsNone(diag.quantization_confidence)
+        self.assertIsNone(diag.settle_window_secs)
+
+    def test_quantization_fields_populated(self):
+        """CycleDiagnostics can hold the current quantization state."""
+        diag = CycleDiagnostics(
+            gap_wh=-300.0,
+            hysteresis_wh=50,
+            reason="ok",
+            quantization_seconds=60,
+            quantization_offset=5,
+            quantization_confidence=0.9,
+            settle_window_secs=60,
+        )
+        self.assertEqual(diag.quantization_seconds, 60)
+        self.assertEqual(diag.quantization_offset, 5)
+        self.assertEqual(diag.quantization_confidence, 0.9)
+        self.assertEqual(diag.settle_window_secs, 60)
+
+    def test_to_dict_includes_quantization_fields(self):
+        """to_dict() includes the quantization fields (None-preserving)."""
+        diag = CycleDiagnostics(
+            gap_wh=-300.0,
+            hysteresis_wh=50,
+            reason="ok",
+        )
+        d = diag.to_dict()
+        self.assertEqual(d["quantization_seconds"], None)
+        self.assertEqual(d["quantization_offset"], None)
+        self.assertEqual(d["quantization_confidence"], None)
+        self.assertEqual(d["settle_window_secs"], None)
+
+    def test_repr_includes_quantization_fields(self):
+        """repr() surfaces quantization fields (the DEBUG cycle-result log).
+
+        app.py logs the full CycleResult via ``%s`` (default dataclass repr)
+        after every run_cycle(), so the quantization snapshot must appear in
+        the repr for that observability channel.
+        """
+        diag = CycleDiagnostics(
+            gap_wh=-300.0,
+            hysteresis_wh=50,
+            reason="ok",
+            quantization_seconds=60,
+            quantization_offset=5,
+            quantization_confidence=0.9,
+            settle_window_secs=60,
+        )
+        r = repr(diag)
+        self.assertIn("quantization_seconds=60", r)
+        self.assertIn("quantization_offset=5", r)
+        self.assertIn("quantization_confidence=0.9", r)
+        self.assertIn("settle_window_secs=60", r)
+
 
 class TestCandidateDetailPlug(unittest.TestCase):
     """Tests for CandidateDetailPlug dataclass."""

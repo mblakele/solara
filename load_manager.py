@@ -414,6 +414,39 @@ class LoadManager:
                 return qs
         return DEFAULT_PREDICTION_WINDOW_SECS
 
+    def _quantization_diagnostics(self) -> dict[str, Any]:
+        """Snapshot of the current quantization state for cycle diagnostics.
+
+        Reads the detected quantization from the shared EnergyCache
+        (refreshed on every fetch) and the derived settle window from the
+        StateTracker, so every CycleDiagnostics construction site can fold
+        the same snapshot into the cycle result.  This exposes how the
+        meter's reporting behavior shapes the prediction window in the
+        DEBUG cycle-result log and the JSON/SSE payloads.
+
+        Returns:
+            Dict with ``quantization_seconds``, ``quantization_offset``,
+            ``quantization_confidence`` and ``settle_window_secs`` keys;
+            values are None when unavailable (the settle window always has
+            the committed default).
+        """
+        nbc = getattr(self, 'nbc_reader', None)
+        ec = getattr(nbc, 'energy_cache', None)
+        if ec is not None:
+            quantization_seconds = ec.quantization_seconds
+            quantization_offset = ec.quantization_offset
+            quantization_confidence = ec.quantization_confidence
+        else:
+            quantization_seconds = None
+            quantization_offset = None
+            quantization_confidence = None
+        return {
+            "quantization_seconds": quantization_seconds,
+            "quantization_offset": quantization_offset,
+            "quantization_confidence": quantization_confidence,
+            "settle_window_secs": self.state.effective_settle_secs,
+        }
+
     def is_enabled_at(self, now: datetime) -> bool:
         """Check if load management is enabled at the given moment.
 
@@ -468,6 +501,7 @@ class LoadManager:
                 tesla_state=None,
                 tesla_error=None,
                 plugs_configured=list(self.plugs.keys()),
+                **self._quantization_diagnostics(),
             ),
             sleep_hint=self.config_interval_secs,
             sleep_hint_at=ctx.now.isoformat(),
@@ -504,6 +538,7 @@ class LoadManager:
                     tesla_state=None,
                     tesla_error=None,
                     plugs_configured=list(self.plugs.keys()),
+                    **self._quantization_diagnostics(),
                 ),
                 sleep_hint=DEFAULT_SLEEP_HINT_SECS,
                 sleep_hint_at=ctx.now.isoformat(),
@@ -522,6 +557,7 @@ class LoadManager:
                     tesla_state=None,
                     tesla_error=None,
                     plugs_configured=list(self.plugs.keys()),
+                    **self._quantization_diagnostics(),
                 ),
                 sleep_hint=DEFAULT_SLEEP_HINT_SECS,
                 sleep_hint_at=ctx.now.isoformat(),
@@ -589,6 +625,7 @@ class LoadManager:
                     plugs_configured=list(self.plugs.keys()),
                     sentinel_names=list(self.sentinel_names),
                     sentinel_on=True,
+                    **self._quantization_diagnostics(),
                 ),
                 sleep_hint=self.config_interval_secs,
                 sleep_hint_at=ctx.now_postfetch.isoformat() if ctx.now_postfetch else "",
@@ -667,6 +704,7 @@ class LoadManager:
                     plugs_configured=list(self.plugs.keys()),
                     sentinel_names=list(self.sentinel_names),
                     sentinel_on=sentinel_on,
+                    **self._quantization_diagnostics(),
                 ),
                 sleep_hint=self.config_interval_secs,
                 sleep_hint_at=now_postfetch.isoformat(),
@@ -733,6 +771,7 @@ class LoadManager:
                 telemetry_registered=has_telemetry(),
                 active_tesla_telemetry=active_telemetry,
                 tesla_command_offline=self._vehicle_offline_this_cycle,
+                **self._quantization_diagnostics(),
             ),
             sleep_hint=(
                 DEFAULT_SLEEP_HINT_SECS
@@ -822,6 +861,7 @@ class LoadManager:
                     tesla_state=None,
                     tesla_error=None,
                     plugs_configured=plugs_configured,
+                    **self._quantization_diagnostics(),
                 ),
                 sleep_hint=DEFAULT_SLEEP_HINT_SECS,
                 sleep_hint_at=now_postfetch.isoformat(),
@@ -838,6 +878,7 @@ class LoadManager:
             "tesla_state": None,
             "tesla_error": None,
             "plugs_configured": plugs_configured,
+            **self._quantization_diagnostics(),
         }
         if now_postfetch - data_point_at > timedelta(seconds=STALE_DATA_THRESHOLD_SECS):
             pruned = self.state.prune_old_effects(data_point_at, now_postfetch)

@@ -365,6 +365,41 @@ class TestStageBuildResult:
         assert result is not None
         assert len(result.actions) == 1
 
+    def test_includes_quantization_diagnostics(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """_stage_build_result diagnostics carry the current quantization state.
+
+        The quantization snapshot is read from the shared EnergyCache and
+        the derived settle window from StateTracker, so the cycle result
+        (and the DEBUG repr logged by app.py) exposes how the meter's
+        reporting behavior shapes the prediction window.
+        """
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = -100.0
+        ctx.seconds_remaining = 450
+        ctx.now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        ec = lm.nbc_reader.energy_cache
+        ec.quantization_seconds = 60
+        ec.quantization_offset = 5
+        ec.quantization_confidence = 0.9
+        # Commit a 60 s settle window via the two-cycle confirmation path.
+        lm.state.apply_prediction_window(60)
+        lm.state.apply_prediction_window(60)
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.quantization_seconds == 60
+        assert result.diagnostics.quantization_offset == 5
+        assert result.diagnostics.quantization_confidence == 0.9
+        assert result.diagnostics.settle_window_secs == 60
+
 
 class TestStageAsyncPhase:
     """_stage_async_phase() — Stage 5 of the pipeline.
@@ -993,6 +1028,28 @@ class TestStageEnabledCheck:
         assert result is not None
         assert result.status == "disabled"
         assert result.diagnostics is not None
+
+    def test_disabled_includes_quantization_diagnostics(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Disabled-path diagnostics carry the current quantization state.
+
+        Early-exit results surface the same quantization snapshot as the
+        success path, so the DEBUG cycle-result log shows meter behavior
+        even when no decisions are made.
+        """
+        lm.enabled = False
+        ec = lm.nbc_reader.energy_cache
+        ec.quantization_seconds = 30
+        ec.quantization_offset = 2
+        ec.quantization_confidence = 0.92
+        result = lm._stage_enabled_check(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.quantization_seconds == 30
+        assert result.diagnostics.quantization_offset == 2
+        assert result.diagnostics.quantization_confidence == 0.92
+        assert result.diagnostics.settle_window_secs == lm.state.effective_settle_secs
 
 
 # --- Tesla action execution clamping tests ---
