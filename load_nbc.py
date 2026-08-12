@@ -20,6 +20,7 @@ from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTele
 
 from constants import (
     DEFAULT_PREDICTION_WINDOW_SECS,
+    MIN_SECONDS_TO_ACT,
     SETTLE_WINDOW_DEADBAND_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
@@ -876,7 +877,6 @@ class GapMinder:
     """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
-    MIN_SECONDS_TO_ACT = 31
     CAR_POWER_WATTS_5A = TESLA_CHARGE_AMPS_MIN_DEFAULT * TESLA_NOMINAL_VOLTAGE
     """1200W at Tesla's minimum charge rate (5A * 240V)."""
     MAX_DEFER_SECS = 120          # cap on the safe defer window
@@ -992,7 +992,7 @@ class GapMinder:
             List of PendingEffect objects.
         """
         actions: list[PendingEffect] = []
-        if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
+        if ctx.seconds_remaining < MIN_SECONDS_TO_ACT:
             logger.debug(
                 "[_decide_turn_on] skipped (too little time: %d sec)",
                 ctx.seconds_remaining,
@@ -1270,10 +1270,10 @@ class GapMinder:
                 ctx.requires_home_check,
             )
             return None
-        if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
+        if ctx.seconds_remaining < MIN_SECONDS_TO_ACT:
             logger.debug(
                 "[_decide_tesla_amps] skipped: too little time (%d s < %d s)",
-                ctx.seconds_remaining, self.MIN_SECONDS_TO_ACT,
+                ctx.seconds_remaining, MIN_SECONDS_TO_ACT,
             )
             return None
 

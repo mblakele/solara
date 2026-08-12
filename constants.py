@@ -23,6 +23,11 @@ DEFAULT_TARGET_WH: int = -50
 HYSTERESIS_PROPORTION: float = 1.0 / 3.0
 """Hysteresis Wh is abs(target_wh) * this proportion."""
 
+MIN_SECONDS_TO_ACT: int = 21
+"""Minimum seconds remaining in a quarter-hour before the GapMinder will
+allow turn-on or Tesla amp changes.  Prevents actions too close to the
+QH boundary where the device would run into the next quarter-hour."""
+
 # ── Sleep / cycle timing ─────────────────────────────────────────────
 
 SLEEP_PROPORTION: float = 0.0833
