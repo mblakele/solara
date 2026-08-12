@@ -183,7 +183,7 @@ project-root
 ├── env.example            # Template for required environment variables
 ├── tests/                 # All pytest tests
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages)
-├── docs/                  # Supplementary documentation (e.g., LOADMANAGER.md, SSE_STREAMING.md)
+├── docs/                  # Supplementary documentation (e.g., LOADMANAGER.md, SSE_STREAMING.md, architecture.md)
 ├── devices.json           # Local device configuration — never commit
 ├── .env                   # Local secrets — never commit
 ├── .tesla-callback-config # Tesla callback registration config (client_id, registration_url)
