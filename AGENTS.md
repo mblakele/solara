@@ -19,7 +19,9 @@ Write tests first, then diagnose and fix bugs.
 
 Always invoke tools using structured function-calling JSON (not inline XML or markdown text).
 
-Never try to work around permission errors.
+When calling `todowrite`, emit todos as a raw JSON array (not a stringified array).
+
+Never try to work around permission errors. Stop and ask for help.
 
 ### Editing
 
