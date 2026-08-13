@@ -956,6 +956,50 @@ class TestFetchChannelDataErrors(unittest.TestCase):
         self.assertEqual(data_start, chart_start)
         self.assertEqual(channel_num, 4)
 
+    def test_fetch_channel_data_records_true_call_duration(self):
+        """api_response records the get_chart_usage call duration, not window age.
+
+        The per-channel api_response entry used to record
+        ``_CLOCK.now() - chart_start`` — the wall-clock age of the chart
+        window — which is unrelated to how long the API call actually took
+        and grows with QH position.  It must instead record the elapsed
+        time of the get_chart_usage call itself.
+        """
+        hp = HourlyProjection.__new__(HourlyProjection)
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+        hp.instant = now.replace(minute=30)
+        hp.vue = MagicMock()
+        hp.logger = MagicMock()
+        hp.metrics = {"api_response": {}}
+
+        chart_start = now.replace(minute=0)  # QH-aligned
+        # Clock starts 30 minutes into the QH so the old window-age
+        # implementation (now - chart_start) yields a wildly different value.
+        fake_clock = FakeClock(now)
+        old_clock = metrics._CLOCK
+        metrics.set_clock(fake_clock)
+        self.addCleanup(metrics.set_clock, old_clock)
+
+        def _slow_get_chart_usage(_channel, _start, _end, **_kwargs):
+            fake_clock.advance(1)  # simulate a 1s API round trip
+            return ([0.1] * 60, chart_start)
+
+        hp.vue.get_chart_usage.side_effect = _slow_get_chart_usage
+
+        chan_mock = MagicMock()
+        chan_mock.channel_num = 7
+
+        usage, data_start, channel_num = hp._fetch_channel_data(
+            chan_mock, chart_start, now
+        )
+        self.assertEqual(usage, [0.1] * 60)
+        self.assertEqual(data_start, chart_start)
+        self.assertEqual(channel_num, 7)
+
+        recorded = hp.metrics["api_response"]["get_chart_usage/7"]
+        self.assertEqual(recorded, timedelta(seconds=1))
+
 
 class TestDriftRejectionObservability(unittest.TestCase):
     """Persistent head-of-window drift becomes observable after N rejections.
