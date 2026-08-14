@@ -109,7 +109,6 @@ Key capabilities:
 | `flask` | Web framework for routing, templating, and JSON responses |
 | `pytz` | Timezone conversion for displaying timestamps in device-local time |
 | `isodate` | Serializes Python `timedelta` objects to ISO 8601 duration strings |
-| `humps` | Case conversion utilities (camelCase ↔ snake_case) for API data |
 | `requests` | HTTP client used internally by `pyemvue` for API calls |
 
 ### Key Environment Variables
