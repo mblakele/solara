@@ -511,7 +511,7 @@ class TestEdgeCasesWithContext:
         }
         ctx = DecideContext(
             now=near_end,
-            seconds_remaining=21,
+            seconds_remaining=20,
             state=state,
             plugs=plugs,
             tesla=None,

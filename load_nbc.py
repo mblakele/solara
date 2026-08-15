@@ -20,6 +20,8 @@ from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTele
 
 from constants import (
     DEFAULT_PREDICTION_WINDOW_SECS,
+    MIN_SECONDS_TO_ACT,
+    SETTLE_WINDOW_DEADBAND_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
     TESLA_HARD_MAX_AMPS,
@@ -394,6 +396,10 @@ class StateTracker:
 
     def __init__(self, prediction_window_seconds: int = DEFAULT_PREDICTION_WINDOW_SECS) -> None:
         self._pending_effect_min_secs = prediction_window_seconds
+        # Adaptive settle window: a candidate is committed only after it is
+        # observed on two consecutive cycles (see apply_prediction_window).
+        self._window_candidate: int | None = None
+        self._window_candidate_confirmations = 0
         self.devices: dict[str, DeviceState] = {}
         self.pending_effects: list[PendingEffect] = []
         self.last_data_point_at: datetime | None = None
@@ -404,6 +410,40 @@ class StateTracker:
         self.has_fresh_telemetry: bool = False
         # Whether fleet-telemetry push has been registered via the callback API.
         self.registered: bool = False
+
+    def apply_prediction_window(self, prediction_window_seconds: int) -> None:
+        """Resolve the prediction/settle window from quantization data.
+
+        The window is adaptive: a new value is committed only when it is
+        observed on two consecutive calls (one call per cycle, from
+        ``_stage_compute_gap``).  Values within
+        ``SETTLE_WINDOW_DEADBAND_SECS`` of the committed window are treated
+        as detector jitter and never seed a candidate.  This keeps the
+        settle window stable under ±1 s quantization jitter while still
+        tracking genuine, sustained meter-behavior changes.
+
+        Args:
+            prediction_window_seconds: Prediction window in seconds.
+        """
+        committed = self._pending_effect_min_secs
+        if prediction_window_seconds == committed:
+            self._window_candidate = None
+            self._window_candidate_confirmations = 0
+            return
+        if abs(prediction_window_seconds - committed) < SETTLE_WINDOW_DEADBAND_SECS:
+            # Jitter around the committed window — reset any in-flight candidate.
+            self._window_candidate = None
+            self._window_candidate_confirmations = 0
+            return
+        if self._window_candidate == prediction_window_seconds:
+            self._window_candidate_confirmations += 1
+            if self._window_candidate_confirmations >= 2:
+                self._pending_effect_min_secs = prediction_window_seconds
+                self._window_candidate = None
+                self._window_candidate_confirmations = 0
+        else:
+            self._window_candidate = prediction_window_seconds
+            self._window_candidate_confirmations = 1
 
     def estimated_current_wh(self, nbc_predicted_wh: float, seconds_remaining:
   int) -> float:
@@ -837,7 +877,6 @@ class GapMinder:
     """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
-    MIN_SECONDS_TO_ACT = 31
     CAR_POWER_WATTS_5A = TESLA_CHARGE_AMPS_MIN_DEFAULT * TESLA_NOMINAL_VOLTAGE
     """1200W at Tesla's minimum charge rate (5A * 240V)."""
     MAX_DEFER_SECS = 120          # cap on the safe defer window
@@ -953,7 +992,7 @@ class GapMinder:
             List of PendingEffect objects.
         """
         actions: list[PendingEffect] = []
-        if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
+        if ctx.seconds_remaining < MIN_SECONDS_TO_ACT:
             logger.debug(
                 "[_decide_turn_on] skipped (too little time: %d sec)",
                 ctx.seconds_remaining,
@@ -1231,10 +1270,10 @@ class GapMinder:
                 ctx.requires_home_check,
             )
             return None
-        if ctx.seconds_remaining < self.MIN_SECONDS_TO_ACT:
+        if ctx.seconds_remaining < MIN_SECONDS_TO_ACT:
             logger.debug(
                 "[_decide_tesla_amps] skipped: too little time (%d s < %d s)",
-                ctx.seconds_remaining, self.MIN_SECONDS_TO_ACT,
+                ctx.seconds_remaining, MIN_SECONDS_TO_ACT,
             )
             return None
 

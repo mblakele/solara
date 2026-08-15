@@ -607,6 +607,7 @@ class HourlyProjection(MetricsBase):
         Raises RetryableMetricsException if no valid data is returned.
         """
         scale = Scale.SECOND.value
+        fetch_started_at = _CLOCK.now()
         usage_data_local, usage_data_start_local = self.vue.get_chart_usage(
             chan,
             chart_start,
@@ -614,6 +615,7 @@ class HourlyProjection(MetricsBase):
             scale=scale,
             unit=Unit.KWH.value,
         )
+        fetch_elapsed = _CLOCK.now() - fetch_started_at
         if (
             usage_data_start_local is None
             or usage_data_local is None
@@ -680,7 +682,7 @@ class HourlyProjection(MetricsBase):
         with _drift_lock:
             _drift_rejections.pop((chan.channel_num, chart_start), None)
         self.metrics["api_response"]["get_chart_usage/" + str(chan.channel_num)] = (
-            _CLOCK.now() - chart_start
+            fetch_elapsed
         )
         return usage_data_local, usage_data_start_local, chan.channel_num
 

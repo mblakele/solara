@@ -426,6 +426,16 @@ class CycleDiagnostics:
             registered (True/False) or None when Tesla is not
             configured.
         active_tesla_telemetry: Latest MQTT telemetry snapshot dict, or None.
+        quantization_seconds: Detected quantization interval in seconds
+            from the shared EnergyCache, or None when no quantization was
+            detected.
+        quantization_offset: Offset within the quantization period in
+            seconds, or None.
+        quantization_confidence: Confidence in the quantization detection
+            (0–1), or None.
+        settle_window_secs: Effective prediction/settle window used for
+            decisions (derived from quantization with a minimum floor),
+            or None when not resolved.
     """
 
     gap_wh: float | None = None
@@ -446,6 +456,10 @@ class CycleDiagnostics:
     telemetry_registered: bool | None = None
     active_tesla_telemetry: dict[str, Any] | None = None
     tesla_command_offline: bool | None = None
+    quantization_seconds: int | None = None
+    quantization_offset: int | None = None
+    quantization_confidence: float | None = None
+    settle_window_secs: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -480,6 +494,10 @@ class CycleDiagnostics:
             "telemetry_registered": self.telemetry_registered,
             "active_tesla_telemetry": self.active_tesla_telemetry,
             "tesla_command_offline": self.tesla_command_offline,
+            "quantization_seconds": self.quantization_seconds,
+            "quantization_offset": self.quantization_offset,
+            "quantization_confidence": self.quantization_confidence,
+            "settle_window_secs": self.settle_window_secs,
         }
 
 

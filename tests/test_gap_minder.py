@@ -858,7 +858,7 @@ def test_turn_on_skipped_when_seconds_remaining_below_min():
         actions = engine.decide(
             ctx=DecideContext(
                 now=fixed_now,
-                seconds_remaining=21,
+                seconds_remaining=20,
                 state=state,
                 plugs=plugs,
                 tesla=None,
