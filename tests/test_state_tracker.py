@@ -7,7 +7,7 @@ import pytest
 
 from constants import DEFAULT_PREDICTION_WINDOW_SECS
 from load_models import PlugConfig, DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
-from load_nbc import StateTracker
+from load_nbc import StateTracker, nominal_voltage
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 
@@ -439,17 +439,21 @@ class TestTeslaInflightWh:
         result = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900, now=fixed_now)
         assert pytest.approx(result) == 13 * 240 * 900 / 3600
 
-    def test_charging_stopped_clears_command_and_returns_zero(self) -> None:
-        """When car stops charging (amps=0), cleans up and returns 0.
+    def test_charging_stopped_single_zero_keeps_command(self) -> None:
+        """A single reported_amps==0 does NOT immediately clear the command.
 
-        This is the regression test for the leak after charging completes.
+        Plan 3.5: one zero-amp telemetry frame may be a stale/in-transit
+        sample while the car is still ramping or briefly idle. The command
+        survives and the full commanded delta stays accounted until a
+        second consecutive zero confirms the car actually stopped.
         """
         tracker = StateTracker()
         tracker.last_commanded_amps = 18
+        # Full commanded delta: 18 A * 240 V * 900 s / 3600 = 1080 Wh
         result = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
-        assert result == 0.0
-        # last_commanded_amps should be cleared so it doesn't leak
-        assert tracker.last_commanded_amps is None
+        assert pytest.approx(result) == 18 * 240 * 900 / 3600
+        # Command must survive the first zero report
+        assert tracker.last_commanded_amps == 18
 
     def test_one_amp_with_old_command_clears_state(self) -> None:
         """When car reports 1 amp and the command is old (beyond settle),
@@ -495,7 +499,9 @@ class TestTeslaInflightWh:
         result = tracker.tesla_inflight_wh(
             reported_amps=1, seconds_remaining=900, now=fixed_now,
         )
-        assert result == 0.0  # not confirmed yet, but no inflight Wh to report
+        # Plan 3.5: during ramp-up the unconfirmed portion (commanded 20 A,
+        # car reporting 1 A) is still credited: (20-1) * 240 * 900 / 3600.
+        assert pytest.approx(result) == (20 - 1) * 240 * 900 / 3600
         # last_commanded_amps must survive — the ramp is still in progress
         assert tracker.last_commanded_amps == 20
 
@@ -543,7 +549,9 @@ class TestTeslaInflightWh:
             reported_amps=1, seconds_remaining=900,
             now=fixed_now, data_point_at=command_dp + timedelta(seconds=55),
         )
-        assert result == 0.0
+        # Plan 3.5: data-age ramp-up branch also credits the unconfirmed
+        # portion: (20-1) * 240 * 900 / 3600.
+        assert pytest.approx(result) == (20 - 1) * 240 * 900 / 3600
         assert tracker.last_commanded_amps == 20  # not cleared
 
     def test_settle_expired_car_below_target_clears(self) -> None:
@@ -607,7 +615,120 @@ class TestTeslaInflightWh:
         assert tracker.last_commanded_amps is None  # cleared as stale
 
 
-class TestEffectiveSettleSecs:
+class TestTeslaInflightAccounting:
+    """Zero-amp confirmation and ramp-up credit (plan 3.5, fixes A5).
+
+    The old behavior cleared the command on a single 0 A telemetry frame
+    and returned 0 Wh during 1 A ramp-up — both overstate surplus because
+    in-flight amp commands stop being accounted before they are confirmed.
+    """
+
+    def _settle_effect(self, age_secs: int = 10) -> PendingEffect:
+        """Build a recent set_amps settle effect targeting the Tesla device."""
+        return PendingEffect(
+            device_name="tesla", action="set_amps",
+            timestamp=fixed_now - timedelta(seconds=age_secs),
+            data_point_at=fixed_now - timedelta(seconds=age_secs),
+            power_watts=0, target_amps=20,
+            direction="increase", suppress_action="turn_off",
+            qh_name="QH1",
+        )
+
+    # ── Zero-amp confirmation ──────────────────────────────────────────
+
+    def test_single_zero_keeps_command_returns_full_delta(self) -> None:
+        """First zero report: command kept, full commanded delta returned."""
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 18
+        result = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
+        assert pytest.approx(result) == 18 * 240 * 900 / 3600
+        assert tracker.last_commanded_amps == 18
+
+    def test_second_consecutive_zero_clears_and_returns_zero(self) -> None:
+        """Second consecutive zero confirms the car stopped: clear + 0 Wh."""
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 18
+        first = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
+        assert pytest.approx(first) == 18 * 240 * 900 / 3600
+        second = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
+        assert second == 0.0
+        assert tracker.last_commanded_amps is None
+
+    def test_nonzero_report_resets_zero_amp_counter(self) -> None:
+        """A non-zero report resets confirmation; an isolated zero never clears."""
+        tracker = StateTracker()
+        tracker.last_commanded_amps = 18
+        tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
+        # Car resumes charging below commanded level — counter must reset.
+        resumed = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900, now=fixed_now)
+        assert pytest.approx(resumed) == 13 * 240 * 900 / 3600
+        assert tracker.last_commanded_amps == 18
+        # Isolated zero after reset: still only one consecutive sample.
+        isolated = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
+        assert pytest.approx(isolated) == 18 * 240 * 900 / 3600
+        assert tracker.last_commanded_amps == 18
+
+    def test_new_command_resets_zero_amp_counter(self) -> None:
+        """Recording a fresh amp command resets zero-amp confirmation."""
+        tracker = StateTracker()
+        tracker.record_tesla_amp_command(18)
+        tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
+        # New command issued while the old count was already at 1.
+        tracker.record_tesla_amp_command(12)
+        result = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
+        assert pytest.approx(result) == 12 * 240 * 900 / 3600
+        assert tracker.last_commanded_amps == 12
+
+    def test_record_none_clears_counter_too(self) -> None:
+        """Recording None (stop/turn_off) clears both command and counter."""
+        tracker = StateTracker()
+        tracker.record_tesla_amp_command(18)
+        tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
+        tracker.record_tesla_amp_command(None)
+        assert tracker.last_commanded_amps is None
+        # Next isolated zero is again just a single unconfirmed sample.
+
+    # ── Ramp-up credit ─────────────────────────────────────────────────
+
+    def test_rampup_one_amp_credits_unconfirmed_delta(self) -> None:
+        """Wall-clock ramp-up branch credits (commanded - reported) delta."""
+        tracker = StateTracker(prediction_window_seconds=60)
+        tracker.last_commanded_amps = 20
+        tracker.pending_effects.append(self._settle_effect(age_secs=10))
+        result = tracker.tesla_inflight_wh(
+            reported_amps=1, seconds_remaining=900, now=fixed_now,
+        )
+        assert pytest.approx(result) == (20 - 1) * 240 * 900 / 3600
+        assert tracker.last_commanded_amps == 20
+
+    def test_rampup_one_amp_data_age_branch_credits_unconfirmed_delta(self) -> None:
+        """Data-point-age ramp-up branch credits the unconfirmed delta too."""
+        tracker = StateTracker(prediction_window_seconds=60)
+        tracker.last_commanded_amps = 20
+        effect = self._settle_effect(age_secs=200)
+        tracker.pending_effects.append(effect)
+        # Wall clock expired (200s > 60s) but data age is fresh (55s < 60s).
+        result = tracker.tesla_inflight_wh(
+            reported_amps=1, seconds_remaining=900,
+            now=fixed_now,
+            data_point_at=effect.data_point_at + timedelta(seconds=55),
+        )
+        assert pytest.approx(result) == (20 - 1) * 240 * 900 / 3600
+        assert tracker.last_commanded_amps == 20
+
+    def test_one_amp_stale_command_still_clears(self) -> None:
+        """Beyond BOTH settle measures, 1 A remains stale → clear + 0 Wh."""
+        tracker = StateTracker(prediction_window_seconds=60)
+        tracker.last_commanded_amps = 20
+        tracker.pending_effects.append(self._settle_effect(age_secs=200))
+        result = tracker.tesla_inflight_wh(
+            reported_amps=1, seconds_remaining=900, now=fixed_now,
+        )
+        assert result == 0.0
+        assert tracker.last_commanded_amps is None
+
+
+
     """Tests for StateTracker.effective_settle_secs."""
 
     def test_default_prediction_window(self) -> None:
@@ -1067,3 +1188,191 @@ class TestPendingEffectDirection:
         assert eff.direction == "decrease"
         assert eff.suppress_action == "turn_on"
         assert eff.qh_name == "QH1"
+
+
+# =============================================================================
+# Thread-safe snapshots (plan subtask 2.1, fixes R1)
+# =============================================================================
+
+
+class TestThreadSafeSnapshots:
+    """Cross-thread readers must consume atomic copies, not live dicts.
+
+    The load-management thread mutates ``devices``/``pending_effects``
+    while Flask request threads iterate them via load_status() and
+    state.to_dict(). Lazy iteration over the live structures raises
+    intermittent "dictionary changed size during iteration" 500s.
+    """
+
+    def _tracker_with_device(self) -> StateTracker:
+        tracker = StateTracker()
+        tracker.devices["plug_a"] = DeviceState(
+            name="plug_a", desired_state=True
+        )
+        tracker.pending_effects.append(
+            PendingEffect(
+                device_name="plug_a",
+                action="turn_on",
+                timestamp=fixed_now,
+                data_point_at=fixed_now,
+                power_watts=100.0,
+            )
+        )
+        return tracker
+
+    def test_snapshot_devices_returns_copy(self):
+        """snapshot_devices() returns an independent copy."""
+        tracker = self._tracker_with_device()
+        snapshot = tracker.snapshot_devices()
+        assert set(snapshot) == {"plug_a"}
+
+        tracker.set_device_state(
+            "plug_b", DeviceState(name="plug_b", desired_state=False)
+        )
+        assert "plug_b" not in snapshot
+        assert "plug_b" in tracker.devices
+
+    def test_snapshot_effects_returns_copy(self):
+        """snapshot_effects() returns an independent copy."""
+        tracker = self._tracker_with_device()
+        snapshot = tracker.snapshot_effects()
+        assert len(snapshot) == 1
+
+        from load_models import PendingEffect as PE
+
+        tracker.add_effect(
+            PE(
+                device_name="plug_b",
+                action="turn_off",
+                timestamp=fixed_now,
+                data_point_at=fixed_now,
+                power_watts=-50.0,
+            )
+        )
+        assert len(snapshot) == 1
+        assert len(tracker.pending_effects) == 2
+
+    def test_to_dict_isolated_from_later_mutations(self):
+        """to_dict() output reflects a point-in-time snapshot."""
+        tracker = self._tracker_with_device()
+        data = tracker.to_dict()
+
+        tracker.set_device_state(
+            "plug_c", DeviceState(name="plug_c", desired_state=False)
+        )
+        tracker.snapshot_effects()  # exercise lock re-entrancy paths
+        assert set(data["devices"]) == {"plug_a"}
+        assert len(data["pending_effects"]) == 1
+
+    def test_load_status_reads_snapshots_not_live_dicts(self):
+        """/api/v1/load/status builds devices/effects from snapshots."""
+        import app as app_mod
+        from load_manager import LoadManager, LoadManagerConfig
+
+        lm = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
+        lm.state.devices["plug_a"] = DeviceState(
+            name="plug_a", desired_state=True
+        )
+
+        calls = {"devices": False, "effects": False}
+
+        def fake_device_snapshot():
+            calls["devices"] = True
+            return {}
+
+        def fake_effect_snapshot():
+            calls["effects"] = True
+            return []
+
+        lm.state.snapshot_devices = fake_device_snapshot
+        lm.state.snapshot_effects = fake_effect_snapshot
+
+        client = app_mod.app.test_client()
+        client.testing = True
+        with patch("app._get_load_manager", return_value=lm):
+            response = client.get("/api/v1/load/status")
+
+        assert response.status_code == 200
+        data = response.get_json()
+        assert calls["devices"] is True, (
+            "load_status must read device state via snapshot_devices()"
+        )
+        assert calls["effects"] is True, (
+            "load_status must read pending effects via snapshot_effects()"
+        )
+        assert data["devices"] == {}
+        assert data["pendingEffects"] == []
+
+    def test_hammer_mutations_vs_snapshots(self):
+        """Concurrent mutation + snapshotting never raises RuntimeError."""
+        import threading
+
+        tracker = self._tracker_with_device()
+        errors: list[BaseException] = []
+        stop = threading.Event()
+
+        def writer():
+            index = 0
+            while not stop.is_set():
+                try:
+                    name = f"w{index % 7}"
+                    tracker.set_device_state(
+                        name, DeviceState(name=name, desired_state=True)
+                    )
+                    if index % 5 == 0:
+                        with tracker._state_lock:
+                            tracker.devices.pop(name, None)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    return
+                index += 1
+
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        writer_thread.start()
+        try:
+            for _ in range(5000):
+                snapshot = tracker.snapshot_devices()
+                effects = tracker.snapshot_effects()
+                assert isinstance(snapshot, dict)
+                assert isinstance(effects, list)
+        finally:
+            stop.set()
+            writer_thread.join(timeout=5)
+
+        assert errors == [], f"writer hit {errors[0]!r}"
+
+
+class TestNominalVoltageConfig:
+    """TESLA_NOMINAL_VOLTAGE env threading through conversions (plan 3.6)."""
+
+    @pytest.mark.parametrize("bad", ["abc", "", "0", "-10", "  "])
+    def test_invalid_value_falls_back_to_default(self, monkeypatch, bad) -> None:
+        """Non-numeric or non-positive values fall back to 240 V."""
+        monkeypatch.setenv("TESLA_NOMINAL_VOLTAGE", bad)
+        assert nominal_voltage() == 240.0
+
+    def test_default_is_240(self, monkeypatch) -> None:
+        """With no env override, conversions use the 240 V default."""
+        monkeypatch.delenv("TESLA_NOMINAL_VOLTAGE", raising=False)
+        assert nominal_voltage() == 240.0
+
+    def test_env_override_honored(self, monkeypatch) -> None:
+        """A valid TESLA_NOMINAL_VOLTAGE overrides the default."""
+        monkeypatch.setenv("TESLA_NOMINAL_VOLTAGE", "208")
+        assert nominal_voltage() == 208.0
+
+    def test_conversions_honor_override(self, monkeypatch) -> None:
+        """All four amp/watt conversions read the configured voltage."""
+        monkeypatch.setenv("TESLA_NOMINAL_VOLTAGE", "208")
+        assert StateTracker.amps_to_watts(10) == pytest.approx(2080.0)
+        assert StateTracker.watts_to_amps(2080.0) == 10
+        assert StateTracker.delta_amps_to_wh(10, 3600) == pytest.approx(2080.0)
+        assert StateTracker.wh_to_amps(2080.0, 3600) == pytest.approx(10.0)
+
+    def test_conversions_default_unchanged(self, monkeypatch) -> None:
+        """Without env override the historical 240 V math still applies."""
+        monkeypatch.delenv("TESLA_NOMINAL_VOLTAGE", raising=False)
+        assert StateTracker.amps_to_watts(10) == pytest.approx(2400.0)
+        assert StateTracker.watts_to_amps(2400.0) == 10
+        assert StateTracker.delta_amps_to_wh(10, 3600) == pytest.approx(2400.0)
+        assert StateTracker.wh_to_amps(2400.0, 3600) == pytest.approx(10.0)

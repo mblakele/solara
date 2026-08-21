@@ -45,7 +45,7 @@ from load_models import (
     build_tesla_state,
     parse_charge_amps,
 )
-from util import _haversine_distance
+from util import _haversine_distance, atomic_write_json
 
 
 logger = logging.getLogger(__name__)
@@ -245,8 +245,7 @@ def save_tesla_tokens(
             "access_token": access_token,
             "expires": expires,
         }
-        with open(tokens_path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        atomic_write_json(tokens_path, data)
         logger.info("Tesla tokens persisted to %s", tokens_path)
     except OSError as e:
         logger.error("Failed to save Tesla tokens: %s", e)
@@ -956,8 +955,7 @@ class RealPlugController(AbstractPlugController):
     def _save_pairing_data(self, data: dict[str, Any]) -> None:
         """Save pairing data to JSON file."""
         try:
-            with open(self.pairings_path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
+            atomic_write_json(self.pairings_path, data)
         except OSError as e:
             logger.error("Failed to save pairings file: %s", e)
 
@@ -1000,12 +998,14 @@ class RealPlugController(AbstractPlugController):
             controller = IpController(None, azc)  # type: ignore[arg-type]
         except RuntimeError as e:
             logger.error("Failed to create IpController: %s", e)
+            await azc.async_close()
             return False
 
         try:
             pairing = controller.load_pairing(target_ip, entry)
         except Exception as e:
             logger.error("Failed to load pairing for %s: %s", target_ip, e)
+            await azc.async_close()
             return False
 
         if pairing is None:
@@ -1013,6 +1013,7 @@ class RealPlugController(AbstractPlugController):
                 "Could not restore pairing for %s. Run --pair-plug first.",
                 target_ip,
             )
+            await azc.async_close()
             return False
 
         self._pairing = pairing
@@ -1022,6 +1023,7 @@ class RealPlugController(AbstractPlugController):
         except Exception as e:
             logger.error("Failed to list accessories: %s", e)
             self._connected = False
+            await azc.async_close()
             return False
 
         switch_uuid = ServicesTypes.SWITCH
@@ -1046,6 +1048,7 @@ class RealPlugController(AbstractPlugController):
             logger.error(
                 "No Switch/On characteristic found for %s", target_ip
             )
+            await azc.async_close()
             return False
 
         try:
@@ -1055,6 +1058,7 @@ class RealPlugController(AbstractPlugController):
         except Exception as e:
             logger.error("Failed to connect to %s: %s", target_ip, e)
             self._connected = False
+            await azc.async_close()
 
         return self._connected
 
@@ -1402,8 +1406,7 @@ def pair_homekit_accessory(
             existing[accessory_id] = pairing.pairing_data  # type: ignore[attr-defined]
 
             try:
-                with open(pairings_path, "w", encoding="utf-8") as f:
-                    json.dump(existing, f)
+                atomic_write_json(pairings_path, existing)
             except OSError as e:
                 logger.error("Failed to save pairings file: %s", e)
                 return False

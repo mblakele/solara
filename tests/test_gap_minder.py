@@ -1719,3 +1719,20 @@ def test_tesla_clamps_to_max_residual_filled_by_smaller_plug():
     assert any(
         a.device_name == "small" and a.action == "turn_on" for a in actions
     )
+
+
+# --- Nominal voltage configuration (plan 3.6) ---
+
+
+def test_car_power_watts_5a_default_240(monkeypatch):
+    """Default defer-rate basis stays 5A * 240V = 1200 W."""
+    monkeypatch.delenv("TESLA_NOMINAL_VOLTAGE", raising=False)
+    engine = GapMinder()
+    assert engine.car_power_watts_5a == pytest.approx(1200.0)
+
+
+def test_car_power_watts_5a_honors_voltage_override(monkeypatch):
+    """The defer-rate basis follows TESLA_NOMINAL_VOLTAGE (208V -> 1040 W)."""
+    monkeypatch.setenv("TESLA_NOMINAL_VOLTAGE", "208")
+    engine = GapMinder()
+    assert engine.car_power_watts_5a == pytest.approx(5 * 208)

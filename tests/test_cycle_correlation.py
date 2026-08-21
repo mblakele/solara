@@ -184,6 +184,7 @@ class TestLoadStatusHealthCounters:
             assert isinstance(data["sseSubscriberCount"], int)
             assert "cache" in data
             assert "mqtt" in data
+            assert "connected" in data["mqtt"]
         finally:
             app_mod._state.consecutive_error_count = 0
             app_mod._state.last_error_type = None

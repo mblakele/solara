@@ -17,9 +17,10 @@ from typing import Any
 
 from clock import Clock, RealClock
 from constants import MIN_SLEEP_SECS, QUANTIZATION_CONFIDENCE_THRESHOLD
-from quantization import detect_quantization
+from quantization import detect_quantization, usable_window
 from util import (
     CompletedNBCPeriod,
+    QH_PERIOD_SECONDS,
     RetryableError,
     ceil_to_qh,
     compute_nbc_quarters,
@@ -202,6 +203,9 @@ class EnergyCache:
         self._ttl_seconds: int = ttl_seconds
         self._clock: Clock = clock if clock is not None else RealClock()
         self._lock: threading.Lock = threading.Lock()
+        # Single-flight gate: serializes fetches WITHOUT holding _lock,
+        # so readers never block behind network I/O (plan 2.2).
+        self._fetch_lock: threading.Lock = threading.Lock()
         self._fetch_timeout_secs: int = fetch_timeout_secs
 
     # ------------------------------------------------------------------
@@ -789,9 +793,15 @@ class EnergyCache:
 
         Returns:
             Tuple of *(metrics_dict_or_none, was_fresh)*.
+
+        Locking contract (plan 2.2): the state lock ``_lock`` guards only
+        snapshot reads and store operations — never network I/O. Fetches
+        run under a separate single-flight gate (``_fetch_lock``) so
+        concurrent callers produce at most one fetch per refresh while
+        readers proceed uninterrupted.
         """
         with self._lock:
-            # Check if cache is valid (non-expired data exists).
+            # Fast path: serve a valid snapshot without any I/O.
             if not force and self._is_valid_unlocked(now):
                 result = self._build_result()
                 logger.debug(
@@ -803,7 +813,16 @@ class EnergyCache:
                 )
                 return result, False
 
-            # Fetch fresh data with timeout protection.
+        with self._fetch_lock:
+            # Double-check: another fetcher may have refreshed the cache
+            # while we waited on the single-flight gate.
+            with self._lock:
+                if not force and self._is_valid_unlocked(now):
+                    result = self._build_result()
+                    logger.debug("EnergyCache cache_hit after fetch gate")
+                    return result, False
+
+            # Fetch fresh data with timeout protection — outside _lock.
             fetch_start = _time_mod.monotonic()
             result = self._run_fetch_with_timeout(fetch_func)
             fetch_elapsed = _time_mod.monotonic() - fetch_start
@@ -813,18 +832,18 @@ class EnergyCache:
                 "ok" if result is not None else "None",
             )
 
-            if result is None:
-                # Timed out or fetch_func returned None — return stale cache
-                # if available, so callers get stale-but-valid data instead
-                # of crashing on None.
-                if self._data is not None:
-                    return self._build_result(), False
-                logger.warning(
-                    "EnergyCache: fetch failed and no stale cache available"
-                )
-                return (None, True)
+            with self._lock:
+                if result is None:
+                    # Timed out or raised — serve stale cache if available,
+                    # so callers get stale-but-valid data instead of
+                    # crashing on None.
+                    if self._data is not None:
+                        return self._build_result(), False
+                    logger.warning(
+                        "EnergyCache: fetch failed and no stale cache available"
+                    )
+                    return (None, True)
 
-            if result is not None:
                 new_samples: list[float] = []
 
                 # Extract per-second data from the result dict.
@@ -890,9 +909,6 @@ class EnergyCache:
 
                 return (result, True) if result is not None else (None, True)
 
-            # fetch_func returned None — keep existing cache data.
-            return (None, True)
-
     # ------------------------------------------------------------------
     # Quarter-hour extraction (caller holds lock when called from
     # get_current_qh, but we acquire it here too for standalone safety.)
@@ -942,14 +958,22 @@ class EnergyCache:
                 f"data_start {data_start} not aligned to QH boundary"
             )
 
-        # Use quantization-aware prediction window when available.
-        prediction_window_seconds: int | None = None
-        qs = self._data.quantization_seconds
-        qc = self._data.quantization_confidence
-        if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
-            prediction_window_seconds = qs
+        # Use quantization-aware prediction window when available. The
+        # shared guard rejects the flat-data N=2 artifact (plan 3.2).
+        prediction_window_seconds: int | None = usable_window(
+            self._data.quantization_seconds,
+            self._data.quantization_confidence,
+        )
 
-        nbc = compute_nbc_quarters(samples, prediction_window_seconds)
+        # One time base (plan 3.3): extrapolate with wall-clock remaining
+        # so prediction and downstream decision math agree even when data
+        # lag makes sample count diverge from elapsed time.
+        wall_remaining = qh_seconds_remaining(now)
+        nbc = compute_nbc_quarters(
+            samples,
+            prediction_window_seconds,
+            seconds_remaining_override=wall_remaining,
+        )
 
         # Map from attribute names to QH labels for fallback lookup.
         _qh_attrs = [("qh1", "QH1"), ("qh2", "QH2"), ("qh3", "QH3"), ("qh4", "QH4")]
@@ -980,10 +1004,16 @@ class EnergyCache:
 
         seconds_remaining = qh_seconds_remaining(now)
         predicted_wh = qh1_data.predicted_wh if qh1_data.predicted_wh is not None else qh1_data.wh
+        sample_remaining = (
+            QH_PERIOD_SECONDS - qh1_data.samples_used
+            if qh1_data.samples_used is not None
+            else None
+        )
         return {
             "qh_name": "QH1",
             "predicted_wh": predicted_wh,
             "seconds_remaining": seconds_remaining,
+            "sample_seconds_remaining": sample_remaining,
             "data_start": data_start,
             "samples_used": qh1_data.samples_used,
         }

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time as _time_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,31 @@ _telemetry_state: dict[str, Any] = {}
 _telemetry_warned_empty = False
 # Wall-clock timestamp of the last update to each field.
 _field_update_at: dict[str, datetime] = {}
+# Live broker-connection flag (plan 2.5): True only while a session is
+# established, regardless of message freshness.
+_connection_ok: bool = False
+
+# Reconnect tuning: exponential backoff from MIN, capped at MAX.
+_MQTT_RECONNECT_MIN_SECS = 2.0
+_MQTT_RECONNECT_MAX_SECS = 30.0
+
+
+def _set_connection_ok(value: bool) -> None:
+    """Update the broker-connection flag under the telemetry lock."""
+    global _connection_ok
+    with _telemetry_lock:
+        _connection_ok = value
+
+
+def is_connected() -> bool:
+    """Return True while a broker session is currently established.
+
+    Diagnostics surface for /health and /api/v1/load/status: message
+    freshness alone cannot distinguish a live feed from one that went
+    dark seconds ago with old messages still cached.
+    """
+    with _telemetry_lock:
+        return _connection_ok
 
 # === Public API ===
 
@@ -182,8 +208,11 @@ def start_mqtt_subscriber(cfg: Any) -> None:
     Subscribes to ``{cfg.mqtt_topic_base}/#`` so all field sub-topics are
     received.  Runs the network loop in a daemon thread via ``loop_start()``.
 
-    If the broker is unreachable the error is logged and the background
-    thread keeps retrying (paho auto-reconnect disabled — caller can restart).
+    Resilience (plan 2.5): a failed initial connect no longer kills the
+    thread — the outer loop retries forever with exponential backoff
+    (2 s doubling to a 30 s cap, reset after any successful session).
+    Live connection state is tracked for /health and /api/v1/load/status
+    via :func:`is_connected`.
 
     Args:
         cfg: Application ``Config`` instance (must expose ``mqtt_host``,
@@ -194,31 +223,61 @@ def start_mqtt_subscriber(cfg: Any) -> None:
     topic_base = cfg.mqtt_topic_base
 
     def _run() -> None:
-        client = mqtt.Client()
-        client.on_message = on_message
+        backoff = _MQTT_RECONNECT_MIN_SECS
+        while True:
+            was_connected = False
 
-        def _on_connect(c: Any, _userdata: Any, _flags: Any, rc: int) -> None:  # noqa: ARG001
-            if rc == 0:
-                logger.info(
-                    "mqtt_telemetry: connected to %s:%d, subscribing to %s/#",
-                    host, port, topic_base,
-                )
-                c.subscribe(f"{topic_base}/#")
-            else:
-                logger.error(
-                    "mqtt_telemetry: connection failed rc=%d host=%s port=%d"
-                    " — check mqtt_host/mqtt_port config",
-                    rc, host, port,
-                )
+            def _on_connect(c: Any, _userdata: Any, _flags: Any, rc: int) -> None:  # noqa: ARG001
+                nonlocal was_connected
+                if rc == 0:
+                    was_connected = True
+                    _set_connection_ok(True)
+                    logger.info(
+                        "mqtt_telemetry: connected to %s:%d, subscribing to %s/#",
+                        host, port, topic_base,
+                    )
+                    c.subscribe(f"{topic_base}/#")
+                else:
+                    logger.error(
+                        "mqtt_telemetry: connection failed rc=%d host=%s port=%d"
+                        " — check mqtt_host/mqtt_port config",
+                        rc, host, port,
+                    )
 
-        client.on_connect = _on_connect
-        try:
-            client.connect(host, port, keepalive=60)
-            client.loop_forever()
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.exception(
-                "mqtt_telemetry: subscriber thread terminated host=%s port=%d",
-                host, port,
+            def _on_disconnect(_client: Any, _userdata: Any, rc: Any) -> None:  # noqa: ARG001
+                _set_connection_ok(False)
+                if rc == 0:
+                    logger.info("mqtt_telemetry: disconnected cleanly")
+                else:
+                    logger.warning(
+                        "mqtt_telemetry: unexpected disconnect rc=%s"
+                        " — will reconnect",
+                        rc,
+                    )
+
+            client = mqtt.Client()
+            client.on_message = on_message
+            client.on_connect = _on_connect
+            client.on_disconnect = _on_disconnect
+            try:
+                client.connect(host, port, keepalive=60)
+                # loop_forever auto-reconnects after an ESTABLISHED
+                # connection drops; a failed initial connect raises and is
+                # handled below by re-entering the loop after backoff.
+                client.loop_forever()
+                logger.warning(
+                    "mqtt_telemetry: network loop exited — reconnecting"
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception(
+                    "mqtt_telemetry: connection attempt failed host=%s port=%d",
+                    host, port,
+                )
+            _set_connection_ok(False)
+            _time_mod.sleep(backoff)
+            backoff = (
+                _MQTT_RECONNECT_MIN_SECS if was_connected
+                else min(backoff * 2, _MQTT_RECONNECT_MAX_SECS)
             )
 
     check_fleet_telemetry_dotfile()

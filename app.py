@@ -42,6 +42,7 @@ from flask import (
 from flask.typing import ResponseReturnValue
 
 from config import Config, _config, get_timezone
+from clock import Clock, RealClock
 from constants import STALE_DATA_THRESHOLD_SECS
 
 from energy_cache import EnergyCache
@@ -84,10 +85,15 @@ class _AppState:
     consecutive_error_count: int = 0
     last_error_type: str | None = None
     lm_thread_started: bool = False
+    # Init-retry state (plan 2.6): failures back off instead of latching.
+    load_manager_init_attempts: int = 0
+    load_manager_next_init_retry_at: datetime | None = None
     # Liveness/health signals (plan 1.5).
     lm_heartbeat_at: datetime | None = None
     mqtt_subscriber_started: bool = False
     background_services_started_at: datetime | None = None
+    # Watchdog input (plan 2.7): last completed loop iteration.
+    lm_last_cycle_finished_at: datetime | None = None
 
 
 # Application-level configuration injected into all consumers.
@@ -223,14 +229,28 @@ def astimezone_filter(dt: datetime, tz_str: str) -> datetime:
 
 
 def parse_date_to_utc(date_str: str) -> datetime:
-    """Parse date string and convert to UTC timezone."""
+    """Parse date string and convert to UTC timezone.
+
+    Raises:
+        ValueError: If the string is malformed, or names a local time that
+            is ambiguous (DST fall-back overlap) or nonexistent (DST
+            spring-forward gap) in the configured timezone. Failing
+            explicitly beats silently picking the wrong UTC instant.
+    """
     tz = pytz.timezone(get_timezone())
     if "T" in date_str:
         dt = datetime.fromisoformat(date_str)
     else:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
     if dt.tzinfo is None:
-        dt = tz.localize(dt)
+        try:
+            # is_dst=None makes ambiguous/nonexistent local times raise
+            # instead of silently resolving to an arbitrary offset.
+            dt = tz.localize(dt, is_dst=None)
+        except pytz.exceptions.InvalidTimeError as exc:
+            raise ValueError(
+                f"Ambiguous or nonexistent local time: {date_str!r}"
+            ) from exc
 
     return dt.astimezone(pytz.utc)
 
@@ -282,11 +302,22 @@ def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = 
     return TOUResult(buckets=model.tou_result, nbc=model.nbc_result)
 
 
-def _validate_dates(start_date_str: str | None, end_date_str: str | None):
+def _validate_dates(
+    start_date_str: str | None,
+    end_date_str: str | None,
+    clock: Clock | None = None,
+):
     """Parse and validate date parameters.
 
     Returns (start_date, end_date) as UTC datetimes or aborts with 400.
-    Defaults end_date to now if not provided.
+    Defaults end_date to the injected clock's current time when not
+    provided (RealClock in production — always a correctly localized,
+    timezone-aware instant; FakeClock in tests).
+
+    Args:
+        start_date_str: Start date string, or None to abort with 400.
+        end_date_str: End date string; defaults to now via *clock*.
+        clock: Time source for the default end date. Defaults to RealClock.
     """
     if not start_date_str:
         return abort(400, "start_date is required")
@@ -302,7 +333,7 @@ def _validate_dates(start_date_str: str | None, end_date_str: str | None):
         except (ValueError, TypeError):
             return abort(400, "Invalid end_date format")
     else:
-        end_date = pytz.utc.localize(datetime.now())
+        end_date = (clock or RealClock()).now()
 
     date_diff = end_date - start_date
     if date_diff.days > 366:
@@ -402,8 +433,94 @@ def index() -> ResponseReturnValue:
 # avoid restart storms during boot or when load management is disabled.
 _HEALTH_BOOT_GRACE_SECS = 300.0
 _HEALTH_MQTT_DARK_SECS = 600.0
+_HEALTH_MQTT_DISCONNECT_STALE_SECS = 60.0
 _HEALTH_ERROR_THRESHOLD = 3
 _HEALTH_LM_MIN_STALE_SECS = 120.0
+
+# LoadManager init-retry tuning (plan 2.6).
+_LM_INIT_RETRY_BASE_SECS = 30.0
+_LM_INIT_RETRY_MAX_SECS = 600.0
+
+
+def _lm_init_backoff_secs(attempts: int) -> float:
+    """Exponential backoff for LoadManager init retries, capped.
+
+    Args:
+        attempts: 1-based count of failed init attempts.
+
+    Returns:
+        Seconds to wait before the next attempt.
+    """
+    return min(
+        _LM_INIT_RETRY_BASE_SECS * (2 ** max(0, attempts - 1)),
+        _LM_INIT_RETRY_MAX_SECS,
+    )
+
+
+def _compute_loop_sleep(result: Any, interval_secs: float) -> float:
+    """Compute the LM loop's sleep duration defensively.
+
+    A negative sleep hint or an exception from
+    ``EnergyCache.sleep_interval_adjust`` must never kill the background
+    thread (R10): clamp to >= 0 and fall back to the configured interval.
+
+    Args:
+        result: The cycle result (or None) from ``run_cycle``.
+        interval_secs: Configured polling interval fallback.
+
+    Returns:
+        Non-negative seconds to sleep.
+    """
+    try:
+        if result is not None and result.status == "disabled":
+            raw = float(interval_secs)
+        else:
+            raw = _state.energy_cache.sleep_interval_adjust(
+                interval_secs,
+                datetime.now(pytz.timezone(_config.timezone)),
+            )
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning(
+            "sleep_interval_adjust failed; using configured interval",
+            exc_info=True,
+        )
+        raw = float(interval_secs)
+    return max(0.0, raw)
+
+
+_stall_critical_last_at: datetime | None = None
+
+
+def _check_stall_watchdog(now: datetime) -> None:
+    """CRITICAL-log when enabled load management stops completing cycles.
+
+    Rate-limited to one entry per hour so a prolonged stall stays visible
+    without flooding logs.
+    """
+    global _stall_critical_last_at
+    if _config.load_manage_enabled is False:
+        return
+    finished_at = _state.lm_last_cycle_finished_at
+    if finished_at is None:
+        return
+    threshold = max(
+        300.0, 10.0 * float(_config.load_manage_interval_secs)
+    )
+    stalled_for = (now - finished_at).total_seconds()
+    if stalled_for <= threshold:
+        return
+    if (
+        _stall_critical_last_at is not None
+        and (now - _stall_critical_last_at).total_seconds() < 3600
+    ):
+        return
+    _stall_critical_last_at = now
+    logger.critical(
+        "Load management stalled: no completed cycle for %.0fs "
+        "(threshold %.0fs)",
+        stalled_for,
+        threshold,
+    )
 
 
 def _build_health_payload(now: datetime) -> dict[str, Any]:
@@ -472,15 +589,30 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
         if freshness
         else None
     )
+    mqtt_connected: bool | None = None
     if not _state.mqtt_subscriber_started:
         mqtt_state = "not_started"
         mqtt_gated = False
-    elif mqtt_last_age is None:
-        mqtt_state = "waiting"
-        mqtt_gated = booted_long_ago
     else:
-        mqtt_gated = mqtt_last_age > _HEALTH_MQTT_DARK_SECS
-        mqtt_state = "dark" if mqtt_gated else "receiving"
+        mqtt_connected = mqtt_telemetry.is_connected()
+        if mqtt_last_age is None:
+            mqtt_state = "waiting"
+            mqtt_gated = booted_long_ago
+        elif mqtt_last_age > _HEALTH_MQTT_DARK_SECS:
+            # Most severe: no usable data for >10 min, whatever the cause.
+            mqtt_state = "dark"
+            mqtt_gated = True
+        elif (
+            not mqtt_connected
+            and mqtt_last_age > _HEALTH_MQTT_DISCONNECT_STALE_SECS
+        ):
+            # Feed went dark recently enough that old cached messages
+            # still look "fresh" — connection state closes that gap.
+            mqtt_state = "disconnected"
+            mqtt_gated = True
+        else:
+            mqtt_state = "receiving"
+            mqtt_gated = False
 
     # ── Sustained cycle errors ────────────────────────────────────────
     errors_gated = (
@@ -504,6 +636,7 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
             },
             "mqtt_telemetry": {
                 "state": mqtt_state,
+                "connected": mqtt_connected,
                 "has_telemetry": bool(freshness),
                 "last_update_age_secs": mqtt_last_age,
             },
@@ -639,11 +772,17 @@ def _build_load_management_payload(lm: Any = None) -> dict:
 def _get_load_manager():
     """Get or create the singleton LoadManager instance.
 
-    If initialization has previously failed, returns None without retrying
-    to avoid generating warnings on every call.
+    Initialization failures are not permanent (plan 2.6): the next call
+    after the backoff window elapses retries construction, so a transient
+    bad devices.json heals without a process restart.
     """
     with _state.load_manager_lock:
-        if _state.load_manager is None and not _state.load_manager_init_failed:
+        if _state.load_manager is None:
+            now_ = datetime.now(timezone.utc)
+            if _state.load_manager_init_failed:
+                next_at = _state.load_manager_next_init_retry_at
+                if next_at is not None and now_ < next_at:
+                    return None
             try:
                 from load_manager import LoadManager, LoadManagerConfig
 
@@ -680,13 +819,27 @@ def _get_load_manager():
                     ),
                 )
                 logger.info("LoadManager initialized")
-
+                _state.load_manager_init_failed = False
+                _state.load_manager_init_attempts = 0
+                _state.load_manager_next_init_retry_at = None
 
             except Exception as e:
-                logger.warning(
-                    "Failed to initialize LoadManager: %s", e, exc_info=True
+                _state.load_manager_init_attempts += 1
+                delay = _lm_init_backoff_secs(
+                    _state.load_manager_init_attempts
+                )
+                _state.load_manager_next_init_retry_at = now_ + timedelta(
+                    seconds=delay
                 )
                 _state.load_manager_init_failed = True
+                logger.warning(
+                    "Failed to initialize LoadManager "
+                    "(attempt %d, retry in %.0fs): %s",
+                    _state.load_manager_init_attempts,
+                    delay,
+                    e,
+                    exc_info=True,
+                )
         return _state.load_manager
 
 
@@ -769,14 +922,11 @@ def _load_management_loop() -> None:
             _state.consecutive_error_count = 0
             _state.last_error_type = None
 
-        if result is not None and result.status == "disabled":
-            interval_secs_adjusted: float = interval_secs
-        else:
-            interval_secs_adjusted = _state.energy_cache.sleep_interval_adjust(
-                interval_secs, datetime.now(pytz.timezone(_config.timezone)))
+        _state.lm_last_cycle_finished_at = datetime.now(timezone.utc)
+        _check_stall_watchdog(datetime.now(timezone.utc))
+        interval_secs_adjusted = _compute_loop_sleep(result, interval_secs)
         logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
         time.sleep(interval_secs_adjusted)
-
 
 def load_status() -> Response:
     """Read-only endpoint returning current load management state.
@@ -831,11 +981,12 @@ def load_status() -> Response:
         "cache": cache_payload,
         "mqtt": {
             "has_telemetry": mqtt_telemetry.has_telemetry(),
+            "connected": mqtt_telemetry.is_connected(),
             "last_update_age_secs": mqtt_age,
         },
     }
 
-    for name, device_state in lm.state.devices.items():
+    for name, device_state in lm.state.snapshot_devices().items():
         payload["devices"][name] = {
             "desired_state": device_state.desired_state,
             "actual_state": device_state.actual_state,
@@ -847,7 +998,7 @@ def load_status() -> Response:
             ),
         }
 
-    for effect in lm.state.pending_effects:
+    for effect in lm.state.snapshot_effects():
         payload["pending_effects"].append(
             {
                 "device_name": effect.device_name,

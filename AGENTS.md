@@ -245,6 +245,18 @@ project-root
   `Location` is absent in the snapshot. Delegates to controller's `init_tesla_state()`
   (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
 - Data models in `load_models.py`
+- `nominal_voltage()` in `load_nbc.py` — deferred-config resolver for the
+  `TESLA_NOMINAL_VOLTAGE` env (default 240; invalid/non-positive falls back
+  with a WARNING). All StateTracker amp↔watt conversions and
+  `GapMinder.car_power_watts_5a` read it per-call. Do not reintroduce
+  import-time voltage constants into conversion math.
+- `StateTracker.record_tesla_amp_command()` / `tesla_inflight_wh()` zero-amp
+  confirmation (plan 3.5): a single reported 0 A frame does NOT clear
+  `last_commanded_amps` — only `TESLA_ZERO_AMPS_CLEAR_SAMPLES` (2)
+  consecutive zeros do, and until then the full commanded delta stays
+  accounted. The 1 A ramp-up gate credits the unconfirmed portion
+  (`commanded − reported`) instead of returning 0. Tests asserting an
+  instant clear or a ramp-up zero encode the old bug — do not restore them.
 - Shared fleet-telemetry parsing helpers in `load_models.py` (`unwrap_telemetry_value`,
   `parse_charge_amps`) — single home for the `{"value": ...}` envelope unwrap + amps
   rounding, used by `mqtt_telemetry.py` (`on_message`, `tesla_state_from_snapshot`,

@@ -374,3 +374,41 @@ class TestDetectQuantization:
         assert sample_size == 30
         assert offset == 1
         assert confidence >= 0.99
+
+
+# =============================================================================
+# Shared guard (plan subtask 3.2, fixes A2)
+# =============================================================================
+
+
+class TestUsableWindow:
+    """usable_window() is the single source of truth for accepting a
+    detected quantization period; the flat-data artifact (N=2,
+    confidence 1.0) must be rejected everywhere."""
+
+    def test_flat_data_artifact_rejected(self):
+        from quantization import usable_window
+
+        assert usable_window(2, 1.0) is None
+
+    def test_none_inputs_rejected(self):
+        from quantization import usable_window
+
+        assert usable_window(None, 1.0) is None
+        assert usable_window(30, None) is None
+        assert usable_window(None, None) is None
+
+    def test_low_confidence_rejected(self):
+        from quantization import usable_window
+
+        assert usable_window(30, 0.5) is None
+
+    def test_valid_window_passes(self):
+        from quantization import usable_window
+
+        assert usable_window(30, 0.9) == 30
+
+    def test_minimum_boundary_inclusive(self):
+        from quantization import usable_window
+
+        assert usable_window(15, 1.0) == 15

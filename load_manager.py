@@ -31,9 +31,7 @@ from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
-    MIN_QUANTIZATION_WINDOW_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
-    QUANTIZATION_CONFIDENCE_THRESHOLD,
     STALE_DATA_THRESHOLD_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
@@ -49,6 +47,8 @@ from config_loader import (
     load_vocolinc_credentials,
     load_vocolinc_plugs_from_file,
 )
+
+from util import atomic_write_text
 
 from load_controllers import (
     CompositePlugController,
@@ -84,6 +84,7 @@ from load_models import (
 )
 
 from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder, DecideContext
+from quantization import usable_window
 
 from energy_cache import EnergyCache
 
@@ -158,6 +159,18 @@ _cycle_counter = itertools.count(1)
 def _next_cycle_id() -> str:
     """Return the next cycle correlation id (e.g. ``c17-a3f9``)."""
     return f"c{next(_cycle_counter)}-{_BOOT_ID}"
+
+
+def _write_fleet_telemetry_dotfile(dotfile_path: Any) -> None:
+    """Record fleet-telemetry provisioning time atomically.
+
+    Args:
+        dotfile_path: Destination path (e.g. mqtt_telemetry's
+            ``_FLEET_TELEMETRY_DOTFILE``).
+    """
+    atomic_write_text(
+        dotfile_path, datetime.now(tz=timezone.utc).isoformat() + "\n"
+    )
 
 
 # === LoadManager Orchestrator ===
@@ -417,16 +430,10 @@ class LoadManager:
         if nbc is None:
             return DEFAULT_PREDICTION_WINDOW_SECS
         ec = getattr(nbc, 'energy_cache', None)
-        if ec is not None and ec.data is not None:
-            qs = ec.quantization_seconds
-            qc = ec.quantization_confidence
-            if (
-                qs is not None
-                and qs >= MIN_QUANTIZATION_WINDOW_SECS
-                and qc is not None
-                and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD
-            ):
-                return qs
+        if ec is not None:
+            window = usable_window(ec.quantization_seconds, ec.quantization_confidence)
+            if window is not None:
+                return window
         return DEFAULT_PREDICTION_WINDOW_SECS
 
     def _quantization_diagnostics(self) -> dict[str, Any]:
@@ -653,7 +660,7 @@ class LoadManager:
             if effect.device_name == "tesla" and effect.action == "set_amps":
                 prev_amps = self.state.last_commanded_amps
                 new_amps = effect.target_amps
-                self.state.last_commanded_amps = new_amps
+                self.state.record_tesla_amp_command(new_amps)
                 if new_amps is not None and (
                     prev_amps is None or new_amps > prev_amps
                 ):
@@ -681,9 +688,9 @@ class LoadManager:
                         new_amps,
                     )
             elif effect.device_name == "tesla" and effect.action in ("turn_off", "turn_on"):
-                self.state.last_commanded_amps = None
+                self.state.record_tesla_amp_command(None)
                 self.state.clear_tesla_settle_effects()
-            self.state.pending_effects.append(effect)
+            self.state.add_effect(effect)
 
         # Sync Tesla entry in devices from live vehicle state
         self.state.sync_tesla_device_state(ctx.tesla_state)
@@ -2436,9 +2443,7 @@ class LoadManager:
             asyncio.run(fleet_telemetry_config_create(self.tesla_ctrl, config))
             logger.info("provision_fleet_telemetry: Provisioning succeeded.")
             from mqtt_telemetry import _FLEET_TELEMETRY_DOTFILE
-            _FLEET_TELEMETRY_DOTFILE.write_text(
-                datetime.now(tz=timezone.utc).isoformat() + "\n"
-            )
+            _write_fleet_telemetry_dotfile(_FLEET_TELEMETRY_DOTFILE)
             logger.info(
                 "provision_fleet_telemetry: wrote dotfile %s",
                 _FLEET_TELEMETRY_DOTFILE,

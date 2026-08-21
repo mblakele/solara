@@ -131,6 +131,45 @@ class TestHealthPayload:
         )
         assert payload["status"] == "ok"
 
+    def test_mqtt_disconnected_with_recent_messages_degrades(
+        self, monkeypatch
+    ):
+        """Started MQTT, messages <600s old, but broker disconnected.
+
+        Message freshness alone cannot see a feed that went dark seconds
+        ago with old values still cached — connection state closes that
+        gap once the disconnect outlives a single backoff window.
+        """
+        app_mod._state.mqtt_subscriber_started = True
+        monkeypatch.setattr(
+            mqtt_telemetry,
+            "_field_update_at",
+            {"ChargeAmps": _now() - timedelta(seconds=90)},
+        )
+        monkeypatch.setattr(mqtt_telemetry, "_connection_ok", False)
+        payload = app_mod._build_health_payload(_now())
+        components = payload["components"]["mqtt_telemetry"]
+        assert components["connected"] is False
+        assert components["state"] == "disconnected"
+        assert payload["status"] == "degraded"
+
+    def test_mqtt_brief_disconnect_within_stale_bound_not_gating(
+        self, monkeypatch
+    ):
+        """A blip inside one backoff window stays informational."""
+        app_mod._state.mqtt_subscriber_started = True
+        monkeypatch.setattr(
+            mqtt_telemetry,
+            "_field_update_at",
+            {"ChargeAmps": _now() - timedelta(seconds=10)},
+        )
+        monkeypatch.setattr(mqtt_telemetry, "_connection_ok", False)
+        payload = app_mod._build_health_payload(_now())
+        components = payload["components"]["mqtt_telemetry"]
+        assert components["connected"] is False
+        assert components["state"] == "receiving"
+        assert payload["status"] == "ok"
+
     def test_mqtt_waiting_beyond_boot_grace_degrades(
         self, monkeypatch
     ):

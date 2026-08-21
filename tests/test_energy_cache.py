@@ -91,12 +91,14 @@ class TestGetCurrentQhQuantization:
         Layout: 70 samples of 0.001, then 30 samples of 0.003 = 100 total.
         With quantization_seconds=30, confidence=1.0 → window=30s.
 
-        Expected predicted_wh with 30s window:
+        Expected predicted_wh with 30s window (plan 3.3: extrapolation uses
+        the WALL-CLOCK remainder, not sample count):
+            wall remaining at 14:01 = 900 - 60 = 840 s
             prediction_w = 1000 * 0.003 = 3.0 W
             raw_wh = 1000 * (70*0.001 + 30*0.003) = 160 Wh
-            predicted_wh = 160 + 800 * 3.0 = 2560 Wh
+            predicted_wh = 160 + 840 * 3.0 = 2680 Wh
 
-        With default 60s window, prediction_w would be 2.0 W and predicted_wh=1760.
+        The dict also exposes the sample-count remainder for diagnostics.
         """
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         samples = [0.001] * 70 + [0.003] * 30
@@ -109,10 +111,12 @@ class TestGetCurrentQhQuantization:
 
         assert result is not None
         assert result["qh_name"] == "QH1"
-        # 2560 from 30s window (not 1760 from 60s window)
-        assert result["predicted_wh"] == pytest.approx(2560.0, abs=0.01), (
-            f"Expected 2560 (30s window) but got {result['predicted_wh']}"
+        # 2680 from 30s window on the wall-clock remainder
+        assert result["predicted_wh"] == pytest.approx(2680.0, abs=0.01), (
+            f"Expected 2680 (30s window, wall-clock) but got {result['predicted_wh']}"
         )
+        assert result["seconds_remaining"] == 840
+        assert result["sample_seconds_remaining"] == 800
 
     def test_get_current_qh_falls_back_when_no_quantization(self):
         """get_current_qh falls back to default window when no quantization data.
@@ -130,9 +134,9 @@ class TestGetCurrentQhQuantization:
 
         assert result is not None
         assert result["qh_name"] == "QH1"
-        # 2560 from 30s window
-        assert result["predicted_wh"] == pytest.approx(2560.0, abs=0.01), (
-            f"Expected 1760 (60s window) but got {result['predicted_wh']}"
+        # 2680 from 30s default window on the wall-clock remainder
+        assert result["predicted_wh"] == pytest.approx(2680.0, abs=0.01), (
+            f"Expected 2680 (30s window) but got {result['predicted_wh']}"
         )
 
     def test_get_current_qh_falls_back_when_confidence_below_threshold(self):
@@ -151,9 +155,9 @@ class TestGetCurrentQhQuantization:
 
         assert result is not None
         assert result["qh_name"] == "QH1"
-        # 2560 from 30s default (not 1760 from old 60s default)
-        assert result["predicted_wh"] == pytest.approx(2560.0, abs=0.01), (
-            f"Expected 2560 (30s default) but got {result['predicted_wh']}"
+        # 2680 from 30s default (not old 60s default)
+        assert result["predicted_wh"] == pytest.approx(2680.0, abs=0.01), (
+            f"Expected 2680 (30s default) but got {result['predicted_wh']}"
         )
 
     def test_get_current_qh_returns_none_when_no_data(self):
@@ -522,4 +526,189 @@ class TestPruneOldSamplesLastSampleAt:
         # last_sample_at must be >= data_start (the invariant).
         assert pruned.last_sample_at >= pruned.data_start, (
             f"last_sample_at {pruned.last_sample_at} < data_start {pruned.data_start}"
+        )
+
+
+# =============================================================================
+# Fetch-outside-the-lock (plan subtask 2.2, fixes R2)
+# =============================================================================
+
+
+class TestFetchOutsideLock:
+    """get_or_fetch must not hold the state lock across network I/O.
+
+    Holding ``_lock`` during the fetch (up to fetch_timeout_secs=30 s)
+    blocks every Flask request thread behind the load-management thread's
+    Emporia call. After the fix, readers acquire the lock only for
+    instant snapshot operations.
+    """
+
+    def _now(self):
+        return datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+
+    def _payload(self, now):
+        return {
+            "per_second_data": [0.2] * 60,
+            "data_start": now.replace(minute=0),
+        }
+
+    def test_reader_not_blocked_during_slow_fetch(self):
+        """get_current_qh completes while another thread's fetch is stuck."""
+        import threading
+
+        cache = EnergyCache()
+        now = self._now()
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_fetch():
+            started.set()
+            release.wait(timeout=10)
+            return self._payload(now)
+
+        worker = threading.Thread(
+            target=lambda: cache.get_or_fetch(slow_fetch, now), daemon=True
+        )
+        worker.start()
+        assert started.wait(timeout=5), "fetcher never started"
+
+        reader = threading.Thread(
+            target=lambda: cache.get_current_qh(now), daemon=True
+        )
+        reader.start()
+        reader.join(timeout=1.0)
+        assert not reader.is_alive(), (
+            "reader is blocked behind an in-flight fetch: the state lock "
+            "is still held across network I/O"
+        )
+        reader.join(timeout=5)
+
+        release.set()
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert cache.data is not None
+
+    def test_single_flight_only_one_fetch_per_refresh(self):
+        """Concurrent invalid-cache callers produce exactly one fetch."""
+        import threading
+
+        cache = EnergyCache(ttl_seconds=30)
+        now = self._now()
+        calls: list[int] = []
+        calls_lock = threading.Lock()
+        started = threading.Event()
+        release = threading.Event()
+
+        def counting_fetch():
+            with calls_lock:
+                calls.append(1)
+            started.set()
+            release.wait(timeout=10)
+            return self._payload(now)
+
+        results: list[tuple] = []
+
+        def call_it():
+            results.append(cache.get_or_fetch(counting_fetch, now))
+
+        t1 = threading.Thread(target=call_it, daemon=True)
+        t1.start()
+        assert started.wait(timeout=5)
+
+        t2 = threading.Thread(target=call_it, daemon=True)
+        t2.start()
+        release.set()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert not t1.is_alive() and not t2.is_alive()
+        assert len(calls) == 1, f"expected single-flight, got {len(calls)} calls"
+        assert results[0][1] is True
+        assert results[1][1] is False
+
+    def test_stale_served_when_fetch_times_out(self):
+        """Timeout path still serves the previous snapshot untouched."""
+        import time as time_mod
+
+        cache = EnergyCache(fetch_timeout_secs=1)
+        now = self._now()
+
+        stale_samples = [0.1] * 60
+        data_start = now - timedelta(minutes=2)
+        cache._data = EnergyCacheData(
+            samples=stale_samples,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=59),
+            last_fetch_at=now - timedelta(minutes=1),
+            sample_count=60,
+            quantization_seconds=30,
+            quantization_offset=0,
+            quantization_confidence=1.0,
+        )
+
+        def hanging_fetch():
+            time_mod.sleep(3)
+            return self._payload(now)
+
+        result, fresh = cache.get_or_fetch(hanging_fetch, now)
+        assert fresh is False
+        assert result is not None
+
+    def test_fetcher_exception_absorbed_and_lock_usable_after(self):
+        """Fetcher exceptions are absorbed (logged) -> empty/stale result.
+
+        _run_fetch_with_timeout converts any raised exception into None so
+        get_or_fetch can serve stale data; that contract must survive the
+        locking rework.
+        """
+        cache = EnergyCache()
+        now = self._now()
+
+        def bad_fetch():
+            raise ValueError("api down")
+
+        result, fresh = cache.get_or_fetch(bad_fetch, now)
+        assert result is None
+        assert fresh is True
+
+        # State lock must be free and the cache still readable.
+        assert cache.get_current_qh(now) is None
+
+
+class TestFlatDataQuantizationGuard:
+    """get_current_qh must reject the flat-data N=2 artifact (A2)."""
+
+    def test_flat_data_falls_back_to_default_window(self):
+        from dataclasses import replace
+
+        cache = EnergyCache()
+        now = datetime(2025, 6, 15, 14, 5, 0, tzinfo=timezone.utc)
+        data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+
+        # Trailing-2 rate differs wildly from the default-window rate.
+        samples = [1.0] * 40 + [9.0] * 20
+        cache._data = cache._merge_samples_replace(samples, data_start, now)
+        assert cache.data is not None
+
+        # Force the flat-data artifact into stored state (N=2, conf 1.0,
+        # as detect_quantization reports for all-identical arrays). The
+        # shared guard must reject it so extrapolation uses the default
+        # window instead of the last 2 samples.
+        cache._data = replace(
+            cache.data,
+            quantization_seconds=2,
+            quantization_confidence=1.0,
+        )
+
+        result = cache.get_current_qh(now)
+        assert result is not None
+
+        from util import compute_nbc_quarters, qh_seconds_remaining
+
+        expected = compute_nbc_quarters(
+            samples, None, seconds_remaining_override=qh_seconds_remaining(now)
+        ).qh1.predicted_wh
+        assert result["predicted_wh"] == pytest.approx(expected), (
+            "flat-data N=2 artifact must not drive extrapolation"
         )

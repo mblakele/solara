@@ -2620,3 +2620,134 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
 
 
 
+
+
+# =============================================================================
+# Emporia auth hardening (plan subtask 2.4, fixes R5 / mitigates R7)
+# =============================================================================
+
+
+class TestVueInitHardening(unittest.TestCase):
+    """Corrupt .vue-keys.json must fall back to password auth, not crash."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.keys_path = f"{self._tmp.name}/.vue-keys.json"
+
+    def _make_hp(self, keys_content):
+        hp = HourlyProjection.__new__(HourlyProjection)
+        hp.logger = MagicMock()
+        hp.vue = MagicMock()
+        if keys_content is not None:
+            with open(self.keys_path, "w", encoding="utf-8") as fh:
+                fh.write(keys_content)
+        hp.vue_keys = self.keys_path
+        return hp
+
+    def test_corrupt_json_falls_back_to_password(self):
+        """Unparseable keys file -> single password login, no raise."""
+        hp = self._make_hp("{definitely not json")
+        hp.vue.login.return_value = True
+
+        hp.vue_init()
+
+        self.assertEqual(hp.vue.login.call_count, 1)
+        kwargs = hp.vue.login.call_args.kwargs
+        self.assertIn("username", kwargs)
+        self.assertIn("password", kwargs)
+        self.assertNotIn("id_token", kwargs)
+
+    def test_missing_token_fields_fall_back_to_password(self):
+        """Valid JSON missing required keys -> password fallback."""
+        hp = self._make_hp('{"id_token": "only"}')
+        hp.vue.login.return_value = True
+
+        hp.vue_init()
+
+        self.assertEqual(hp.vue.login.call_count, 1)
+        kwargs = hp.vue.login.call_args.kwargs
+        self.assertIn("username", kwargs)
+
+    def test_password_fallback_failure_wraps_auth_error(self):
+        """When the fallback also fails, raise VueAuthenticationError."""
+        from metrics import VueAuthenticationError
+
+        hp = self._make_hp("{corrupt")
+        hp.vue.login.side_effect = RuntimeError("nope")
+
+        with self.assertRaises(VueAuthenticationError):
+            hp.vue_init()
+
+    def test_concurrent_vue_init_serializes_login(self):
+        """Concurrent vue_init calls never overlap inside vue.login."""
+        import threading
+
+        hp = self._make_hp(None)  # no keys file -> IOError -> password path
+        state = {"active": 0, "max_active": 0}
+        state_lock = threading.Lock()
+
+        def fake_login(**_kwargs):
+            with state_lock:
+                state["active"] += 1
+                state["max_active"] = max(
+                    state["max_active"], state["active"]
+                )
+            time.sleep(0.03)
+            with state_lock:
+                state["active"] -= 1
+            return True
+
+        hp.vue.login = MagicMock(side_effect=fake_login)
+
+        threads = [
+            threading.Thread(target=hp.vue_init, daemon=True)
+            for _ in range(6)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(hp.vue.login.call_count, 6)
+        self.assertEqual(
+            state["max_active"],
+            1,
+            "vue.login calls overlapped: _vue_init_lock is not held "
+            "across authentication",
+        )
+
+
+class TestPredictionWindowFromCache:
+    """prediction_window_from_cache applies the shared guard (A2)."""
+
+    def test_flat_data_artifact_rejected(self):
+        from types import SimpleNamespace
+
+        cache = SimpleNamespace(
+            data=SimpleNamespace(
+                quantization_seconds=2, quantization_confidence=1.0
+            )
+        )
+        assert metrics.prediction_window_from_cache(cache) is None
+
+    def test_valid_window_passes_through(self):
+        from types import SimpleNamespace
+
+        cache = SimpleNamespace(
+            data=SimpleNamespace(
+                quantization_seconds=30, quantization_confidence=0.9
+            )
+        )
+        assert metrics.prediction_window_from_cache(cache) == 30
+
+    def test_none_cache_returns_none(self):
+        assert metrics.prediction_window_from_cache(None) is None
+
+    def test_empty_data_returns_none(self):
+        from types import SimpleNamespace
+
+        cache = SimpleNamespace(data=None)
+        assert metrics.prediction_window_from_cache(cache) is None

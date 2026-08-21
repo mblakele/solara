@@ -10,6 +10,39 @@ from __future__ import annotations
 import math
 from collections import Counter
 
+from constants import (
+    MIN_QUANTIZATION_WINDOW_SECS,
+    QUANTIZATION_CONFIDENCE_THRESHOLD,
+)
+
+
+def usable_window(
+    quantization_seconds: int | None,
+    quantization_confidence: float | None,
+) -> int | None:
+    """Return the detected period if it is safe to use, else ``None``.
+
+    Single source of truth for accepting a detected quantization period
+    (plan 3.2): rejects missing data, low confidence, and short periods
+    that are almost always artifacts — notably the flat-data case where
+    ``detect_quantization`` reports N=2 with confidence 1.0.
+
+    Args:
+        quantization_seconds: Detected period in seconds, or None.
+        quantization_confidence: Confidence score, or None.
+
+    Returns:
+        The period when it passes both guards, otherwise ``None``
+        (callers fall back to ``DEFAULT_PREDICTION_WINDOW_SECS``).
+    """
+    if quantization_seconds is None or quantization_confidence is None:
+        return None
+    if quantization_confidence < QUANTIZATION_CONFIDENCE_THRESHOLD:
+        return None
+    if quantization_seconds < MIN_QUANTIZATION_WINDOW_SECS:
+        return None
+    return quantization_seconds
+
 
 def _equal(a: float, b: float) -> bool:
     """Compare two floats, treating NaN == NaN as equal."""

@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from energy_cache import EnergyCache
+from config import Config
 from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
 
 from constants import (
@@ -26,10 +28,47 @@ from constants import (
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
     TESLA_HARD_MAX_AMPS,
     TESLA_NOMINAL_VOLTAGE,
+    TESLA_ZERO_AMPS_CLEAR_SAMPLES,
 )
 
 
 logger = logging.getLogger(__name__)
+
+# Deferred config accessor for the nominal-voltage override — instantiated
+# at import (cheap) but only READ when conversions run, so tests can control
+# it via env vars per-test.
+_VOLTAGE_CONFIG = Config()
+
+
+def nominal_voltage() -> float:
+    """Return the nominal mains voltage used for watts/amps conversions.
+
+    Reads ``TESLA_NOMINAL_VOLTAGE`` through the deferred config lookup
+    chain (env var → .env → default 240) so deployments on 208 V or 230 V
+    mains can correct the Tesla amp↔watt math without code changes
+    (plan 3.6). Invalid or non-positive values fall back to the default.
+
+    Returns:
+        Voltage in volts (always positive).
+    """
+    raw = _VOLTAGE_CONFIG.get(
+        "TESLA_NOMINAL_VOLTAGE", default=str(TESLA_NOMINAL_VOLTAGE),
+    )
+    try:
+        volts = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid TESLA_NOMINAL_VOLTAGE=%r — using default %d V",
+            raw, TESLA_NOMINAL_VOLTAGE,
+        )
+        return float(TESLA_NOMINAL_VOLTAGE)
+    if volts <= 0:
+        logger.warning(
+            "Non-positive TESLA_NOMINAL_VOLTAGE=%r — using default %d V",
+            raw, TESLA_NOMINAL_VOLTAGE,
+        )
+        return float(TESLA_NOMINAL_VOLTAGE)
+    return volts
 
 
 @dataclass(frozen=True)
@@ -313,6 +352,11 @@ class NBCReader:
 
 
 class StateTracker:
+    # Too many public methods (24/20): StateTracker is the state facade over
+    # device states, pending effects, and Tesla command/settle tracking —
+    # each method is a small, independently tested operation. Splitting it
+    # would scatter related state transitions without reducing complexity.
+    # pylint: disable=too-many-public-methods
     """In-memory state of managed devices and pending effects."""
 
     # Asymmetric debounce: turn-on is conservative (prevents chatter), turn-off
@@ -320,8 +364,6 @@ class StateTracker:
     # full on-guard period, which would leave a large deficit in place).
     MIN_TOGGLE_ON_SECS = 60
     MIN_TOGGLE_OFF_SECS = 20
-    STALE_THRESHOLD_SECS = 61
-    VOLTAGE = TESLA_NOMINAL_VOLTAGE
 
     # The settle window duration is now derived dynamically from the
     # quantization-based prediction window via effective_settle_secs.
@@ -361,12 +403,12 @@ class StateTracker:
         """
         if current_amps is None:
             return 0.0
-        return current_amps * StateTracker.VOLTAGE
+        return current_amps * nominal_voltage()
 
     @staticmethod
     def watts_to_amps(power_watts: float) -> int:
         """Convert power in watts to integer amps at nominal voltage."""
-        return int(power_watts / StateTracker.VOLTAGE)
+        return int(power_watts / nominal_voltage())
 
     @staticmethod
     def delta_amps_to_wh(amp_delta: float, seconds: int) -> float:
@@ -379,7 +421,7 @@ class StateTracker:
         Returns:
             Watt-hours consumed or saved by the delta.
         """
-        return amp_delta * StateTracker.VOLTAGE * seconds / 3600.0
+        return amp_delta * nominal_voltage() * seconds / 3600.0
 
     @staticmethod
     def wh_to_amps(energy_wh: float, seconds: int) -> float:
@@ -392,7 +434,7 @@ class StateTracker:
         Returns:
             Float amp change — callers apply floor or ceil as appropriate.
         """
-        return energy_wh * 3600.0 / (StateTracker.VOLTAGE * seconds)
+        return energy_wh * 3600.0 / (nominal_voltage() * seconds)
 
     def __init__(self, prediction_window_seconds: int = DEFAULT_PREDICTION_WINDOW_SECS) -> None:
         self._pending_effect_min_secs = prediction_window_seconds
@@ -400,16 +442,58 @@ class StateTracker:
         # observed on two consecutive cycles (see apply_prediction_window).
         self._window_candidate: int | None = None
         self._window_candidate_confirmations = 0
+        # Guards devices/pending_effects against cross-thread readers
+        # (Flask request threads) vs writers (the load-management thread).
+        # RLock so internal mutators can nest.
+        self._state_lock = threading.RLock()
         self.devices: dict[str, DeviceState] = {}
         self.pending_effects: list[PendingEffect] = []
         self.last_data_point_at: datetime | None = None
         self.last_nbc_predicted_wh: float | None = None
         self.last_commanded_amps: int | None = None
+        # Consecutive reported_amps==0 samples seen for the current command.
+        # A single 0 A telemetry frame is not enough to confirm the car
+        # stopped — see tesla_inflight_wh() (plan 3.5).
+        self._zero_amp_samples: int = 0
         # Fleet-telemetry push callbacks replace REST reads of Tesla state.
         self.tesla_telemetry_state: TeslaVehicleTelemetry | None = None
         self.has_fresh_telemetry: bool = False
         # Whether fleet-telemetry push has been registered via the callback API.
         self.registered: bool = False
+
+    def snapshot_devices(self) -> dict[str, DeviceState]:
+        """Return an atomic copy of device states for cross-thread readers.
+
+        Flask request threads must never iterate the live ``devices`` dict:
+        a concurrent resize on the load-management thread raises
+        "dictionary changed size during iteration".
+        """
+        with self._state_lock:
+            return dict(self.devices)
+
+    def snapshot_effects(self) -> list[PendingEffect]:
+        """Return an atomic copy of pending effects for cross-thread readers."""
+        with self._state_lock:
+            return list(self.pending_effects)
+
+    def set_device_state(self, name: str, state: DeviceState) -> None:
+        """Insert or replace a device state under the state lock.
+
+        Args:
+            name: Device name key.
+            state: The new DeviceState.
+        """
+        with self._state_lock:
+            self.devices[name] = state
+
+    def add_effect(self, effect: PendingEffect) -> None:
+        """Append a pending effect under the state lock.
+
+        Args:
+            effect: The executed-action record to append.
+        """
+        with self._state_lock:
+            self.pending_effects.append(effect)
 
     def apply_prediction_window(self, prediction_window_seconds: int) -> None:
         """Resolve the prediction/settle window from quantization data.
@@ -486,9 +570,14 @@ class StateTracker:
         Returns zero when no amp command is in flight or the car has already
         reached the commanded level (confirmed by vehicle API).
 
+        A reported 0 A frame is not trusted immediately: the command is only
+        cleared after ``TESLA_ZERO_AMPS_CLEAR_SAMPLES`` consecutive zero
+        samples, and until then the full commanded delta stays accounted.
+
         If the car reports 1 A during the settle window after a recent command,
         it is considered to be ramping up (not stale) and ``last_commanded_amps``
-        is preserved.  The settle window considers both wall-clock age and
+        is preserved while the unconfirmed portion of the delta is credited.
+        The settle window considers both wall-clock age and
         data-point-at age — the ramp-up status is preserved if **either**
         measure is still within ``effective_settle_secs``.
 
@@ -507,11 +596,22 @@ class StateTracker:
         if self.last_commanded_amps is None or reported_amps is None:
             return 0.0
         resolve_now = now
-        # Car has stopped drawing power — clear the stale command state.
-        # reported_amps == 0 means the car is idle or disconnected.
+        # Car reports 0 A: not immediately trusted as "stopped" — a single
+        # zero frame can be stale or in-transit while the car is still
+        # ramping. Only after TESLA_ZERO_AMPS_CLEAR_SAMPLES consecutive
+        # zero samples is the command cleared (plan 3.5).
         if reported_amps == 0:
-            self.last_commanded_amps = None
-            return 0.0
+            self._zero_amp_samples += 1
+            if self._zero_amp_samples >= TESLA_ZERO_AMPS_CLEAR_SAMPLES:
+                self.last_commanded_amps = None
+                self._zero_amp_samples = 0
+                return 0.0
+            # Unconfirmed stop — keep accounting for the full commanded delta.
+            return StateTracker.delta_amps_to_wh(
+                self.last_commanded_amps, seconds_remaining,
+            )
+        # Any non-zero report resets the zero-amp confirmation counter.
+        self._zero_amp_samples = 0
         latest_cmd = self._latest_tesla_command()
         # Car is at 1 A: gate the stale-clearing behind a recency check.
         # During ramp-up the car briefly reports 1A — treat as stale only
@@ -522,7 +622,12 @@ class StateTracker:
                 elapsed_wall = (resolve_now - latest_cmd.timestamp).total_seconds()
                 if elapsed_wall < self.effective_settle_secs:
                     # Recent command — car is ramping up, don't clear.
-                    return 0.0
+                    # Credit the unconfirmed portion so surplus is not
+                    # overstated after an amp increase (plan 3.5).
+                    return StateTracker.delta_amps_to_wh(
+                        self.last_commanded_amps - reported_amps,
+                        seconds_remaining,
+                    )
                 # Wall clock expired — check data-point-at age.
                 if (data_point_at is not None
                         and latest_cmd.data_point_at is not None):
@@ -530,10 +635,14 @@ class StateTracker:
                         data_point_at - latest_cmd.data_point_at
                     ).total_seconds()
                     if elapsed_data < self.effective_settle_secs:
-                        return 0.0
+                        return StateTracker.delta_amps_to_wh(
+                            self.last_commanded_amps - reported_amps,
+                            seconds_remaining,
+                        )
             # No recent command (or command age exceeds settle window) —
             # treat as stale and clear.
             self.last_commanded_amps = None
+            self._zero_amp_samples = 0
             return 0.0
         delta = self.last_commanded_amps - reported_amps
         if delta == 0:
@@ -558,8 +667,24 @@ class StateTracker:
                 self.last_commanded_amps, reported_amps,
             )
             self.last_commanded_amps = None
+            self._zero_amp_samples = 0
             return 0.0
         return StateTracker.delta_amps_to_wh(delta, seconds_remaining)
+
+    def record_tesla_amp_command(self, amps: int | None) -> None:
+        """Record a commanded Tesla amp level and reset zero-amp confirmation.
+
+        Called by the load manager when a ``set_amps`` action commits (or a
+        turn_on/turn_off clears the command). Resetting the zero-sample
+        counter here prevents a count accumulated against an earlier command
+        from instantly clearing the fresh one on its first 0 A frame.
+
+        Args:
+            amps: The newly commanded amp level, or None to clear the
+                recorded command.
+        """
+        self.last_commanded_amps = amps
+        self._zero_amp_samples = 0
 
     def sync_tesla_device_state(
         self, tesla_state: TeslaState | None,
@@ -575,15 +700,19 @@ class StateTracker:
         """
         if tesla_state is not None:
             latest_cmd = self._latest_tesla_command()
-            self.devices["tesla"] = DeviceState(
-                name="tesla",
-                actual_state=tesla_state.is_charging,
-                current_amps=tesla_state.current_amps,
-                desired_state=self.last_commanded_amps is not None,
-                last_toggle=latest_cmd.timestamp if latest_cmd else None,
+            self.set_device_state(
+                "tesla",
+                DeviceState(
+                    name="tesla",
+                    actual_state=tesla_state.is_charging,
+                    current_amps=tesla_state.current_amps,
+                    desired_state=self.last_commanded_amps is not None,
+                    last_toggle=latest_cmd.timestamp if latest_cmd else None,
+                ),
             )
         else:
-            self.devices.pop("tesla", None)
+            with self._state_lock:
+                self.devices.pop("tesla", None)
 
     def _latest_tesla_command(self) -> PendingEffect | None:
         """Return the most recent Tesla effect (set_amps, turn_on, or turn_off).
@@ -687,10 +816,11 @@ class StateTracker:
         which supersedes any prior amp-change effects. Only removes "set_amps"
         effects — turn_on/turn_off effects are preserved.
         """
-        self.pending_effects = [
-            eff for eff in self.pending_effects
-            if not (eff.device_name == "tesla" and eff.action == "set_amps")
-        ]
+        with self._state_lock:
+            self.pending_effects = [
+                eff for eff in self.pending_effects
+                if not (eff.device_name == "tesla" and eff.action == "set_amps")
+            ]
 
     def has_pending_effect_since(self, nbc_timestamp: datetime) -> bool:
         """Return True if we took an action after the NBC timestamp by either measure.
@@ -763,14 +893,15 @@ class StateTracker:
         """
         wall_cutoff = now - timedelta(seconds=self._pending_effect_min_secs)
         dp_cutoff = data_point_at - timedelta(seconds=self._pending_effect_min_secs)
-        before = len(self.pending_effects)
-        self.pending_effects = [
-            eff for eff in self.pending_effects
-            if eff.timestamp >= wall_cutoff
-            or eff.data_point_at >= dp_cutoff
-            or eff.timestamp > data_point_at
-        ]
-        return before - len(self.pending_effects)
+        with self._state_lock:
+            before = len(self.pending_effects)
+            self.pending_effects = [
+                eff for eff in self.pending_effects
+                if eff.timestamp >= wall_cutoff
+                or eff.data_point_at >= dp_cutoff
+                or eff.timestamp > data_point_at
+            ]
+            return before - len(self.pending_effects)
 
     def can_toggle(
         self, device_name: str, now: datetime, turning_on: bool = True
@@ -823,14 +954,14 @@ class StateTracker:
                 "current_amps": ds.current_amps,
                 "last_toggle": ds.last_toggle.isoformat()
                 if ds.last_toggle else None,
-            } for name, ds in self.devices.items()},
+            } for name, ds in self.snapshot_devices().items()},
             "pending_effects": [{
                 "device_name": eff.device_name,
                 "action": eff.action,
                 "timestamp": eff.timestamp.isoformat(),
                 "data_point_at": eff.data_point_at.isoformat(),
                 "power_watts": eff.power_watts,
-            } for eff in self.pending_effects],
+            } for eff in self.snapshot_effects()],
             "last_data_point_at": (self.last_data_point_at.isoformat()
                                    if self.last_data_point_at else None),
             "last_commanded_amps": self.last_commanded_amps,
@@ -877,8 +1008,6 @@ class GapMinder:
     """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
-    CAR_POWER_WATTS_5A = TESLA_CHARGE_AMPS_MIN_DEFAULT * TESLA_NOMINAL_VOLTAGE
-    """1200W at Tesla's minimum charge rate (5A * 240V)."""
     MAX_DEFER_SECS = 120          # cap on the safe defer window
     HARD_MAX_AMPS = TESLA_HARD_MAX_AMPS
     """Absolute max — never exceed, regardless of config."""
@@ -888,6 +1017,15 @@ class GapMinder:
     # new QH starting with Tesla at a high amp level that immediately overwhelms
     # solar production).
     TESLA_SETTLE_SUPPRESS_WH = 240
+
+    @property
+    def car_power_watts_5a(self) -> float:
+        """Car draw at Tesla's minimum charge rate, at nominal voltage.
+
+        1200 W with the default 5 A * 240 V; follows the
+        ``TESLA_NOMINAL_VOLTAGE`` override for other mains.
+        """
+        return TESLA_CHARGE_AMPS_MIN_DEFAULT * nominal_voltage()
 
     def __init__(
         self,
@@ -932,7 +1070,7 @@ class GapMinder:
             Maximum defer window in seconds, capped at MAX_DEFER_SECS.
         """
         return int(
-            min(self.MAX_DEFER_SECS, remaining_reduction / (self.CAR_POWER_WATTS_5A / 3600))
+            min(self.MAX_DEFER_SECS, remaining_reduction / (self.car_power_watts_5a / 3600))
         )
 
     def decide(
@@ -1047,8 +1185,11 @@ class GapMinder:
                 )
                 remaining_gap -= capacity
                 if not ctx.dry_run:
-                    ctx.state.devices[name] = DeviceState(
-                        name=name, last_toggle=ctx.now, desired_state=True
+                    ctx.state.set_device_state(
+                        name,
+                        DeviceState(
+                            name=name, last_toggle=ctx.now, desired_state=True
+                        ),
                     )
 
             else:
@@ -1185,13 +1326,15 @@ class GapMinder:
                     action="turn_off",
                     timestamp=ctx.now,
                     data_point_at=dp,
-                    power_watts=plug.power_watts,
+                    # Signed: shedding load is negative (plan 3.4).
+                    power_watts=-plug.power_watts,
                 )
             )
             remaining_reduction -= savings
             if not ctx.dry_run:
-                ctx.state.devices[name] = DeviceState(
-                    name=name, last_toggle=ctx.now, desired_state=False
+                ctx.state.set_device_state(
+                    name,
+                    DeviceState(name=name, last_toggle=ctx.now, desired_state=False),
                 )
             if remaining_reduction <= 0:
                 break

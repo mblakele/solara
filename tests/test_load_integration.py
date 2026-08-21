@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from constants import DEFAULT_PREDICTION_WINDOW_SECS
+from constants import DEFAULT_PREDICTION_WINDOW_SECS, STALE_DATA_THRESHOLD_SECS
 from load_controllers import PlugController, TeslaController
 from load_manager import LoadManager, LoadManagerConfig
 from load_models import (
@@ -434,27 +434,36 @@ def test_stale_data_skips_cycle():
     assert result.status == "stale_data"
 
 
-def test_stale_no_pending_effects_proceeds():
-    """NBC data >120s old with zero pending effects should NOT skip.
+def test_stale_data_skips_even_with_zero_pending_effects():
+    """Genuinely stale data (>80s) returns stale_data EVEN with zero effects.
 
-    Regression test: previously, stale data alone (with no unreflected
-    actions) caused permanent lockout since last_data_point_at was never
-    updated while stuck in the stale path. With zero pending effects,
-    there are no unreflected actions, so it's safe to proceed.
+    Regression guard for the stale gate's contract: the data-point age
+    threshold is unconditional — when the most recent per-second sample is
+    older than STALE_DATA_THRESHOLD_SECS the cycle is skipped regardless of
+    pending effects, because an aged prediction is unsafe to act on by
+    itself. (An earlier version of this test asserted stale + zero effects
+    proceeds, but it used a 61s age — BELOW the 80s threshold — and so
+    never actually exercised the stale path.)
     """
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
-    data_point_at = fixed_now - timedelta(seconds=StateTracker.STALE_THRESHOLD_SECS)
+    # Genuinely stale (past STALE_DATA_THRESHOLD_SECS).
+    # (Previously referenced the dead StateTracker.STALE_THRESHOLD_SECS=61,
+    # which is BELOW the 80 s production threshold and thus never stale.)
+    data_point_at = fixed_now - timedelta(seconds=STALE_DATA_THRESHOLD_SECS + 50)
     fetched_at = data_point_at + timedelta(seconds=10)
     metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
+    metrics_data["_data_lag_secs"] = 130
 
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
+    energy_cache = _make_energy_cache_with_prediction(
+        -2000.0, fixed_now, data_lag_secs=130,
+    )
     mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -470,7 +479,7 @@ def test_stale_no_pending_effects_proceeds():
 
 
     assert len(mgr.state.pending_effects) == 0
-    assert result.status != "stale_data"
+    assert result.status == "stale_data"
 
 
 def test_stale_data_from_previous_qh():

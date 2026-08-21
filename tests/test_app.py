@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import requests
+from werkzeug.exceptions import BadRequest
 from app import app
 
 
@@ -1696,3 +1697,66 @@ class TestLoadManagerSharedCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestValidateDatesHygiene(unittest.TestCase):
+    """Injected clock + explicit-DST handling in date parsing (plan 3.8)."""
+
+    def setUp(self):
+        self.app = app.test_client()
+
+    def test_validate_dates_accepts_injected_clock(self):
+        """end_date defaults to the INJECTED clock's time, not raw datetime.now()."""
+        from app import _validate_dates
+        from clock import FakeClock
+
+        fake = FakeClock(datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc))
+        start, end = _validate_dates("2026-01-01", None, clock=fake)
+        self.assertEqual(end, fake.now())
+        self.assertIsNotNone(end.tzinfo)
+
+    def test_validate_dates_default_end_is_utc_aware(self):
+        """Without injection, end_date defaults to an aware UTC instant."""
+        from app import _validate_dates
+        from clock import RealClock
+
+        real = RealClock()
+        start, end = _validate_dates("2026-01-01", None)
+        self.assertIsNotNone(end.tzinfo)
+        self.assertLess(abs((end - real.now()).total_seconds()), 60)
+
+    def test_validate_dates_missing_start_aborts(self):
+        """Missing start_date aborts with 400 (werkzeug BadRequest)."""
+        from app import _validate_dates
+
+        with self.assertRaises(BadRequest):
+            _validate_dates(None, None)
+
+    def test_parse_date_rejects_nonexistent_spring_forward_time(self):
+        """A nonexistent local time (DST spring-forward gap) raises ValueError."""
+        import pytest
+        from app import parse_date_to_utc
+
+        with patch("app.get_timezone", return_value="America/Los_Angeles"):
+            with pytest.raises(ValueError):
+                # 2026-03-08 02:30 PST does not exist (clocks jump to 03:00).
+                parse_date_to_utc("2026-03-08T02:30:00")
+
+    def test_parse_date_rejects_ambiguous_fall_back_time(self):
+        """An ambiguous local time (DST fall-back overlap) raises ValueError."""
+        import pytest
+        from app import parse_date_to_utc
+
+        with patch("app.get_timezone", return_value="America/Los_Angeles"):
+            with pytest.raises(ValueError):
+                # 2026-11-01 01:30 occurs twice (PDT then PST).
+                parse_date_to_utc("2026-11-01T01:30:00")
+
+    def test_parse_date_unambiguous_local_time_still_parses(self):
+        """Ordinary local times still localize + convert to UTC correctly."""
+        from app import parse_date_to_utc
+
+        with patch("app.get_timezone", return_value="America/Los_Angeles"):
+            dt = parse_date_to_utc("2026-06-15T12:00:00")
+        self.assertEqual(dt.utcoffset(), timedelta(0))
+        self.assertEqual(dt.hour, 19)  # 12:00 PDT == 19:00 UTC

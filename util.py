@@ -2,9 +2,14 @@
 Utility functions and custom JSON provider for the application.
 """
 
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, time as TimeType, timedelta
+import json
 import math
+import os
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import isodate
@@ -120,7 +125,10 @@ class NBCQuarter:
         complete: Whether all 900 per-second samples are present.
         raw_wh: Sum of per-second kWh values converted to watt-hours.
         wh: ``raw_wh`` clamped to zero (negative values become 0).
-        prediction_w: Estimated power rate in watts for incomplete quarters.
+        prediction_w: Estimated accumulation rate in watt-hours per SECOND
+            (Wh/s) for incomplete quarters — ``1000 * kWh_window / window_secs``.
+            Multiply by seconds to get Wh (e.g. ``predicted_wh`` does exactly
+            that); it is NOT watts despite the historical ``_w`` suffix.
         predicted_wh: Extrapolated watt-hours for incomplete quarters.
         remaining_seconds: Seconds remaining in the quarter for incomplete quarters.
         samples_used: Number of per-second samples used for incomplete quarters.
@@ -199,6 +207,7 @@ class CompletedNBCPeriod:
 def compute_nbc_quarter(
     values: list[float],
     prediction_window_seconds: int | None = None,
+    seconds_remaining_override: int | None = None,
 ) -> NBCQuarter | None:
     """Compute NBC metrics for a single quarter-hour period from per-second kWh data.
 
@@ -211,6 +220,11 @@ def compute_nbc_quarter(
             rate extrapolation when the quarter is incomplete. Defaults to
             ``DEFAULT_PREDICTION_WINDOW_SECS`` when ``None``. Caps at
             ``len(values)``. A value of 0 also falls back to the default.
+        seconds_remaining_override: Wall-clock seconds remaining in the
+            quarter, when known. When provided (and the quarter is
+            incomplete), it replaces the sample-count-derived remainder so
+            prediction and decision math share one time base (plan 3.3).
+            Clamped to >= 0; ignored for complete quarters.
     """
     if values is None:
         return None
@@ -232,7 +246,10 @@ def compute_nbc_quarter(
         prediction_values = values[-window:]
         prediction_values_len = len(prediction_values)
         prediction_w = 1000 * sum(prediction_values) / prediction_values_len
-        remaining_seconds = QH_PERIOD_SECONDS - values_len
+        if seconds_remaining_override is not None:
+            remaining_seconds = max(0, int(seconds_remaining_override))
+        else:
+            remaining_seconds = QH_PERIOD_SECONDS - values_len
         return NBCQuarter(
             complete=False,
             raw_wh=raw_wh,
@@ -250,6 +267,7 @@ def compute_nbc_quarter(
 def compute_nbc_quarters(
     values: list[float],
     prediction_window_seconds: int | None = None,
+    seconds_remaining_override: int | None = None,
 ) -> NBCQuarterSet:
     """Compute NBC metrics for each quarter-hour from per-second kWh data.
 
@@ -267,6 +285,8 @@ def compute_nbc_quarters(
         prediction_window_seconds: Number of trailing seconds to use for
             rate extrapolation of the incomplete quarter. Passed through to
             ``compute_nbc_quarter``. Defaults to 60 when ``None``.
+        seconds_remaining_override: Wall-clock remainder applied to QH1 only
+            (see ``compute_nbc_quarter``).
 
     Returns:
         An ``NBCQuarterSet`` with keys QH1-QH4, each containing NBC metrics or
@@ -284,6 +304,7 @@ def compute_nbc_quarters(
         qh1 = compute_nbc_quarter(
             values[-incomplete_len:],
             prediction_window_seconds=prediction_window_seconds,
+            seconds_remaining_override=seconds_remaining_override,
         )
         names_remaining = QH_NAMES[1:]
     else:
@@ -424,3 +445,50 @@ def _haversine_distance(
     )
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return earth_radius_m * c
+
+
+def _atomic_write(dest: Path, write_body) -> None:
+    """Write via temp-file + fsync + os.replace so readers never see partials.
+
+    A crash mid-write leaves the previous destination file intact; the
+    temp file is removed on any failure. mkstemp creates the temp file
+    with owner-only permissions (0600), which is preserved through
+    os.replace — appropriate for credential files.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dest.parent), prefix=dest.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            write_body(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, str(dest))
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def atomic_write_text(path: Path | str, text: str) -> None:
+    """Atomically replace *path* with *text*.
+
+    Args:
+        path: Destination file path.
+        text: Full contents to write.
+    """
+    _atomic_write(Path(path), lambda fh: fh.write(text))
+
+
+def atomic_write_json(path: Path | str, data: Any) -> None:
+    """Atomically replace *path* with the JSON serialization of *data*.
+
+    Used for credential/pairing files (.tesla-tokens.json,
+    .homekit-pairings.json): concurrent writers converge to one valid
+    file and a crash mid-write never corrupts existing secrets.
+
+    Args:
+        path: Destination file path.
+        data: JSON-serializable payload.
+    """
+    _atomic_write(Path(path), lambda fh: json.dump(data, fh))
