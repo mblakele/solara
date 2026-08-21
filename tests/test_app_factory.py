@@ -56,11 +56,11 @@ class TestCreateApp:
         app = app_mod.create_app()
         assert app.config["SOLARA_CONFIG"] is app_mod._config
 
-    def test_health_serves_ok(self):
+    def test_health_serves_json_status(self):
         app = app_mod.create_app()
         resp = app.test_client().get("/health")
         assert resp.status_code == 200
-        assert resp.data == b"ok"
+        assert resp.get_json()["status"] == "ok"
 
     def test_index_serves_html_in_mock_mode(self):
         app = app_mod.create_app()
@@ -101,4 +101,4 @@ class TestWsgiEntrypoint:
         assert isinstance(wsgi.app, Flask)
         resp = wsgi.app.test_client().get("/health")
         assert resp.status_code == 200
-        assert resp.data == b"ok"
+        assert "status" in resp.get_json()

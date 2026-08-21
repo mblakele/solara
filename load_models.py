@@ -656,6 +656,9 @@ class CycleResult:
         pending_effects_count: Number of pending effects at cycle time.
         candidates: List of candidate devices considered for action,
             or None if not computed.
+        cycle_id: Correlation id for this cycle (boot-uuid prefix +
+            monotonic counter), or None on legacy results.
+        timings: Wall-clock seconds per pipeline stage, or None.
     """
 
     status: CycleStatus
@@ -672,6 +675,8 @@ class CycleResult:
     gap_wh: float | None = None
     pending_effects_count: int | None = None
     candidates: list[CandidateDetail] | None = None
+    cycle_id: str | None = None
+    timings: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -713,6 +718,8 @@ class CycleResult:
                 if self.candidates
                 else None
             ),
+            "cycle_id": self.cycle_id,
+            "timings": dict(self.timings) if self.timings else None,
         }
 
 
@@ -776,6 +783,9 @@ class CycleContext:
 
     # Timing
     timings: dict[str, float] = field(default_factory=dict)
+
+    # Correlation (1.3): stable within one cycle, unique across cycles.
+    cycle_id: str = ""
 
 
 # === Exception Types ===

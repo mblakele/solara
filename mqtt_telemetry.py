@@ -81,6 +81,21 @@ def has_telemetry() -> bool:
         _telemetry_warned_empty = True
     return result
 
+
+def get_field_freshness() -> dict[str, datetime]:
+    """Return a thread-safe copy of per-field last-update timestamps.
+
+    Diagnostics surface for /api/v1/load/status and /health: lets callers
+    detect a dark MQTT feed (no updates, or stale timestamps) instead of
+    silently trusting the last received snapshot.
+
+    Returns:
+        Dict mapping each received field name to the wall-clock timestamp
+        of its most recent update. Empty when nothing has been received.
+    """
+    with _telemetry_lock:
+        return dict(_field_update_at)
+
 def get_field_update_at(field: str) -> datetime | None:
     """Return the wall-clock timestamp when *field* was last updated.
 

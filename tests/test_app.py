@@ -54,8 +54,10 @@ class TestApp(unittest.TestCase):
     def test_health_endpoint(self):
         response = self.app.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data.decode("utf-8"), "ok")
-        self.assertEqual(response.headers["Content-Type"], "text/plain")
+        self.assertEqual(response.headers["Content-Type"], "application/json")
+        data = json.loads(response.data)
+        self.assertIn(data["status"], ("ok", "degraded"))
+        self.assertIn("components", data)
 
     def test_index_json_mock(self):
         with mock_config():

@@ -8,12 +8,14 @@ and TeslaAuthError exception.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, time, timezone
+import itertools
 import logging
 import sys
 import threading
 import time as _time_mod
+import uuid
 
 # Third-party imports.
 from typing import Any, Callable
@@ -143,6 +145,19 @@ logger = logging.getLogger(__name__)
 
 _no_telemetry_warn_cycle: int = 0
 _NO_TELEMETRY_WARN_INTERVAL = 10
+
+# === Cycle correlation (plan 1.3) ===
+# Boot-scoped id prefix + per-process monotonic counter, e.g. "c17-a3f9".
+# Scope decision (a): ids tag the LM layer only — pipeline stages, NBC
+# reader, actions, and serialized payloads. EnergyCache/fetch-layer logs
+# stay untagged; get_or_fetch() is cycle-agnostic by design.
+_BOOT_ID = uuid.uuid4().hex[:4]
+_cycle_counter = itertools.count(1)
+
+
+def _next_cycle_id() -> str:
+    """Return the next cycle correlation id (e.g. ``c17-a3f9``)."""
+    return f"c{next(_cycle_counter)}-{_BOOT_ID}"
 
 
 # === LoadManager Orchestrator ===
@@ -1986,7 +2001,10 @@ class LoadManager:
             try:
                 await self.tesla_ctrl.close()
             except Exception:  # pylint: disable=broad-exception-caught
-                pass
+                logger.debug(
+                    "Failed to close Tesla controller during session cleanup",
+                    exc_info=True,
+                )
         if self.telegram_sender is not None:
             client = getattr(self.telegram_sender, "_telegram_client", None)
             if client is not None:
@@ -1995,7 +2013,10 @@ class LoadManager:
                     try:
                         await session.close()
                     except Exception:  # pylint: disable=broad-exception-caught
-                        pass
+                        logger.debug(
+                            "Failed to close Telegram session during cleanup",
+                            exc_info=True,
+                        )
                     client._session = None
 
     @staticmethod
@@ -2139,13 +2160,23 @@ class LoadManager:
         with self._lock:
             self._check_config_changes()
 
-            ctx = CycleContext(now=self._clock.now(), force=force)
+            ctx = CycleContext(
+                now=self._clock.now(), force=force, cycle_id=_next_cycle_id()
+            )
+
+            def _finalize(res: CycleResult) -> CycleResult:
+                """Attach the correlation id and stage timings to a result."""
+                return replace(
+                    res, cycle_id=ctx.cycle_id, timings=dict(ctx.timings)
+                )
+
             # DEBUG: fires every ~30 s even when a cycle_early_exit /
             # cycle_complete event immediately follows; the boundary events
             # carry the signal, so the start marker stays at DEBUG.
-            logger.debug("cycle_start force=%s",
-                         force,
-                         extra={"event": "cycle_start", "force": force})
+            logger.debug("cycle_start id=%s force=%s",
+                         ctx.cycle_id, force,
+                         extra={"event": "cycle_start", "force": force,
+                                "cycle_id": ctx.cycle_id})
 
             _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=enabled_check force=%s", force)
@@ -2155,8 +2186,9 @@ class LoadManager:
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "enabled_check",
                                    "status": result.status,
-                                   "reason": result.diagnostics.reason if result.diagnostics else "none"})
-                return result
+                                   "reason": result.diagnostics.reason if result.diagnostics else "none",
+                                   "cycle_id": ctx.cycle_id})
+                return _finalize(result)
             ctx.timings["enabled_check"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2172,8 +2204,9 @@ class LoadManager:
                             stage2_result.status, stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "nbc_fetch",
                                    "status": stage2_result.status,
-                                   "reason": stage2_result.diagnostics.reason if stage2_result.diagnostics else "none"})
-                return stage2_result
+                                   "reason": stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",
+                                   "cycle_id": ctx.cycle_id})
+                return _finalize(stage2_result)
             ctx.timings["nbc_fetch"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2184,8 +2217,9 @@ class LoadManager:
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "pending_check",
                                    "status": result.status,
-                                   "reason": result.diagnostics.reason if result.diagnostics else "none"})
-                return result
+                                   "reason": result.diagnostics.reason if result.diagnostics else "none",
+                                   "cycle_id": ctx.cycle_id})
+                return _finalize(result)
             ctx.timings["pending_check"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2208,8 +2242,9 @@ class LoadManager:
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "commit",
                                    "status": result.status,
-                                   "reason": result.diagnostics.reason if result.diagnostics else "none"})
-                return result
+                                   "reason": result.diagnostics.reason if result.diagnostics else "none",
+                                   "cycle_id": ctx.cycle_id})
+                return _finalize(result)
             ctx.timings["commit"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2217,14 +2252,15 @@ class LoadManager:
             result = self._stage_build_result(ctx)
             ctx.timings["build_result"] = _time_mod.perf_counter() - _t0
             reason = result.diagnostics.reason if result.diagnostics else "none"
-            logger.info("cycle_complete status=%s reason=%s actions=%d sleep_hint=%.1f timings=%s",
-                        result.status, reason, len(result.actions), result.sleep_hint, ctx.timings,
-                        extra={"event": "cycle_complete", "status": result.status,
+            logger.info("cycle_complete id=%s status=%s reason=%s actions=%d sleep_hint=%.1f timings=%s",
+                        ctx.cycle_id, result.status, reason, len(result.actions), result.sleep_hint, ctx.timings,
+                        extra={"event": "cycle_complete", "cycle_id": ctx.cycle_id,
+                               "status": result.status,
                                "reason": reason, "actions_count": len(result.actions),
                                "sleep_hint": result.sleep_hint, "timings": ctx.timings,
                                "gap_wh": ctx.gap_wh, "adjusted_wh": ctx.adjusted_wh,
                                "predicted_wh": ctx.predicted_wh, "qh_name": ctx.qh_name})
-            return result
+            return _finalize(result)
 
     async def _execute_action(self, action: PendingEffect) -> bool:
         """Execute a single pending action against the appropriate controller.
@@ -2240,7 +2276,9 @@ class LoadManager:
                 return await self._execute_tesla_action(action)
             return await self._execute_plug_action(action)
         except Exception as e:
-            logger.error("Failed to execute action %s: %s", action, e)
+            logger.error(
+                "Failed to execute action %s: %s", action, e, exc_info=True
+            )
             return False
 
     async def _execute_plug_action(self, action: PendingEffect) -> bool:
@@ -2295,7 +2333,9 @@ class LoadManager:
                 self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
                 return False
             except Exception as e:
-                logger.error("Failed to set Tesla charge amps: %s", e)
+                logger.error(
+                    "Failed to set Tesla charge amps: %s", e, exc_info=True
+                )
                 return False
         logger.warning("Unknown Tesla action: %s", action.action)
         return False
@@ -2320,7 +2360,9 @@ class LoadManager:
             self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
             return False
         except Exception as e:
-            logger.error("Failed to stop Tesla charging: %s", e)
+            logger.error(
+                "Failed to stop Tesla charging: %s", e, exc_info=True
+            )
             return False
 
     def close(self) -> None:

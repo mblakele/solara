@@ -961,9 +961,9 @@ class TestFetchChannelDataErrors(unittest.TestCase):
 
         The per-channel api_response entry used to record
         ``_CLOCK.now() - chart_start`` — the wall-clock age of the chart
-        window — which is unrelated to how long the API call actually took
-        and grows with QH position.  It must instead record the elapsed
-        time of the get_chart_usage call itself.
+        window.  It must instead record the elapsed time of the
+        get_chart_usage call itself, measured on a monotonic clock so NTP
+        steps cannot distort it.
         """
         hp = HourlyProjection.__new__(HourlyProjection)
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -974,31 +974,31 @@ class TestFetchChannelDataErrors(unittest.TestCase):
         hp.metrics = {"api_response": {}}
 
         chart_start = now.replace(minute=0)  # QH-aligned
-        # Clock starts 30 minutes into the QH so the old window-age
-        # implementation (now - chart_start) yields a wildly different value.
-        fake_clock = FakeClock(now)
-        old_clock = metrics._CLOCK
-        metrics.set_clock(fake_clock)
-        self.addCleanup(metrics.set_clock, old_clock)
+
+        monotonic_values = iter([1000.0, 1001.5])
+
+        def _fake_monotonic():
+            return next(monotonic_values)
 
         def _slow_get_chart_usage(_channel, _start, _end, **_kwargs):
-            fake_clock.advance(1)  # simulate a 1s API round trip
             return ([0.1] * 60, chart_start)
 
         hp.vue.get_chart_usage.side_effect = _slow_get_chart_usage
 
-        chan_mock = MagicMock()
-        chan_mock.channel_num = 7
+        with patch.object(metrics, "_monotonic", _fake_monotonic):
+            chan_mock = MagicMock()
+            chan_mock.channel_num = 7
 
-        usage, data_start, channel_num = hp._fetch_channel_data(
-            chan_mock, chart_start, now
-        )
-        self.assertEqual(usage, [0.1] * 60)
-        self.assertEqual(data_start, chart_start)
-        self.assertEqual(channel_num, 7)
+            usage, data_start, channel_num = hp._fetch_channel_data(
+                chan_mock, chart_start, now
+            )
+            self.assertEqual(usage, [0.1] * 60)
+            self.assertEqual(data_start, chart_start)
+            self.assertEqual(channel_num, 7)
 
         recorded = hp.metrics["api_response"]["get_chart_usage/7"]
-        self.assertEqual(recorded, timedelta(seconds=1))
+        self.assertIsInstance(recorded, float)
+        self.assertEqual(recorded, 1.5)
 
 
 class TestDriftRejectionObservability(unittest.TestCase):

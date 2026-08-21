@@ -233,6 +233,38 @@ flowchart TD
     APP --> REG["atexit → _shutdown_load_manager()"]
 ```
 
+## Data Model Axioms
+
+### Per-second sample contiguity
+
+The `EnergyCache` sample list is **strictly contiguous**: sample `i`
+represents exactly the 1-second bucket beginning at
+`data_start + timedelta(seconds=i)`, and every bucket is present, non-null,
+and finite.
+
+This is an axiom, not a validated invariant. The upstream Emporia API (via
+pyemvue `get_chart_usage`) is trusted to return complete, contiguous windows;
+interior gaps and null buckets are ruled out by design. Only the window head
+is checked (`firstUsageInstant != chart_start` → drift rejection). No
+count-vs-span, interior-gap, or null-bucket validation exists anywhere in the
+pipeline — by deliberate decision, not oversight.
+
+Code that would be wrong if this axiom were violated (and therefore depends
+on it):
+
+- Pruning maps index → time arithmetically (`_prune_old_samples`,
+  `sample_time = data_start + i s`).
+- Compaction chunks purely by count (`samples[offset:offset+900]`).
+- Quarter-hour splitting is count-based (`values_len % 900` in
+  `util.compute_nbc_quarters`).
+- `_data_lag_secs` is *derived from the sample count*
+  (`instant − (data_start + len(samples))` in `metrics.py`), so it measures
+  tail freshness only — it cannot reveal interior gaps, and any hypothetical
+  gap check built on it would be circular.
+
+If upstream behavior ever changes such that gaps or nulls can appear, revisit
+this axiom before adding defensive checks.
+
 ## File → Module Map
 
 | Concern | Module |
@@ -248,6 +280,7 @@ flowchart TD
 | Shared data models, telemetry parsing helpers | `load_models.py` |
 | Tesla MQTT telemetry parsing | `mqtt_telemetry.py` |
 | Quantization detection | `quantization.py` |
+| Structured log formatting | `logfmt.py` |
 | SSE broadcaster | `sse_event.py` |
 | Telegram notifications | `telegram.py`, `telegram_client.py` |
 | Deferred config, Tesla/Plug config dataclasses | `config.py`, `config_loader.py` |

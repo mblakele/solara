@@ -638,8 +638,11 @@ class ConfigWatcher:
                     self._env_mtime = new_mtime
                     if changed_keys:
                         changes.env_changed = changed_keys
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning(
+                    "Hot-reload check failed for %s: %s",
+                    self._env_path, e, exc_info=True,
+                )
 
         if self._devices_path.exists():
             try:
@@ -648,7 +651,10 @@ class ConfigWatcher:
                     device_config.reload()
                     self._devices_mtime = new_mtime
                     changes.devices_changed = True
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning(
+                    "Hot-reload check failed for %s: %s",
+                    self._devices_path, e, exc_info=True,
+                )
 
         return changes

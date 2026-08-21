@@ -10,6 +10,7 @@ import json
 import locale
 import logging
 import threading
+from time import monotonic as _monotonic
 from typing import Any, ClassVar, Optional
 
 import requests
@@ -607,7 +608,7 @@ class HourlyProjection(MetricsBase):
         Raises RetryableMetricsException if no valid data is returned.
         """
         scale = Scale.SECOND.value
-        fetch_started_at = _CLOCK.now()
+        fetch_started = _monotonic()
         usage_data_local, usage_data_start_local = self.vue.get_chart_usage(
             chan,
             chart_start,
@@ -615,7 +616,9 @@ class HourlyProjection(MetricsBase):
             scale=scale,
             unit=Unit.KWH.value,
         )
-        fetch_elapsed = _CLOCK.now() - fetch_started_at
+        # Monotonic delta: immune to NTP steps that would distort a
+        # wall-clock (FakeClock/_CLOCK) measurement.
+        fetch_elapsed = _monotonic() - fetch_started
         if (
             usage_data_start_local is None
             or usage_data_local is None

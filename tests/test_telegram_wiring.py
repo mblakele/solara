@@ -400,4 +400,8 @@ class TestDriftErrorAlerts:
             with patch.object(mgr, "_drain_drift_alerts") as mock_drain:
                 result = mgr.run_cycle(force=True)
         mock_drain.assert_called_once()
-        assert result is early
+        # run_cycle finalizes results (attaches cycle_id + timings), so the
+        # returned object is an enriched copy of the stage result rather
+        # than the identical instance.
+        assert result.status == early.status
+        assert result.cycle_id

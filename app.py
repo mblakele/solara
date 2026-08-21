@@ -42,8 +42,10 @@ from flask import (
 from flask.typing import ResponseReturnValue
 
 from config import Config, _config, get_timezone
+from constants import STALE_DATA_THRESHOLD_SECS
 
 from energy_cache import EnergyCache
+import logfmt
 from metrics import (
     create_metrics,
     Metrics,
@@ -52,6 +54,7 @@ from metrics import (
     RetryableMetricsException,
 )
 from mockdata import MetricsMock
+import mqtt_telemetry
 from load_models import CycleResult
 from sse_event import SSEBroadcaster, event_stream
 from util import CustomJSONProvider, is_debug
@@ -81,6 +84,10 @@ class _AppState:
     consecutive_error_count: int = 0
     last_error_type: str | None = None
     lm_thread_started: bool = False
+    # Liveness/health signals (plan 1.5).
+    lm_heartbeat_at: datetime | None = None
+    mqtt_subscriber_started: bool = False
+    background_services_started_at: datetime | None = None
 
 
 # Application-level configuration injected into all consumers.
@@ -193,8 +200,10 @@ def _setup_file_logging(config: Config) -> logging.Handler | None:
         maxBytes=config.log_max_bytes,
         backupCount=config.log_backup_count,
     )
-    handler.setFormatter(logging.Formatter(
-        "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s %(message)s",
+    json_mode = str(config.get("LOG_FORMAT", "text")).lower() == "json"
+    handler.setFormatter(logfmt.create_formatter(
+        json_mode,
+        fmt="[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S %z",
     ))
     return handler
@@ -389,12 +398,132 @@ def index() -> ResponseReturnValue:
     return abort(406)
 
 
+# Health-check tuning (plan 1.5): gates are deliberately conservative to
+# avoid restart storms during boot or when load management is disabled.
+_HEALTH_BOOT_GRACE_SECS = 300.0
+_HEALTH_MQTT_DARK_SECS = 600.0
+_HEALTH_ERROR_THRESHOLD = 3
+_HEALTH_LM_MIN_STALE_SECS = 120.0
+
+
+def _build_health_payload(now: datetime) -> dict[str, Any]:
+    """Compute component health for the /health endpoint.
+
+    Args:
+        now: Current time (injected so tests can pin it).
+
+    Returns:
+        Dict with overall ``status`` ("ok" or "degraded") plus a
+        ``components`` map: load_manager_thread, energy_cache,
+        mqtt_telemetry, errors.
+    """
+
+    def _iso(value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    # ── Load-management thread liveness ──────────────────────────────
+    lm_enabled = _config.load_manage_enabled is not False
+    heartbeat = _state.lm_heartbeat_at
+    lm_state = "disabled"
+    lm_age: float | None = None
+    if lm_enabled:
+        if heartbeat is None:
+            lm_state = "never_run"
+        else:
+            lm_age = (now - heartbeat).total_seconds()
+            stale_bound = max(
+                _HEALTH_LM_MIN_STALE_SECS,
+                3.0 * float(_config.load_manage_interval_secs),
+            )
+            lm_state = "alive" if lm_age <= stale_bound else "stale"
+
+    # ── Emporia sample-cache freshness ────────────────────────────────
+    cache_data = _state.energy_cache.data
+    cache_state = "empty"
+    cache_age: float | None = None
+    if (
+        cache_data is not None
+        and cache_data.samples
+        and cache_data.data_start is not None
+    ):
+        newest_sample = cache_data.data_start + timedelta(
+            seconds=len(cache_data.samples)
+        )
+        cache_age = (now - newest_sample).total_seconds()
+        cache_state = (
+            "fresh"
+            if cache_age <= 2 * STALE_DATA_THRESHOLD_SECS
+            else "stale"
+        )
+    started_at = _state.background_services_started_at
+    booted_long_ago = (
+        started_at is not None
+        and (now - started_at).total_seconds() > _HEALTH_BOOT_GRACE_SECS
+    )
+    cache_gated = lm_enabled and (
+        cache_state == "stale"
+        or (cache_state == "empty" and booted_long_ago)
+    )
+
+    # ── MQTT telemetry feed ───────────────────────────────────────────
+    freshness = mqtt_telemetry.get_field_freshness()
+    mqtt_last_age = (
+        (now - max(freshness.values())).total_seconds()
+        if freshness
+        else None
+    )
+    if not _state.mqtt_subscriber_started:
+        mqtt_state = "not_started"
+        mqtt_gated = False
+    elif mqtt_last_age is None:
+        mqtt_state = "waiting"
+        mqtt_gated = booted_long_ago
+    else:
+        mqtt_gated = mqtt_last_age > _HEALTH_MQTT_DARK_SECS
+        mqtt_state = "dark" if mqtt_gated else "receiving"
+
+    # ── Sustained cycle errors ────────────────────────────────────────
+    errors_gated = (
+        _state.consecutive_error_count >= _HEALTH_ERROR_THRESHOLD
+    )
+
+    degraded = (
+        lm_state == "stale" or cache_gated or mqtt_gated or errors_gated
+    )
+    return {
+        "status": "degraded" if degraded else "ok",
+        "components": {
+            "load_manager_thread": {
+                "state": lm_state,
+                "last_heartbeat_at": _iso(heartbeat),
+                "age_secs": lm_age,
+            },
+            "energy_cache": {
+                "state": cache_state,
+                "age_secs": cache_age,
+            },
+            "mqtt_telemetry": {
+                "state": mqtt_state,
+                "has_telemetry": bool(freshness),
+                "last_update_age_secs": mqtt_last_age,
+            },
+            "errors": {
+                "consecutive_error_count": _state.consecutive_error_count,
+                "last_error_type": _state.last_error_type,
+            },
+        },
+    }
+
+
 def health() -> Response:
-    """Health check endpoint returning 'ok'."""
-    logger.debug("health")
-    resp = Response("ok")
-    resp.headers["Content-Type"] = "text/plain"
-    return resp
+    """Component health endpoint (always HTTP 200).
+
+    Deploy tooling inspects the JSON ``status``/``components`` fields
+    rather than the HTTP code, so a degraded instance can be observed
+    and alerted on, not just blindly restarted.
+    """
+    payload = _build_health_payload(datetime.now(timezone.utc))
+    return _json_response(camelize(payload))
 
 
 def tou() -> ResponseReturnValue:
@@ -554,7 +683,9 @@ def _get_load_manager():
 
 
             except Exception as e:
-                logger.warning("Failed to initialize LoadManager: %s", e)
+                logger.warning(
+                    "Failed to initialize LoadManager: %s", e, exc_info=True
+                )
                 _state.load_manager_init_failed = True
         return _state.load_manager
 
@@ -573,7 +704,7 @@ def _send_error_alert(exc: Exception) -> None:
     try:
         _state.telegram_sender.send_notification_sync(event)
     except Exception:  # pylint: disable=broad-exception-caught
-        logger.debug("Failed to send error alert", exc_info=True)
+        logger.warning("Failed to send error alert", exc_info=True)
 
 
 def _load_management_loop() -> None:
@@ -584,6 +715,7 @@ def _load_management_loop() -> None:
         _config.dry_run, _config.is_mock_mode, interval_secs_config
     )
     while True:
+        _state.lm_heartbeat_at = datetime.now(timezone.utc)
         result = None
         try:
             lm = _get_load_manager()
@@ -593,6 +725,7 @@ def _load_management_loop() -> None:
                 with _state.load_manager_lock:
                     _state.last_cycle_result = result
                     _state.recent_cycles.append({
+                        "cycle_id": result.cycle_id,
                         "status": result.status,
                         "reason": result.diagnostics.reason if result.diagnostics else None,
                         "actions_count": len(result.actions),
@@ -624,7 +757,9 @@ def _load_management_loop() -> None:
             interval_secs = interval_secs_config
             _state.consecutive_error_count += 1
             _state.last_error_type = type(e).__name__
-            logger.error("Error in load management loop: %s", e)
+            logger.error(
+                "Error in load management loop: %s", e, exc_info=True
+            )
             _state.energy_cache.invalidate()
             if _state.consecutive_error_count == 1 or _state.consecutive_error_count % 10 == 0:
                 _send_error_alert(e)
@@ -656,6 +791,32 @@ def load_status() -> Response:
     with _state.load_manager_lock:
         last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
 
+    cache_data = _state.energy_cache.data
+    if cache_data is not None:
+        cache_payload = {
+            "data_start": (
+                cache_data.data_start.isoformat()
+                if cache_data.data_start
+                else None
+            ),
+            "last_fetch_at": (
+                cache_data.last_fetch_at.isoformat()
+                if cache_data.last_fetch_at
+                else None
+            ),
+            "sample_count": cache_data.sample_count,
+        }
+    else:
+        cache_payload = None
+
+    mqtt_updates = mqtt_telemetry.get_field_freshness()
+    last_update_at = max(mqtt_updates.values()) if mqtt_updates else None
+    mqtt_age = (
+        (datetime.now(timezone.utc) - last_update_at).total_seconds()
+        if last_update_at is not None
+        else None
+    )
+
     payload = {
         "enabled": lm.enabled,
         "target_wh": lm.target_wh,
@@ -664,6 +825,14 @@ def load_status() -> Response:
         "pending_effects": [],
         "last_cycle_result": last_result,
         "recent_cycles": list(_state.recent_cycles),
+        "consecutive_error_count": _state.consecutive_error_count,
+        "last_error_type": _state.last_error_type,
+        "sse_subscriber_count": _state.sse_broadcaster.subscriber_count(),
+        "cache": cache_payload,
+        "mqtt": {
+            "has_telemetry": mqtt_telemetry.has_telemetry(),
+            "last_update_age_secs": mqtt_age,
+        },
     }
 
     for name, device_state in lm.state.devices.items():
@@ -720,6 +889,7 @@ def _start_mqtt_subscriber() -> None:
     """Start the MQTT subscriber thread for Tesla fleet-telemetry events."""
     from mqtt_telemetry import start_mqtt_subscriber as _start
     _start(_config)
+    _state.mqtt_subscriber_started = True
     logger.info("MQTT subscriber started")
 
 
@@ -755,6 +925,7 @@ def start_background_services() -> None:
         _start_mqtt_subscriber()
     if _config.load_manage_enabled is not False:
         _start_load_manager_thread()
+    _state.background_services_started_at = datetime.now(timezone.utc)
 
 
 def create_app() -> Flask:
@@ -796,21 +967,42 @@ app = create_app()
 
 
 logger = app.logger
-if __name__ != "__main__":
+
+
+def _route_root_logging_through_gunicorn() -> None:
+    """Route root logging through gunicorn's handlers when available.
+
+    Under gunicorn, the ``gunicorn.error`` logger carries the server's
+    configured handlers; reusing them keeps app logs interleaved with
+    request logs in the same output stream.  When gunicorn's logger has
+    no handlers (tests, scripts, any other embedding of this module),
+    this is a no-op so pre-existing logging configuration is preserved
+    instead of being silently wiped.
+    """
     gunicorn_logger = logging.getLogger("gunicorn.error")
+    if not gunicorn_logger.handlers:
+        return
     root_logger = logging.getLogger()
     root_logger.handlers = gunicorn_logger.handlers
     root_logger.setLevel(logging.DEBUG if is_debug() else logging.INFO)
+
+
+if __name__ != "__main__":
+    _route_root_logging_through_gunicorn()
     file_handler = _setup_file_logging(_config)
     if file_handler:
-        root_logger.addHandler(file_handler)
-        gunicorn_logger.addHandler(file_handler)
+        logging.getLogger().addHandler(file_handler)
+        logging.getLogger("gunicorn.error").addHandler(file_handler)
 else:
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S %z",
-    ))
+    json_mode = str(_config.get("LOG_FORMAT", "text")).lower() == "json"
+    if json_mode:
+        handler.setFormatter(logfmt.create_formatter(True))
+    else:
+        handler.setFormatter(logfmt.StructuredFormatter(
+            "[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S %z",
+        ))
     logging.basicConfig(handlers=[handler],
                         level=logging.DEBUG if is_debug() else logging.INFO)
     file_handler = _setup_file_logging(_config)

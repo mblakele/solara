@@ -557,7 +557,9 @@ class RealTeslaController(AbstractTeslaController):
                 logger.warning("Tesla vehicle not online, command deferred: %s", e)
                 return False
             self._last_command_vehicle_offline = False
-            logger.error("Failed to stop Tesla charging: %s", e)
+            logger.error(
+                "Failed to stop Tesla charging: %s", e, exc_info=True
+            )
             return False
         finally:
             await self.close()
@@ -598,7 +600,9 @@ class RealTeslaController(AbstractTeslaController):
                 logger.warning("Tesla vehicle not online, command deferred: %s", e)
                 return False
             self._last_command_vehicle_offline = False
-            logger.error("Failed to set Tesla charge amps: %s", e)
+            logger.error(
+                "Failed to set Tesla charge amps: %s", e, exc_info=True
+            )
             return False
         finally:
             await self.close()

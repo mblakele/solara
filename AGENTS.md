@@ -170,6 +170,9 @@ project-root
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
 ├── load_nbc.py            # NBCReader, StateTracker, GapMinder bin-packing, Tesla decisions
+ ├── logfmt.py              # Structured log formatters: render extra= fields as
+ │                          #   [key=value ...] suffixes (default) or JSON lines
+ │                          #   (LOG_FORMAT=json); wired into app.py handlers
  ├── mockdata.py            # Test data generation utilities
  ├── mqtt_telemetry.py      # Tesla MQTT message parsing (on_message, tesla_state_from_snapshot)
   ├── quantization.py        # Detect N-second constant-value windows (quantization) in per-second data
@@ -297,6 +300,12 @@ project-root
 - Actions are determined by comparing adjusted predicted_wh against target_wh (default -50 Wh)
 - Three action types: "turn_on", "turn_off", "set_amps"
 - Algorithm uses bin-packing to fit eligible loads into the surplus gap
+- Turn-off shedding is deliberately unguarded (design decision, not an
+  oversight): no MIN_SECONDS_TO_ACT floor and no overshoot cap —
+  `_decide_turn_off` turns plugs off until `remaining_reduction <= 0`, even
+  for negligible in-quarter savings near the QH boundary. Asserted by
+  tests/test_gap_minder.py; do not add turn-off guards without revisiting
+  this decision.
 
 ### Dry-Run Mode
 - Controlled by LOAD_MANAGE_DRY_RUN env var (currently True in .env line 10)
@@ -348,6 +357,21 @@ project-root
 - Tesla notifications use device-specific format: `🔌 Tesla charging stopped` / `⚡ Tesla charging started` / `🔋 Tesla charge amps → N A`
 
 ### EnergyCache & Incremental Fetch
+
+**⚠️ Contiguity axiom (deliberate design decision):** per-second samples are
+strictly contiguous at 1 s from `data_start` — sample `i` occurred at exactly
+`data_start + timedelta(seconds=i)`, and every bucket is present, non-null,
+and finite. The upstream Emporia API is trusted to return complete windows;
+interior gaps / null buckets are ruled out by design and **no count-vs-span,
+interior-gap, or null-bucket validation exists anywhere in the pipeline — do
+not add defensive gap detection without revisiting this axiom first.**
+Everything below depends on it: pruning maps index → time arithmetically,
+compaction chunks purely by count (`samples[offset:offset+900]`), QH splitting
+is count-based (`values_len % 900`), and `_data_lag_secs` is *derived* from the
+count (`instant − (data_start + len(samples))`, metrics.py), so lag measures
+tail freshness only and cannot reveal interior gaps. Only the window *head* is
+validated (`firstUsageInstant != chart_start` drift check).
+
 - `EnergyCache` (energy_cache.py) stores per-second energy samples with metadata in a
   frozen `EnergyCacheData` dataclass:
   - `samples`: list[float] — per-second Wh values
@@ -408,9 +432,6 @@ When asked to plan changes, break tasks into subtasks that each fit within a
 files or ~200 lines of code, split it into sequential subtasks and plan them
 separately. Document each subtask in the overall plan file in your agent's plan directory.
 
-## Plan files
-When writing or updating plan files in your agent's plan directory (`.opencode/plans/*.md` or `.mimocode/plans/*.md`), always use bash (e.g. `cat > .opencode/plans/foo.md << 'EOF'...` or `cat > .mimocode/plans/foo.md << 'EOF'...`)
-rather than the Write or Edit tools, which fail due to path matching issues.
 
 ### Plan Implementation
 
