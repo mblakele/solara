@@ -480,7 +480,7 @@ def test_stale_data_from_previous_qh():
     data from the immediately preceding QH can be only seconds or minutes old.
 
     The system must NOT make load decisions on this data — turning on a plug
-    based on stale QH1 prediction at 15:02 would waste energy.
+    based on stale QH1 prediction at 15:02 could cause overshoot.
 
     We patch ``datetime.now`` so that both the enabled-check time and
     now_postfetch are consistent: 15:02 (QH2).  data_point_at is at the

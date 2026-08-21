@@ -832,13 +832,8 @@ def test_edge_gap_reduces_tesla_amps_reduction():
 def test_turn_on_skipped_when_seconds_remaining_below_min():
     """Skips plug turn-on when fewer than MIN_SECONDS_TO_ACT remain in QH.
 
-    Near the end of a quarter-hour, turning on a plug wastes energy because
-    it will stay on through the QH boundary and draw power not counted toward
-    any surplus.  The same MIN_SECONDS_TO_ACT guard that protects Tesla actions
+    The same MIN_SECONDS_TO_ACT guard that protects Tesla actions
     should also protect plug turn-on decisions.
-
-    Regression test for: jackery turned on with 21 s remaining in QH3,
-    then left running through the entire next quarter-hour.
     """
     engine = GapMinder()
     fixed_now = datetime(2026, 5, 7, 15, 59, 39, tzinfo=timezone.utc)

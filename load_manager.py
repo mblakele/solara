@@ -1940,10 +1940,6 @@ class LoadManager:
         succeeded_effects: list[PendingEffect] = []
         results: list[PendingEffect] = []
         for action in actions:
-            # Suppress Tesla turn_on when active telemetry confirms charging.
-            # The callback updates telemetry with a ~10 s delay; if the car is
-            # confirmed charging, dispatching a turn_on action is wasteful and
-            # defeats the purpose of the telemetry feedback loop.
             if dry_run:
                 logger.info(
                     "[DRY-RUN] Would execute: %s on %s",
