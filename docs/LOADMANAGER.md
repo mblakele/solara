@@ -118,6 +118,17 @@ of excess solar unabsorbed rather than driving net usage to exactly zero.
 Set it closer to 0 to absorb more solar, or more negative (e.g., -100)
 to be conservative and leave more surplus on the grid.
 
+**Two sign conventions, deliberately:**
+
+- **Engine-internal "gap"** (CycleDiagnostics, `gapminder_decide` logs):
+  `target_wh - predicted_wh` — positive means surplus to absorb. This is
+  control math; do not change it without revisiting the decision engine.
+- **Operator-facing NBC-signed figures** (e.g. the Telegram
+  "skipped: no actions" log lines): `predicted_wh - target_wh` — negative
+  = excess solar, positive = grid draw, matching how NBC predictions are
+  displayed everywhere else. Users are used to reading -N as solar;
+  these lines say so explicitly (`positive=grid draw`).
+
 ## Dry-Run Mode
 
 Set `LOAD_MANAGE_DRY_RUN=True` to test load management without executing actions.

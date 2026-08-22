@@ -445,6 +445,15 @@ class StateTracker:
         # Guards devices/pending_effects against cross-thread readers
         # (Flask request threads) vs writers (the load-management thread).
         # RLock so internal mutators can nest.
+        #
+        # Single-writer contract: ONLY the load-management thread mutates
+        # devices / pending_effects / last_commanded_amps. Readers running
+        # on Flask request threads MUST use snapshot_devices() /
+        # snapshot_effects() (or to_dict(), which uses them internally).
+        # Methods that iterate the live structures — estimated_current_wh,
+        # _latest_tesla_command, has_pending_effect_since,
+        # pending_since_count, can_toggle — are LM-thread-only by this
+        # contract; do not call them from request paths.
         self._state_lock = threading.RLock()
         self.devices: dict[str, DeviceState] = {}
         self.pending_effects: list[PendingEffect] = []

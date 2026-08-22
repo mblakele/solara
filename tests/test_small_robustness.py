@@ -172,6 +172,57 @@ class TestOAuthStatePruning:
         assert removed == 1
         assert tesla_oauth._oauth_states == {"live": 2000.0}
 
+    def test_prune_safe_against_concurrent_insert(self):
+        """A large sweep racing inserts must not raise (review #6).
+
+        ``prune_expired_oauth_states`` iterated ``_oauth_states`` through a
+        Python-level comprehension, which can be suspended by a thread
+        switch mid-iteration while /auth/initiate threads grow the dict —
+        CPython then raises "dictionary changed size during iteration"
+        (a 500 on /auth/initiate). Seeding thousands of expiries makes the
+        sweep span multiple GIL switch intervals, so an unguarded
+        iteration reproduces reliably.
+        """
+        import sys
+
+        import tesla_oauth
+
+        errors: list[Exception] = []
+        stop = threading.Event()
+        tesla_oauth._oauth_states.clear()
+        # Thousands of expired entries -> the sweep takes many ms.
+        for n in range(20000):
+            tesla_oauth._oauth_states[str(n)] = 0.0
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                try:
+                    # Insert-only growth: future expiry, must survive.
+                    tesla_oauth._oauth_states[f"live{i}"] = 1.0e12
+                    i += 1
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    return
+
+        # Force thread switches every ~microsecond so the interpreter can
+        # suspend the prune sweep mid-iteration while the writer grows the
+        # dict — exactly the production /auth/initiate race shape.
+        original_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        writer_thread.start()
+        try:
+            removed = tesla_oauth.prune_expired_oauth_states(now=1.0)
+        finally:
+            stop.set()
+            writer_thread.join(timeout=5)
+            sys.setswitchinterval(original_interval)
+            tesla_oauth._oauth_states.clear()
+
+        assert not errors, f"concurrent insert hit {errors[0]!r}"
+        assert removed == 20000
+
     def test_initiate_prunes_before_inserting(self, monkeypatch):
         """The initiate route sweeps expired states on every call."""
         import app as app_mod_inner

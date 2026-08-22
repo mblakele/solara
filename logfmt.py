@@ -58,6 +58,12 @@ class StructuredFormatter(logging.Formatter):
         return f"{message} [{suffix}]"
 
 
+# Keys owned by the JSON envelope. A caller extra with one of these names
+# is preserved under an ``x_`` prefix instead of silently overwriting the
+# record's real timestamp/level/logger/message (review #5).
+_ENVELOPE_KEYS = frozenset({"ts", "level", "logger", "message", "exc_info"})
+
+
 class JsonFormatter(logging.Formatter):
     """Formatter emitting one JSON object per record."""
 
@@ -73,7 +79,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         for key, value in _extra_fields(record).items():
-            payload[key] = value
+            payload[f"x_{key}" if key in _ENVELOPE_KEYS else key] = value
         return json.dumps(payload, default=str)
 
 

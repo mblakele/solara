@@ -496,6 +496,12 @@ def _check_stall_watchdog(now: datetime) -> None:
 
     Rate-limited to one entry per hour so a prolonged stall stays visible
     without flooding logs.
+
+    Called by ``_load_management_loop`` at the END of each iteration,
+    BEFORE refreshing ``lm_last_cycle_finished_at`` — so it measures the
+    duration of the iteration that just finished. Residual limitation: a
+    thread that hangs mid-cycle never reaches this check at all; that
+    case is covered by the /health heartbeat staleness instead.
     """
     global _stall_critical_last_at
     if _config.load_manage_enabled is False:
@@ -563,8 +569,12 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
         and cache_data.samples
         and cache_data.data_start is not None
     ):
-        newest_sample = cache_data.data_start + timedelta(
-            seconds=len(cache_data.samples)
+        # Per the contiguity axiom sample i occurs at data_start + i·s, so
+        # the newest of N samples sits at data_start + (N-1)·s. Prefer the
+        # maintained last_sample_at; the arithmetic is only a fallback.
+        newest_sample = cache_data.last_sample_at or (
+            cache_data.data_start
+            + timedelta(seconds=len(cache_data.samples) - 1)
         )
         cache_age = (now - newest_sample).total_seconds()
         cache_state = (
@@ -922,8 +932,13 @@ def _load_management_loop() -> None:
             _state.consecutive_error_count = 0
             _state.last_error_type = None
 
-        _state.lm_last_cycle_finished_at = datetime.now(timezone.utc)
-        _check_stall_watchdog(datetime.now(timezone.utc))
+        # Check BEFORE refreshing: the watchdog must measure how long the
+        # iteration that just completed took. Refreshing first (the original
+        # ordering) made stalled_for ≈ 0 every cycle and the CRITICAL branch
+        # unreachable — see review finding #1.
+        now = datetime.now(timezone.utc)
+        _check_stall_watchdog(now)
+        _state.lm_last_cycle_finished_at = now
         interval_secs_adjusted = _compute_loop_sleep(result, interval_secs)
         logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
         time.sleep(interval_secs_adjusted)

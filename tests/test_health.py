@@ -259,3 +259,36 @@ class TestHeartbeatWiring:
         finally:
             app_mod._state.consecutive_error_count = 0
             app_mod._state.last_error_type = None
+
+
+class TestCacheFreshnessNewestSample:
+    """Freshness must use last_sample_at, not data_start + len(samples).
+
+    Review #3: per the contiguity axiom sample *i* occurs at
+    ``data_start + i·s``, so the newest of N samples is at
+    ``data_start + (N-1)·s`` — exactly what the maintained
+    ``EnergyCacheData.last_sample_at`` field holds.
+    """
+
+    def test_boundary_uses_last_sample_at_not_off_by_one(self):
+        base = _now()
+        data_start = base - timedelta(seconds=169.5)
+        # 10 samples: newest (correct) = data_start + 9s -> age 160.5s
+        # (stale); buggy data_start + 10s -> age 159.5s (fresh).
+        app_mod._state.energy_cache._data = EnergyCacheData(
+            samples=[0.001] * 10,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=9),
+            last_fetch_at=data_start + timedelta(seconds=9),
+            sample_count=10,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+        try:
+            payload = app_mod._build_health_payload(base)
+        finally:
+            app_mod._state.energy_cache._data = None
+        cache = payload["components"]["energy_cache"]
+        assert cache["age_secs"] == pytest.approx(160.5)
+        assert cache["state"] == "stale"

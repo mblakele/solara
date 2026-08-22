@@ -1407,9 +1407,16 @@ class LoadManager:
             )
             return False
         if not actions:
+            # Operator-facing sign convention (deliberate, do NOT "fix"):
+            # NBC-signed — negative = excess solar, positive = grid draw —
+            # matching how predictions are displayed everywhere else.
+            # This is the OPPOSITE of the engine-internal control gap
+            # (target_wh - predicted_wh) in CycleDiagnostics/gapminder logs.
+            # See docs/LOADMANAGER.md and arch-review-pr-code-review.md #7.
             gap_wh = predicted_wh - target_wh
             logger.info(
-                "Telegram notification skipped: no actions (gap=%+.1f Wh)",
+                "Telegram notification skipped: no actions "
+                "(gap=%+.1f Wh, positive=grid draw)",
                 gap_wh,
             )
             return False
@@ -1548,9 +1555,13 @@ class LoadManager:
             )
             return
         if not actions:
+            # Operator-facing sign convention (deliberate, do NOT "fix"):
+            # NBC-signed — negative = excess solar, positive = grid draw.
+            # See the twin comment in _fire_telegram_notification.
             gap_wh = predicted_wh - target_wh
             logger.info(
-                "Telegram notification skipped: no actions (gap=%+.1f Wh)",
+                "Telegram notification skipped: no actions "
+                "(gap=%+.1f Wh, positive=grid draw)",
                 gap_wh,
             )
             return

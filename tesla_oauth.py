@@ -64,12 +64,23 @@ def prune_expired_oauth_states(now: float | None = None) -> int:
         Number of expired entries removed.
     """
     current = _time_module.time() if now is None else now
+    # Snapshot the items with a single C-level list() call: iterating the
+    # live dict through a Python comprehension can be suspended by a thread
+    # switch while an /auth/initiate request inserts, raising
+    # "dictionary changed size during iteration" (review #6). list() over a
+    # dict view does not release the GIL, so the snapshot is atomic.
     expired = [
-        key for key, expiry in _oauth_states.items() if expiry <= current
+        key
+        for key, expiry in list(_oauth_states.items())
+        if expiry <= current
     ]
+    removed = 0
     for key in expired:
-        del _oauth_states[key]
-    return len(expired)
+        # pop (not del): a callback thread may have consumed this state
+        # between the snapshot and now.
+        if _oauth_states.pop(key, None) is not None:
+            removed += 1
+    return removed
 
 
 @bp.route("/api/v1/tesla/auth/initiate")

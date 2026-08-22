@@ -1760,3 +1760,65 @@ class TestValidateDatesHygiene(unittest.TestCase):
             dt = parse_date_to_utc("2026-06-15T12:00:00")
         self.assertEqual(dt.utcoffset(), timedelta(0))
         self.assertEqual(dt.hour, 19)  # 12:00 PDT == 19:00 UTC
+
+
+class TestStallWatchdogWiring(unittest.TestCase):
+    """The LM loop must check the watchdog BEFORE refreshing finished_at.
+
+    Review #1: refreshing ``lm_last_cycle_finished_at`` immediately before
+    calling ``_check_stall_watchdog`` makes ``stalled_for ≈ 0`` every
+    iteration, so the CRITICAL branch was unreachable through the loop.
+    """
+
+    def setUp(self):
+        import app as app_mod
+
+        self._app = app_mod
+        app_mod._stall_critical_last_at = None
+        app_mod._state.lm_last_cycle_finished_at = None
+
+    def tearDown(self):
+        self._app._stall_critical_last_at = None
+        self._app._state.lm_last_cycle_finished_at = None
+
+    def test_loop_fires_watchdog_after_long_previous_iteration(self):
+        """A >300s iteration trips the watchdog at its END (before refresh)."""
+        import time as time_module
+        from datetime import timedelta
+
+        from config import Config
+
+        class _StopLoop(BaseException):
+            """Sentinel raised from patched sleep to exit the infinite loop."""
+
+        # Simulate: the PREVIOUS iteration finished 400s ago (e.g. run_cycle
+        # hung for ~7 min before finally returning). The next iteration's
+        # tail check must fire the CRITICAL watchdog.
+        self._app._state.lm_last_cycle_finished_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=400)
+        )
+
+        def fake_sleep(_secs):
+            raise _StopLoop()
+
+        with patch.object(
+            self._app, "_get_load_manager", return_value=None
+        ), patch.object(time_module, "sleep", side_effect=fake_sleep):
+            Config().set("LOAD_MANAGE_ENABLED", "True")
+            try:
+                with self.assertLogs("app", level="CRITICAL") as captured:
+                    with self.assertRaises(_StopLoop):
+                        self._app._load_management_loop()
+            finally:
+                Config().set("LOAD_MANAGE_ENABLED", "False")
+
+        criticals = [
+            r for r in captured.records if r.levelno == logging.CRITICAL
+        ]
+        self.assertTrue(
+            criticals,
+            "stall watchdog never fired through the loop wiring",
+        )
+        # After the firing check, finished_at must have been refreshed so
+        # the NEXT iteration measures only its own duration.
+        self.assertIsNotNone(self._app._state.lm_last_cycle_finished_at)

@@ -174,3 +174,39 @@ class TestAppLoggingWiring:
             logger.removeHandler(handler)
         assert "gap_wh=-3.2" in written
         assert "event=cycle_complete" in written
+
+
+class TestJsonFormatterKeyCollisions:
+    """Caller extras must never clobber the JSON envelope keys (review #5).
+
+    Note: extras named after RESERVED LogRecord attrs (``message``,
+    ``exc_info``, ...) never reach the payload at all — ``_extra_fields``
+    drops them. Only unreserved envelope keys (``ts``, ``level``,
+    ``logger``) can actually collide, so those get the ``x_`` prefix.
+    """
+
+    COLLIDERS = {
+        "ts": "FAKE-ts",
+        "level": "FAKE-level",
+        "logger": "FAKE-logger",
+        "message": "FAKE-message",
+    }
+
+    def test_envelope_keys_win_and_colliders_are_prefixed(self) -> None:
+        record = _record("hello", **self.COLLIDERS)
+        payload = json.loads(JsonFormatter().format(record))
+        assert payload["message"] == "hello"  # reserved: extra dropped
+        assert payload["level"] == "INFO"
+        assert payload["logger"] == "load_manager"
+        assert payload["ts"] != "FAKE-ts"  # real ISO timestamp
+        for key in ("ts", "level", "logger"):
+            assert payload[f"x_{key}"] == self.COLLIDERS[key], (
+                f"colliding extra {key!r} must be preserved as x_{key}"
+            )
+        assert "x_message" not in payload  # reserved attr, filtered upstream
+
+    def test_non_colliding_extras_unchanged(self) -> None:
+        record = _record("hello", event="cycle", gap_wh=-12.5)
+        payload = json.loads(JsonFormatter().format(record))
+        assert payload["event"] == "cycle"
+        assert payload["gap_wh"] == -12.5
