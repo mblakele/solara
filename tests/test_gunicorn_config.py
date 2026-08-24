@@ -32,40 +32,58 @@ _HOOKED_SIGNALS = (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _gunicorn_timeout(command: str) -> int:
-    """Extract the numeric Gunicorn timeout from a startup command."""
-    match = re.search(r"--timeout(?:=|\s+)(\d+)", command)
-    assert match is not None, f"Gunicorn timeout not found in: {command}"
-    return int(match.group(1))
-
-
 class TestDeploymentConfiguration(unittest.TestCase):
-    """Local and Render startup commands use the same worker timeout."""
+    """Deploy commands share one arbiter timeout via gunicorn.conf.py.
 
-    def test_render_and_replit_gunicorn_timeouts_match(self):
+    The timeout is pinned in ``gunicorn.conf.py`` (see
+    TestArbiterTimeoutSetting) so Render and Replit cannot drift. Startup
+    commands therefore must NOT carry their own ``--timeout`` override
+    (which would reintroduce per-environment divergence), and must load the
+    shared conf file so they also pick up the cooperative-shutdown hooks.
+    """
+
+    def _startup_commands(self) -> list[tuple[str, str]]:
+        """(source, command) pairs for each deployment environment."""
         replit_config = (_PROJECT_ROOT / ".replit").read_text(encoding="utf-8")
         render_config = (_PROJECT_ROOT / "render.yaml").read_text(encoding="utf-8")
 
-        replit_timeout = _gunicorn_timeout(
-            next(
-                line.split("=", 1)[1]
-                for line in replit_config.splitlines()
-                if line.startswith("run = ")
-            )
-        )
-        render_timeout = _gunicorn_timeout(
-            next(
-                line.split(":", 1)[1]
-                for line in render_config.splitlines()
-                if "startCommand:" in line
-            )
-        )
+        return [
+            (
+                ".replit",
+                next(
+                    line.split("=", 1)[1]
+                    for line in replit_config.splitlines()
+                    if line.startswith("run = ")
+                ),
+            ),
+            (
+                "render.yaml",
+                next(
+                    line.split(":", 1)[1]
+                    for line in render_config.splitlines()
+                    if "startCommand:" in line
+                ),
+            ),
+        ]
 
-        self.assertEqual(
-            replit_timeout,
-            render_timeout,
-            "Render and Replit Gunicorn timeouts must stay consistent",
-        )
+    def test_no_environment_overrides_the_shared_timeout(self):
+        for source, command in self._startup_commands():
+            with self.subTest(source=source):
+                self.assertIsNone(
+                    re.search(r"--timeout(?:=|\s+)\d+", command),
+                    f"{source} sets its own --timeout; the value is pinned "
+                    "in gunicorn.conf.py",
+                )
+
+    def test_all_environments_load_the_shared_conf(self):
+        for source, command in self._startup_commands():
+            with self.subTest(source=source):
+                self.assertIn(
+                    "-c gunicorn.conf.py",
+                    command,
+                    f"{source} must load gunicorn.conf.py so it shares the "
+                    "pinned timeout and shutdown hooks",
+                )
 
 
 class TestSignalHookInstallation(unittest.TestCase):
