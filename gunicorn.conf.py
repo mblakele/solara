@@ -36,3 +36,13 @@ def worker_exit(_server, _worker):
     from app import request_shutdown
 
     request_shutdown("gunicorn:worker_exit")
+
+
+# Arbiter watchdog ("--timeout"): a hung-worker guard, NOT a request limit.
+# The gthread worker's main loop heartbeats every ~1s regardless of what
+# its pool threads are doing, so slow requests (even a full 30s Emporia
+# fetch) never trip it. Pinned here rather than per-deploy CLI flags so
+# Render, Replit, and local runs share one value; kept at double the app's
+# fetch bound (EnergyCache fetch_timeout_secs = 30s) so watchdog and
+# application timeout can never converge if either changes.
+timeout = 60

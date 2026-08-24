@@ -152,3 +152,35 @@ class TestGunicornHooks(unittest.TestCase):
         with patch.object(app_mod, "request_shutdown") as spy:
             self.conf.worker_exit(MagicMock(), MagicMock())
         spy.assert_called_once_with("gunicorn:worker_exit")
+
+
+class TestArbiterTimeoutSetting(unittest.TestCase):
+    """gunicorn.conf.py pins the arbiter watchdog above the app fetch bound.
+
+    The gthread worker heartbeats ~1s from its main loop regardless of pool
+    threads, so ``--timeout`` is a hung-worker guard, not a request limit.
+    It is pinned in gunicorn.conf.py (not per-deploy CLI flags) so every
+    environment shares one value, and kept well above EnergyCache's 30s
+    fetch bound so watchdog and application timeout can never converge.
+    """
+
+    def setUp(self):
+        self.conf = _load_gunicorn_conf()
+
+    def test_timeout_pinned_at_60(self):
+        self.assertEqual(self.conf.timeout, 60)
+
+    def test_timeout_materially_above_fetch_bound(self):
+        import inspect
+
+        from energy_cache import EnergyCache
+
+        fetch_default = inspect.signature(EnergyCache).parameters[
+            "fetch_timeout_secs"
+        ].default
+        self.assertGreaterEqual(
+            self.conf.timeout,
+            2 * fetch_default,
+            f"arbiter timeout {self.conf.timeout}s must be at least double "
+            f"the app fetch bound ({fetch_default}s)",
+        )

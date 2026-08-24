@@ -143,7 +143,8 @@ project-root
                            # _AppState runtime singletons, start_background_services()
 ├── wsgi.py                # Gunicorn entry point: app = create_app(); start_background_services()
 ├── gunicorn.conf.py       # Gunicorn hooks: post_worker_init chains cooperative-shutdown
-                           # signal handlers; worker_int/worker_exit call app.request_shutdown()
+                           # signal handlers; worker_int/worker_exit call app.request_shutdown();
+                           # timeout = 60 pins the arbiter watchdog (2x the 30s fetch bound)
 ├── clock.py               # Clock protocol (now()) with FakeClock for tests
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
                            # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
@@ -505,7 +506,7 @@ is required (e.g. CI, or after changing test-relevant code).
 | Lint | `uv run pylint *.py` |
 | Type check | `uv run mypy` |
 | Dev server | `uv run python app.py` |
-| Production-like server | `gunicorn --reload -c gunicorn.conf.py --worker-class=gthread --threads=4 --timeout=31 --bind 127.0.0.1:8000 wsgi:app` |
+| Production-like server | `gunicorn --reload -c gunicorn.conf.py --worker-class=gthread --threads=4 --bind 127.0.0.1:8000 wsgi:app` |
 
 The dev server reads credentials from `.env` (`VUE_USERNAME`, `VUE_PASSWORD`).
 Ensure that file is present and sourced before running.
