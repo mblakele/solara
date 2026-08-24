@@ -74,23 +74,23 @@ args = "uv run python -m pytest"
 name = "pylint"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "pylint *.py"
-
 [workflows.workflow.metadata]
 isValidation = true
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run python -m pylint *.py"
 
 [[workflows.workflow]]
 name = "mypy"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "mypy *.py"
-
 [workflows.workflow.metadata]
 isValidation = true
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "uv run python -m mypy *.py"
 
 [userenv]
 
