@@ -394,3 +394,81 @@ class TestStartMqttSubscriber:
             )
         finally:
             blocker.set()
+
+    def test_restart_supersedes_lingering_old_session(self):
+        """stop→start while the old thread is parked in loop_forever().
+
+        The prompt-restart path must not revive the superseded session:
+        when the old thread's disconnect finally lands, it must exit rather
+        than reconnect — and its teardown must not clear the new session's
+        active-client registration or health flag.
+        """
+        from mqtt_telemetry import (
+            _get_active_client,
+            start_mqtt_subscriber,
+            stop_mqtt_subscriber,
+        )
+        import mqtt_telemetry
+        from config import Config
+
+        cfg = Config(overrides={
+            "MQTT_HOST": "localhost",
+            "MQTT_PORT": "1883",
+            "MQTT_TOPIC_BASE": "tesla",
+        })
+
+        clients: list[MagicMock] = []
+
+        def make_client():
+            client = MagicMock()
+            release = threading.Event()
+
+            def _park() -> None:
+                # Simulate a live network loop: parked until disconnected.
+                release.wait(timeout=10)
+
+            client.loop_forever.side_effect = _park
+            client._test_release = release
+            clients.append(client)
+            return client
+
+        def subscriber_threads():
+            return [
+                t for t in threading.enumerate()
+                if t.name == "mqtt-subscriber"
+            ]
+
+        with patch("mqtt_telemetry.mqtt.Client", side_effect=make_client), \
+             patch.object(mqtt_telemetry, "_MQTT_RECONNECT_MIN_SECS", 0.05):
+            start_mqtt_subscriber(cfg)
+            time.sleep(0.05)  # let S1 park inside loop_forever
+            threads_after_first = subscriber_threads()
+            assert len(threads_after_first) == 1
+            old_thread = threads_after_first[0]
+
+            stop_mqtt_subscriber()
+            start_mqtt_subscriber(cfg)  # prompt restart while S1 unwinds
+            time.sleep(0.05)
+
+            assert len(clients) == 2, "restart did not create a new session"
+            new_client = clients[1]
+            assert _get_active_client() is new_client
+
+            clients[0]._test_release.set()  # S1's disconnect finally lands
+            old_thread.join(timeout=5)
+
+            assert not old_thread.is_alive(), (
+                "superseded session kept running after restart"
+            )
+            assert len(clients) == 2, (
+                f"superseded session reconnected "
+                f"({len(clients)} sessions constructed)"
+            )
+            assert _get_active_client() is new_client, (
+                "superseded session's teardown clobbered the new session's "
+                "active-client registration"
+            )
+
+            stop_mqtt_subscriber()
+            for t in subscriber_threads():
+                t.join(timeout=5)

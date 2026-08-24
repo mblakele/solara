@@ -72,6 +72,11 @@ _client_lock: threading.Lock = threading.Lock()
 # would corrupt the running session's shutdown path and health reporting.
 _subscriber_thread: threading.Thread | None = None
 _subscriber_lock: threading.Lock = threading.Lock()
+# Generation token: bumped on every real session start. A superseded thread
+# (whose stop event was cleared by a prompt restart) detects staleness via
+# this counter and exits without reconnecting or touching the new session's
+# client registration or health state.
+_session_gen: int = 0
 _active_client: Any | None = None
 
 
@@ -274,12 +279,15 @@ def start_mqtt_subscriber(cfg: Any) -> None:
 
     Idempotent: while a previous subscriber thread is still alive, repeat
     calls are logged and ignored instead of spawning a duplicate session.
+    Prompt restart after an explicit stop is also safe: each session carries
+    a generation token, so a superseded thread exits itself instead of
+    reconnecting alongside (or clobbering) the new session.
 
     Args:
         cfg: Application ``Config`` instance (must expose ``mqtt_host``,
             ``mqtt_port``, ``mqtt_topic_base``).
     """
-    global _subscriber_thread
+    global _subscriber_thread, _session_gen
     with _subscriber_lock:
         if _subscriber_thread is not None and _subscriber_thread.is_alive():
             logger.info(
@@ -287,6 +295,8 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                 "ignoring duplicate start"
             )
             return
+        _session_gen += 1
+        gen = _session_gen
         host = cfg.mqtt_host
         port = cfg.mqtt_port
         topic_base = cfg.mqtt_topic_base
@@ -338,24 +348,34 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                     # connection drops; a failed initial connect raises and is
                     # handled below by re-entering the loop after backoff.
                     client.loop_forever()
-                    if _stop_event.is_set():
+                    if _stop_event.is_set() or _session_gen != gen:
                         return
                     logger.warning(
                         "mqtt_telemetry: network loop exited — reconnecting"
                     )
                 except Exception:  # pylint: disable=broad-exception-caught
-                    if _stop_event.is_set():
+                    if _stop_event.is_set() or _session_gen != gen:
                         return
                     logger.exception(
                         "mqtt_telemetry: connection attempt failed host=%s port=%d",
                         host, port,
                     )
                 finally:
-                    _clear_active_client()
-                _set_connection_ok(False)
+                    # Only the current generation may reset shared session
+                    # state — a superseded thread's teardown must not
+                    # deregister the new session's active client.
+                    if _session_gen == gen:
+                        _clear_active_client()
+                if _session_gen == gen:
+                    _set_connection_ok(False)
                 # Event-based backoff: stop_mqtt_subscriber() ends the wait (and
                 # this thread) immediately instead of after the full sleep.
                 if _stop_event.wait(backoff):
+                    return
+                if _session_gen != gen:
+                    # A prompt restart cleared the shared stop event before
+                    # this (superseded) thread woke up: exit quietly instead
+                    # of reconnecting alongside the new session.
                     return
                 backoff = (
                     _MQTT_RECONNECT_MIN_SECS if was_connected

@@ -178,7 +178,8 @@ project-root
  │                          #   (LOG_FORMAT=json); wired into app.py handlers
  ├── mockdata.py            # Test data generation utilities
  ├── mqtt_telemetry.py      # Tesla MQTT message parsing (on_message, tesla_state_from_snapshot);
- │                          # idempotent start_mqtt_subscriber() (lock + live-thread check)
+ │                          # idempotent start_mqtt_subscriber() (lock + live-thread check);
+ │                          # generation token isolates superseded sessions after restart
   ├── quantization.py        # Detect N-second constant-value windows (quantization) in per-second data
   ├── sse_event.py            # SSEBroadcaster thread-safe pub/sub + event_stream generator for Flask
                               # (close_all() wakes blocked streams on shutdown; sentinel never yielded)

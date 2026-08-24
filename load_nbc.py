@@ -243,7 +243,10 @@ class NBCReader:
             parsed = self._parse_metrics(self.device_name, metrics_data)
             if parsed is None:
                 return None
-            fetched_at = metrics_data.get("_fetched_at", now)
+            raw_fetched_at = metrics_data.get("_fetched_at")
+            fetched_at = (
+                raw_fetched_at if isinstance(raw_fetched_at, datetime) else now
+            )
             data_point_at = fetched_at - timedelta(seconds=parsed.data_lag_secs)
             return NBCFetchResult(
                 qh_name=parsed.qh_name,
