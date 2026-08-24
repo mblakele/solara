@@ -9,6 +9,7 @@ one Ctrl-C/SIGTERM stops background services promptly, and ``worker_int`` /
 from __future__ import annotations
 
 import importlib.util
+import re
 import signal
 import unittest
 from pathlib import Path
@@ -28,6 +29,43 @@ def _load_gunicorn_conf():
 
 
 _HOOKED_SIGNALS = (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _gunicorn_timeout(command: str) -> int:
+    """Extract the numeric Gunicorn timeout from a startup command."""
+    match = re.search(r"--timeout(?:=|\s+)(\d+)", command)
+    assert match is not None, f"Gunicorn timeout not found in: {command}"
+    return int(match.group(1))
+
+
+class TestDeploymentConfiguration(unittest.TestCase):
+    """Local and Render startup commands use the same worker timeout."""
+
+    def test_render_and_replit_gunicorn_timeouts_match(self):
+        replit_config = (_PROJECT_ROOT / ".replit").read_text(encoding="utf-8")
+        render_config = (_PROJECT_ROOT / "render.yaml").read_text(encoding="utf-8")
+
+        replit_timeout = _gunicorn_timeout(
+            next(
+                line.split("=", 1)[1]
+                for line in replit_config.splitlines()
+                if line.startswith("run = ")
+            )
+        )
+        render_timeout = _gunicorn_timeout(
+            next(
+                line.split(":", 1)[1]
+                for line in render_config.splitlines()
+                if "startCommand:" in line
+            )
+        )
+
+        self.assertEqual(
+            replit_timeout,
+            render_timeout,
+            "Render and Replit Gunicorn timeouts must stay consistent",
+        )
 
 
 class TestSignalHookInstallation(unittest.TestCase):
