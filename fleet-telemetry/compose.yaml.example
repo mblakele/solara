@@ -23,7 +23,7 @@ services:
     command:
       - /tesla-http-proxy
     ports:
-      - 4444:4444
+      - 127.0.0.1:4444:4444
     environment:
       - TESLA_HTTP_PROXY_TLS_CERT=/certs/fullchain.pem
       - TESLA_HTTP_PROXY_TLS_KEY=/certs/privkey.pem
