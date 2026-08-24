@@ -21,10 +21,15 @@ pytestmark = pytest.mark.filterwarnings(
 
 
 @pytest.fixture(autouse=True)
-def reset_connection_state():
+def reset_connection_state(monkeypatch):
     """Reset module connection state around each test."""
     with mqtt_telemetry._telemetry_lock:
         mqtt_telemetry._connection_ok = False
+    # Idempotent-start guard: forget any subscriber thread reference left by
+    # a previous test so every test here starts a fresh session.
+    monkeypatch.setattr(
+        mqtt_telemetry, "_subscriber_thread", None, raising=False
+    )
     yield
     with mqtt_telemetry._telemetry_lock:
         mqtt_telemetry._connection_ok = False

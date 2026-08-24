@@ -1063,7 +1063,14 @@ def stream_status():
 
 
 def _start_mqtt_subscriber() -> None:
-    """Start the MQTT subscriber thread for Tesla fleet-telemetry events."""
+    """Start the MQTT subscriber thread for Tesla fleet-telemetry events.
+
+    Idempotent (mirrors the load-manager thread guard): repeated calls are
+    no-ops. The underlying :func:`mqtt_telemetry.start_mqtt_subscriber`
+    self-guards too, so embedders calling it directly are equally safe.
+    """
+    if _state.mqtt_subscriber_started:
+        return
     from mqtt_telemetry import start_mqtt_subscriber as _start
     _start(_config)
     _state.mqtt_subscriber_started = True

@@ -316,3 +316,81 @@ class TestStartMqttSubscriber:
             "mqtt-subscriber thread leaked past the test — it would keep "
             "reconnecting in the background for the rest of the session"
         )
+
+    def test_double_start_is_idempotent(self):
+        """A second start while the subscriber is alive must be a no-op.
+
+        Re-starting clears _stop_event and the active-client registration,
+        which would corrupt the running subscriber's shutdown path and
+        health reporting — so a duplicate start must never spawn a second
+        session.
+        """
+        from mqtt_telemetry import start_mqtt_subscriber, stop_mqtt_subscriber
+        from config import Config
+
+        cfg = Config(overrides={
+            "MQTT_HOST": "localhost",
+            "MQTT_PORT": "1883",
+            "MQTT_TOPIC_BASE": "tesla",
+        })
+
+        def subscriber_threads():
+            return [t for t in threading.enumerate() if t.name == "mqtt-subscriber"]
+
+        with patch("mqtt_telemetry.mqtt.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value = mock_client
+            mock_client.loop_forever.side_effect = Exception("stop")
+
+            start_mqtt_subscriber(cfg)
+            time.sleep(0.05)
+            threads_after_first = subscriber_threads()
+
+            start_mqtt_subscriber(cfg)  # must be a no-op
+            threads_after_second = subscriber_threads()
+
+            stop_mqtt_subscriber()
+            for t in threads_after_second:
+                t.join(timeout=5)
+
+        assert len(threads_after_first) == 1, (
+            f"expected one subscriber thread after first start, "
+            f"got {len(threads_after_first)}"
+        )
+        assert len(threads_after_second) == 1, (
+            f"second start spawned a duplicate subscriber "
+            f"({len(threads_after_second)} threads)"
+        )
+        assert mock_client_cls.call_count == 1, (
+            "second start constructed a second MQTT session"
+        )
+        assert all(not t.is_alive() for t in threads_after_second), (
+            "subscriber thread leaked past stop"
+        )
+
+    def test_stop_clears_session_so_prompt_restart_is_allowed(self, monkeypatch):
+        """After stop_mqtt_subscriber(), a new start must be permitted.
+
+        Even if the previous subscriber thread is technically still alive
+        (winding down its backoff wait), an explicit stop ends the session:
+        the stored reference must be cleared so the next start is not
+        swallowed by the duplicate-start guard.
+        """
+        from mqtt_telemetry import _subscriber_thread, stop_mqtt_subscriber
+        import mqtt_telemetry
+
+        blocker = threading.Event()
+        zombie = threading.Thread(target=blocker.wait, daemon=True)
+        zombie.start()
+        monkeypatch.setattr(mqtt_telemetry, "_subscriber_thread", zombie)
+        try:
+            assert zombie.is_alive()  # precondition: reference looks live
+
+            stop_mqtt_subscriber()
+
+            assert mqtt_telemetry._subscriber_thread is None, (
+                "stop must clear the stored subscriber reference so a "
+                "fresh start is allowed"
+            )
+        finally:
+            blocker.set()
