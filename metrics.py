@@ -602,9 +602,11 @@ class HourlyProjection(MetricsBase):
         # Fetch usage data without mutating device_info
         population = self.populate_internal(chart_start, self.energy_cache)
 
-        self.metrics["api_response"]["total"] = sum(
-            self.metrics["api_response"].values(), timedelta()
-        )
+        # Per-channel entries are monotonic elapsed seconds (floats) recorded
+        # by _fetch_channel_data; sum them numerically and convert so "total"
+        # stays a timedelta (JSON serializes it as an ISO 8601 duration).
+        total_fetch_secs: float = sum(self.metrics["api_response"].values())
+        self.metrics["api_response"]["total"] = timedelta(seconds=total_fetch_secs)
 
         # Compute predictions from population results
         predictions = self.predict(population)

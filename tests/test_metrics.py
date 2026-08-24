@@ -450,6 +450,35 @@ class TestHourlyProjectionPopulateChartStart(unittest.TestCase):
             nearby_chart_start, hp.energy_cache
         )
 
+    def test_populate_total_sums_float_fetch_durations(self):
+        """api_response['total'] must sum float per-channel entries.
+
+        _fetch_channel_data records each get_chart_usage duration as
+        monotonic elapsed *seconds* (float), so populate() cannot seed its
+        sum with timedelta().  Regression test for a production crash:
+
+            TypeError: unsupported operand type(s) for +:
+            'datetime.timedelta' and 'float'
+        """
+        chart_start = datetime(2026, 8, 24, 1, 30, 0, tzinfo=timezone.utc)
+        hp = HourlyProjection(instant=chart_start)
+        # Simulate successful channel fetches: _fetch_channel_data stores
+        # monotonic seconds as floats under get_chart_usage/<channel_num>.
+        hp.metrics["api_response"] = {
+            "get_chart_usage/1": 0.25,
+            "get_chart_usage/2": 0.5,
+        }
+
+        with patch.object(hp, "populate_internal", return_value={}):
+            hp.populate(chart_start)
+
+        total = hp.metrics["api_response"]["total"]
+        self.assertIsInstance(
+            total, timedelta, "total must stay a timedelta so JSON keeps "
+            "emitting ISO durations (e.g. PT0.75S)"
+        )
+        self.assertEqual(total, timedelta(seconds=0.75))
+
 
 class TestCapChartStart(unittest.TestCase):
     """Tests for the cap_chart_start guard function."""
