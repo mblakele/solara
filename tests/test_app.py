@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import requests
 from werkzeug.exceptions import BadRequest
 from app import app
+from config import Config
 
 
 
@@ -45,6 +46,79 @@ def mock_config(**overrides: Any):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = old
+
+
+@contextlib.contextmanager
+def real_mode_config(**overrides: Any):
+    """Configure real (non-mock) mode and reset the LoadManager singleton.
+
+    The autouse clean_env fixture has already cleared config; this sets
+    real-mode values on top (optionally overridden per-test, e.g.
+    LOAD_MANAGE_ENABLED="True") and resets the module-level singletons so
+    the test starts from a clean state. Restores singleton state on exit.
+
+    Args:
+        overrides: Key-value pairs to set in config on top of the defaults.
+    """
+    import app as app_mod
+
+    cfg = Config()
+    for key, value in {
+        "VUE_USERNAME": "",
+        "VUE_PASSWORD": "",
+        "MOCK": "False",
+        "MOCK_ERROR": "False",
+        "DEBUG": "False",
+        "LOAD_MANAGE_ENABLED": "False",
+        "LOAD_MANAGE_DRY_RUN": "True",
+        "LOAD_PLUG_CONTROLLER": "stub",
+        "LOAD_TESLA_CONTROLLER": "stub",
+        **overrides,
+    }.items():
+        cfg.set(key, value)
+
+    def _reset_singletons() -> None:
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = None
+
+    _reset_singletons()
+    try:
+        yield
+    finally:
+        _reset_singletons()
+
+
+def realistic_metrics() -> dict[str, Any]:
+    """Return a metrics dict shaped like real-mode HourlyProjection.metrics."""
+    from mockdata import _generate_hour_seconds
+    from util import compute_nbc_quarters
+
+    now = datetime.now(timezone.utc)
+    per_second = _generate_hour_seconds(12345, 42, sign=-1.0)
+    return {
+        "api_response": {"total": timedelta(microseconds=750072)},
+        "debug": True,
+        "devices": [
+            {
+                "gid": 12345,
+                "lag": timedelta(seconds=2),
+                "name": "METER",
+                "minute_predicted": -100.0,
+                "minutes_remaining": 18.0,
+                "per_second_data": per_second,
+                "prediction": -1000.0,
+                "prediction_min": -1100.0,
+                "prediction_max": -900.0,
+                "timezone": "America/Los_Angeles",
+                "nbc": compute_nbc_quarters(per_second).to_dict(),
+            }
+        ],
+        "instant": now,
+        "data_start": now.replace(second=0, microsecond=0) - timedelta(minutes=42),
+        "_fetched_at": now,
+        "_data_lag_secs": 2.0,
+    }
 
 
 
@@ -128,7 +202,7 @@ class TestApp(unittest.TestCase):
         import app as app_mod
 
         with self._real_mode_config():
-            with patch("app.create_metrics", return_value=self._realistic_metrics()):
+            with patch("app.create_metrics", return_value=realistic_metrics()):
                 response = self.app.get("/", headers={"Accept": "application/json"})
         self.assertEqual(response.status_code, 200)
 
@@ -166,75 +240,20 @@ class TestApp(unittest.TestCase):
             self.assertEqual(result.status, "disabled")
             with app_mod._state.load_manager_lock:
                 app_mod._state.last_cycle_result = result
-            with patch("app.create_metrics", return_value=self._realistic_metrics()):
+            with patch("app.create_metrics", return_value=realistic_metrics()):
                 response = self.app.get("/", headers={"Accept": "application/json"})
         self.assertEqual(response.status_code, 200)
 
     @contextlib.contextmanager
     def _real_mode_config(self):
-        """Configure real (non-mock) mode and reset the LoadManager singleton.
-
-        The autouse clean_env fixture has already cleared config; this sets
-        real-mode values on top and resets the module-level singletons so the
-        test starts from a clean state. Restores on exit.
-        """
-        import app as app_mod
-        from config import Config
-
-        cfg = Config()
-        for key, value in {
-            "VUE_USERNAME": "",
-            "VUE_PASSWORD": "",
-            "MOCK": "False",
-            "MOCK_ERROR": "False",
-            "DEBUG": "False",
-            "LOAD_MANAGE_ENABLED": "False",
-            "LOAD_MANAGE_DRY_RUN": "True",
-            "LOAD_PLUG_CONTROLLER": "stub",
-            "LOAD_TESLA_CONTROLLER": "stub",
-        }.items():
-            cfg.set(key, value)
-        app_mod._state.load_manager = None
-        app_mod._state.load_manager_init_failed = False
-        app_mod._state.last_cycle_result = None
-        try:
+        """Configure real (non-mock) mode and reset the LoadManager singleton."""
+        with real_mode_config():
             yield
-        finally:
-            app_mod._state.load_manager = None
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = None
 
     @staticmethod
     def _realistic_metrics():
         """Return a metrics dict shaped like real-mode HourlyProjection.metrics."""
-        from mockdata import _generate_hour_seconds
-        from util import compute_nbc_quarters
-
-        now = datetime.now(timezone.utc)
-        per_second = _generate_hour_seconds(12345, 42, sign=-1.0)
-        return {
-            "api_response": {"total": timedelta(microseconds=750072)},
-            "debug": True,
-            "devices": [
-                {
-                    "gid": 12345,
-                    "lag": timedelta(seconds=2),
-                    "name": "METER",
-                    "minute_predicted": -100.0,
-                    "minutes_remaining": 18.0,
-                    "per_second_data": per_second,
-                    "prediction": -1000.0,
-                    "prediction_min": -1100.0,
-                    "prediction_max": -900.0,
-                    "timezone": "America/Los_Angeles",
-                    "nbc": compute_nbc_quarters(per_second).to_dict(),
-                }
-            ],
-            "instant": now,
-            "data_start": now.replace(second=0, microsecond=0) - timedelta(minutes=42),
-            "_fetched_at": now,
-            "_data_lag_secs": 2.0,
-        }
+        return realistic_metrics()
 
     def test_tou_endpoint_missing_start_date(self):
         response = self.app.get("/api/v1/tou")
@@ -320,12 +339,84 @@ class TestApp(unittest.TestCase):
         self.assertGreater(data["buckets"]["peak"], 0)
 
 
+
+# Sentinel for "use lm.run_cycle.return_value" in _lm_wired.
+_UNSET = object()
+
+
+def _cycle_result(**overrides):
+    """Full cycle-result payload as stored in _state.last_cycle_result."""
+    result = {
+        "status": "ok",
+        "qh": "QH1",
+        "predicted_wh": -800,
+        "adjusted_wh": -750,
+        "target_wh": -500,
+        "actions": [],
+        "diagnostics": {
+            "gap_wh": -300,
+            "hysteresis_wh": 50,
+            "seconds_remaining": 45,
+            "reason": "ok",
+            "pending_effects_count": 0,
+            "candidates": [],
+            "tesla_configured": False,
+            "tesla_state": None,
+            "tesla_error": None,
+            "tesla_login_url": None,
+            "plugs_configured": 0,
+        },
+        "sleep_hint": 30.0,
+        "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+    }
+    result.update(overrides)
+    return result
+
+
+def _make_lm(result, *, interval=30):
+    """Standard mocked LoadManager wired the way app.py expects."""
+    lm = unittest.mock.MagicMock()
+    lm.enabled = True
+    lm.dry_run = True
+    lm.target_wh = -500
+    lm.nbc_device = "test_nbc"
+    lm.state.to_dict.return_value = {}
+    if interval is not None:
+        lm.config_interval_secs = interval
+    if result is not None:
+        lm.run_cycle.return_value = result
+    return lm
+
+
 class TestLoadManagementEndpoints(unittest.TestCase):
-    """Tests for GET /api/v1/load/status."""
+    """Tests for GET /api/v1/load/status and the index endpoint's
+    load-management payload."""
 
     def setUp(self):
         self.app = app.test_client()
         self.app.testing = True
+
+    # --- shared builders -------------------------------------------------
+
+    @contextlib.contextmanager
+    def _lm_wired(self, lm, last_cycle_result=_UNSET):
+        """Install a LoadManager mock into app state under real-ish config.
+
+        last_cycle_result defaults to ``lm.run_cycle.return_value`` (what the
+        background loop would store after a cycle); pass an explicit value
+        (including None) to override.
+        """
+        import app as app_mod
+
+        with mock_config():
+            Config().set("LOAD_MANAGE_ENABLED", "True")
+            app_mod._state.load_manager = lm
+            app_mod._state.load_manager_init_failed = False
+            if last_cycle_result is _UNSET:
+                app_mod._state.last_cycle_result = lm.run_cycle.return_value
+            else:
+                app_mod._state.last_cycle_result = last_cycle_result
+            yield
 
     def test_load_status_503_when_not_initialized(self):
         """GET /load/status returns 503 when LoadManager is None."""
@@ -335,8 +426,6 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_load_status_success(self):
         """GET /load/status returns 200 with state payload."""
-        from datetime import datetime, timezone
-
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
         mock_lm.target_wh = -500
@@ -404,46 +493,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_includes_sleep_hint_meta(self):
         """Index HTML includes a meta tag with the sleep_hint value for JS."""
-        from config import Config
-        dc_config = Config()
+        lm = _make_lm(_cycle_result())
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "qh": "QH1",
-            "predicted_wh": -800,
-            "adjusted_wh": -750,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -453,32 +505,18 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_includes_top_level_sleep_hint(self):
         """Index JSON loadManagement includes top-level sleepHint."""
-        from config import Config
-        dc_config = Config()
+        lm = _make_lm(
+            {
+                "status": "ok",
+                "predicted_wh": -800,
+                "target_wh": -500,
+                "actions": [],
+                "sleep_hint": 30.0,
+                "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+            }
+        )
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -489,31 +527,18 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_fallback_sleep_hint_to_config_interval(self):
         """Index JSON falls back to config_interval_secs when lastCycleResult is empty."""
-        from config import Config
-        dc_config = Config()
+        # Minimal result without sleep_hint; lastCycleResult left empty so
+        # sleepHint should fall back to config_interval_secs.
+        lm = _make_lm(
+            {
+                "status": "ok",
+                "predicted_wh": -800,
+                "target_wh": -500,
+                "actions": [],
+            }
+        )
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        # lastCycleResult is empty — sleep_hint should fall back to config_interval_secs
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = None
+        with self._lm_wired(lm, last_cycle_result=None):
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -524,80 +549,29 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_missing_sleep_hint_no_crash(self):
         """Index HTML handles a cycle result without sleep_hint without crashing."""
-        from config import Config
-        dc_config = Config()
+        result = _cycle_result()
+        del result["sleep_hint"]  # No sleep_hint — should not cause a template error
+        lm = _make_lm(result)
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_result = {
-            "status": "ok",
-            "qh": "QH1",
-            "predicted_wh": -800,
-            "adjusted_wh": -750,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-            # No sleep_hint — should not cause a template error
-        }
-        mock_lm.run_cycle.return_value = mock_result
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_result
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
 
     def test_index_json_includes_sleep_hint_at(self):
         """Index JSON loadManagement includes sleepHintAt timestamp."""
-        from datetime import datetime
+        lm = _make_lm(
+            {
+                "status": "ok",
+                "predicted_wh": -800,
+                "target_wh": -500,
+                "actions": [],
+                "sleep_hint": 30.0,
+                "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+            }
+        )
 
-        from config import Config
-        dc_config = Config()
-
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -611,32 +585,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_includes_sleep_hint_at_meta(self):
         """Index HTML includes a meta tag with the sleep_hint_at value for JS."""
-        from config import Config
-        dc_config = Config()
+        lm = _make_lm(_cycle_result())
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -646,32 +597,12 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_missing_sleep_hint_at_no_crash(self):
         """Index JSON handles missing sleepHintAt gracefully."""
-        from config import Config
-        dc_config = Config()
-
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
         # No sleep_hint_at in the result
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-            "sleep_hint": 30.0,
-        }
+        result = _cycle_result()
+        del result["sleep_hint_at"]
+        lm = _make_lm(result)
 
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -682,90 +613,23 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_missing_sleep_hint_at_no_crash(self):
         """Index HTML handles missing sleep_hint_at without crashing."""
-        from config import Config
-        dc_config = Config()
+        result = _cycle_result()
+        del result["sleep_hint_at"]  # No sleep_hint_at — should not crash
+        lm = _make_lm(result)
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        mock_result = {
-            "status": "ok",
-            "qh": "QH1",
-            "predicted_wh": -800,
-            "adjusted_wh": -750,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-            "sleep_hint": 30.0,
-            # No sleep_hint_at — should not cause a template error
-        }
-        mock_lm.run_cycle.return_value = mock_result
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_result
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
 
     def test_index_html_handles_none_predicted_wh(self):
         """Index template renders when predicted_wh is None (no crash)."""
-        from config import Config
-        dc_config = Config()
+        result = _cycle_result(predicted_wh=None)
+        del result["sleep_hint"]
+        del result["sleep_hint_at"]
+        lm = _make_lm(result)
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": None,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -1221,8 +1085,7 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
         self.assertIn("devices", result)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestLagRecalculation(unittest.TestCase):
     """Tests that lag is recalculated per request, not frozen by cache."""
 
     def setUp(self):
@@ -1705,64 +1568,11 @@ class TestLoadManagerSharedCache(unittest.TestCase):
     @contextlib.contextmanager
     def _enabled_real_mode(self):
         """Real-mode config with load management enabled; reset singletons."""
-        import app as app_mod
-        from config import Config
-
-        cfg = Config()
-        for key, value in {
-            "VUE_USERNAME": "",
-            "VUE_PASSWORD": "",
-            "MOCK": "False",
-            "MOCK_ERROR": "False",
-            "DEBUG": "False",
-            "LOAD_MANAGE_ENABLED": "True",
-            "LOAD_MANAGE_DRY_RUN": "True",
-            "LOAD_PLUG_CONTROLLER": "stub",
-            "LOAD_TESLA_CONTROLLER": "stub",
-            "LOAD_NBC_DEVICE": "METER",
-        }.items():
-            cfg.set(key, value)
-        app_mod._state.load_manager = None
-        app_mod._state.load_manager_init_failed = False
-        app_mod._state.last_cycle_result = None
-        try:
+        with real_mode_config(
+            LOAD_MANAGE_ENABLED="True",
+            LOAD_NBC_DEVICE="METER",
+        ):
             yield
-        finally:
-            app_mod._state.load_manager = None
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = None
-
-    @staticmethod
-    def _realistic_metrics():
-        """Return a metrics dict shaped like real-mode HourlyProjection.metrics."""
-        from mockdata import _generate_hour_seconds
-        from util import compute_nbc_quarters
-
-        now = datetime.now(timezone.utc)
-        per_second = _generate_hour_seconds(12345, 42, sign=-1.0)
-        return {
-            "api_response": {"total": timedelta(microseconds=750072)},
-            "debug": True,
-            "devices": [
-                {
-                    "gid": 12345,
-                    "lag": timedelta(seconds=2),
-                    "name": "METER",
-                    "minute_predicted": -100.0,
-                    "minutes_remaining": 18.0,
-                    "per_second_data": per_second,
-                    "prediction": -1000.0,
-                    "prediction_min": -1100.0,
-                    "prediction_max": -900.0,
-                    "timezone": "America/Los_Angeles",
-                    "nbc": compute_nbc_quarters(per_second).to_dict(),
-                }
-            ],
-            "instant": now,
-            "data_start": now.replace(second=0, microsecond=0) - timedelta(minutes=42),
-            "_fetched_at": now,
-            "_data_lag_secs": 2.0,
-        }
 
     def test_reader_uses_app_energy_cache(self):
         """NBCReader reads from the shared app-level EnergyCache, not a private one."""
@@ -1807,7 +1617,7 @@ class TestLoadManagerSharedCache(unittest.TestCase):
         with self._enabled_real_mode():
             with patch(
                 "app.create_metrics",
-                return_value=self._realistic_metrics(),
+                return_value=realistic_metrics(),
             ) as mock_metrics:
                 lm = app_mod._get_load_manager()
                 self.assertIsNotNone(lm)

@@ -24,7 +24,6 @@ from util import (
     CompletedNBCPeriod,
     NBCQuarter,
     NBCQuarterSet,
-    ceil_to_qh,
 )
 
 
@@ -42,84 +41,54 @@ class TestCompletedNBCPeriod:
         with pytest.raises(AttributeError):
             p.start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)  # type: ignore[misc]
 
-    def test_fields(self) -> None:
-        """start and raw_wh are stored correctly."""
-        start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
-        p = CompletedNBCPeriod(start=start, raw_wh=456.78)
-        assert p.start == start
-        assert p.raw_wh == 456.78
-
-    def test_equality(self) -> None:
-        """Two periods with same start and raw_wh are equal."""
-        start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
-        a = CompletedNBCPeriod(start=start, raw_wh=100.0)
-        b = CompletedNBCPeriod(start=start, raw_wh=100.0)
-        assert a == b
-
-    def test_inequality_different_start(self) -> None:
-        """Periods with different start times are not equal."""
-        a = CompletedNBCPeriod(
-            start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
-            raw_wh=100.0,
-        )
-        b = CompletedNBCPeriod(
-            start=datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc),
-            raw_wh=100.0,
-        )
-        assert a != b
-
-    def test_inequality_different_raw_wh(self) -> None:
-        """Periods with different raw_wh are not equal."""
-        start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
-        a = CompletedNBCPeriod(start=start, raw_wh=100.0)
-        b = CompletedNBCPeriod(start=start, raw_wh=200.0)
-        assert a != b
-
 
 # ---------------------------------------------------------------------------
-# Phase 2: EnergyCacheData completed_periods field
+# Shared helpers
 # ---------------------------------------------------------------------------
 
-class TestEnergyCacheDataCompletedPeriods:
-    """Tests for the completed_periods field on EnergyCacheData."""
 
-    def test_completed_periods_defaults_to_none(self) -> None:
-        """EnergyCacheData.completed_periods defaults to None."""
-        now = datetime.now(timezone.utc)
-        data = EnergyCacheData(
-            samples=[],
-            data_start=now,
-            last_sample_at=now,
-            last_fetch_at=now,
-            sample_count=0,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        assert data.completed_periods is None
+def _make_data(
+    samples: list[float],
+    data_start: datetime,
+    now: datetime,
+    completed_periods: list[CompletedNBCPeriod] | None = None,
+    full_metrics_dict: dict | None = None,
+) -> EnergyCacheData:
+    """Create an EnergyCacheData with metadata derived from the samples."""
+    return EnergyCacheData(
+        samples=samples,
+        data_start=data_start,
+        last_sample_at=data_start + timedelta(seconds=len(samples) - 1)
+        if samples
+        else data_start,
+        last_fetch_at=now,
+        sample_count=len(samples),
+        quantization_seconds=None,
+        quantization_offset=None,
+        quantization_confidence=None,
+        completed_periods=completed_periods,
+        full_metrics_dict=full_metrics_dict,
+    )
 
-    def test_completed_periods_can_be_set(self) -> None:
-        """EnergyCacheData.completed_periods can be set via replace()."""
-        from dataclasses import replace
 
-        now = datetime.now(timezone.utc)
-        data = EnergyCacheData(
-            samples=[],
-            data_start=now,
-            last_sample_at=now,
-            last_fetch_at=now,
-            sample_count=0,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-        periods = [
-            CompletedNBCPeriod(start=now - timedelta(minutes=15), raw_wh=100.0),
-        ]
-        updated = replace(data, completed_periods=periods)
-        assert updated.completed_periods is not None
-        assert len(updated.completed_periods) == 1
-        assert updated.completed_periods[0].raw_wh == 100.0
+def _make_cache(
+    samples: list[float],
+    data_start: datetime,
+    now: datetime,
+    completed_periods: list[CompletedNBCPeriod] | None = None,
+    full_metrics_dict: dict | None = None,
+    last_fetch_at: datetime | None = None,
+) -> EnergyCache:
+    """Create an EnergyCache pre-populated with the given window."""
+    cache = EnergyCache()
+    cache._data = _make_data(
+        samples=samples,
+        data_start=data_start,
+        now=last_fetch_at if last_fetch_at is not None else now,
+        completed_periods=completed_periods,
+        full_metrics_dict=full_metrics_dict,
+    )
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -128,30 +97,6 @@ class TestEnergyCacheDataCompletedPeriods:
 
 class TestCompact:
     """Tests for EnergyCache.compact()."""
-
-    def _make_cache(
-        self,
-        samples: list[float],
-        data_start: datetime,
-        now: datetime,
-        completed_periods: list[CompletedNBCPeriod] | None = None,
-        full_metrics_dict: dict | None = None,
-    ) -> EnergyCache:
-        """Create an EnergyCache with pre-set data."""
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=samples,
-            data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=len(samples) - 1) if samples else data_start,
-            last_fetch_at=now,
-            sample_count=len(samples),
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-            completed_periods=completed_periods,
-            full_metrics_dict=full_metrics_dict,
-        )
-        return cache
 
     def test_no_data_noop(self) -> None:
         """compact() is a no-op when cache is empty."""
@@ -166,7 +111,7 @@ class TestCompact:
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
         # Only 500 samples — less than one QH
-        cache = self._make_cache(
+        cache = _make_cache(
             samples=[0.001] * 500,
             data_start=data_start,
             now=now,
@@ -187,7 +132,7 @@ class TestCompact:
         # 2700 samples = 3 complete QH (900 each) + 0 extra
         # Actually let's do 2700 + 300 = 3000 samples to have a partial QH1
         samples = [0.001] * 2700 + [0.002] * 300
-        cache = self._make_cache(samples=samples, data_start=data_start, now=now)
+        cache = _make_cache(samples=samples, data_start=data_start, now=now)
         with cache._lock:
             cache.compact(now)
         assert cache._data is not None
@@ -203,7 +148,7 @@ class TestCompact:
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         # 1200 samples = 1 complete QH (900) + 300 in current QH
         samples = [0.001] * 900 + [0.002] * 300
-        cache = self._make_cache(samples=samples, data_start=data_start, now=now)
+        cache = _make_cache(samples=samples, data_start=data_start, now=now)
         with cache._lock:
             cache.compact(now)
         assert cache._data is not None
@@ -221,7 +166,7 @@ class TestCompact:
             start=datetime(2025, 6, 15, 13, 0, 0, tzinfo=timezone.utc),
             raw_wh=500.0,
         )
-        cache = self._make_cache(
+        cache = _make_cache(
             samples=samples,
             data_start=data_start,
             now=now,
@@ -245,7 +190,7 @@ class TestCompact:
             start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
             raw_wh=999.0,  # different raw_wh
         )
-        cache = self._make_cache(
+        cache = _make_cache(
             samples=samples,
             data_start=data_start,
             now=now,
@@ -273,25 +218,12 @@ class TestCompact:
         # So QH4 ends at 14:59:59, which is < 15:00 = ceil_to_qh(now).
         # All 4 are complete. But we keep at most 3.
         samples = [0.001] * 3600
-        cache = self._make_cache(samples=samples, data_start=data_start, now=now)
+        cache = _make_cache(samples=samples, data_start=data_start, now=now)
         with cache._lock:
             cache.compact(now)
         assert cache._data is not None
         assert cache._data.completed_periods is not None
         assert len(cache._data.completed_periods) <= 3
-
-    def test_data_start_moves_to_current_qh(self) -> None:
-        """compact() updates data_start to start of current QH."""
-        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
-        data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
-        # 1200 samples = 1 complete QH (900) + 300 in current QH
-        samples = [0.001] * 900 + [0.002] * 300
-        cache = self._make_cache(samples=samples, data_start=data_start, now=now)
-        with cache._lock:
-            cache.compact(now)
-        assert cache._data is not None
-        # data_start should be 14:15 (start of current QH)
-        assert cache._data.data_start == datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -458,16 +390,10 @@ class TestMergeSamplesReplace:
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
 
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
+        cache = _make_cache(
             samples=[0.001] * 900,
             data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=899),
-            last_fetch_at=now,
-            sample_count=900,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            now=now,
             completed_periods=[
                 CompletedNBCPeriod(
                     start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
@@ -492,7 +418,6 @@ class TestMergeSamplesReplace:
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
 
-        cache = EnergyCache()
         periods = [
             CompletedNBCPeriod(
                 start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
@@ -503,15 +428,10 @@ class TestMergeSamplesReplace:
                 raw_wh=200.0,
             ),
         ]
-        cache._data = EnergyCacheData(
+        cache = _make_cache(
             samples=[0.001] * 300,
             data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=299),
-            last_fetch_at=now,
-            sample_count=300,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            now=now,
             completed_periods=periods,
         )
 
@@ -534,16 +454,11 @@ class TestGetOrFetchReplace:
         now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
 
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
+        cache = _make_cache(
             samples=[0.001] * 300,
             data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=299),
             last_fetch_at=now - timedelta(seconds=60),
-            sample_count=300,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            now=now,
             completed_periods=[
                 CompletedNBCPeriod(
                     start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
@@ -573,16 +488,11 @@ class TestGetOrFetchReplace:
         now = datetime(2025, 6, 15, 14, 10, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
+        cache = _make_cache(
             samples=[0.001] * 500,
             data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=499),
             last_fetch_at=now - timedelta(seconds=60),
-            sample_count=500,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            now=now,
         )
 
         new_data_start = data_start + timedelta(seconds=500)
@@ -619,16 +529,10 @@ class TestBoundaryFetchCompaction:
         now = datetime(2026, 7, 31, 18, 45, 40, tzinfo=timezone.utc)
         data_start = datetime(2026, 7, 31, 18, 30, 0, tzinfo=timezone.utc)
 
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
+        cache = _make_cache(
             samples=[0.001] * 890,
             data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=889),
-            last_fetch_at=now,
-            sample_count=890,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            now=now,
         )
 
         def fetcher() -> dict[str, Any]:
@@ -666,16 +570,10 @@ class TestComputeDeviceMetricsCompletedPeriods:
         now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
 
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
+        cache = _make_cache(
             samples=[0.001] * 300,
             data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=299),
-            last_fetch_at=now,
-            sample_count=300,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            now=now,
             completed_periods=[
                 CompletedNBCPeriod(
                     start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
@@ -782,79 +680,6 @@ class TestCompactionIntegration:
 # data_start QH-alignment after compaction
 # ---------------------------------------------------------------------------
 
-class TestDataStartQHAlignment:
-    """Tests that compact() snaps data_start to the QH boundary."""
-
-    def test_compact_trims_leading_partial_chunk(self) -> None:
-        """Non-aligned data_start is trimmed to the QH boundary, not ceil-snapped.
-
-        Reproduces the bug where the leading partial chunk was compacted
-        as a bogus straddling period and the remaining samples were snapped
-        FORWARD to the next QH boundary (03:00:00 while the samples only
-        reach 02:54:00).  Instead, the partial chunk must be trimmed so
-        data_start lands on a real QH boundary without jumping into the
-        future.
-        """
-        now = datetime(2026, 7, 30, 2, 50, 0, tzinfo=timezone.utc)
-        data_start = datetime(2026, 7, 30, 2, 34, 1, tzinfo=timezone.utc)
-
-        # 1200 samples: data_start is not QH-aligned (02:34:01).  The
-        # leading partial chunk (02:34:01–02:44:59, 659 samples) must be
-        # trimmed so chunking starts on the 02:45:00 boundary.
-        samples = [0.001] * 900 + [0.002] * 300
-
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=samples,
-            data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=1199),
-            last_fetch_at=now,
-            sample_count=1200,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
-        with cache._lock:
-            cache.compact(now)
-
-        assert cache._data is not None
-        # 1200 - 659 trimmed = 541 samples, aligned to 02:45:00.
-        assert len(cache._data.samples) == 541
-        assert cache._data.data_start == datetime(
-            2026, 7, 30, 2, 45, 0, tzinfo=timezone.utc
-        )
-        # data_start must never jump past the last sample time.
-        assert cache._data.data_start <= cache._data.last_sample_at
-        # No bogus straddling periods compacted.
-        assert not cache._data.completed_periods
-
-    def test_compact_preserves_qh_aligned_data_start(self) -> None:
-        """When data_start is already QH-aligned and no compaction occurs, compact keeps it unchanged."""
-        now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
-        data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
-
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
-            samples=[0.001] * 300,
-            data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=299),
-            last_fetch_at=now,
-            sample_count=300,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
-        with cache._lock:
-            cache.compact(now)
-
-        assert cache._data is not None
-        assert len(cache._data.samples) == 300
-        # Already QH-aligned and no compaction occurred — should stay unchanged.
-        assert cache._data.data_start == data_start
-
-
 class TestCompactPartialChunkWarning:
     """compact() must not silently drop a misaligned leading chunk.
 
@@ -882,16 +707,10 @@ class TestCompactPartialChunkWarning:
         # a CompletedNBCPeriod.
         samples = [0.001] * 1200
 
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
+        cache = _make_cache(
             samples=samples,
             data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=1199),
-            last_fetch_at=now,
-            sample_count=1200,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            now=now,
         )
 
         with caplog.at_level(logging.WARNING, logger="energy_cache"):
@@ -909,6 +728,8 @@ class TestCompactPartialChunkWarning:
         assert cache._data.data_start == datetime(
             2026, 7, 30, 2, 45, 0, tzinfo=timezone.utc
         )
+        # data_start must never jump past the last sample time.
+        assert cache._data.data_start <= cache._data.last_sample_at
         assert not cache._data.completed_periods
 
     def test_no_warning_when_aligned_and_nothing_to_do(self, caplog) -> None:
@@ -918,16 +739,10 @@ class TestCompactPartialChunkWarning:
         now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
 
-        cache = EnergyCache()
-        cache._data = EnergyCacheData(
+        cache = _make_cache(
             samples=[0.001] * 300,
             data_start=data_start,
-            last_sample_at=data_start + timedelta(seconds=299),
-            last_fetch_at=now,
-            sample_count=300,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
+            now=now,
         )
 
         with caplog.at_level(logging.WARNING, logger="energy_cache"):
@@ -938,3 +753,7 @@ class TestCompactPartialChunkWarning:
             "partial chunk" in record.message
             for record in caplog.records
         )
+        # Already QH-aligned and nothing to do — data stays unchanged.
+        assert cache._data is not None
+        assert len(cache._data.samples) == 300
+        assert cache._data.data_start == data_start

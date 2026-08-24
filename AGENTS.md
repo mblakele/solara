@@ -311,7 +311,7 @@ project-root
 - Telegram sender in `telegram.py` (`TelegramSender`, `NotificationEvent`)
 - SSE broadcaster and endpoint tests in `tests/test_sse.py` (`SSEBroadcaster`, `event_stream`)
 - Pipeline stage tests in `tests/test_pipeline_stages.py`
-- CycleContext tests in `tests/test_cycle_context.py`
+- CycleContext usage is covered by the pipeline stage tests (`tests/test_pipeline_stages.py`)
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 - Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`

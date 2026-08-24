@@ -2,6 +2,32 @@
 
 from datetime import datetime, timezone
 
+from load_models import TeslaConfig
+
+
+def _now_utc() -> datetime:
+    """Return the current UTC time."""
+    return datetime.now(timezone.utc)
+
+
+def make_tesla_config(**overrides) -> TeslaConfig:
+    """Create a TeslaConfig with standard test defaults.
+
+    Args:
+        overrides: Any TeslaConfig fields to override (e.g. charge_amps_max).
+    """
+    values: dict = {
+        "client_id": "test-id",
+        "client_secret": "test-secret",
+        "redirect_uri": "http://localhost/callback",
+        "vehicle_id": "vehicle-123",
+        "home_lat": 37.0,
+        "home_lon": -122.0,
+        "home_radius_m": 500,
+    }
+    values.update(overrides)
+    return TeslaConfig(**values)
+
 
 def _make_qh_data(
     qh_index: int, minute_in_hour: int, predicted_wh: float, complete: bool = False
@@ -99,8 +125,3 @@ def _make_metrics_with_wh(
             }
 
     return {"devices": [{"name": device_name, "nbc": qh_data}]}
-
-
-def _now_utc() -> datetime:
-    """Return the current UTC time."""
-    return datetime.now(timezone.utc)

@@ -6,10 +6,39 @@ from unittest.mock import patch
 import pytest
 
 from constants import DEFAULT_PREDICTION_WINDOW_SECS
-from load_models import PlugConfig, DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
+from load_models import PlugConfig, DeviceState, PendingEffect, TeslaState
 from load_nbc import StateTracker, nominal_voltage
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
+
+
+def make_settle_effect(
+    age_secs: int = 10,
+    target_amps: int = 20,
+    *,
+    direction: str = "increase",
+    suppress_action: str = "turn_off",
+    data_point_at: datetime | None = None,
+) -> PendingEffect:
+    """Build a Tesla ``set_amps`` pending effect for settle-window tests.
+
+    Args:
+        age_secs: How long ago the command was issued.
+        target_amps: The commanded amp level.
+        direction: Effect direction metadata.
+        suppress_action: Suppress metadata for the opposite action.
+        data_point_at: Defaults to the same age as the command timestamp.
+    """
+    return PendingEffect(
+        device_name="tesla", action="set_amps",
+        timestamp=fixed_now - timedelta(seconds=age_secs),
+        data_point_at=data_point_at
+        if data_point_at is not None
+        else fixed_now - timedelta(seconds=age_secs),
+        power_watts=0, target_amps=target_amps,
+        direction=direction, suppress_action=suppress_action,
+        qh_name="QH1",
+    )
 
 def test_can_toggle_true_when_never_toggled():
     """True when device never toggled."""
@@ -33,48 +62,33 @@ def test_can_toggle_on_true_after_debounce():
 def test_can_toggle_on_false_before_debounce():
     """False before MIN_TOGGLE_ON_SECS elapsed."""
     tracker = StateTracker()
-
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        tracker.devices["plug"] = DeviceState(
-            name="plug",
-            last_toggle=fixed_now - timedelta(seconds=30),
-            actual_state=True,
-        )
-
+    tracker.devices["plug"] = DeviceState(
+        name="plug",
+        last_toggle=fixed_now - timedelta(seconds=30),
+        actual_state=True,
+    )
     assert tracker.can_toggle("plug", fixed_now) is False
 
 
 def test_can_toggle_off_true_after_debounce():
     """True after MIN_TOGGLE_OFF_SECS elapsed."""
     tracker = StateTracker()
-
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        tracker.devices["plug"] = DeviceState(
-            name="plug",
-            last_toggle=fixed_now - timedelta(seconds=91),
-            actual_state=False,
-        )
-
+    tracker.devices["plug"] = DeviceState(
+        name="plug",
+        last_toggle=fixed_now - timedelta(seconds=91),
+        actual_state=False,
+    )
     assert tracker.can_toggle("plug", fixed_now) is True
 
 
 def test_can_toggle_off_false_before_debounce():
     """False before MIN_TOGGLE_OFF_SECS elapsed."""
     tracker = StateTracker()
-
-    with patch("load_manager.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        tracker.devices["plug"] = DeviceState(
-            name="plug",
-            last_toggle=fixed_now - timedelta(seconds=30),
-            actual_state=False,
-        )
-
+    tracker.devices["plug"] = DeviceState(
+        name="plug",
+        last_toggle=fixed_now - timedelta(seconds=30),
+        actual_state=False,
+    )
     assert tracker.can_toggle("plug", fixed_now) is False
 
 
@@ -439,72 +453,6 @@ class TestTeslaInflightWh:
         result = tracker.tesla_inflight_wh(reported_amps=5, seconds_remaining=900, now=fixed_now)
         assert pytest.approx(result) == 13 * 240 * 900 / 3600
 
-    def test_charging_stopped_single_zero_keeps_command(self) -> None:
-        """A single reported_amps==0 does NOT immediately clear the command.
-
-        Plan 3.5: one zero-amp telemetry frame may be a stale/in-transit
-        sample while the car is still ramping or briefly idle. The command
-        survives and the full commanded delta stays accounted until a
-        second consecutive zero confirms the car actually stopped.
-        """
-        tracker = StateTracker()
-        tracker.last_commanded_amps = 18
-        # Full commanded delta: 18 A * 240 V * 900 s / 3600 = 1080 Wh
-        result = tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
-        assert pytest.approx(result) == 18 * 240 * 900 / 3600
-        # Command must survive the first zero report
-        assert tracker.last_commanded_amps == 18
-
-    def test_one_amp_with_old_command_clears_state(self) -> None:
-        """When car reports 1 amp and the command is old (beyond settle),
-        treat it as stale and clear last_commanded_amps.
-
-        A delta of 1 from a previous command is stale — the car never reached
-        that level, so the in-flight correction should be zero.
-        """
-        tracker = StateTracker(prediction_window_seconds=60)
-        tracker.last_commanded_amps = 18
-        tracker.pending_effects.append(PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now - timedelta(seconds=200),
-            data_point_at=fixed_now - timedelta(seconds=200),
-            power_watts=0, target_amps=18,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        ))
-        result = tracker.tesla_inflight_wh(
-            reported_amps=1, seconds_remaining=900, now=fixed_now,
-        )
-        assert result == 0.0
-        assert tracker.last_commanded_amps is None
-
-    def test_one_amp_during_ramp_up_does_not_clear_state(self) -> None:
-        """When car reports 1 amp during ramp-up (command is recent),
-        do NOT clear last_commanded_amps — the car is still ramping.
-
-        The car briefly reports 1A while transitioning from stopped to the
-        commanded amp level.  Clearing state here would lose the in-flight
-        delta and cause the next cycle to over-allocate.
-        """
-        tracker = StateTracker(prediction_window_seconds=60)
-        tracker.last_commanded_amps = 20
-        tracker.pending_effects.append(PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now - timedelta(seconds=10),
-            data_point_at=fixed_now - timedelta(seconds=10),
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        ))
-        result = tracker.tesla_inflight_wh(
-            reported_amps=1, seconds_remaining=900, now=fixed_now,
-        )
-        # Plan 3.5: during ramp-up the unconfirmed portion (commanded 20 A,
-        # car reporting 1 A) is still credited: (20-1) * 240 * 900 / 3600.
-        assert pytest.approx(result) == (20 - 1) * 240 * 900 / 3600
-        # last_commanded_amps must survive — the ramp is still in progress
-        assert tracker.last_commanded_amps == 20
-
     def test_positive_delta_returns_positive_wh(self) -> None:
         """Positive amp delta (car charging less than commanded) returns positive Wh."""
         tracker = StateTracker()
@@ -530,43 +478,12 @@ class TestTeslaInflightWh:
         tracker.tesla_inflight_wh(reported_amps=0, seconds_remaining=900, now=fixed_now)
         assert tracker.last_commanded_amps is None
 
-    def test_one_amp_with_data_point_at_keeps_alive(self) -> None:
-        """When wall clock past settle but data_point_at recent, keep command."""
-        tracker = StateTracker(prediction_window_seconds=60)  # settle = 60s
-        tracker.last_commanded_amps = 20
-        command_dp = fixed_now - timedelta(seconds=10)
-        # Wall clock is 200s past (well past 60s settle)
-        tracker.pending_effects.append(PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now - timedelta(seconds=200),
-            data_point_at=command_dp,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        ))
-        # But data_point_at has only advanced 55s (within 60s settle)
-        result = tracker.tesla_inflight_wh(
-            reported_amps=1, seconds_remaining=900,
-            now=fixed_now, data_point_at=command_dp + timedelta(seconds=55),
-        )
-        # Plan 3.5: data-age ramp-up branch also credits the unconfirmed
-        # portion: (20-1) * 240 * 900 / 3600.
-        assert pytest.approx(result) == (20 - 1) * 240 * 900 / 3600
-        assert tracker.last_commanded_amps == 20  # not cleared
-
     def test_settle_expired_car_below_target_clears(self) -> None:
         """After settle window, car below target → clear stale state, return 0."""
         tracker = StateTracker(prediction_window_seconds=60)
         tracker.last_commanded_amps = 24
         # Increase recorded 200s ago — well past 60s settle window
-        tracker.pending_effects.append(PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now - timedelta(seconds=200),
-            data_point_at=fixed_now - timedelta(seconds=200),
-            power_watts=0, target_amps=24,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        ))
+        tracker.pending_effects.append(make_settle_effect(age_secs=200, target_amps=24))
         result = tracker.tesla_inflight_wh(
             reported_amps=10, seconds_remaining=746, now=fixed_now,
         )
@@ -578,14 +495,7 @@ class TestTeslaInflightWh:
         tracker = StateTracker(prediction_window_seconds=60)
         tracker.last_commanded_amps = 24
         # Increase recorded 30s ago — within 60s settle window
-        tracker.pending_effects.append(PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now - timedelta(seconds=30),
-            data_point_at=fixed_now - timedelta(seconds=30),
-            power_watts=0, target_amps=24,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        ))
+        tracker.pending_effects.append(make_settle_effect(age_secs=30, target_amps=24))
         result = tracker.tesla_inflight_wh(
             reported_amps=10, seconds_remaining=746, now=fixed_now,
         )
@@ -595,7 +505,7 @@ class TestTeslaInflightWh:
 
     def test_one_amp_with_both_expired_via_data(self) -> None:
         """When both wall and data measures exceed settle, clear state."""
-        tracker = StateTracker(prediction_window_seconds=60)  # settle = 120s
+        tracker = StateTracker(prediction_window_seconds=60)
         tracker.last_commanded_amps = 20
         command_dp = fixed_now - timedelta(seconds=200)
         tracker.pending_effects.append(PendingEffect(
@@ -625,14 +535,7 @@ class TestTeslaInflightAccounting:
 
     def _settle_effect(self, age_secs: int = 10) -> PendingEffect:
         """Build a recent set_amps settle effect targeting the Tesla device."""
-        return PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now - timedelta(seconds=age_secs),
-            data_point_at=fixed_now - timedelta(seconds=age_secs),
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        return make_settle_effect(age_secs=age_secs)
 
     # ── Zero-amp confirmation ──────────────────────────────────────────
 
@@ -729,22 +632,19 @@ class TestTeslaInflightAccounting:
 
 
 
-    """Tests for StateTracker.effective_settle_secs."""
+    # ── Effective settle window ────────────────────────────────────────
 
-    def test_default_prediction_window(self) -> None:
-        """With default prediction_window_seconds, settle matches the default."""
-        tracker = StateTracker()
-        assert tracker.effective_settle_secs == DEFAULT_PREDICTION_WINDOW_SECS
-
-    def test_custom_prediction_window_30(self) -> None:
-        """With prediction_window_seconds=30, settle is 30."""
-        tracker = StateTracker(prediction_window_seconds=30)
-        assert tracker.effective_settle_secs == 30
-
-    def test_small_prediction_window(self) -> None:
-        """With prediction_window_seconds=10, settle is 10."""
-        tracker = StateTracker(prediction_window_seconds=10)
-        assert tracker.effective_settle_secs == 10
+    @pytest.mark.parametrize("window", [None, 30, 10])
+    def test_effective_settle_matches_prediction_window(self, window: int | None) -> None:
+        """effective_settle_secs mirrors prediction_window_seconds (default when None)."""
+        if window is None:
+            tracker = StateTracker()
+            assert (
+                tracker.effective_settle_secs == DEFAULT_PREDICTION_WINDOW_SECS
+            )
+        else:
+            tracker = StateTracker(prediction_window_seconds=window)
+            assert tracker.effective_settle_secs == window
 
 
 class TestApplyPredictionWindow:
@@ -842,13 +742,7 @@ class TestSyncTeslaDeviceState:
     def test_last_toggle_from_command_timestamp(self) -> None:
         """last_toggle reflects the last Tesla command time."""
         tracker = StateTracker()
-        tracker.pending_effects.append(PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=8,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        ))
+        tracker.pending_effects.append(make_settle_effect(age_secs=0, target_amps=8))
         ts = TeslaState(is_charging=True, current_amps=8, plugged_in=True, at_home=True)
         tracker.sync_tesla_device_state(ts)
         assert tracker.devices["tesla"].last_toggle == fixed_now
@@ -870,13 +764,7 @@ class TestIsSettling:
     def test_increase_settle_active(self) -> None:
         """is_settling(direction='increase') returns True within window."""
         tracker = StateTracker(prediction_window_seconds=60)
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        eff = make_settle_effect(age_secs=0)
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=30), current_qh="QH1",
@@ -886,13 +774,7 @@ class TestIsSettling:
     def test_increase_settle_expired(self) -> None:
         """is_settling(direction='increase') returns False after window."""
         tracker = StateTracker(prediction_window_seconds=30)
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        eff = make_settle_effect(age_secs=0)
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=61), current_qh="QH1",
@@ -902,13 +784,7 @@ class TestIsSettling:
     def test_increase_settle_expires_on_qh_change(self) -> None:
         """A new QH expires the settle window."""
         tracker = StateTracker()
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        eff = make_settle_effect(age_secs=0)
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=10), current_qh="QH2",
@@ -918,13 +794,7 @@ class TestIsSettling:
     def test_decrease_settle_active(self) -> None:
         """is_settling(direction='decrease') returns True within window."""
         tracker = StateTracker(prediction_window_seconds=60)
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=10,
-            direction="decrease", suppress_action="turn_on",
-            qh_name="QH1",
-        )
+        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease", suppress_action="turn_on")
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=30), current_qh="QH1",
@@ -934,13 +804,7 @@ class TestIsSettling:
     def test_decrease_settle_expired(self) -> None:
         """is_settling(direction='decrease') returns False after window."""
         tracker = StateTracker(prediction_window_seconds=30)
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=10,
-            direction="decrease", suppress_action="turn_on",
-            qh_name="QH1",
-        )
+        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease", suppress_action="turn_on")
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=61), current_qh="QH1",
@@ -995,13 +859,7 @@ class TestIsSettling:
     def test_wrong_direction_returns_false(self) -> None:
         """is_settling with wrong direction returns False."""
         tracker = StateTracker(prediction_window_seconds=60)
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        eff = make_settle_effect(age_secs=0)
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=30), current_qh="QH1",
@@ -1011,13 +869,7 @@ class TestIsSettling:
     def test_data_point_at_none_falls_back_to_wall(self) -> None:
         """When data_point_at is None, falls back to wall-clock-only check."""
         tracker = StateTracker(prediction_window_seconds=30)
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        eff = make_settle_effect(age_secs=0)
         tracker.pending_effects.append(eff)
         # Within wall window — should be True
         assert tracker.is_settling(
@@ -1033,13 +885,7 @@ class TestIsSettling:
     def test_decrease_settle_expires_on_qh_change(self) -> None:
         """A new QH expires the decrease settle window."""
         tracker = StateTracker()
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=10,
-            direction="decrease", suppress_action="turn_on",
-            qh_name="QH1",
-        )
+        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease", suppress_action="turn_on")
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=10), current_qh="QH2",
@@ -1069,21 +915,8 @@ class TestLatestTeslaCommand:
     def test_returns_most_recent_tesla_effect(self) -> None:
         """Returns the most recent Tesla set_amps effect."""
         tracker = StateTracker()
-        eff1 = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now - timedelta(seconds=10),
-            data_point_at=fixed_now - timedelta(seconds=10),
-            power_watts=0, target_amps=10,
-            direction="decrease", suppress_action="turn_on",
-            qh_name="QH1",
-        )
-        eff2 = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        eff1 = make_settle_effect(age_secs=10, target_amps=10, direction="decrease", suppress_action="turn_on")
+        eff2 = make_settle_effect(age_secs=0)
         tracker.pending_effects.extend([eff1, eff2])
         assert tracker._latest_tesla_command() is eff2
 
@@ -1105,13 +938,7 @@ class TestClearTeslaSettleEffects:
     def test_removes_tesla_set_amps_effects(self) -> None:
         """Removes Tesla set_amps effects from pending_effects."""
         tracker = StateTracker()
-        eff1 = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        eff1 = make_settle_effect(age_secs=0)
         eff2 = PendingEffect(
             device_name="pool_pump", action="turn_on",
             timestamp=fixed_now, data_point_at=fixed_now,
@@ -1125,13 +952,7 @@ class TestClearTeslaSettleEffects:
     def test_keeps_tesla_turn_on_off_effects(self) -> None:
         """Keeps Tesla turn_on/turn_off effects (only set_amps removed)."""
         tracker = StateTracker()
-        eff1 = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
+        eff1 = make_settle_effect(age_secs=0)
         eff2 = PendingEffect(
             device_name="tesla", action="turn_off",
             timestamp=fixed_now, data_point_at=fixed_now,
@@ -1148,46 +969,6 @@ class TestClearTeslaSettleEffects:
         tracker.clear_tesla_settle_effects()
         assert len(tracker.pending_effects) == 0
 
-
-class TestPendingEffectDirection:
-    """Tests for PendingEffect direction/suppress_action/qh_name fields."""
-
-    def test_plug_effect_has_none_direction(self) -> None:
-        """Plug effects have direction=None by default."""
-        eff = PendingEffect(
-            device_name="pool_pump", action="turn_on",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=1000,
-        )
-        assert eff.direction is None
-        assert eff.suppress_action is None
-        assert eff.qh_name is None
-
-    def test_tesla_increase_effect(self) -> None:
-        """Tesla increase effect has correct metadata."""
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
-            qh_name="QH1",
-        )
-        assert eff.direction == "increase"
-        assert eff.suppress_action == "turn_off"
-        assert eff.qh_name == "QH1"
-
-    def test_tesla_decrease_effect(self) -> None:
-        """Tesla decrease effect has correct metadata."""
-        eff = PendingEffect(
-            device_name="tesla", action="set_amps",
-            timestamp=fixed_now, data_point_at=fixed_now,
-            power_watts=0, target_amps=10,
-            direction="decrease", suppress_action="turn_on",
-            qh_name="QH1",
-        )
-        assert eff.direction == "decrease"
-        assert eff.suppress_action == "turn_on"
-        assert eff.qh_name == "QH1"
 
 
 # =============================================================================

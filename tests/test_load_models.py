@@ -207,3 +207,83 @@ class TestSignedEffectInvariant:
         tracker.add_effect(self._effect("turn_off", -60.0))
         adjusted = tracker.estimated_current_wh(100.0, seconds_remaining=900)
         assert adjusted == pytest.approx(100.0 - 15.0)  # -60 W * 900 s
+
+
+class TestCycleResultSerialization:
+    """CycleResult/CycleDiagnostics.to_dict() serialization contracts.
+
+    These pin the JSON payload shape consumed by app.py routes and SSE
+    events: nested dataclasses become dicts, datetimes become ISO strings,
+    and the result stays json.dumps-able.
+    """
+
+    def _pending_effect(self) -> PendingEffect:
+        now = datetime.now(timezone.utc)
+        return PendingEffect(
+            device_name="Test Plug",
+            action="turn_on",
+            timestamp=now,
+            data_point_at=now,
+            power_watts=100.0,
+        )
+
+    def test_diagnostics_to_dict_iso_formats_datetimes(self) -> None:
+        from load_models import CycleDiagnostics
+
+        diag = CycleDiagnostics(
+            gap_wh=-300.0,
+            hysteresis_wh=50,
+            seconds_remaining=45,
+            data_point_at=datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc),
+            reason="ok",
+        )
+        d = diag.to_dict()
+        assert d["data_point_at"] == "2026-05-01T12:00:00+00:00"
+
+    def test_diagnostics_to_dict_preserves_none_quantization(self) -> None:
+        from load_models import CycleDiagnostics
+
+        d = CycleDiagnostics(gap_wh=-1.0, hysteresis_wh=50, reason="ok").to_dict()
+        assert d["quantization_seconds"] is None
+        assert d["settle_window_secs"] is None
+
+    def test_result_to_dict_nests_dicts_not_dataclasses(self) -> None:
+        import json
+
+        from load_models import (
+            CandidateDetailPlug,
+            CandidateDetailTesla,
+            CycleDiagnostics,
+            CycleResult,
+        )
+
+        plug = CandidateDetailPlug(
+            name="Plug",
+            power_watts=100.0,
+            capacity_wh=1200.0,
+            can_toggle=True,
+        )
+        tesla = CandidateDetailTesla(name="Model 3", state_available=True)
+        result = CycleResult(
+            status="ok",
+            actions=[self._pending_effect()],
+            diagnostics=CycleDiagnostics(gap_wh=-1.0, hysteresis_wh=50, reason="ok"),
+            candidates=[plug, tesla],
+        )
+        d = result.to_dict()
+        assert isinstance(d["diagnostics"], dict)
+        assert isinstance(d["actions"][0], dict)
+        assert d["actions"][0]["device_name"] == "Test Plug"
+        assert isinstance(d["candidates"], list)
+        assert all(isinstance(c, dict) for c in d["candidates"])
+        # The whole payload must remain JSON-serializable for the API/SSE layers.
+        json.dumps(d)
+
+    def test_result_to_dict_minimal_defaults(self) -> None:
+        from load_models import CycleResult
+
+        d = CycleResult(status="disabled").to_dict()
+        assert d["status"] == "disabled"
+        assert d["actions"] == []
+        assert d["diagnostics"] is None
+        assert d["candidates"] is None
