@@ -89,13 +89,13 @@ class TestEnergyCacheThreadLeakFix:
 
     def test_timeout_does_not_leak_threads(self) -> None:
         """_run_fetch_with_timeout should not leave zombie threads on timeout."""
-        cache = EnergyCache(fetch_timeout_secs=1)  # 1 second timeout
+        cache = EnergyCache(fetch_timeout_secs=0.1)
 
         # Track active thread count before
         initial_threads = threading.active_count()
 
         def slow_fetch() -> dict[str, Any]:
-            time.sleep(2.0)  # Longer than timeout
+            time.sleep(0.25)  # Longer than timeout
             return {"per_second_data": [1.0], "data_start": None}
 
         # This should timeout and return None
@@ -103,7 +103,7 @@ class TestEnergyCacheThreadLeakFix:
         assert result is None
 
         # Give some time for any threads to clean up
-        time.sleep(0.2)
+        time.sleep(0.05)
 
         # Thread count should not have grown permanently.
         # Allow small variance (+2) for pytest/asyncio test runner threads.

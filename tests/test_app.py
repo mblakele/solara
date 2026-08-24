@@ -1118,8 +1118,8 @@ class TestLagRecalculation(unittest.TestCase):
         data1 = json.loads(resp1.data)
         lag1 = self._lag_to_seconds(data1["devices"][0]["lag"])
 
-        # Small pause so elapsed time is measurable.
-        time.sleep(0.5)
+        # Small pause so the two requests are measurably distinct in time.
+        time.sleep(0.05)
 
         with mock_config():
             resp2 = self.app.get("/", headers={"Accept": "application/json"})

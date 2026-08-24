@@ -294,11 +294,11 @@ class TestGetOrFetchTimeout:
         """When fetch_func exceeds timeout, returns (None, True) without hanging."""
         import time
 
-        cache = EnergyCache(fetch_timeout_secs=0.5)
+        cache = EnergyCache(fetch_timeout_secs=0.05)
         now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
         def slow_fetcher() -> dict[str, Any] | None:
-            time.sleep(0.8)
+            time.sleep(0.08)
             return {"devices": []}
 
         result, was_fresh = cache.get_or_fetch(slow_fetcher, now, force=True)
@@ -321,11 +321,11 @@ class TestGetOrFetchTimeout:
         """Timeout emits a warning log message."""
         import time
 
-        cache = EnergyCache(fetch_timeout_secs=0.5)
+        cache = EnergyCache(fetch_timeout_secs=0.05)
         now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
         def slow_fetcher() -> dict[str, Any] | None:
-            time.sleep(0.8)
+            time.sleep(0.08)
             return {"devices": []}
 
         with caplog.at_level("WARNING", logger="energy_cache"):
@@ -399,17 +399,17 @@ class TestGetOrFetchTimeout:
         """Timeout warning includes the underlying thread exception details."""
         import time
 
-        cache = EnergyCache(fetch_timeout_secs=0.3)
+        cache = EnergyCache(fetch_timeout_secs=0.05)
         now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
         def slow_failing_fetcher() -> dict[str, Any] | None:
-            time.sleep(0.6)
+            time.sleep(0.1)
             raise ConnectionError("DNS resolution failed")
 
         with caplog.at_level("WARNING", logger="energy_cache"):
             cache.get_or_fetch(slow_failing_fetcher, now, force=True)
             # Give the thread time to log its exception after the timeout.
-            time.sleep(0.9)
+            time.sleep(0.15)
 
         all_msgs = [rec.message for rec in caplog.records]
         assert any(
@@ -424,7 +424,7 @@ class TestGetOrFetchTimeout:
         import time
         from datetime import timedelta
 
-        cache = EnergyCache(fetch_timeout_secs=1, ttl_seconds=30)
+        cache = EnergyCache(fetch_timeout_secs=0.1, ttl_seconds=30)
         now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         stale_time = now - timedelta(seconds=60)
 
@@ -442,7 +442,7 @@ class TestGetOrFetchTimeout:
         )
 
         def slow_fetcher() -> dict[str, Any] | None:
-            time.sleep(1.2)
+            time.sleep(0.15)
             return None
 
         result, was_fresh = cache.get_or_fetch(slow_fetcher, now, force=True)
@@ -639,7 +639,7 @@ class TestFetchOutsideLock:
         """Timeout path still serves the previous snapshot untouched."""
         import time as time_mod
 
-        cache = EnergyCache(fetch_timeout_secs=1)
+        cache = EnergyCache(fetch_timeout_secs=0.1)
         now = self._now()
 
         stale_samples = [0.1] * 60
@@ -656,7 +656,7 @@ class TestFetchOutsideLock:
         )
 
         def hanging_fetch():
-            time_mod.sleep(3)
+            time_mod.sleep(0.15)
             return self._payload(now)
 
         result, fresh = cache.get_or_fetch(hanging_fetch, now)

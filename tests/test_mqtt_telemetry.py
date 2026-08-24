@@ -279,7 +279,7 @@ class TestStartMqttSubscriber:
     """start_mqtt_subscriber() starts the background MQTT thread."""
 
     def test_starts_daemon_thread(self):
-        from mqtt_telemetry import start_mqtt_subscriber
+        from mqtt_telemetry import start_mqtt_subscriber, stop_mqtt_subscriber
         from config import Config
 
         cfg = Config(overrides={
@@ -299,3 +299,20 @@ class TestStartMqttSubscriber:
 
         # A new daemon thread should have been spawned
         assert threading.active_count() >= threads_before
+
+        # Stop the subscriber before it can construct a real paho client:
+        # once the patch above exits, the leaked daemon thread would wake
+        # from its reconnect backoff, build a real mqtt.Client() (emitting
+        # a DeprecationWarning that pytest attributes to whatever test is
+        # running at the time), and keep retrying for the rest of the
+        # session. stop_mqtt_subscriber() wakes the backoff wait and makes
+        # the loop exit.
+        stop_mqtt_subscriber()
+        subscriber = next(
+            t for t in threading.enumerate() if t.name == "mqtt-subscriber"
+        )
+        subscriber.join(timeout=5)
+        assert not subscriber.is_alive(), (
+            "mqtt-subscriber thread leaked past the test — it would keep "
+            "reconnecting in the background for the rest of the session"
+        )
