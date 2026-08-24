@@ -12,6 +12,10 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
+# Internal wake-up sentinel placed into subscriber queues by close_all().
+# Identity-compared in event_stream and never yielded to the client.
+_SHUTDOWN = object()
+
 
 class SSEBroadcaster:
     """Thread-safe pub/sub for SSE events.
@@ -32,8 +36,32 @@ class SSEBroadcaster:
             maxsize: Maximum items per subscriber queue.
         """
         self._maxsize = maxsize
+        self._closed = False
         self._subscribers: set[queue.Queue] = set()
         self._lock = threading.Lock()
+
+    @property
+    def closed(self) -> bool:
+        """Whether close_all() has been called (terminal state)."""
+        return self._closed
+
+    def close_all(self) -> None:
+        """Mark the broadcaster closed and wake every subscriber.
+
+        Each subscriber queue receives an internal sentinel so generators
+        parked in ``queue.get`` return promptly; a subscriber whose queue is
+        full observes the closed flag on its next idle timeout instead.
+        Used by process shutdown to free streaming worker threads.
+        """
+        with self._lock:
+            self._closed = True
+            subscribers = list(self._subscribers)
+            self._subscribers.clear()
+        for q in subscribers:
+            try:
+                q.put_nowait(_SHUTDOWN)
+            except queue.Full:
+                pass  # drained frames then hit Empty -> closed -> exit
 
     def subscribe(self) -> queue.Queue:
         """Register a new subscriber.
@@ -112,6 +140,10 @@ def event_stream(
 
     Yields:
         SSE-formatted text frames: "event: NAME\\ndata: JSON\\n\\n"
+
+    Note:
+        ``SSEBroadcaster.close_all()`` terminates the stream promptly; the
+        sentinel that wakes it is never yielded to the client.
     """
     if initial_events:
         for event_name, data in initial_events:
@@ -122,11 +154,15 @@ def event_stream(
         while True:
             try:
                 payload = q.get(timeout=timeout)
+                if payload is _SHUTDOWN:
+                    break
                 yield (
                     f"event: {payload['event']}\n"
                     f"data: {dumper(payload['data'])}\n\n"
                 )
             except queue.Empty:
+                if broadcaster.closed:
+                    break
                 yield "event: heartbeat\ndata: {}\n\n"
     except GeneratorExit:
         pass

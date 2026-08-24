@@ -35,6 +35,14 @@ class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
 
     Ensures worker threads don't block process exit when shutdown(wait=False)
     is called while a worker is blocked in a system call.
+
+    Worker threads are deliberately NOT registered in
+    ``concurrent.futures.thread._threads_queues``: at interpreter exit,
+    ``_python_exit`` joins every registered thread (daemon or not), so a
+    worker blocked in an in-flight fetch (bounded by the fetch timeout) would
+    stall gunicorn worker shutdown for that whole duration. Unregistered
+    daemon threads are simply abandoned when the process exits, which matches
+    this class's contract of never blocking process exit.
     """
 
     def _adjust_thread_count(self) -> None:  # type: ignore[override]
@@ -89,7 +97,13 @@ class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
             )
             t.start()
             self._threads.add(t)  # type: ignore[attr-defined]
-            concurrent.futures.thread._threads_queues[t] = self._work_queue  # type: ignore[index]
+            # Deliberately NOT registering in
+            # concurrent.futures.thread._threads_queues: registration would
+            # make _python_exit join this thread at interpreter exit,
+            # blocking process shutdown on any in-flight fetch (see class
+            # docstring). Idle workers block on the work queue and die with
+            # the daemon thread at exit; the weakref above still wakes them
+            # when the executor is garbage-collected.
 
 
 def _root_cause(exc: BaseException) -> BaseException:

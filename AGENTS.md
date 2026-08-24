@@ -142,6 +142,8 @@ project-root
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
                            # _AppState runtime singletons, start_background_services()
 ├── wsgi.py                # Gunicorn entry point: app = create_app(); start_background_services()
+├── gunicorn.conf.py       # Gunicorn hooks: post_worker_init chains cooperative-shutdown
+                           # signal handlers; worker_int/worker_exit call app.request_shutdown()
 ├── clock.py               # Clock protocol (now()) with FakeClock for tests
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
                            # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
@@ -177,6 +179,7 @@ project-root
  ├── mqtt_telemetry.py      # Tesla MQTT message parsing (on_message, tesla_state_from_snapshot)
   ├── quantization.py        # Detect N-second constant-value windows (quantization) in per-second data
   ├── sse_event.py            # SSEBroadcaster thread-safe pub/sub + event_stream generator for Flask
+                              # (close_all() wakes blocked streams on shutdown; sentinel never yielded)
 ├── telegram.py            # TelegramSender, NotificationEvent, config loading helpers
 ├── telegram_client.py     # Async Telegram Bot API client using aiohttp
 ├── util.py                # Shared utilities (JSON helpers, timezone handling)
@@ -266,6 +269,17 @@ project-root
   `_ensure_api` create/update branches respectively)
 - `create_app()` factory + routes in `app.py` (module-level `app` singleton; no
   background threads start at import time)
+- Cooperative shutdown (single-interrupt exit): `_stop_event` + idempotent
+  `request_shutdown(reason)` in `app.py` — sets the stop event every background
+  loop waits on (`_load_management_loop` sleeps via `_stop_event.wait()`, not
+  `time.sleep()`), wakes SSE streams via `SSEBroadcaster.close_all()`, stops the
+  MQTT subscriber (`mqtt_telemetry.stop_mqtt_subscriber()`), and closes the
+  LoadManager exactly once. `install_shutdown_signal_hooks()` chains those calls
+  over existing SIGINT/SIGQUIT/SIGTERM handlers; wired by `gunicorn.conf.py`
+  hooks (`post_worker_init`/`worker_int`/`worker_exit`) and the `__main__`
+  block. Rationale: concurrent.futures joins all executor threads (daemon or
+  not) at interpreter exit, so a blocked SSE stream used to hang shutdown until
+  a second Ctrl-C.
 - `start_background_services()` in `app.py` — explicitly starts the MQTT subscriber
   and load-management thread; called from `wsgi.py` and the `__main__` block, never
   at import time (so tests can import the module safely)
@@ -491,7 +505,7 @@ is required (e.g. CI, or after changing test-relevant code).
 | Lint | `uv run pylint *.py` |
 | Type check | `uv run mypy` |
 | Dev server | `uv run python app.py` |
-| Production-like server | `gunicorn --reload --worker-class=gthread --threads=4 --timeout=31 --bind 127.0.0.1:8000 wsgi:app` |
+| Production-like server | `gunicorn --reload -c gunicorn.conf.py --worker-class=gthread --threads=4 --timeout=31 --bind 127.0.0.1:8000 wsgi:app` |
 
 The dev server reads credentials from `.env` (`VUE_USERNAME`, `VUE_PASSWORD`).
 Ensure that file is present and sourced before running.

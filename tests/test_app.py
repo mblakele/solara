@@ -2,6 +2,8 @@ import contextlib
 import json
 import logging
 import os
+import threading
+import time as time_module
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1385,6 +1387,26 @@ class TestSendErrorAlert(unittest.TestCase):
             app_mod._state.telegram_sender = None
 
 
+class _LoopStop:
+    """Patch helper: terminate one loop iteration via the stop event.
+
+    The loop now sleeps on ``app._stop_event`` instead of ``time.sleep``;
+    this preserves the old raise-from-sleep test contract.
+    """
+
+    def __init__(self, side_effect=None):
+        ev = MagicMock()
+        ev.is_set.return_value = False
+        ev.wait.side_effect = side_effect or InterruptedError("stop")
+        self._patch = patch("app._stop_event", ev)
+
+    def __enter__(self):
+        return self._patch.__enter__()
+
+    def __exit__(self, *exc_info):
+        return self._patch.__exit__(*exc_info)
+
+
 class TestLoadManagementLoopErrorHandling(unittest.TestCase):
     """Tests for _load_management_loop error handling."""
 
@@ -1413,7 +1435,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         app_mod._state.last_error_type = None
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+            with _LoopStop():
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1432,7 +1454,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         app_mod._state.consecutive_error_count = 0
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+            with _LoopStop():
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1465,7 +1487,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         app_mod._state.telegram_sender = None
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+            with _LoopStop():
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1495,7 +1517,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
                 raise InterruptedError("stop")
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=stop_after_n_sleeps):
+            with _LoopStop(stop_after_n_sleeps):
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1557,7 +1579,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
                 raise InterruptedError("stop")
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=capture_sleep):
+            with _LoopStop(capture_sleep):
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1567,6 +1589,106 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
 
         app_mod._state.consecutive_error_count = 0
         app_mod._state.last_error_type = None
+
+
+class TestCooperativeShutdown(unittest.TestCase):
+    """request_shutdown() must promptly stop background services once.
+
+    Shutdown contract: a single signal (Ctrl-C / SIGTERM via the gunicorn
+    hooks) sets the stop event, wakes every sleeping background loop and SSE
+    stream immediately, and closes the LoadManager exactly once — so
+    interpreter finalization has nothing left to join and no second Ctrl-C
+    is needed.
+    """
+
+    def setUp(self):
+        import app as app_mod
+
+        self.app_mod = app_mod
+
+    def tearDown(self):
+        self.app_mod._stop_event.clear()
+
+    @staticmethod
+    def _make_success_lm():
+        from load_models import CycleResult, CycleDiagnostics
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.run_cycle.return_value = CycleResult(
+            status="ok",
+            sleep_hint=30.0,
+            sleep_hint_at="2026-01-01T12:00:00",
+            diagnostics=CycleDiagnostics(
+                gap_wh=0.0,
+                hysteresis_wh=3.0,
+                seconds_remaining=300,
+                data_point_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                reason="none",
+            ),
+        )
+        mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
+        return mock_lm
+
+    def test_request_shutdown_sets_stop_event(self):
+        self.assertFalse(self.app_mod._stop_event.is_set())
+
+        self.app_mod.request_shutdown("test")
+
+        self.assertTrue(self.app_mod._stop_event.is_set())
+
+    def test_request_shutdown_idempotent(self):
+        """Second call must not re-close resources."""
+        mock_lm = unittest.mock.MagicMock()
+        self.app_mod._state.load_manager = mock_lm
+        self.app_mod._state.mqtt_subscriber_started = False
+        try:
+            with patch.object(
+                self.app_mod._state.sse_broadcaster, "close_all"
+            ) as spy_close:
+                with patch("mqtt_telemetry.stop_mqtt_subscriber") as spy_mqtt:
+                    self.app_mod.request_shutdown("first")
+                    self.app_mod.request_shutdown("second")
+
+            self.assertEqual(mock_lm.close.call_count, 1)
+            self.assertEqual(spy_close.call_count, 1)
+            spy_mqtt.assert_not_called()  # subscriber was never started
+        finally:
+            self.app_mod._state.load_manager = None
+
+    def test_loop_exits_promptly_on_shutdown_request(self):
+        """Loop must wake from its (30 s) sleep within ~2 s of a stop."""
+        mock_lm = self._make_success_lm()
+        self.app_mod._state.telegram_sender = None
+        self.app_mod._state.consecutive_error_count = 0
+
+        done = threading.Event()
+
+        def run():
+            try:
+                self.app_mod._load_management_loop()
+            finally:
+                done.set()
+
+        with patch("app._get_load_manager", return_value=mock_lm):
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            # Wait until the first cycle completed (loop parked in its sleep).
+            parked = False
+            for _ in range(250):
+                if self.app_mod._state.lm_last_cycle_finished_at is not None:
+                    parked = True
+                    break
+                time_module.sleep(0.02)
+            assert parked, "loop never finished its first cycle"
+
+            self.app_mod.request_shutdown("test-loop")
+            t.join(timeout=2.0)
+
+        self.assertFalse(
+            t.is_alive(),
+            "load loop ignored shutdown request for its full sleep interval",
+        )
+        self.app_mod._state.consecutive_error_count = 0
 
 
 class TestLoadManagerSharedCache(unittest.TestCase):
@@ -1801,9 +1923,13 @@ class TestStallWatchdogWiring(unittest.TestCase):
         def fake_sleep(_secs):
             raise _StopLoop()
 
+        stop_ev = MagicMock()
+        stop_ev.is_set.return_value = False
+        stop_ev.wait.side_effect = fake_sleep
+
         with patch.object(
             self._app, "_get_load_manager", return_value=None
-        ), patch.object(time_module, "sleep", side_effect=fake_sleep):
+        ), patch("app._stop_event", stop_ev):
             Config().set("LOAD_MANAGE_ENABLED", "True")
             try:
                 with self.assertLogs("app", level="CRITICAL") as captured:

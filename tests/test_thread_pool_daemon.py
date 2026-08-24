@@ -57,6 +57,31 @@ class TestDaemonThreadPoolExecutor:
         # That's expected — cancel_futures only affects pending queue items.
         assert future.running() or future.done()
 
+    def test_threads_not_registered_for_interpreter_exit_join(self) -> None:
+        """Worker threads must be invisible to concurrent.futures' exit join.
+
+        At interpreter exit, ``concurrent.futures.thread._python_exit``
+        joins every thread registered in ``_threads_queues`` — daemon or
+        not. An in-flight fetch (up to the 30 s fetch timeout) in such a
+        registered daemon worker used to block gunicorn worker shutdown for
+        that whole duration. Since these threads are daemon by design and
+        the executor's contract is "must not block process exit", they must
+        not be registered there.
+        """
+        from concurrent.futures import thread as cf_thread
+
+        executor = DaemonThreadPoolExecutor(max_workers=1)
+        try:
+            executor.submit(lambda: None).result(timeout=5.0)
+
+            registered = set(cf_thread._threads_queues)  # noqa: SLF001
+            overlap = executor._threads & registered  # noqa: SLF001
+            assert not overlap, (
+                f"daemon executor threads registered for exit-join: {overlap}"
+            )
+        finally:
+            executor.shutdown(wait=False)
+
 
 @pytest.mark.slow
 class TestEnergyCacheThreadLeakFix:

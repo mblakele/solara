@@ -58,9 +58,10 @@ class TestLoopErrorVisibility:
         try:
             with caplog.at_level(logging.DEBUG, logger="app"):
                 with patch("app._get_load_manager", return_value=mock_lm):
-                    with patch(
-                        "app.time.sleep", side_effect=InterruptedError("stop")
-                    ):
+                    stop_ev = MagicMock()
+                    stop_ev.is_set.return_value = False
+                    stop_ev.wait.side_effect = InterruptedError("stop")
+                    with patch("app._stop_event", stop_ev):
                         with pytest.raises(InterruptedError):
                             app_mod._load_management_loop()
 

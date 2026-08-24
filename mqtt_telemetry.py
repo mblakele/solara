@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time as _time_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,6 +58,35 @@ _connection_ok: bool = False
 # Reconnect tuning: exponential backoff from MIN, capped at MAX.
 _MQTT_RECONNECT_MIN_SECS = 2.0
 _MQTT_RECONNECT_MAX_SECS = 30.0
+
+# Cooperative shutdown (single-interrupt exit): set by
+# stop_mqtt_subscriber(); the subscriber loop waits on it instead of a bare
+# sleep so shutdown ends the wait immediately.
+_stop_event: threading.Event = threading.Event()
+# The client of the current network-loop session, if any, so stop can wake
+# loop_forever() via disconnect().
+_client_lock: threading.Lock = threading.Lock()
+_active_client: Any | None = None
+
+
+def _register_active_client(client: Any) -> None:
+    """Record the live paho client under the lock."""
+    global _active_client
+    with _client_lock:
+        _active_client = client
+
+
+def _clear_active_client() -> None:
+    """Forget the recorded client (session over or not yet created)."""
+    global _active_client
+    with _client_lock:
+        _active_client = None
+
+
+def _get_active_client() -> Any | None:
+    """Return the live paho client, or None between sessions."""
+    with _client_lock:
+        return _active_client
 
 
 def _set_connection_ok(value: bool) -> None:
@@ -201,6 +229,25 @@ def check_fleet_telemetry_dotfile() -> None:
         )
 
 
+def stop_mqtt_subscriber() -> None:
+    """Signal the subscriber loop to stop and disconnect any active client.
+
+    Wakes a reconnect-backoff sleep immediately and makes ``loop_forever``
+    return for a live connection. Idempotent; safe to call when the
+    subscriber was never started or has already exited.
+    """
+    _stop_event.set()
+    client = _get_active_client()
+    if client is None:
+        return
+    try:
+        client.disconnect()
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.debug(
+            "mqtt_telemetry: disconnect during shutdown failed", exc_info=True
+        )
+
+
 def start_mqtt_subscriber(cfg: Any) -> None:
     """Connect to the MQTT broker and start a non-blocking subscriber loop.
 
@@ -221,10 +268,13 @@ def start_mqtt_subscriber(cfg: Any) -> None:
     host = cfg.mqtt_host
     port = cfg.mqtt_port
     topic_base = cfg.mqtt_topic_base
+    # Fresh session semantics: a new start clears any previous stop request.
+    _stop_event.clear()
+    _clear_active_client()
 
     def _run() -> None:
         backoff = _MQTT_RECONNECT_MIN_SECS
-        while True:
+        while not _stop_event.is_set():
             was_connected = False
 
             def _on_connect(c: Any, _userdata: Any, _flags: Any, rc: int) -> None:  # noqa: ARG001
@@ -256,6 +306,7 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                     )
 
             client = mqtt.Client()
+            _register_active_client(client)
             client.on_message = on_message
             client.on_connect = _on_connect
             client.on_disconnect = _on_disconnect
@@ -265,16 +316,25 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                 # connection drops; a failed initial connect raises and is
                 # handled below by re-entering the loop after backoff.
                 client.loop_forever()
+                if _stop_event.is_set():
+                    return
                 logger.warning(
                     "mqtt_telemetry: network loop exited — reconnecting"
                 )
             except Exception:  # pylint: disable=broad-exception-caught
+                if _stop_event.is_set():
+                    return
                 logger.exception(
                     "mqtt_telemetry: connection attempt failed host=%s port=%d",
                     host, port,
                 )
+            finally:
+                _clear_active_client()
             _set_connection_ok(False)
-            _time_mod.sleep(backoff)
+            # Event-based backoff: stop_mqtt_subscriber() ends the wait (and
+            # this thread) immediately instead of after the full sleep.
+            if _stop_event.wait(backoff):
+                return
             backoff = (
                 _MQTT_RECONNECT_MIN_SECS if was_connected
                 else min(backoff * 2, _MQTT_RECONNECT_MAX_SECS)

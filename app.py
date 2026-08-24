@@ -22,8 +22,8 @@ import logging
 import logging.handlers
 
 import sys
+import signal
 import threading
-import time
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -104,6 +104,14 @@ _state = _AppState(
     energy_cache=EnergyCache(ttl_seconds=60),
     sse_broadcaster=SSEBroadcaster(),
 )
+
+# Cooperative shutdown signal (single-interrupt exit): background loops wait
+# on this event instead of a bare sleep so a stop request ends them
+# immediately. See request_shutdown().
+_stop_event = threading.Event()
+# Guard so signal-hook installation happens once (see
+# install_shutdown_signal_hooks()).
+_shutdown_hooks_installed = False
 
 
 def camelize(obj: object) -> object:
@@ -877,7 +885,7 @@ def _load_management_loop() -> None:
         "Load management background loop started: dry-run=%s, mock=%s, interval=%d",
         _config.dry_run, _config.is_mock_mode, interval_secs_config
     )
-    while True:
+    while not _stop_event.is_set():
         _state.lm_heartbeat_at = datetime.now(timezone.utc)
         result = None
         try:
@@ -941,7 +949,10 @@ def _load_management_loop() -> None:
         _state.lm_last_cycle_finished_at = now
         interval_secs_adjusted = _compute_loop_sleep(result, interval_secs)
         logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
-        time.sleep(interval_secs_adjusted)
+        # Event-based sleep: request_shutdown() ends the wait (and this
+        # loop) immediately instead of after the full interval.
+        if _stop_event.wait(interval_secs_adjusted):
+            break
 
 def load_status() -> Response:
     """Read-only endpoint returning current load management state.
@@ -1069,14 +1080,76 @@ def _start_load_manager_thread():
 
 
 def _shutdown_load_manager():
-    """Clean up LoadManager resources on process exit."""
+    """Clean up LoadManager resources on process exit.
+
+    Nulls the manager before closing so re-entrant calls (atexit after
+    request_shutdown) are natural no-ops.
+    """
     with _state.load_manager_lock:
-        if _state.load_manager is not None:
+        lm = _state.load_manager
+        if lm is not None:
+            _state.load_manager = None
             try:
-                _state.load_manager.close()
+                lm.close()
                 logger.info("LoadManager shut down cleanly")
             except Exception as e:
                 logger.warning("Error during LoadManager shutdown: %s", e)
+
+
+def request_shutdown(reason: str) -> None:
+    """Request cooperative shutdown of background services.
+
+    Idempotent and safe to call from signal handlers, gunicorn worker hooks,
+    and atexit: sets the stop event every background loop waits on, ends all
+    SSE streams so no worker-pool thread blocks interpreter finalization,
+    stops the MQTT subscriber, and closes the LoadManager exactly once.
+
+    Args:
+        reason: Short tag identifying the shutdown trigger (for logs).
+    """
+    if _stop_event.is_set():
+        return
+    logger.info("Shutdown requested (%s)", reason)
+    _stop_event.set()
+    _state.sse_broadcaster.close_all()
+    if _state.mqtt_subscriber_started:
+        from mqtt_telemetry import stop_mqtt_subscriber  # avoid import cycle
+
+        stop_mqtt_subscriber()
+    _shutdown_load_manager()
+
+
+def install_shutdown_signal_hooks() -> None:
+    """Chain cooperative-shutdown handlers over installed signal handlers.
+
+    For each of SIGINT/SIGQUIT/SIGTERM whose current disposition is a
+    callable handler (gunicorn's, Python's default, ...), installs a
+    wrapper that calls :func:`request_shutdown` first and then delegates,
+    preserving the host's own shutdown semantics (graceful SIGTERM vs fast
+    SIGINT). Non-callable dispositions (SIG_DFL/SIG_IGN) are left untouched.
+    Idempotent; must be called from the main thread.
+
+    Called by the gunicorn ``post_worker_init`` hook (after the worker's own
+    ``init_signals()``) and by the ``python app.py`` entry point.
+    """
+    global _shutdown_hooks_installed
+    if _shutdown_hooks_installed:
+        return
+
+    def _make_handler(sig_name: str, previous: Any) -> Any:
+        def _handler(signum: int, frame: Any) -> None:
+            request_shutdown(f"signal:{sig_name}")
+            if callable(previous):
+                previous(signum, frame)
+
+        return _handler
+
+    for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        previous = signal.getsignal(sig)
+        if not callable(previous):
+            continue
+        signal.signal(sig, _make_handler(signal.Signals(sig).name, previous))
+    _shutdown_hooks_installed = True
 
 
 def start_background_services() -> None:
@@ -1248,4 +1321,5 @@ if __name__ == "__main__":
             sys.exit(1)
 
     start_background_services()
+    install_shutdown_signal_hooks()
     app.run(host="0.0.0.0", port=8000)

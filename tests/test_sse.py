@@ -143,6 +143,68 @@ class TestEventStream:
         gen.close()  # should not raise
 
 
+class TestShutdownWake:
+    """close_all() must promptly end every streaming generator.
+
+    Under gunicorn each SSE response occupies a worker-pool thread parked in
+    ``queue.get``; at interpreter exit concurrent.futures joins those threads,
+    so an open stream used to block process shutdown until a second Ctrl-C.
+    """
+
+    def test_close_all_terminates_blocked_generator(self) -> None:
+        """A generator parked in queue.get ends within ~2s of close_all()."""
+        b = SSEBroadcaster()
+        frames: list[str] = []
+        done = threading.Event()
+
+        def consume() -> None:
+            try:
+                for frame in event_stream(b, timeout=30):
+                    frames.append(frame)
+            finally:
+                done.set()
+
+        t = threading.Thread(target=consume, daemon=True)
+        t.start()
+        # Wait until the generator has subscribed and parked in queue.get.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and b.subscriber_count() == 0:
+            time.sleep(0.02)
+        assert b.subscriber_count() == 1, "generator never subscribed"
+
+        b.close_all()
+
+        assert done.wait(timeout=2), (
+            "SSE generator stayed blocked after close_all()"
+        )
+        assert all(frame.startswith("event:") for frame in frames), (
+            f"non-SSE frames leaked to client: {frames!r}"
+        )
+        assert b.subscriber_count() == 0
+
+    def test_close_all_is_terminal_for_heartbeat_loop(self) -> None:
+        """After close_all(), an idle stream exits instead of heartbeating."""
+        b = SSEBroadcaster()
+        gen = event_stream(b, timeout=0.05)
+        next(gen)  # heartbeat
+
+        b.close_all()
+
+        with pytest.raises(StopIteration):
+            next(gen)
+
+    def test_close_all_clears_subscribers(self) -> None:
+        """close_all() drops every subscriber registration."""
+        b = SSEBroadcaster()
+        b.subscribe()
+        b.subscribe()
+        assert b.subscriber_count() == 2
+
+        b.close_all()
+
+        assert b.subscriber_count() == 0
+
+
 class TestMetricsEnrichment:
     """Tests for _enrich_metrics_for_sse()."""
 
