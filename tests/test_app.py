@@ -1514,7 +1514,11 @@ class TestCooperativeShutdown(unittest.TestCase):
 
             self.assertEqual(mock_lm.close.call_count, 1)
             self.assertEqual(spy_close.call_count, 1)
-            spy_mqtt.assert_not_called()  # subscriber was never started
+            # Stop is now UNCONDITIONAL (finding: an embedder may start the
+            # subscriber directly, bypassing the app-layer flag), and
+            # stop_mqtt_subscriber() itself is idempotent/safe-never-started.
+            # The second request_shutdown no-ops via the app-level stop event.
+            spy_mqtt.assert_called_once()
         finally:
             self.app_mod._state.load_manager = None
 

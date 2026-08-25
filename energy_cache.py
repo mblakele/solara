@@ -23,6 +23,7 @@ from util import (
     QH_PERIOD_SECONDS,
     RetryableError,
     ceil_to_qh,
+    floor_to_qh,
     compute_nbc_quarters,
     qh_seconds_remaining,
 )
@@ -952,6 +953,8 @@ class EnergyCache:
             samples = self._data.samples
             samples_len = len(samples)
             data_start = self._data.data_start
+            quantization_seconds = self._data.quantization_seconds
+            quantization_confidence = self._data.quantization_confidence
 
         if samples_len == 0:
             return None
@@ -972,11 +975,30 @@ class EnergyCache:
                 f"data_start {data_start} not aligned to QH boundary"
             )
 
+        # Stale-QH guard: if the trailing (incomplete) chunk's wall window
+        # has already ended, the cache predates a quarter boundary — e.g. an
+        # API outage across :00/:15/:30/:45, exactly when stale serving
+        # matters. Extrapolating it with the wall-clock remainder would
+        # credit a full quarter of *future* energy to a window that is
+        # already over; report no incomplete QH instead (same contract as
+        # the qh1-complete branch below).
+        chunk_start = data_start + timedelta(
+            seconds=(samples_len // QH_PERIOD_SECONDS) * QH_PERIOD_SECONDS
+        )
+        if floor_to_qh(now) >= chunk_start + timedelta(seconds=QH_PERIOD_SECONDS):
+            logger.info(
+                "EnergyCache get_current_qh: cached window starting %s ended "
+                "before %s; reporting no incomplete QH",
+                chunk_start,
+                now,
+            )
+            return None
+
         # Use quantization-aware prediction window when available. The
         # shared guard rejects the flat-data N=2 artifact (plan 3.2).
         prediction_window_seconds: int | None = usable_window(
-            self._data.quantization_seconds,
-            self._data.quantization_confidence,
+            quantization_seconds,
+            quantization_confidence,
         )
 
         # One time base (plan 3.3): extrapolate with wall-clock remaining
@@ -1018,16 +1040,10 @@ class EnergyCache:
 
         seconds_remaining = qh_seconds_remaining(now)
         predicted_wh = qh1_data.predicted_wh if qh1_data.predicted_wh is not None else qh1_data.wh
-        sample_remaining = (
-            QH_PERIOD_SECONDS - qh1_data.samples_used
-            if qh1_data.samples_used is not None
-            else None
-        )
         return {
             "qh_name": "QH1",
             "predicted_wh": predicted_wh,
             "seconds_remaining": seconds_remaining,
-            "sample_seconds_remaining": sample_remaining,
             "data_start": data_start,
             "samples_used": qh1_data.samples_used,
         }
@@ -1056,30 +1072,29 @@ class EnergyCache:
         """
         if self._data is None:
             return interval_seconds
-        if self._data.quantization_confidence is None or self._data.quantization_confidence < QUANTIZATION_CONFIDENCE_THRESHOLD:
+        data = self._data
+        # Single source of truth (plan 3.2): the shared guard rejects
+        # sub-MIN-window artifacts (flat-data N=2 at confidence 1.0) that
+        # the raw inline check used to let through.
+        quantum = usable_window(data.quantization_seconds, data.quantization_confidence)
+        if quantum is None:
             return interval_seconds
 
         # Early-exit: data older than 2× quantum → sleep minimum.
-        if (
-            self._data.last_sample_at is not None
-            and self._data.quantization_seconds is not None
-        ):
-            data_age = (now - self._data.last_sample_at).total_seconds()
-            if data_age > 2 * self._data.quantization_seconds:
+        if data.last_sample_at is not None:
+            data_age = (now - data.last_sample_at).total_seconds()
+            if data_age > 2 * quantum:
                 return MIN_SLEEP_SECS
 
         # At this point quantization fields are guaranteed to be set.
-        assert self._data.data_start is not None
-        assert self._data.quantization_seconds is not None
-        assert self._data.quantization_offset is not None
+        assert data.data_start is not None
+        assert data.quantization_offset is not None
 
         # quantization offset is relative to data_start.
-        offset_start = self._data.data_start + timedelta(seconds=self._data.quantization_offset)
+        offset_start = data.data_start + timedelta(seconds=data.quantization_offset)
         seconds_from_start = (now - offset_start).total_seconds()
-        seconds_in_period = seconds_from_start % self._data.quantization_seconds
-        seconds_remaining = (
-            self._data.quantization_seconds - seconds_in_period
-        ) % self._data.quantization_seconds
+        seconds_in_period = seconds_from_start % quantum
+        seconds_remaining = (quantum - seconds_in_period) % quantum
         logger.debug(
             "EnergyCache.sleep_interval_adjust: %.1f > %.1f",
             interval_seconds,

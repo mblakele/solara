@@ -278,6 +278,32 @@ class TestTeslaStateFromSnapshot:
 class TestStartMqttSubscriber:
     """start_mqtt_subscriber() starts the background MQTT thread."""
 
+    def _drain_subscribers(self) -> None:
+        """Block until no live mqtt-subscriber threads remain (≤5 s).
+
+        Prevents module-global thread leakage from ordering-dependent
+        failures in tests that assert on subscriber thread counts.
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline:
+            live = [
+                t for t in threading.enumerate()
+                if t.name == "mqtt-subscriber" and t.is_alive()
+            ]
+            if not live:
+                return
+            for t in live:
+                t.join(timeout=0.5)
+
+    def _subscriber_threads(self) -> list[threading.Thread]:
+        """Live mqtt-subscriber threads (dying threads excluded)."""
+        return [
+            t for t in threading.enumerate()
+            if t.name == "mqtt-subscriber" and t.is_alive()
+        ]
+
     def test_starts_daemon_thread(self):
         from mqtt_telemetry import start_mqtt_subscriber, stop_mqtt_subscriber
         from config import Config
@@ -334,9 +360,6 @@ class TestStartMqttSubscriber:
             "MQTT_TOPIC_BASE": "tesla",
         })
 
-        def subscriber_threads():
-            return [t for t in threading.enumerate() if t.name == "mqtt-subscriber"]
-
         with patch("mqtt_telemetry.mqtt.Client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client_cls.return_value = mock_client
@@ -344,10 +367,10 @@ class TestStartMqttSubscriber:
 
             start_mqtt_subscriber(cfg)
             time.sleep(0.05)
-            threads_after_first = subscriber_threads()
+            threads_after_first = self._subscriber_threads()
 
             start_mqtt_subscriber(cfg)  # must be a no-op
-            threads_after_second = subscriber_threads()
+            threads_after_second = self._subscriber_threads()
 
             stop_mqtt_subscriber()
             for t in threads_after_second:
@@ -395,6 +418,81 @@ class TestStartMqttSubscriber:
         finally:
             blocker.set()
 
+    def test_stop_restart_during_connect_supersedes_old_session(self):
+        """A stop→restart landing while S1 is inside connect() must not
+        leave S1 running forever once the handshake completes.
+
+        The restart clears the shared stop event, so S1's post-connect
+        checkpoint must rely on the generation token: exit (disconnecting
+        the client) instead of entering loop_forever alongside S2.
+        """
+        from mqtt_telemetry import start_mqtt_subscriber, stop_mqtt_subscriber
+        import mqtt_telemetry
+        from config import Config
+
+        cfg = Config(overrides={
+            "MQTT_HOST": "localhost",
+            "MQTT_PORT": "1883",
+            "MQTT_TOPIC_BASE": "tesla",
+        })
+
+        clients: list[MagicMock] = []
+        client_threads: dict[int, int] = {}
+        connect_gate = threading.Event()
+
+        def make_client():
+            client = MagicMock()
+            release = threading.Event()
+            client_threads[threading.get_ident()] = id(release)
+
+            def _connect(_host, _port, **_kw):
+                # Simulate a slow TCP handshake racing the stop/restart.
+                connect_gate.wait(timeout=10)
+
+            def _park() -> None:
+                release.wait(timeout=10)
+
+            client.connect.side_effect = _connect
+            client.loop_forever.side_effect = _park
+            client._test_release = release
+            clients.append(client)
+            return client
+
+        with patch("mqtt_telemetry.mqtt.Client", side_effect=make_client), \
+             patch.object(mqtt_telemetry, "_MQTT_RECONNECT_MIN_SECS", 0.05):
+            start_mqtt_subscriber(cfg)
+            time.sleep(0.05)  # S1 blocked inside connect()
+            threads_after_first = self._subscriber_threads()
+            assert len(threads_after_first) == 1
+            old_thread = threads_after_first[0]
+
+            stop_mqtt_subscriber()
+            start_mqtt_subscriber(cfg)  # restart clears the shared stop event
+            time.sleep(0.05)
+            threads_after_second = self._subscriber_threads()
+            assert len(threads_after_second) == 2
+
+            connect_gate.set()  # S1's handshake finally completes
+
+            old_thread.join(timeout=5)
+
+            assert not old_thread.is_alive(), (
+                "superseded session entered loop_forever after a "
+                "stop→restart cleared its stop event"
+            )
+            assert len(clients) == 2, (
+                f"superseded session reconnected "
+                f"({len(clients)} sessions constructed)"
+            )
+
+            stop_mqtt_subscriber()  # end S2
+            # The fake loop_forever only honors its release event (a real
+            # paho loop would return on disconnect()) — free every session
+            # so no parked thread outlives the test.
+            for c in clients:
+                c._test_release.set()
+            self._drain_subscribers()
+
     def test_restart_supersedes_lingering_old_session(self):
         """stop→start while the old thread is parked in loop_forever().
 
@@ -432,17 +530,11 @@ class TestStartMqttSubscriber:
             clients.append(client)
             return client
 
-        def subscriber_threads():
-            return [
-                t for t in threading.enumerate()
-                if t.name == "mqtt-subscriber"
-            ]
-
         with patch("mqtt_telemetry.mqtt.Client", side_effect=make_client), \
              patch.object(mqtt_telemetry, "_MQTT_RECONNECT_MIN_SECS", 0.05):
             start_mqtt_subscriber(cfg)
             time.sleep(0.05)  # let S1 park inside loop_forever
-            threads_after_first = subscriber_threads()
+            threads_after_first = self._subscriber_threads()
             assert len(threads_after_first) == 1
             old_thread = threads_after_first[0]
 
@@ -470,5 +562,9 @@ class TestStartMqttSubscriber:
             )
 
             stop_mqtt_subscriber()
-            for t in subscriber_threads():
-                t.join(timeout=5)
+            # Free parked fake loops (same reason as in the connect-window
+            # test) so nothing outlives the test and pollutes thread
+            # counting downstream.
+            for c in clients:
+                c._test_release.set()
+            self._drain_subscribers()

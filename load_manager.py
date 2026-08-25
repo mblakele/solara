@@ -350,7 +350,8 @@ class LoadManager:
 
         # Load the telegram.devices whitelist for notification gating.
         # Dict maps device name (lowercased) → set of allowed action types.
-        # None means no whitelist configured (backward-compatible: no gating).
+        # None means no whitelist configured: notifications are BLOCKED
+        # (fail-closed), not ungated — matches validate_telegram_devices().
         tg_config = device_config.get_telegram_config()
         if tg_config:
             self._telegram_alert_on_auth_error = tg_config.get("alert_on_auth_error", True)

@@ -106,7 +106,8 @@ class TestGetCurrentQhQuantization:
             raw_wh = 1000 * (70*0.001 + 30*0.003) = 160 Wh
             predicted_wh = 160 + 840 * 3.0 = 2680 Wh
 
-        The dict also exposes the sample-count remainder for diagnostics.
+        The dict no longer exposes the sample-count remainder: the
+        wall-clock value is the single time base (plan 3.3).
         """
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         samples = [0.001] * 70 + [0.003] * 30
@@ -124,7 +125,6 @@ class TestGetCurrentQhQuantization:
             f"Expected 2680 (30s window, wall-clock) but got {result['predicted_wh']}"
         )
         assert result["seconds_remaining"] == 840
-        assert result["sample_seconds_remaining"] == 800
 
     def test_get_current_qh_falls_back_when_no_quantization(self):
         """get_current_qh falls back to default window when no quantization data.
@@ -186,6 +186,64 @@ class TestGetCurrentQhQuantization:
         )
         result = cache.get_current_qh(now)
         assert result is None
+
+
+class TestGetCurrentQhStaleWindow:
+    """get_current_qh must not extrapolate a trailing chunk whose wall
+    window has already ended (quarter boundary crossed with no successful
+    fetch — e.g. an API outage, exactly when stale serving matters).
+
+    Review scenario: last fetch at 14:29:30 stored 870 samples of QH 14:15.
+    The boundary crosses; the wall-clock override would otherwise apply
+    qh_seconds_remaining(14:30:10) = 890 s of *future* energy to a quarter
+    that had 30 s left. Contract: report no incomplete QH (None), same as
+    the qh1-complete branch.
+    """
+
+    def _cache(self, samples: list[float], data_start: datetime) -> EnergyCache:
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=samples,
+            data_start=data_start,
+            last_sample_at=data_start + timedelta(seconds=len(samples) - 1),
+            last_fetch_at=data_start,
+            sample_count=len(samples),
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+        )
+        return cache
+
+    def test_boundary_crossed_single_chunk_returns_none(self):
+        data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
+        samples = [0.003] * 870  # QH 14:15 partial from the 14:29:30 fetch
+        now = datetime(2025, 6, 15, 14, 30, 10, tzinfo=timezone.utc)
+
+        cache = self._cache(samples, data_start)
+
+        assert cache.get_current_qh(now) is None
+
+    def test_boundary_crossed_multi_chunk_returns_none(self):
+        data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 900 + [0.003] * 870  # QH2 complete, QH3 partial
+        now = datetime(2025, 6, 15, 14, 30, 10, tzinfo=timezone.utc)
+
+        cache = self._cache(samples, data_start)
+
+        assert cache.get_current_qh(now) is None
+
+    def test_same_quarter_still_extrapolates_with_wall_remainder(self):
+        data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
+        samples = [0.003] * 870
+        now = datetime(2025, 6, 15, 14, 29, 50, tzinfo=timezone.utc)  # same QH
+
+        cache = self._cache(samples, data_start)
+        result = cache.get_current_qh(now)
+
+        assert result is not None
+        assert result["qh_name"] == "QH1"
+        # Plan 3.3 behavior preserved inside the live window: wall remainder.
+        assert result["seconds_remaining"] == 10
 
 
 class TestGetCurrentQhAlignmentGuard:
@@ -1074,12 +1132,34 @@ class TestEnergyCacheWrapper:
         # Returns unchanged because quantization_confidence is None (below threshold)
         assert isinstance(result, float)
 
-    def test_result_clamped_at_5_minimum(self) -> None:
-        """sleep_interval_adjust result is never below MIN_SLEEP_SECS (5.0)."""
+    def test_flat_data_artifact_does_not_pace_sleep(self):
+        """A sub-MIN-window detection (flat-data N=2, confidence 1.0) must
+        not drive sleep pacing — usable_window rejects it everywhere else,
+        so the "single source of truth" applies here too.
+        """
         cache = EnergyCache(ttl_seconds=60)
-        quantum = 5  # Very small quantum: 2×5 = 10s threshold
         data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        now = datetime(2025, 6, 1, 12, 0, 12, tzinfo=timezone.utc)  # 12s > 10s
+        now = datetime(2025, 6, 1, 12, 0, 3, tzinfo=timezone.utc)
+        cache.last_sample_at = data_time
+        cache.data_start = data_time
+        cache.quantization_seconds = 2
+        cache.quantization_offset = 0
+        cache.quantization_confidence = 1.0
+
+        result = cache.sleep_interval_adjust(30.0, now)
+
+        assert result == 30.0
+
+    def test_result_clamped_at_5_minimum(self) -> None:
+        """sleep_interval_adjust result is never below MIN_SLEEP_SECS (5.0).
+
+        Uses a valid (>= MIN_QUANTIZATION_WINDOW_SECS) quantum: sub-window
+        detections are rejected by usable_window before pacing applies.
+        """
+        cache = EnergyCache(ttl_seconds=60)
+        quantum = 30  # 2×30 = 60 s threshold
+        data_time = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 1, 12, 1, 1, tzinfo=timezone.utc)  # 61s > 60s
 
         cache.last_sample_at = data_time
         cache.data_start = data_time

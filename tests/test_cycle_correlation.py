@@ -248,8 +248,10 @@ class TestMonotonicFetchTiming:
 
         chart_start = now.replace(minute=0)
         fake_clock = FakeClock(now)
-        old_clock = metrics._CLOCK
-        metrics.set_clock(fake_clock)
+        # monkeypatch restores the previous clock automatically. (A manual
+        # metrics.set_clock() here leaked the FakeClock into every later
+        # test in the session.)
+        monkeypatch.setattr(metrics, "_CLOCK", fake_clock)
         monkeypatch.setattr(metrics, "_monotonic", lambda: 55.0, raising=False)
 
         def _slow_get_chart_usage(_channel, _start, _end, **_kwargs):
@@ -267,4 +269,3 @@ class TestMonotonicFetchTiming:
             "wall-clock advancement (NTP step) must not inflate the "
             "recorded fetch duration"
         )
-        del old_clock

@@ -324,6 +324,11 @@ class NBCReader:
                 # Derive seconds_remaining from wall-clock time so it stays
                 # monotonic across cache refreshes even when sample counts
                 # fluctuate due to API delivery latency.
+                # NOTE (plan 3.3 asymmetry): predicted_wh above is
+                # sample-window extrapolation (metrics._compute_nbc passes no
+                # seconds_remaining_override), so this path mixes a sample-
+                # count Wh with wall-clock remaining. Deliberate for now —
+                # see the mirrored note in metrics._compute_nbc before unifying.
                 now = metrics_data.get("_now")
                 if now is not None:
                     offset_in_hour = now.second + (now.minute % 15) * 60

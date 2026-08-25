@@ -1119,10 +1119,12 @@ def request_shutdown(reason: str) -> None:
     logger.info("Shutdown requested (%s)", reason)
     _stop_event.set()
     _state.sse_broadcaster.close_all()
-    if _state.mqtt_subscriber_started:
-        from mqtt_telemetry import stop_mqtt_subscriber  # avoid import cycle
+    from mqtt_telemetry import stop_mqtt_subscriber  # avoid import cycle
 
-        stop_mqtt_subscriber()
+    # Unconditional: stop_mqtt_subscriber() is idempotent and safe even
+    # when the app-layer flag was never set (an embedder may have started
+    # the subscriber directly, bypassing start_background_services()).
+    stop_mqtt_subscriber()
     _shutdown_load_manager()
 
 

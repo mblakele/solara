@@ -311,6 +311,15 @@ def start_mqtt_subscriber(cfg: Any) -> None:
 
                 def _on_connect(c: Any, _userdata: Any, _flags: Any, rc: int) -> None:  # noqa: ARG001
                     nonlocal was_connected
+                    if _session_gen != gen:
+                        # Superseded session: never touch shared health state
+                        # or subscribe — drop the connection instead.
+                        logger.info(
+                            "mqtt_telemetry: ignoring CONNACK from "
+                            "superseded session"
+                        )
+                        c.disconnect()
+                        return
                     if rc == 0:
                         was_connected = True
                         _set_connection_ok(True)
@@ -327,7 +336,8 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                         )
 
                 def _on_disconnect(_client: Any, _userdata: Any, rc: Any) -> None:  # noqa: ARG001
-                    _set_connection_ok(False)
+                    if _session_gen == gen:
+                        _set_connection_ok(False)
                     if rc == 0:
                         logger.info("mqtt_telemetry: disconnected cleanly")
                     else:
@@ -344,6 +354,15 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                 client.on_disconnect = _on_disconnect
                 try:
                     client.connect(host, port, keepalive=60)
+                    # Re-check AFTER connect: a stop→restart may have landed
+                    # while the handshake was in flight. The restart clears
+                    # the shared stop event, so the event alone cannot tell
+                    # us we are superseded — only the generation token can.
+                    # Entering loop_forever() on this connected client would
+                    # run it forever alongside the new session.
+                    if _stop_event.is_set() or _session_gen != gen:
+                        client.disconnect()
+                        return
                     # loop_forever auto-reconnects after an ESTABLISHED
                     # connection drops; a failed initial connect raises and is
                     # handled below by re-entering the loop after backoff.

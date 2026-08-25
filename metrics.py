@@ -807,6 +807,13 @@ class HourlyProjection(MetricsBase):
             usage_data_local,
             prediction_window_seconds=prediction_window_seconds,
         )
+        # NOTE (plan 3.3 asymmetry): this path intentionally does NOT pass a
+        # seconds_remaining_override — predicted_wh here is sample-window
+        # extrapolation for display/prediction endpoints, while the load
+        # manager's wall-clock seconds_remaining comes from
+        # NBCReader._parse_metrics. EnergyCache.get_current_qh is the only
+        # caller that aligns both bases via the override. Revisit before
+        # unifying: it changes predicted_wh on this production path.
         self.logger.debug("_compute_nbc len %d (%s)", len(usage_data_local), result)
         return result
 

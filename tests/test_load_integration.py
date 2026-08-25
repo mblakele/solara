@@ -107,7 +107,7 @@ def _make_excess_manager(
     }
     plug_ctrl = PlugController(plugs)
 
-    tesla_config =make_tesla_config()
+    tesla_config = make_tesla_config()
     tesla_ctrl = TeslaController(tesla_config)
 
     metrics_data = _make_metrics_with_wh("main_panel", predicted_wh)
@@ -202,7 +202,7 @@ def _make_tesla_manager(
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    tesla_config =make_tesla_config()
+    tesla_config = make_tesla_config()
     tesla_ctrl = TeslaController(tesla_config)
     tesla_ctrl.set_mock_state(tesla_state)
 
