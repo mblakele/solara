@@ -306,6 +306,61 @@ class TestAtomicWriteText:
         assert target.read_text(encoding="utf-8") == "second\n"
 
 
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").exists(),
+    reason="/proc is required to map fds to open paths (Linux)",
+)
+class TestAtomicWriteDirectoryFsync:
+    """os.replace alone is not durable: until the *directory* entry is
+    fsynced, a crash/power loss can lose the rename itself and revert the
+    file to its previous contents even though the new data reached disk."""
+
+    def test_directory_is_fsynced_after_replace(self, tmp_path, monkeypatch):
+        """The final fsync in an atomic write must target the parent dir."""
+        import os
+
+        from util import atomic_write_text
+
+        real_fsync = os.fsync
+        synced_paths: list[str] = []
+
+        def spying_fsync(fd: int) -> None:
+            try:
+                # /proc maps each open fd to its path while it is open.
+                synced_paths.append(os.readlink(f"/proc/self/fd/{fd}"))
+            except OSError:  # pragma: no cover - fd vanished mid-test
+                synced_paths.append("<unmapped>")
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", spying_fsync)
+
+        target = tmp_path / "tokens.json"
+        atomic_write_text(target, "payload\n")
+
+        # Two barriers total: file data first, then the rename via its dir.
+        assert len(synced_paths) == 2, (
+            f"expected 2 fsyncs (file, then dir), saw {synced_paths}"
+        )
+        tmp_file_path, dir_path = synced_paths
+        assert tmp_file_path.startswith(str(tmp_path)), (
+            f"first fsync must be the temp file, saw {tmp_file_path}"
+        )
+        assert dir_path == str(tmp_path), (
+            f"last fsync must target the destination directory {tmp_path}, "
+            f"saw {dir_path}"
+        )
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX directory fds are unsupported on Windows",
+    )
+    def test_fsync_directory_helper_accepts_real_dir(self, tmp_path):
+        """_fsync_directory runs cleanly against a live directory."""
+        from util import _fsync_directory
+
+        _fsync_directory(tmp_path)  # must not raise
+
+
 class TestAtomicPersistenceWiring:
     """Production credential writes go through the atomic helpers."""
 

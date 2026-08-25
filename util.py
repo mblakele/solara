@@ -447,13 +447,35 @@ def _haversine_distance(
     return earth_radius_m * c
 
 
+def _fsync_directory(dir_path: Path) -> None:
+    """Flush *dir_path*'s directory entry to stable storage.
+
+    Required after ``os.replace`` for true durability: until the parent
+    directory is fsynced, a crash or power loss can lose the rename itself,
+    reverting the file to its previous contents even though the new data
+    reached the disk.
+
+    Args:
+        dir_path: Directory whose entry should be flushed.
+    """
+    # O_DIRECTORY (absent on some platforms) fails fast if the path is not
+    # a directory; O_RDONLY is the only access mode valid for directories.
+    dir_fd = os.open(dir_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _atomic_write(dest: Path, write_body) -> None:
     """Write via temp-file + fsync + os.replace so readers never see partials.
 
     A crash mid-write leaves the previous destination file intact; the
     temp file is removed on any failure. mkstemp creates the temp file
     with owner-only permissions (0600), which is preserved through
-    os.replace — appropriate for credential files.
+    os.replace — appropriate for credential files. The parent directory
+    is fsynced after the replace so the rename itself survives a crash
+    (see :func:`_fsync_directory`).
     """
     fd, tmp_name = tempfile.mkstemp(
         dir=str(dest.parent), prefix=dest.name + ".", suffix=".tmp"
@@ -464,6 +486,7 @@ def _atomic_write(dest: Path, write_body) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_name, str(dest))
+        _fsync_directory(dest.parent)
     except BaseException:
         with suppress(OSError):
             os.unlink(tmp_name)
