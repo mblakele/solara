@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import requests
+import pytest
 import metrics
 from energy_cache import EnergyCache, EnergyCacheData
 from metrics import (
@@ -14,6 +15,7 @@ from metrics import (
     RetryableMetricsException,
     _PopulationResult,
 )
+from util import CompletedNBCPeriod
 from util import compute_nbc_quarters
 from mockdata import MetricsMock
 from test_app import mock_config
@@ -2586,3 +2588,97 @@ class TestPredictionWindowFromCache:
 
         cache = SimpleNamespace(data=None)
         assert metrics.prediction_window_from_cache(cache) is None
+
+
+class TestNbcLogging:
+    """Logging behavior of the NBC pipeline.
+
+    The old ``_compute_nbc`` debug line printed the raw quarter set
+    *before* inject_completed_qh() filled QH2-QH4, which made healthy
+    responses look like missing data (every cycle logged qh2=qh3=qh4=None).
+    The final set is now logged once, after injection, in
+    ``_compute_device_metrics``; ``_compute_nbc`` itself stays silent.
+    """
+
+    INSTANT = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    LOGGER_NAME = "test-nbc-logging"
+
+    def _make_hp(self, energy_cache):
+        return HourlyProjection(
+            instant=self.INSTANT,
+            logger_next=logging.getLogger(self.LOGGER_NAME),
+            energy_cache=energy_cache,
+        )
+
+    @staticmethod
+    def _pop_result(n_samples):
+        return _PopulationResult(
+            per_second_data=[0.001] * n_samples,
+            chart_data=[],
+            nbc_seconds=[0.001] * n_samples,
+            nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+            nbc_sample_count=n_samples,
+        )
+
+    @staticmethod
+    def _pred_result():
+        return DevicePrediction(
+            lag=timedelta(seconds=5),
+            minute_predicted=1.0,
+            prediction=60.0,
+            prediction_min=55.0,
+            prediction_max=65.0,
+            seconds_remaining=900.0,
+        )
+
+    @staticmethod
+    def _vdi():
+        mock_vdi = MagicMock()
+        mock_vdi.device_gid = 1234
+        mock_vdi.device_name = "TEST_DEVICE"
+        mock_vdi.time_zone = None
+        return mock_vdi
+
+    def _cache_with_completed_period(self):
+        cache = EnergyCache()
+        cache._data = EnergyCacheData(
+            samples=[0.001] * 300,
+            data_start=datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc),
+            last_sample_at=datetime(2025, 6, 15, 14, 19, 59, tzinfo=timezone.utc),
+            last_fetch_at=self.INSTANT,
+            sample_count=300,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+            completed_periods=[
+                CompletedNBCPeriod(
+                    start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+                    raw_wh=500.0,
+                )
+            ],
+            full_metrics_dict=None,
+        )
+        return cache
+
+    def test_compute_nbc_does_not_log(self, caplog):
+        """_compute_nbc stays silent: it only sees the pre-injection set."""
+        hp = self._make_hp(None)
+        with caplog.at_level(logging.DEBUG, logger=self.LOGGER_NAME):
+            result = hp._compute_nbc([0.001] * 60)
+        assert result.qh1 is not None
+        assert caplog.records == []
+
+    def test_compute_device_metrics_logs_final_set_after_injection(self, caplog):
+        """The NBC debug log shows the post-injection set served to callers."""
+        hp = self._make_hp(self._cache_with_completed_period())
+        with caplog.at_level(logging.DEBUG, logger=self.LOGGER_NAME):
+            device_metrics = hp._compute_device_metrics(
+                self._vdi(), self._pop_result(300), self._pred_result()
+            )
+        # Sanity: injection really happened on the returned object.
+        assert device_metrics.nbc.qh2 is not None
+        assert device_metrics.nbc.qh2.raw_wh == pytest.approx(500.0)
+        messages = [record.getMessage() for record in caplog.records]
+        nbc_logs = [message for message in messages if "nbc_set" in message]
+        assert len(nbc_logs) == 1, messages
+        assert "500" in nbc_logs[0]  # injected period value visible in log

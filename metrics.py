@@ -814,7 +814,6 @@ class HourlyProjection(MetricsBase):
         # NBCReader._parse_metrics. EnergyCache.get_current_qh is the only
         # caller that aligns both bases via the override. Revisit before
         # unifying: it changes predicted_wh on this production path.
-        self.logger.debug("_compute_nbc len %d (%s)", len(usage_data_local), result)
         return result
 
     def _populate_device(
@@ -945,6 +944,13 @@ class HourlyProjection(MetricsBase):
         )
         if completed_periods:
             nbc_result = inject_completed_qh(nbc_result, completed_periods)
+
+        # Log the final set *after* injection: QH2-QH4 are reconstructed from
+        # CompletedNBCPeriod records at this point, so this is the truth that
+        # reaches DeviceMetrics/HTTP. Logging inside _compute_nbc (the old
+        # behavior) dumped the pre-injection set and made healthy responses
+        # look like missing data (qh2=qh3=qh4=None on every cycle).
+        self.logger.debug("nbc_set len %d (%s)", len(nbc_seconds), nbc_result)
 
         return DeviceMetrics(
             gid=vdi.device_gid,

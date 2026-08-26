@@ -618,12 +618,16 @@ class EnergyCache:
             quantization_confidence=qc,
         )
 
+        period_details = " ".join(
+            f"{p.start.isoformat()}={p.raw_wh:.2f}Wh" for p in deduped
+        )
         logger.debug(
             "EnergyCache compact: %d samples → %d samples, "
-            "%d completed periods",
+            "%d completed periods [%s]",
             len(samples),
             len(remaining_samples),
             len(deduped),
+            period_details,
         )
 
     def _merge_samples_replace(

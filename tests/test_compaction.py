@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -141,6 +142,28 @@ class TestCompact:
         assert len(cache._data.completed_periods) == 3
         # Current QH data preserved (300 samples)
         assert len(cache._data.samples) == 300
+
+    def test_compact_logs_completed_period_details(self, caplog) -> None:
+        """compact() logs each kept period's start and raw Wh, not just counts.
+
+        A completed QH's value is otherwise invisible in DEBUG logs: the
+        _compute_nbc line only shows it during the brief window between the
+        900-sample fetch and compaction trimming it.  The durable compaction
+        record must carry start → raw_wh pairs so closed-quarter values are
+        always recoverable from logs.
+        """
+        now = datetime(2025, 6, 15, 14, 50, 0, tzinfo=timezone.utc)
+        data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        samples = [0.001] * 2700 + [0.002] * 300
+        cache = _make_cache(samples=samples, data_start=data_start, now=now)
+        with caplog.at_level(logging.DEBUG, logger="energy_cache"):
+            with cache._lock:
+                cache.compact(now)
+        message = "\n".join(record.getMessage() for record in caplog.records)
+        # Each kept period logged as start=<raw_wh>Wh.
+        assert "2025-06-15T14:00:00+00:00=900.00Wh" in message
+        assert "2025-06-15T14:15:00+00:00=900.00Wh" in message
+        assert "2025-06-15T14:30:00+00:00=900.00Wh" in message
 
     def test_preserves_current_qh(self) -> None:
         """compact() preserves per-second data for current QH."""
@@ -696,8 +719,6 @@ class TestCompactPartialChunkWarning:
         self, caplog
     ) -> None:
         """A misaligned leading chunk trimmed with no completed period warns."""
-        import logging
-
         now = datetime(2026, 7, 30, 2, 50, 0, tzinfo=timezone.utc)
         data_start = datetime(2026, 7, 30, 2, 34, 1, tzinfo=timezone.utc)
 
@@ -734,8 +755,6 @@ class TestCompactPartialChunkWarning:
 
     def test_no_warning_when_aligned_and_nothing_to_do(self, caplog) -> None:
         """QH-aligned data_start with no completed periods logs nothing."""
-        import logging
-
         now = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
         data_start = datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc)
 
