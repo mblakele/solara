@@ -535,6 +535,12 @@ class TestGetSessionLoopMismatch:
 class TestSendMessageSync:
     """Tests for TelegramClient.send_message_sync()."""
 
+    @pytest.fixture(autouse=True)
+    def _no_retry_backoff(self, monkeypatch):
+        """Skip real backoff sleeps — the retry *logic* is under test, not
+        the wall-clock delay (which is 1s/2s/... and would dominate runtime)."""
+        monkeypatch.setattr("telegram_client.time.sleep", lambda _s: None)
+
     def test_sync_success(self, telegram_config):
         """Successful API response returns True."""
         with patch("telegram_client.requests.post") as mock_post:

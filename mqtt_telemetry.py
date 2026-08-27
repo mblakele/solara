@@ -51,6 +51,71 @@ _telemetry_state: dict[str, Any] = {}
 _telemetry_warned_empty = False
 # Wall-clock timestamp of the last update to each field.
 _field_update_at: dict[str, datetime] = {}
+# Live broker-connection flag (plan 2.5): True only while a session is
+# established, regardless of message freshness.
+_connection_ok: bool = False
+
+# Reconnect tuning: exponential backoff from MIN, capped at MAX.
+_MQTT_RECONNECT_MIN_SECS = 2.0
+_MQTT_RECONNECT_MAX_SECS = 30.0
+
+# Cooperative shutdown (single-interrupt exit): set by
+# stop_mqtt_subscriber(); the subscriber loop waits on it instead of a bare
+# sleep so shutdown ends the wait immediately.
+_stop_event: threading.Event = threading.Event()
+# The client of the current network-loop session, if any, so stop can wake
+# loop_forever() via disconnect().
+_client_lock: threading.Lock = threading.Lock()
+# Idempotent startup: reference to the live subscriber thread, guarded by
+# _subscriber_lock. A second start while this thread is alive is a no-op —
+# re-starting clears _stop_event and the active-client registration, which
+# would corrupt the running session's shutdown path and health reporting.
+_subscriber_thread: threading.Thread | None = None
+_subscriber_lock: threading.Lock = threading.Lock()
+# Generation token: bumped on every real session start. A superseded thread
+# (whose stop event was cleared by a prompt restart) detects staleness via
+# this counter and exits without reconnecting or touching the new session's
+# client registration or health state.
+_session_gen: int = 0
+_active_client: Any | None = None
+
+
+def _register_active_client(client: Any) -> None:
+    """Record the live paho client under the lock."""
+    global _active_client
+    with _client_lock:
+        _active_client = client
+
+
+def _clear_active_client() -> None:
+    """Forget the recorded client (session over or not yet created)."""
+    global _active_client
+    with _client_lock:
+        _active_client = None
+
+
+def _get_active_client() -> Any | None:
+    """Return the live paho client, or None between sessions."""
+    with _client_lock:
+        return _active_client
+
+
+def _set_connection_ok(value: bool) -> None:
+    """Update the broker-connection flag under the telemetry lock."""
+    global _connection_ok
+    with _telemetry_lock:
+        _connection_ok = value
+
+
+def is_connected() -> bool:
+    """Return True while a broker session is currently established.
+
+    Diagnostics surface for /health and /api/v1/load/status: message
+    freshness alone cannot distinguish a live feed from one that went
+    dark seconds ago with old messages still cached.
+    """
+    with _telemetry_lock:
+        return _connection_ok
 
 # === Public API ===
 
@@ -80,6 +145,21 @@ def has_telemetry() -> bool:
         logger.warning("mqtt_telemetry: has_telemetry() is False — no MQTT messages received yet")
         _telemetry_warned_empty = True
     return result
+
+
+def get_field_freshness() -> dict[str, datetime]:
+    """Return a thread-safe copy of per-field last-update timestamps.
+
+    Diagnostics surface for /api/v1/load/status and /health: lets callers
+    detect a dark MQTT feed (no updates, or stale timestamps) instead of
+    silently trusting the last received snapshot.
+
+    Returns:
+        Dict mapping each received field name to the wall-clock timestamp
+        of its most recent update. Empty when nothing has been received.
+    """
+    with _telemetry_lock:
+        return dict(_field_update_at)
 
 def get_field_update_at(field: str) -> datetime | None:
     """Return the wall-clock timestamp when *field* was last updated.
@@ -160,6 +240,30 @@ def check_fleet_telemetry_dotfile() -> None:
         )
 
 
+def stop_mqtt_subscriber() -> None:
+    """Signal the subscriber loop to stop and disconnect any active client.
+
+    Wakes a reconnect-backoff sleep immediately and makes ``loop_forever``
+    return for a live connection. Idempotent; safe to call when the
+    subscriber was never started or has already exited. Also forgets the
+    stored subscriber thread so a prompt restart is allowed even while the
+    old thread is still winding down.
+    """
+    global _subscriber_thread
+    _stop_event.set()
+    with _subscriber_lock:
+        _subscriber_thread = None
+    client = _get_active_client()
+    if client is None:
+        return
+    try:
+        client.disconnect()
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.debug(
+            "mqtt_telemetry: disconnect during shutdown failed", exc_info=True
+        )
+
+
 def start_mqtt_subscriber(cfg: Any) -> None:
     """Connect to the MQTT broker and start a non-blocking subscriber loop.
 
@@ -167,52 +271,145 @@ def start_mqtt_subscriber(cfg: Any) -> None:
     Subscribes to ``{cfg.mqtt_topic_base}/#`` so all field sub-topics are
     received.  Runs the network loop in a daemon thread via ``loop_start()``.
 
-    If the broker is unreachable the error is logged and the background
-    thread keeps retrying (paho auto-reconnect disabled — caller can restart).
+    Resilience (plan 2.5): a failed initial connect no longer kills the
+    thread — the outer loop retries forever with exponential backoff
+    (2 s doubling to a 30 s cap, reset after any successful session).
+    Live connection state is tracked for /health and /api/v1/load/status
+    via :func:`is_connected`.
+
+    Idempotent: while a previous subscriber thread is still alive, repeat
+    calls are logged and ignored instead of spawning a duplicate session.
+    Prompt restart after an explicit stop is also safe: each session carries
+    a generation token, so a superseded thread exits itself instead of
+    reconnecting alongside (or clobbering) the new session.
 
     Args:
         cfg: Application ``Config`` instance (must expose ``mqtt_host``,
             ``mqtt_port``, ``mqtt_topic_base``).
     """
-    host = cfg.mqtt_host
-    port = cfg.mqtt_port
-    topic_base = cfg.mqtt_topic_base
-
-    def _run() -> None:
-        client = mqtt.Client()
-        client.on_message = on_message
-
-        def _on_connect(c: Any, _userdata: Any, _flags: Any, rc: int) -> None:  # noqa: ARG001
-            if rc == 0:
-                logger.info(
-                    "mqtt_telemetry: connected to %s:%d, subscribing to %s/#",
-                    host, port, topic_base,
-                )
-                c.subscribe(f"{topic_base}/#")
-            else:
-                logger.error(
-                    "mqtt_telemetry: connection failed rc=%d host=%s port=%d"
-                    " — check mqtt_host/mqtt_port config",
-                    rc, host, port,
-                )
-
-        client.on_connect = _on_connect
-        try:
-            client.connect(host, port, keepalive=60)
-            client.loop_forever()
-        except Exception:  # pylint: disable=broad-exception-caught
-            logger.exception(
-                "mqtt_telemetry: subscriber thread terminated host=%s port=%d",
-                host, port,
+    global _subscriber_thread, _session_gen
+    with _subscriber_lock:
+        if _subscriber_thread is not None and _subscriber_thread.is_alive():
+            logger.info(
+                "mqtt_telemetry: subscriber already running; "
+                "ignoring duplicate start"
             )
+            return
+        _session_gen += 1
+        gen = _session_gen
+        host = cfg.mqtt_host
+        port = cfg.mqtt_port
+        topic_base = cfg.mqtt_topic_base
+        # Fresh session semantics: a new start clears any previous stop request.
+        _stop_event.clear()
+        _clear_active_client()
 
-    check_fleet_telemetry_dotfile()
-    t = threading.Thread(target=_run, name="mqtt-subscriber", daemon=True)
-    t.start()
-    logger.info(
-        "mqtt_telemetry: subscriber thread started host=%s port=%d topic=%s/#",
-        host, port, topic_base,
-    )
+        def _run() -> None:
+            backoff = _MQTT_RECONNECT_MIN_SECS
+            while not _stop_event.is_set():
+                was_connected = False
+
+                def _on_connect(c: Any, _userdata: Any, _flags: Any, rc: int) -> None:  # noqa: ARG001
+                    nonlocal was_connected
+                    if _session_gen != gen:
+                        # Superseded session: never touch shared health state
+                        # or subscribe — drop the connection instead.
+                        logger.info(
+                            "mqtt_telemetry: ignoring CONNACK from "
+                            "superseded session"
+                        )
+                        c.disconnect()
+                        return
+                    if rc == 0:
+                        was_connected = True
+                        _set_connection_ok(True)
+                        logger.info(
+                            "mqtt_telemetry: connected to %s:%d, subscribing to %s/#",
+                            host, port, topic_base,
+                        )
+                        c.subscribe(f"{topic_base}/#")
+                    else:
+                        logger.error(
+                            "mqtt_telemetry: connection failed rc=%d host=%s port=%d"
+                            " — check mqtt_host/mqtt_port config",
+                            rc, host, port,
+                        )
+
+                def _on_disconnect(_client: Any, _userdata: Any, rc: Any) -> None:  # noqa: ARG001
+                    if _session_gen == gen:
+                        _set_connection_ok(False)
+                    if rc == 0:
+                        logger.info("mqtt_telemetry: disconnected cleanly")
+                    else:
+                        logger.warning(
+                            "mqtt_telemetry: unexpected disconnect rc=%s"
+                            " — will reconnect",
+                            rc,
+                        )
+
+                client = mqtt.Client()
+                _register_active_client(client)
+                client.on_message = on_message
+                client.on_connect = _on_connect
+                client.on_disconnect = _on_disconnect
+                try:
+                    client.connect(host, port, keepalive=60)
+                    # Re-check AFTER connect: a stop→restart may have landed
+                    # while the handshake was in flight. The restart clears
+                    # the shared stop event, so the event alone cannot tell
+                    # us we are superseded — only the generation token can.
+                    # Entering loop_forever() on this connected client would
+                    # run it forever alongside the new session.
+                    if _stop_event.is_set() or _session_gen != gen:
+                        client.disconnect()
+                        return
+                    # loop_forever auto-reconnects after an ESTABLISHED
+                    # connection drops; a failed initial connect raises and is
+                    # handled below by re-entering the loop after backoff.
+                    client.loop_forever()
+                    if _stop_event.is_set() or _session_gen != gen:
+                        return
+                    logger.warning(
+                        "mqtt_telemetry: network loop exited — reconnecting"
+                    )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    if _stop_event.is_set() or _session_gen != gen:
+                        return
+                    logger.exception(
+                        "mqtt_telemetry: connection attempt failed host=%s port=%d",
+                        host, port,
+                    )
+                finally:
+                    # Only the current generation may reset shared session
+                    # state — a superseded thread's teardown must not
+                    # deregister the new session's active client.
+                    if _session_gen == gen:
+                        _clear_active_client()
+                if _session_gen == gen:
+                    _set_connection_ok(False)
+                # Event-based backoff: stop_mqtt_subscriber() ends the wait (and
+                # this thread) immediately instead of after the full sleep.
+                if _stop_event.wait(backoff):
+                    return
+                if _session_gen != gen:
+                    # A prompt restart cleared the shared stop event before
+                    # this (superseded) thread woke up: exit quietly instead
+                    # of reconnecting alongside the new session.
+                    return
+                backoff = (
+                    _MQTT_RECONNECT_MIN_SECS if was_connected
+                    else min(backoff * 2, _MQTT_RECONNECT_MAX_SECS)
+                )
+
+        check_fleet_telemetry_dotfile()
+        t = threading.Thread(target=_run, name="mqtt-subscriber", daemon=True)
+        _subscriber_thread = t
+        t.start()
+        logger.info(
+            "mqtt_telemetry: subscriber thread started host=%s port=%d topic=%s/#",
+            host, port, topic_base,
+        )
+
 
 
 def tesla_state_from_snapshot(

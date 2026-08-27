@@ -22,8 +22,8 @@ import logging
 import logging.handlers
 
 import sys
+import signal
 import threading
-import time
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -42,8 +42,11 @@ from flask import (
 from flask.typing import ResponseReturnValue
 
 from config import Config, _config, get_timezone
+from clock import Clock, RealClock
+from constants import STALE_DATA_THRESHOLD_SECS
 
 from energy_cache import EnergyCache
+import logfmt
 from metrics import (
     create_metrics,
     Metrics,
@@ -52,6 +55,7 @@ from metrics import (
     RetryableMetricsException,
 )
 from mockdata import MetricsMock
+import mqtt_telemetry
 from load_models import CycleResult
 from sse_event import SSEBroadcaster, event_stream
 from util import CustomJSONProvider, is_debug
@@ -81,6 +85,15 @@ class _AppState:
     consecutive_error_count: int = 0
     last_error_type: str | None = None
     lm_thread_started: bool = False
+    # Init-retry state (plan 2.6): failures back off instead of latching.
+    load_manager_init_attempts: int = 0
+    load_manager_next_init_retry_at: datetime | None = None
+    # Liveness/health signals (plan 1.5).
+    lm_heartbeat_at: datetime | None = None
+    mqtt_subscriber_started: bool = False
+    background_services_started_at: datetime | None = None
+    # Watchdog input (plan 2.7): last completed loop iteration.
+    lm_last_cycle_finished_at: datetime | None = None
 
 
 # Application-level configuration injected into all consumers.
@@ -91,6 +104,14 @@ _state = _AppState(
     energy_cache=EnergyCache(ttl_seconds=60),
     sse_broadcaster=SSEBroadcaster(),
 )
+
+# Cooperative shutdown signal (single-interrupt exit): background loops wait
+# on this event instead of a bare sleep so a stop request ends them
+# immediately. See request_shutdown().
+_stop_event = threading.Event()
+# Guard so signal-hook installation happens once (see
+# install_shutdown_signal_hooks()).
+_shutdown_hooks_installed = False
 
 
 def camelize(obj: object) -> object:
@@ -193,8 +214,10 @@ def _setup_file_logging(config: Config) -> logging.Handler | None:
         maxBytes=config.log_max_bytes,
         backupCount=config.log_backup_count,
     )
-    handler.setFormatter(logging.Formatter(
-        "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s %(message)s",
+    json_mode = str(config.get("LOG_FORMAT", "text")).lower() == "json"
+    handler.setFormatter(logfmt.create_formatter(
+        json_mode,
+        fmt="[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S %z",
     ))
     return handler
@@ -214,14 +237,28 @@ def astimezone_filter(dt: datetime, tz_str: str) -> datetime:
 
 
 def parse_date_to_utc(date_str: str) -> datetime:
-    """Parse date string and convert to UTC timezone."""
+    """Parse date string and convert to UTC timezone.
+
+    Raises:
+        ValueError: If the string is malformed, or names a local time that
+            is ambiguous (DST fall-back overlap) or nonexistent (DST
+            spring-forward gap) in the configured timezone. Failing
+            explicitly beats silently picking the wrong UTC instant.
+    """
     tz = pytz.timezone(get_timezone())
     if "T" in date_str:
         dt = datetime.fromisoformat(date_str)
     else:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
     if dt.tzinfo is None:
-        dt = tz.localize(dt)
+        try:
+            # is_dst=None makes ambiguous/nonexistent local times raise
+            # instead of silently resolving to an arbitrary offset.
+            dt = tz.localize(dt, is_dst=None)
+        except pytz.exceptions.InvalidTimeError as exc:
+            raise ValueError(
+                f"Ambiguous or nonexistent local time: {date_str!r}"
+            ) from exc
 
     return dt.astimezone(pytz.utc)
 
@@ -273,11 +310,22 @@ def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = 
     return TOUResult(buckets=model.tou_result, nbc=model.nbc_result)
 
 
-def _validate_dates(start_date_str: str | None, end_date_str: str | None):
+def _validate_dates(
+    start_date_str: str | None,
+    end_date_str: str | None,
+    clock: Clock | None = None,
+):
     """Parse and validate date parameters.
 
     Returns (start_date, end_date) as UTC datetimes or aborts with 400.
-    Defaults end_date to now if not provided.
+    Defaults end_date to the injected clock's current time when not
+    provided (RealClock in production — always a correctly localized,
+    timezone-aware instant; FakeClock in tests).
+
+    Args:
+        start_date_str: Start date string, or None to abort with 400.
+        end_date_str: End date string; defaults to now via *clock*.
+        clock: Time source for the default end date. Defaults to RealClock.
     """
     if not start_date_str:
         return abort(400, "start_date is required")
@@ -293,7 +341,7 @@ def _validate_dates(start_date_str: str | None, end_date_str: str | None):
         except (ValueError, TypeError):
             return abort(400, "Invalid end_date format")
     else:
-        end_date = pytz.utc.localize(datetime.now())
+        end_date = (clock or RealClock()).now()
 
     date_diff = end_date - start_date
     if date_diff.days > 366:
@@ -389,12 +437,244 @@ def index() -> ResponseReturnValue:
     return abort(406)
 
 
+# Health-check tuning (plan 1.5): gates are deliberately conservative to
+# avoid restart storms during boot or when load management is disabled.
+_HEALTH_BOOT_GRACE_SECS = 300.0
+_HEALTH_MQTT_DARK_SECS = 600.0
+_HEALTH_MQTT_DISCONNECT_STALE_SECS = 60.0
+_HEALTH_ERROR_THRESHOLD = 3
+_HEALTH_LM_MIN_STALE_SECS = 120.0
+
+# LoadManager init-retry tuning (plan 2.6).
+_LM_INIT_RETRY_BASE_SECS = 30.0
+_LM_INIT_RETRY_MAX_SECS = 600.0
+
+
+def _lm_init_backoff_secs(attempts: int) -> float:
+    """Exponential backoff for LoadManager init retries, capped.
+
+    Args:
+        attempts: 1-based count of failed init attempts.
+
+    Returns:
+        Seconds to wait before the next attempt.
+    """
+    return min(
+        _LM_INIT_RETRY_BASE_SECS * (2 ** max(0, attempts - 1)),
+        _LM_INIT_RETRY_MAX_SECS,
+    )
+
+
+def _compute_loop_sleep(result: Any, interval_secs: float) -> float:
+    """Compute the LM loop's sleep duration defensively.
+
+    A negative sleep hint or an exception from
+    ``EnergyCache.sleep_interval_adjust`` must never kill the background
+    thread (R10): clamp to >= 0 and fall back to the configured interval.
+
+    Args:
+        result: The cycle result (or None) from ``run_cycle``.
+        interval_secs: Configured polling interval fallback.
+
+    Returns:
+        Non-negative seconds to sleep.
+    """
+    try:
+        if result is not None and result.status == "disabled":
+            raw = float(interval_secs)
+        else:
+            raw = _state.energy_cache.sleep_interval_adjust(
+                interval_secs,
+                datetime.now(pytz.timezone(_config.timezone)),
+            )
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning(
+            "sleep_interval_adjust failed; using configured interval",
+            exc_info=True,
+        )
+        raw = float(interval_secs)
+    return max(0.0, raw)
+
+
+_stall_critical_last_at: datetime | None = None
+
+
+def _check_stall_watchdog(now: datetime) -> None:
+    """CRITICAL-log when enabled load management stops completing cycles.
+
+    Rate-limited to one entry per hour so a prolonged stall stays visible
+    without flooding logs.
+
+    Called by ``_load_management_loop`` at the END of each iteration,
+    BEFORE refreshing ``lm_last_cycle_finished_at`` — so it measures the
+    duration of the iteration that just finished. Residual limitation: a
+    thread that hangs mid-cycle never reaches this check at all; that
+    case is covered by the /health heartbeat staleness instead.
+    """
+    global _stall_critical_last_at
+    if _config.load_manage_enabled is False:
+        return
+    finished_at = _state.lm_last_cycle_finished_at
+    if finished_at is None:
+        return
+    threshold = max(
+        300.0, 10.0 * float(_config.load_manage_interval_secs)
+    )
+    stalled_for = (now - finished_at).total_seconds()
+    if stalled_for <= threshold:
+        return
+    if (
+        _stall_critical_last_at is not None
+        and (now - _stall_critical_last_at).total_seconds() < 3600
+    ):
+        return
+    _stall_critical_last_at = now
+    logger.critical(
+        "Load management stalled: no completed cycle for %.0fs "
+        "(threshold %.0fs)",
+        stalled_for,
+        threshold,
+    )
+
+
+def _build_health_payload(now: datetime) -> dict[str, Any]:
+    """Compute component health for the /health endpoint.
+
+    Args:
+        now: Current time (injected so tests can pin it).
+
+    Returns:
+        Dict with overall ``status`` ("ok" or "degraded") plus a
+        ``components`` map: load_manager_thread, energy_cache,
+        mqtt_telemetry, errors.
+    """
+
+    def _iso(value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    # ── Load-management thread liveness ──────────────────────────────
+    lm_enabled = _config.load_manage_enabled is not False
+    heartbeat = _state.lm_heartbeat_at
+    lm_state = "disabled"
+    lm_age: float | None = None
+    if lm_enabled:
+        if heartbeat is None:
+            lm_state = "never_run"
+        else:
+            lm_age = (now - heartbeat).total_seconds()
+            stale_bound = max(
+                _HEALTH_LM_MIN_STALE_SECS,
+                3.0 * float(_config.load_manage_interval_secs),
+            )
+            lm_state = "alive" if lm_age <= stale_bound else "stale"
+
+    # ── Emporia sample-cache freshness ────────────────────────────────
+    cache_data = _state.energy_cache.data
+    cache_state = "empty"
+    cache_age: float | None = None
+    if (
+        cache_data is not None
+        and cache_data.samples
+        and cache_data.data_start is not None
+    ):
+        # Per the contiguity axiom sample i occurs at data_start + i·s, so
+        # the newest of N samples sits at data_start + (N-1)·s. Prefer the
+        # maintained last_sample_at; the arithmetic is only a fallback.
+        newest_sample = cache_data.last_sample_at or (
+            cache_data.data_start
+            + timedelta(seconds=len(cache_data.samples) - 1)
+        )
+        cache_age = (now - newest_sample).total_seconds()
+        cache_state = (
+            "fresh"
+            if cache_age <= 2 * STALE_DATA_THRESHOLD_SECS
+            else "stale"
+        )
+    started_at = _state.background_services_started_at
+    booted_long_ago = (
+        started_at is not None
+        and (now - started_at).total_seconds() > _HEALTH_BOOT_GRACE_SECS
+    )
+    cache_gated = lm_enabled and (
+        cache_state == "stale"
+        or (cache_state == "empty" and booted_long_ago)
+    )
+
+    # ── MQTT telemetry feed ───────────────────────────────────────────
+    freshness = mqtt_telemetry.get_field_freshness()
+    mqtt_last_age = (
+        (now - max(freshness.values())).total_seconds()
+        if freshness
+        else None
+    )
+    mqtt_connected: bool | None = None
+    if not _state.mqtt_subscriber_started:
+        mqtt_state = "not_started"
+        mqtt_gated = False
+    else:
+        mqtt_connected = mqtt_telemetry.is_connected()
+        if mqtt_last_age is None:
+            mqtt_state = "waiting"
+            mqtt_gated = booted_long_ago
+        elif mqtt_last_age > _HEALTH_MQTT_DARK_SECS:
+            # Most severe: no usable data for >10 min, whatever the cause.
+            mqtt_state = "dark"
+            mqtt_gated = True
+        elif (
+            not mqtt_connected
+            and mqtt_last_age > _HEALTH_MQTT_DISCONNECT_STALE_SECS
+        ):
+            # Feed went dark recently enough that old cached messages
+            # still look "fresh" — connection state closes that gap.
+            mqtt_state = "disconnected"
+            mqtt_gated = True
+        else:
+            mqtt_state = "receiving"
+            mqtt_gated = False
+
+    # ── Sustained cycle errors ────────────────────────────────────────
+    errors_gated = (
+        _state.consecutive_error_count >= _HEALTH_ERROR_THRESHOLD
+    )
+
+    degraded = (
+        lm_state == "stale" or cache_gated or mqtt_gated or errors_gated
+    )
+    return {
+        "status": "degraded" if degraded else "ok",
+        "components": {
+            "load_manager_thread": {
+                "state": lm_state,
+                "last_heartbeat_at": _iso(heartbeat),
+                "age_secs": lm_age,
+            },
+            "energy_cache": {
+                "state": cache_state,
+                "age_secs": cache_age,
+            },
+            "mqtt_telemetry": {
+                "state": mqtt_state,
+                "connected": mqtt_connected,
+                "has_telemetry": bool(freshness),
+                "last_update_age_secs": mqtt_last_age,
+            },
+            "errors": {
+                "consecutive_error_count": _state.consecutive_error_count,
+                "last_error_type": _state.last_error_type,
+            },
+        },
+    }
+
+
 def health() -> Response:
-    """Health check endpoint returning 'ok'."""
-    logger.debug("health")
-    resp = Response("ok")
-    resp.headers["Content-Type"] = "text/plain"
-    return resp
+    """Component health endpoint (always HTTP 200).
+
+    Deploy tooling inspects the JSON ``status``/``components`` fields
+    rather than the HTTP code, so a degraded instance can be observed
+    and alerted on, not just blindly restarted.
+    """
+    payload = _build_health_payload(datetime.now(timezone.utc))
+    return _json_response(camelize(payload))
 
 
 def tou() -> ResponseReturnValue:
@@ -510,11 +790,17 @@ def _build_load_management_payload(lm: Any = None) -> dict:
 def _get_load_manager():
     """Get or create the singleton LoadManager instance.
 
-    If initialization has previously failed, returns None without retrying
-    to avoid generating warnings on every call.
+    Initialization failures are not permanent (plan 2.6): the next call
+    after the backoff window elapses retries construction, so a transient
+    bad devices.json heals without a process restart.
     """
     with _state.load_manager_lock:
-        if _state.load_manager is None and not _state.load_manager_init_failed:
+        if _state.load_manager is None:
+            now_ = datetime.now(timezone.utc)
+            if _state.load_manager_init_failed:
+                next_at = _state.load_manager_next_init_retry_at
+                if next_at is not None and now_ < next_at:
+                    return None
             try:
                 from load_manager import LoadManager, LoadManagerConfig
 
@@ -551,11 +837,27 @@ def _get_load_manager():
                     ),
                 )
                 logger.info("LoadManager initialized")
-
+                _state.load_manager_init_failed = False
+                _state.load_manager_init_attempts = 0
+                _state.load_manager_next_init_retry_at = None
 
             except Exception as e:
-                logger.warning("Failed to initialize LoadManager: %s", e)
+                _state.load_manager_init_attempts += 1
+                delay = _lm_init_backoff_secs(
+                    _state.load_manager_init_attempts
+                )
+                _state.load_manager_next_init_retry_at = now_ + timedelta(
+                    seconds=delay
+                )
                 _state.load_manager_init_failed = True
+                logger.warning(
+                    "Failed to initialize LoadManager "
+                    "(attempt %d, retry in %.0fs): %s",
+                    _state.load_manager_init_attempts,
+                    delay,
+                    e,
+                    exc_info=True,
+                )
         return _state.load_manager
 
 
@@ -573,7 +875,7 @@ def _send_error_alert(exc: Exception) -> None:
     try:
         _state.telegram_sender.send_notification_sync(event)
     except Exception:  # pylint: disable=broad-exception-caught
-        logger.debug("Failed to send error alert", exc_info=True)
+        logger.warning("Failed to send error alert", exc_info=True)
 
 
 def _load_management_loop() -> None:
@@ -583,7 +885,8 @@ def _load_management_loop() -> None:
         "Load management background loop started: dry-run=%s, mock=%s, interval=%d",
         _config.dry_run, _config.is_mock_mode, interval_secs_config
     )
-    while True:
+    while not _stop_event.is_set():
+        _state.lm_heartbeat_at = datetime.now(timezone.utc)
         result = None
         try:
             lm = _get_load_manager()
@@ -593,6 +896,7 @@ def _load_management_loop() -> None:
                 with _state.load_manager_lock:
                     _state.last_cycle_result = result
                     _state.recent_cycles.append({
+                        "cycle_id": result.cycle_id,
                         "status": result.status,
                         "reason": result.diagnostics.reason if result.diagnostics else None,
                         "actions_count": len(result.actions),
@@ -624,7 +928,9 @@ def _load_management_loop() -> None:
             interval_secs = interval_secs_config
             _state.consecutive_error_count += 1
             _state.last_error_type = type(e).__name__
-            logger.error("Error in load management loop: %s", e)
+            logger.error(
+                "Error in load management loop: %s", e, exc_info=True
+            )
             _state.energy_cache.invalidate()
             if _state.consecutive_error_count == 1 or _state.consecutive_error_count % 10 == 0:
                 _send_error_alert(e)
@@ -634,14 +940,19 @@ def _load_management_loop() -> None:
             _state.consecutive_error_count = 0
             _state.last_error_type = None
 
-        if result is not None and result.status == "disabled":
-            interval_secs_adjusted: float = interval_secs
-        else:
-            interval_secs_adjusted = _state.energy_cache.sleep_interval_adjust(
-                interval_secs, datetime.now(pytz.timezone(_config.timezone)))
+        # Check BEFORE refreshing: the watchdog must measure how long the
+        # iteration that just completed took. Refreshing first (the original
+        # ordering) made stalled_for ≈ 0 every cycle and the CRITICAL branch
+        # unreachable — see review finding #1.
+        now = datetime.now(timezone.utc)
+        _check_stall_watchdog(now)
+        _state.lm_last_cycle_finished_at = now
+        interval_secs_adjusted = _compute_loop_sleep(result, interval_secs)
         logger.debug("Load management sleeping %.1f", interval_secs_adjusted)
-        time.sleep(interval_secs_adjusted)
-
+        # Event-based sleep: request_shutdown() ends the wait (and this
+        # loop) immediately instead of after the full interval.
+        if _stop_event.wait(interval_secs_adjusted):
+            break
 
 def load_status() -> Response:
     """Read-only endpoint returning current load management state.
@@ -656,6 +967,32 @@ def load_status() -> Response:
     with _state.load_manager_lock:
         last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
 
+    cache_data = _state.energy_cache.data
+    if cache_data is not None:
+        cache_payload = {
+            "data_start": (
+                cache_data.data_start.isoformat()
+                if cache_data.data_start
+                else None
+            ),
+            "last_fetch_at": (
+                cache_data.last_fetch_at.isoformat()
+                if cache_data.last_fetch_at
+                else None
+            ),
+            "sample_count": cache_data.sample_count,
+        }
+    else:
+        cache_payload = None
+
+    mqtt_updates = mqtt_telemetry.get_field_freshness()
+    last_update_at = max(mqtt_updates.values()) if mqtt_updates else None
+    mqtt_age = (
+        (datetime.now(timezone.utc) - last_update_at).total_seconds()
+        if last_update_at is not None
+        else None
+    )
+
     payload = {
         "enabled": lm.enabled,
         "target_wh": lm.target_wh,
@@ -664,9 +1001,18 @@ def load_status() -> Response:
         "pending_effects": [],
         "last_cycle_result": last_result,
         "recent_cycles": list(_state.recent_cycles),
+        "consecutive_error_count": _state.consecutive_error_count,
+        "last_error_type": _state.last_error_type,
+        "sse_subscriber_count": _state.sse_broadcaster.subscriber_count(),
+        "cache": cache_payload,
+        "mqtt": {
+            "has_telemetry": mqtt_telemetry.has_telemetry(),
+            "connected": mqtt_telemetry.is_connected(),
+            "last_update_age_secs": mqtt_age,
+        },
     }
 
-    for name, device_state in lm.state.devices.items():
+    for name, device_state in lm.state.snapshot_devices().items():
         payload["devices"][name] = {
             "desired_state": device_state.desired_state,
             "actual_state": device_state.actual_state,
@@ -678,7 +1024,7 @@ def load_status() -> Response:
             ),
         }
 
-    for effect in lm.state.pending_effects:
+    for effect in lm.state.snapshot_effects():
         payload["pending_effects"].append(
             {
                 "device_name": effect.device_name,
@@ -717,9 +1063,17 @@ def stream_status():
 
 
 def _start_mqtt_subscriber() -> None:
-    """Start the MQTT subscriber thread for Tesla fleet-telemetry events."""
+    """Start the MQTT subscriber thread for Tesla fleet-telemetry events.
+
+    Idempotent (mirrors the load-manager thread guard): repeated calls are
+    no-ops. The underlying :func:`mqtt_telemetry.start_mqtt_subscriber`
+    self-guards too, so embedders calling it directly are equally safe.
+    """
+    if _state.mqtt_subscriber_started:
+        return
     from mqtt_telemetry import start_mqtt_subscriber as _start
     _start(_config)
+    _state.mqtt_subscriber_started = True
     logger.info("MQTT subscriber started")
 
 
@@ -733,14 +1087,78 @@ def _start_load_manager_thread():
 
 
 def _shutdown_load_manager():
-    """Clean up LoadManager resources on process exit."""
+    """Clean up LoadManager resources on process exit.
+
+    Nulls the manager before closing so re-entrant calls (atexit after
+    request_shutdown) are natural no-ops.
+    """
     with _state.load_manager_lock:
-        if _state.load_manager is not None:
+        lm = _state.load_manager
+        if lm is not None:
+            _state.load_manager = None
             try:
-                _state.load_manager.close()
+                lm.close()
                 logger.info("LoadManager shut down cleanly")
             except Exception as e:
                 logger.warning("Error during LoadManager shutdown: %s", e)
+
+
+def request_shutdown(reason: str) -> None:
+    """Request cooperative shutdown of background services.
+
+    Idempotent and safe to call from signal handlers, gunicorn worker hooks,
+    and atexit: sets the stop event every background loop waits on, ends all
+    SSE streams so no worker-pool thread blocks interpreter finalization,
+    stops the MQTT subscriber, and closes the LoadManager exactly once.
+
+    Args:
+        reason: Short tag identifying the shutdown trigger (for logs).
+    """
+    if _stop_event.is_set():
+        return
+    logger.info("Shutdown requested (%s)", reason)
+    _stop_event.set()
+    _state.sse_broadcaster.close_all()
+    from mqtt_telemetry import stop_mqtt_subscriber  # avoid import cycle
+
+    # Unconditional: stop_mqtt_subscriber() is idempotent and safe even
+    # when the app-layer flag was never set (an embedder may have started
+    # the subscriber directly, bypassing start_background_services()).
+    stop_mqtt_subscriber()
+    _shutdown_load_manager()
+
+
+def install_shutdown_signal_hooks() -> None:
+    """Chain cooperative-shutdown handlers over installed signal handlers.
+
+    For each of SIGINT/SIGQUIT/SIGTERM whose current disposition is a
+    callable handler (gunicorn's, Python's default, ...), installs a
+    wrapper that calls :func:`request_shutdown` first and then delegates,
+    preserving the host's own shutdown semantics (graceful SIGTERM vs fast
+    SIGINT). Non-callable dispositions (SIG_DFL/SIG_IGN) are left untouched.
+    Idempotent; must be called from the main thread.
+
+    Called by the gunicorn ``post_worker_init`` hook (after the worker's own
+    ``init_signals()``) and by the ``python app.py`` entry point.
+    """
+    global _shutdown_hooks_installed
+    if _shutdown_hooks_installed:
+        return
+
+    def _make_handler(sig_name: str, previous: Any) -> Any:
+        def _handler(signum: int, frame: Any) -> None:
+            request_shutdown(f"signal:{sig_name}")
+            if callable(previous):
+                previous(signum, frame)
+
+        return _handler
+
+    for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        previous = signal.getsignal(sig)
+        if not callable(previous):
+            continue
+        signal.signal(sig, _make_handler(signal.Signals(sig).name, previous))
+    _shutdown_hooks_installed = True
 
 
 def start_background_services() -> None:
@@ -755,6 +1173,7 @@ def start_background_services() -> None:
         _start_mqtt_subscriber()
     if _config.load_manage_enabled is not False:
         _start_load_manager_thread()
+    _state.background_services_started_at = datetime.now(timezone.utc)
 
 
 def create_app() -> Flask:
@@ -796,21 +1215,42 @@ app = create_app()
 
 
 logger = app.logger
-if __name__ != "__main__":
+
+
+def _route_root_logging_through_gunicorn() -> None:
+    """Route root logging through gunicorn's handlers when available.
+
+    Under gunicorn, the ``gunicorn.error`` logger carries the server's
+    configured handlers; reusing them keeps app logs interleaved with
+    request logs in the same output stream.  When gunicorn's logger has
+    no handlers (tests, scripts, any other embedding of this module),
+    this is a no-op so pre-existing logging configuration is preserved
+    instead of being silently wiped.
+    """
     gunicorn_logger = logging.getLogger("gunicorn.error")
+    if not gunicorn_logger.handlers:
+        return
     root_logger = logging.getLogger()
     root_logger.handlers = gunicorn_logger.handlers
     root_logger.setLevel(logging.DEBUG if is_debug() else logging.INFO)
+
+
+if __name__ != "__main__":
+    _route_root_logging_through_gunicorn()
     file_handler = _setup_file_logging(_config)
     if file_handler:
-        root_logger.addHandler(file_handler)
-        gunicorn_logger.addHandler(file_handler)
+        logging.getLogger().addHandler(file_handler)
+        logging.getLogger("gunicorn.error").addHandler(file_handler)
 else:
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S %z",
-    ))
+    json_mode = str(_config.get("LOG_FORMAT", "text")).lower() == "json"
+    if json_mode:
+        handler.setFormatter(logfmt.create_formatter(True))
+    else:
+        handler.setFormatter(logfmt.StructuredFormatter(
+            "[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S %z",
+        ))
     logging.basicConfig(handlers=[handler],
                         level=logging.DEBUG if is_debug() else logging.INFO)
     file_handler = _setup_file_logging(_config)
@@ -890,4 +1330,5 @@ if __name__ == "__main__":
             sys.exit(1)
 
     start_background_services()
+    install_shutdown_signal_hooks()
     app.run(host="0.0.0.0", port=8000)

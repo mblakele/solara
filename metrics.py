@@ -10,6 +10,7 @@ import json
 import locale
 import logging
 import threading
+from time import monotonic as _monotonic
 from typing import Any, ClassVar, Optional
 
 import requests
@@ -19,10 +20,10 @@ from pyemvue.enums import Scale, Unit
 from clock import Clock, RealClock
 from constants import (
     DRIFT_REJECTION_ALERT_AFTER,
-    QUANTIZATION_CONFIDENCE_THRESHOLD,
 )
 from energy_cache import EnergyCache
 from energy_aggregator import EnergyDataAggregator, TOUBuckets
+from quantization import usable_window
 from util import (
     CustomJSONProvider,
     NBCQuarterSet,
@@ -41,6 +42,33 @@ from config import Config, _config
 logger = logging.getLogger(__name__)
 
 _CLOCK: Clock = RealClock()
+
+
+def prediction_window_from_cache(energy_cache: Optional["EnergyCache"]) -> int | None:
+    """Return the usable quantization window from *energy_cache*, or None.
+
+    Applies the shared ``quantization.usable_window`` guard so the
+    flat-data N=2 artifact is rejected here too (plan 3.2).
+
+    Args:
+        energy_cache: The shared EnergyCache (or None).
+
+    Returns:
+        Accepted period in seconds, or None when unavailable/rejected.
+    """
+    if energy_cache is None:
+        return None
+    data = energy_cache.data
+    if data is None:
+        return None
+    return usable_window(
+        getattr(data, "quantization_seconds", None),
+        getattr(data, "quantization_confidence", None),
+    )
+
+# Serializes MetricsBase auth/init (vue.login + get_devices) across the
+# load-management fetch thread and TOU request threads (plan 2.4).
+_vue_init_lock = threading.Lock()
 
 
 def set_clock(clock: Clock) -> None:
@@ -397,6 +425,10 @@ class MetricsBase:
         Initialize access to Emporia VUE API.
         Prefer stored authentication token,
         falling back on username and password.
+
+        Serialized by ``_vue_init_lock`` so concurrent callers (fetch
+        thread vs TOU requests) cannot race ``vue.login()`` or pyemvue's
+        token-file writes.
         """
 
         if not self.vue:
@@ -404,97 +436,110 @@ class MetricsBase:
 
         cfg = getattr(self, '_cfg', _config)
 
-        #self.logger.debug({"keys": self.vue_keys})
-        try:
-            encoding = locale.getpreferredencoding()
-            vkf = open(self.vue_keys, encoding=encoding)
-            with vkf:
-                vkf_data = json.load(vkf)
-                login_ok = self.vue.login(
-                    id_token=vkf_data["id_token"],
-                    access_token=vkf_data["access_token"],
-                    refresh_token=vkf_data["refresh_token"],
-                    token_storage_file=self.vue_keys,
-                )
-        except (requests.exceptions.RequestException, IOError):
-            self.logger.exception("keys failed: will use password")
+        with _vue_init_lock:
             try:
-                login_ok = self.vue.login(
-                    username=cfg.vue_username,
-                    password=cfg.vue_password,
-                    token_storage_file=self.vue_keys,
-                )
-            except Exception as inner_ex:
+                encoding = locale.getpreferredencoding()
+                vkf = open(self.vue_keys, encoding=encoding)
+                with vkf:
+                    vkf_data = json.load(vkf)
+                    login_ok = self.vue.login(
+                        id_token=vkf_data["id_token"],
+                        access_token=vkf_data["access_token"],
+                        refresh_token=vkf_data["refresh_token"],
+                        token_storage_file=self.vue_keys,
+                    )
+            except (
+                requests.exceptions.RequestException,
+                IOError,
+                KeyError,
+                ValueError,
+            ):
+                # ValueError covers json.JSONDecodeError from a corrupt
+                # .vue-keys.json; KeyError covers missing token fields.
+                # Both mean the stored tokens are unusable: fall back to
+                # password auth instead of crashing the caller.
+                self.logger.exception("keys failed: will use password")
+                try:
+                    login_ok = self.vue.login(
+                        username=cfg.vue_username,
+                        password=cfg.vue_password,
+                        token_storage_file=self.vue_keys,
+                    )
+                except Exception as inner_ex:
+                    raise VueAuthenticationError(
+                        "Vue authentication failed: check credentials"
+                    ) from inner_ex
+
+            if not login_ok:
+                # Token login returned False — fall back to password auth.
+                self.logger.debug("token login failed, trying password")
+                try:
+                    login_ok = self.vue.login(
+                        username=cfg.vue_username,
+                        password=cfg.vue_password,
+                        token_storage_file=self.vue_keys,
+                    )
+                except Exception as inner_ex:
+                    raise VueAuthenticationError(
+                        "Vue authentication failed: check credentials"
+                    ) from inner_ex
+
+            if not login_ok:
+                self.logger.error("login failed")
                 raise VueAuthenticationError(
                     "Vue authentication failed: check credentials"
-                ) from inner_ex
-
-        if not login_ok:
-            # Token login returned False — fall back to password auth.
-            self.logger.debug("token login failed, trying password")
-            try:
-                login_ok = self.vue.login(
-                    username=cfg.vue_username,
-                    password=cfg.vue_password,
-                    token_storage_file=self.vue_keys,
                 )
-            except Exception as inner_ex:
-                raise VueAuthenticationError(
-                    "Vue authentication failed: check credentials"
-                ) from inner_ex
 
-        if not login_ok:
-            self.logger.error("login failed")
-            raise VueAuthenticationError(
-                "Vue authentication failed: check credentials"
-            )
-
-        self.vue_auth["last"] = _CLOCK.now()
+            self.vue_auth["last"] = _CLOCK.now()
 
     def get_device_info(self) -> None:
         """
         Wrapper for vue get_devices,
         filtering results for ZIG001 devices.
+
+        Serialized by ``_vue_init_lock`` together with :meth:`vue_init`
+        so device discovery cannot interleave with re-authentication.
         """
-        rt_start = _CLOCK.now()
-        age_limit = timedelta(hours=24)
-        self.logger.debug(
-            {"device_info_len": len(self.device_info), "vue_auth": self.vue_auth}
-        )
-        if len(self.device_info) > 0 and "last" in self.vue_auth:
-            age = rt_start - self.vue_auth["last"]
-            #self.logger.debug({"age": age})
-            if age < age_limit:
-                #self.logger.debug({"device_info": self.device_info})
-                return
-
-        try:
-            devices = [self.vue.get_devices()[-1]]
-        except requests.exceptions.HTTPError as ex:
-            if ex.response is not None and ex.response.status_code == 401:
-                self.logger.exception("invalidating auth tokens")
-                self.vue.auth = None
-            else:
-                self.logger.exception(ex)
-            raise RetryableMetricsException("get_devices failed") from ex
-
-        for vdi in devices:
+        with _vue_init_lock:
+            rt_start = _CLOCK.now()
+            age_limit = timedelta(hours=24)
             self.logger.debug(
-                "device %s, connected %s, model %s, channels %d",
-                vdi.device_gid,
-                vdi.connected,
-                vdi.model,
-                len(vdi.channels),
+                {"device_info_len": len(self.device_info), "vue_auth": self.vue_auth}
             )
-            if not vdi.connected:
-                continue
-            if not vdi.model == "ZIG001":
-                continue
-            if not len(vdi.channels) > 0:
-                continue
-            if not vdi.device_gid in self.device_info:
-                self.device_info[vdi.device_gid] = vdi
-                break
+            if len(self.device_info) > 0 and "last" in self.vue_auth:
+                age = rt_start - self.vue_auth["last"]
+                #self.logger.debug({"age": age})
+                if age < age_limit:
+                    #self.logger.debug({"device_info": self.device_info})
+                    return
+
+            try:
+                devices = [self.vue.get_devices()[-1]]
+            except requests.exceptions.HTTPError as ex:
+                if ex.response is not None and ex.response.status_code == 401:
+                    self.logger.exception("invalidating auth tokens")
+                    self.vue.auth = None
+                else:
+                    self.logger.exception(ex)
+                raise RetryableMetricsException("get_devices failed") from ex
+
+            for vdi in devices:
+                self.logger.debug(
+                    "device %s, connected %s, model %s, channels %d",
+                    vdi.device_gid,
+                    vdi.connected,
+                    vdi.model,
+                    len(vdi.channels),
+                )
+                if not vdi.connected:
+                    continue
+                if not vdi.model == "ZIG001":
+                    continue
+                if not len(vdi.channels) > 0:
+                    continue
+                if not vdi.device_gid in self.device_info:
+                    self.device_info[vdi.device_gid] = vdi
+                    break
 
 
 class HourlyProjection(MetricsBase):
@@ -557,9 +602,11 @@ class HourlyProjection(MetricsBase):
         # Fetch usage data without mutating device_info
         population = self.populate_internal(chart_start, self.energy_cache)
 
-        self.metrics["api_response"]["total"] = sum(
-            self.metrics["api_response"].values(), timedelta()
-        )
+        # Per-channel entries are monotonic elapsed seconds (floats) recorded
+        # by _fetch_channel_data; sum them numerically and convert so "total"
+        # stays a timedelta (JSON serializes it as an ISO 8601 duration).
+        total_fetch_secs: float = sum(self.metrics["api_response"].values())
+        self.metrics["api_response"]["total"] = timedelta(seconds=total_fetch_secs)
 
         # Compute predictions from population results
         predictions = self.predict(population)
@@ -607,7 +654,7 @@ class HourlyProjection(MetricsBase):
         Raises RetryableMetricsException if no valid data is returned.
         """
         scale = Scale.SECOND.value
-        fetch_started_at = _CLOCK.now()
+        fetch_started = _monotonic()
         usage_data_local, usage_data_start_local = self.vue.get_chart_usage(
             chan,
             chart_start,
@@ -615,7 +662,9 @@ class HourlyProjection(MetricsBase):
             scale=scale,
             unit=Unit.KWH.value,
         )
-        fetch_elapsed = _CLOCK.now() - fetch_started_at
+        # Monotonic delta: immune to NTP steps that would distort a
+        # wall-clock (FakeClock/_CLOCK) measurement.
+        fetch_elapsed = _monotonic() - fetch_started
         if (
             usage_data_start_local is None
             or usage_data_local is None
@@ -758,7 +807,13 @@ class HourlyProjection(MetricsBase):
             usage_data_local,
             prediction_window_seconds=prediction_window_seconds,
         )
-        self.logger.debug("_compute_nbc len %d (%s)", len(usage_data_local), result)
+        # NOTE (plan 3.3 asymmetry): this path intentionally does NOT pass a
+        # seconds_remaining_override — predicted_wh here is sample-window
+        # extrapolation for display/prediction endpoints, while the load
+        # manager's wall-clock seconds_remaining comes from
+        # NBCReader._parse_metrics. EnergyCache.get_current_qh is the only
+        # caller that aligns both bases via the override. Revisit before
+        # unifying: it changes predicted_wh on this production path.
         return result
 
     def _populate_device(
@@ -877,13 +932,9 @@ class HourlyProjection(MetricsBase):
         nbc_seconds = list(pop_result.nbc_seconds) if pop_result.nbc_seconds is not None else []
         per_second_data = list(pop_result.per_second_data) if pop_result.per_second_data is not None else []
 
-        # Determine the prediction window from quantization data, if available.
-        prediction_window_seconds: int | None = None
-        if energy_cache is not None and energy_cache.data is not None:
-            qs = energy_cache.quantization_seconds
-            qc = energy_cache.quantization_confidence
-            if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
-                prediction_window_seconds = qs
+        # Determine the prediction window from quantization data via the
+        # shared guard (plan 3.2) — rejects the flat-data N=2 artifact.
+        prediction_window_seconds = prediction_window_from_cache(energy_cache)
 
         nbc_result = self._compute_nbc(nbc_seconds, prediction_window_seconds)
 
@@ -893,6 +944,13 @@ class HourlyProjection(MetricsBase):
         )
         if completed_periods:
             nbc_result = inject_completed_qh(nbc_result, completed_periods)
+
+        # Log the final set *after* injection: QH2-QH4 are reconstructed from
+        # CompletedNBCPeriod records at this point, so this is the truth that
+        # reaches DeviceMetrics/HTTP. Logging inside _compute_nbc (the old
+        # behavior) dumped the pre-injection set and made healthy responses
+        # look like missing data (qh2=qh3=qh4=None on every cycle).
+        self.logger.debug("nbc_set len %d (%s)", len(nbc_seconds), nbc_result)
 
         return DeviceMetrics(
             gid=vdi.device_gid,

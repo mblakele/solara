@@ -26,12 +26,14 @@ The load manager uses **data-point age** (not fetch time) to determine whether
 NBC data is stale. The Emporia VUE API has inherent lag — the most recent
 per-second data point in a prediction may be several seconds behind when the
 API call completes. The system derives `data_point_at = fetched_at - lag` and
-compares it against a 120-second threshold.
+compares it against an 80-second threshold (`STALE_DATA_THRESHOLD_SECS`).
 
-When data is stale **and** there are pending effects (actions taken since the
-last data point that may not yet be reflected), the cycle is skipped to avoid
-double-counting load. When data is stale but there are no pending effects, the
-cycle proceeds normally since there's nothing to wait for.
+When data is older than that threshold, the cycle is skipped with a
+`stale_data` status **regardless of pending effects** — an aged prediction is
+unsafe to act on by itself. The pending-effects count in the skip log/diag is
+informational only. Data whose most recent point falls in a previous quarter
+hour is treated as stale too (`previous_qh`). `run_cycle(force=True)` bypasses
+the stale gate for debugging.
 
 If actions were taken after the last data point, the system enters a
 `waiting_for_fresh_data` state until the next NBC fetch confirms those actions.
@@ -106,14 +108,26 @@ that the load management engine tries to hit. Default is -50 Wh.
 
 How it works:
 - NBC predicts how many Wh you'll use in the current quarter-hour (negative = excess solar, positive = grid draw)
-- The engine calculates `gap = predicted_wh - target_wh`
-  - Negative gap (e.g., predicted=-2000, target=-50 → gap=-1950): too much excess solar → turn loads on to absorb it
-  - Positive gap (e.g., predicted=2000, target=-50 → gap=2050): drawing too much from grid → turn eligible loads off
+- The engine calculates `gap = target_wh - predicted_wh` (after adjusting the
+  prediction for pending effects and Tesla in-flight draw)
+  - Positive gap (e.g., predicted=-2000, target=-50 → gap=+1950): too much excess solar → turn loads on to absorb it
+  - Negative gap (e.g., predicted=2000, target=-50 → gap=-2050): drawing too much from grid → turn eligible loads off
 
 With the default of -50, the system aims to leave a small buffer
 of excess solar unabsorbed rather than driving net usage to exactly zero.
 Set it closer to 0 to absorb more solar, or more negative (e.g., -100)
 to be conservative and leave more surplus on the grid.
+
+**Two sign conventions, deliberately:**
+
+- **Engine-internal "gap"** (CycleDiagnostics, `gapminder_decide` logs):
+  `target_wh - predicted_wh` — positive means surplus to absorb. This is
+  control math; do not change it without revisiting the decision engine.
+- **Operator-facing NBC-signed figures** (e.g. the Telegram
+  "skipped: no actions" log lines): `predicted_wh - target_wh` — negative
+  = excess solar, positive = grid draw, matching how NBC predictions are
+  displayed everywhere else. Users are used to reading -N as solar;
+  these lines say so explicitly (`positive=grid draw`).
 
 ## Dry-Run Mode
 

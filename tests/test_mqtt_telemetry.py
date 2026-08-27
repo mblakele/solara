@@ -278,8 +278,34 @@ class TestTeslaStateFromSnapshot:
 class TestStartMqttSubscriber:
     """start_mqtt_subscriber() starts the background MQTT thread."""
 
+    def _drain_subscribers(self) -> None:
+        """Block until no live mqtt-subscriber threads remain (≤5 s).
+
+        Prevents module-global thread leakage from ordering-dependent
+        failures in tests that assert on subscriber thread counts.
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline:
+            live = [
+                t for t in threading.enumerate()
+                if t.name == "mqtt-subscriber" and t.is_alive()
+            ]
+            if not live:
+                return
+            for t in live:
+                t.join(timeout=0.5)
+
+    def _subscriber_threads(self) -> list[threading.Thread]:
+        """Live mqtt-subscriber threads (dying threads excluded)."""
+        return [
+            t for t in threading.enumerate()
+            if t.name == "mqtt-subscriber" and t.is_alive()
+        ]
+
     def test_starts_daemon_thread(self):
-        from mqtt_telemetry import start_mqtt_subscriber
+        from mqtt_telemetry import start_mqtt_subscriber, stop_mqtt_subscriber
         from config import Config
 
         cfg = Config(overrides={
@@ -299,3 +325,246 @@ class TestStartMqttSubscriber:
 
         # A new daemon thread should have been spawned
         assert threading.active_count() >= threads_before
+
+        # Stop the subscriber before it can construct a real paho client:
+        # once the patch above exits, the leaked daemon thread would wake
+        # from its reconnect backoff, build a real mqtt.Client() (emitting
+        # a DeprecationWarning that pytest attributes to whatever test is
+        # running at the time), and keep retrying for the rest of the
+        # session. stop_mqtt_subscriber() wakes the backoff wait and makes
+        # the loop exit.
+        stop_mqtt_subscriber()
+        subscriber = next(
+            t for t in threading.enumerate() if t.name == "mqtt-subscriber"
+        )
+        subscriber.join(timeout=5)
+        assert not subscriber.is_alive(), (
+            "mqtt-subscriber thread leaked past the test — it would keep "
+            "reconnecting in the background for the rest of the session"
+        )
+
+    def test_double_start_is_idempotent(self):
+        """A second start while the subscriber is alive must be a no-op.
+
+        Re-starting clears _stop_event and the active-client registration,
+        which would corrupt the running subscriber's shutdown path and
+        health reporting — so a duplicate start must never spawn a second
+        session.
+        """
+        from mqtt_telemetry import start_mqtt_subscriber, stop_mqtt_subscriber
+        from config import Config
+
+        cfg = Config(overrides={
+            "MQTT_HOST": "localhost",
+            "MQTT_PORT": "1883",
+            "MQTT_TOPIC_BASE": "tesla",
+        })
+
+        with patch("mqtt_telemetry.mqtt.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value = mock_client
+            mock_client.loop_forever.side_effect = Exception("stop")
+
+            start_mqtt_subscriber(cfg)
+            time.sleep(0.05)
+            threads_after_first = self._subscriber_threads()
+
+            start_mqtt_subscriber(cfg)  # must be a no-op
+            threads_after_second = self._subscriber_threads()
+
+            stop_mqtt_subscriber()
+            for t in threads_after_second:
+                t.join(timeout=5)
+
+        assert len(threads_after_first) == 1, (
+            f"expected one subscriber thread after first start, "
+            f"got {len(threads_after_first)}"
+        )
+        assert len(threads_after_second) == 1, (
+            f"second start spawned a duplicate subscriber "
+            f"({len(threads_after_second)} threads)"
+        )
+        assert mock_client_cls.call_count == 1, (
+            "second start constructed a second MQTT session"
+        )
+        assert all(not t.is_alive() for t in threads_after_second), (
+            "subscriber thread leaked past stop"
+        )
+
+    def test_stop_clears_session_so_prompt_restart_is_allowed(self, monkeypatch):
+        """After stop_mqtt_subscriber(), a new start must be permitted.
+
+        Even if the previous subscriber thread is technically still alive
+        (winding down its backoff wait), an explicit stop ends the session:
+        the stored reference must be cleared so the next start is not
+        swallowed by the duplicate-start guard.
+        """
+        from mqtt_telemetry import _subscriber_thread, stop_mqtt_subscriber
+        import mqtt_telemetry
+
+        blocker = threading.Event()
+        zombie = threading.Thread(target=blocker.wait, daemon=True)
+        zombie.start()
+        monkeypatch.setattr(mqtt_telemetry, "_subscriber_thread", zombie)
+        try:
+            assert zombie.is_alive()  # precondition: reference looks live
+
+            stop_mqtt_subscriber()
+
+            assert mqtt_telemetry._subscriber_thread is None, (
+                "stop must clear the stored subscriber reference so a "
+                "fresh start is allowed"
+            )
+        finally:
+            blocker.set()
+
+    def test_stop_restart_during_connect_supersedes_old_session(self):
+        """A stop→restart landing while S1 is inside connect() must not
+        leave S1 running forever once the handshake completes.
+
+        The restart clears the shared stop event, so S1's post-connect
+        checkpoint must rely on the generation token: exit (disconnecting
+        the client) instead of entering loop_forever alongside S2.
+        """
+        from mqtt_telemetry import start_mqtt_subscriber, stop_mqtt_subscriber
+        import mqtt_telemetry
+        from config import Config
+
+        cfg = Config(overrides={
+            "MQTT_HOST": "localhost",
+            "MQTT_PORT": "1883",
+            "MQTT_TOPIC_BASE": "tesla",
+        })
+
+        clients: list[MagicMock] = []
+        client_threads: dict[int, int] = {}
+        connect_gate = threading.Event()
+
+        def make_client():
+            client = MagicMock()
+            release = threading.Event()
+            client_threads[threading.get_ident()] = id(release)
+
+            def _connect(_host, _port, **_kw):
+                # Simulate a slow TCP handshake racing the stop/restart.
+                connect_gate.wait(timeout=10)
+
+            def _park() -> None:
+                release.wait(timeout=10)
+
+            client.connect.side_effect = _connect
+            client.loop_forever.side_effect = _park
+            client._test_release = release
+            clients.append(client)
+            return client
+
+        with patch("mqtt_telemetry.mqtt.Client", side_effect=make_client), \
+             patch.object(mqtt_telemetry, "_MQTT_RECONNECT_MIN_SECS", 0.05):
+            start_mqtt_subscriber(cfg)
+            time.sleep(0.05)  # S1 blocked inside connect()
+            threads_after_first = self._subscriber_threads()
+            assert len(threads_after_first) == 1
+            old_thread = threads_after_first[0]
+
+            stop_mqtt_subscriber()
+            start_mqtt_subscriber(cfg)  # restart clears the shared stop event
+            time.sleep(0.05)
+            threads_after_second = self._subscriber_threads()
+            assert len(threads_after_second) == 2
+
+            connect_gate.set()  # S1's handshake finally completes
+
+            old_thread.join(timeout=5)
+
+            assert not old_thread.is_alive(), (
+                "superseded session entered loop_forever after a "
+                "stop→restart cleared its stop event"
+            )
+            assert len(clients) == 2, (
+                f"superseded session reconnected "
+                f"({len(clients)} sessions constructed)"
+            )
+
+            stop_mqtt_subscriber()  # end S2
+            # The fake loop_forever only honors its release event (a real
+            # paho loop would return on disconnect()) — free every session
+            # so no parked thread outlives the test.
+            for c in clients:
+                c._test_release.set()
+            self._drain_subscribers()
+
+    def test_restart_supersedes_lingering_old_session(self):
+        """stop→start while the old thread is parked in loop_forever().
+
+        The prompt-restart path must not revive the superseded session:
+        when the old thread's disconnect finally lands, it must exit rather
+        than reconnect — and its teardown must not clear the new session's
+        active-client registration or health flag.
+        """
+        from mqtt_telemetry import (
+            _get_active_client,
+            start_mqtt_subscriber,
+            stop_mqtt_subscriber,
+        )
+        import mqtt_telemetry
+        from config import Config
+
+        cfg = Config(overrides={
+            "MQTT_HOST": "localhost",
+            "MQTT_PORT": "1883",
+            "MQTT_TOPIC_BASE": "tesla",
+        })
+
+        clients: list[MagicMock] = []
+
+        def make_client():
+            client = MagicMock()
+            release = threading.Event()
+
+            def _park() -> None:
+                # Simulate a live network loop: parked until disconnected.
+                release.wait(timeout=10)
+
+            client.loop_forever.side_effect = _park
+            client._test_release = release
+            clients.append(client)
+            return client
+
+        with patch("mqtt_telemetry.mqtt.Client", side_effect=make_client), \
+             patch.object(mqtt_telemetry, "_MQTT_RECONNECT_MIN_SECS", 0.05):
+            start_mqtt_subscriber(cfg)
+            time.sleep(0.05)  # let S1 park inside loop_forever
+            threads_after_first = self._subscriber_threads()
+            assert len(threads_after_first) == 1
+            old_thread = threads_after_first[0]
+
+            stop_mqtt_subscriber()
+            start_mqtt_subscriber(cfg)  # prompt restart while S1 unwinds
+            time.sleep(0.05)
+
+            assert len(clients) == 2, "restart did not create a new session"
+            new_client = clients[1]
+            assert _get_active_client() is new_client
+
+            clients[0]._test_release.set()  # S1's disconnect finally lands
+            old_thread.join(timeout=5)
+
+            assert not old_thread.is_alive(), (
+                "superseded session kept running after restart"
+            )
+            assert len(clients) == 2, (
+                f"superseded session reconnected "
+                f"({len(clients)} sessions constructed)"
+            )
+            assert _get_active_client() is new_client, (
+                "superseded session's teardown clobbered the new session's "
+                "active-client registration"
+            )
+
+            stop_mqtt_subscriber()
+            # Free parked fake loops (same reason as in the connect-window
+            # test) so nothing outlives the test and pollutes thread
+            # counting downstream.
+            for c in clients:
+                c._test_release.set()
+            self._drain_subscribers()

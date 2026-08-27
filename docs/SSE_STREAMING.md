@@ -237,22 +237,24 @@ SSE connections are long-lived and require a threaded worker model.
 The production deployment uses:
 
 ```yaml
-startCommand: gunicorn wsgi:app --worker-class=gthread --threads=4 --timeout=31
+startCommand: gunicorn wsgi:app -c gunicorn.conf.py --worker-class=gthread --threads=4
 ```
 
 With the gthread worker, each in-flight request — including each SSE
 client — runs in one of the `--threads` worker threads. Adjust
 `--threads` to match expected concurrency.
 
-`--timeout` is the worker heartbeat threshold (default 30 seconds), not
-a per-request deadline. Workers that stop updating their heartbeat for
-longer than `--timeout` seconds are restarted by the master. The gthread
-worker's main event loop updates the heartbeat continuously while SSE
-requests are open on pool threads, so an indefinite stream does not trip
-the timeout. `--timeout=31` in production is therefore a hung-worker
-guard, not a request limit, and `--timeout=0` (which disables the check)
-is only needed for the sync worker model, where each request blocks a
-whole worker.
+`timeout = 60` in `gunicorn.conf.py` is the worker heartbeat threshold
+(default 30 seconds), not a per-request deadline. Workers that stop
+updating their heartbeat for longer than `timeout` seconds are restarted
+by the master. The gthread worker's main event loop updates the heartbeat
+continuously while SSE requests are open on pool threads, so an indefinite
+stream does not trip the timeout. The value therefore acts as a
+hung-worker guard, not a request limit; it is pinned in
+`gunicorn.conf.py` (rather than per-deploy CLI flags) so every
+environment shares one value, at double the app's 30s fetch bound.
+`timeout = 0` (which disables the check) is only needed for the sync
+worker model, where each request blocks a whole worker.
 
 ## nginx Proxy Configuration
 

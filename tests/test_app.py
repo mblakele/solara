@@ -2,13 +2,17 @@ import contextlib
 import json
 import logging
 import os
+import threading
+import time as time_module
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import requests
+from werkzeug.exceptions import BadRequest
 from app import app
+from config import Config
 
 
 
@@ -44,6 +48,79 @@ def mock_config(**overrides: Any):
                 os.environ[key] = old
 
 
+@contextlib.contextmanager
+def real_mode_config(**overrides: Any):
+    """Configure real (non-mock) mode and reset the LoadManager singleton.
+
+    The autouse clean_env fixture has already cleared config; this sets
+    real-mode values on top (optionally overridden per-test, e.g.
+    LOAD_MANAGE_ENABLED="True") and resets the module-level singletons so
+    the test starts from a clean state. Restores singleton state on exit.
+
+    Args:
+        overrides: Key-value pairs to set in config on top of the defaults.
+    """
+    import app as app_mod
+
+    cfg = Config()
+    for key, value in {
+        "VUE_USERNAME": "",
+        "VUE_PASSWORD": "",
+        "MOCK": "False",
+        "MOCK_ERROR": "False",
+        "DEBUG": "False",
+        "LOAD_MANAGE_ENABLED": "False",
+        "LOAD_MANAGE_DRY_RUN": "True",
+        "LOAD_PLUG_CONTROLLER": "stub",
+        "LOAD_TESLA_CONTROLLER": "stub",
+        **overrides,
+    }.items():
+        cfg.set(key, value)
+
+    def _reset_singletons() -> None:
+        app_mod._state.load_manager = None
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = None
+
+    _reset_singletons()
+    try:
+        yield
+    finally:
+        _reset_singletons()
+
+
+def realistic_metrics() -> dict[str, Any]:
+    """Return a metrics dict shaped like real-mode HourlyProjection.metrics."""
+    from mockdata import _generate_hour_seconds
+    from util import compute_nbc_quarters
+
+    now = datetime.now(timezone.utc)
+    per_second = _generate_hour_seconds(12345, 42, sign=-1.0)
+    return {
+        "api_response": {"total": timedelta(microseconds=750072)},
+        "debug": True,
+        "devices": [
+            {
+                "gid": 12345,
+                "lag": timedelta(seconds=2),
+                "name": "METER",
+                "minute_predicted": -100.0,
+                "minutes_remaining": 18.0,
+                "per_second_data": per_second,
+                "prediction": -1000.0,
+                "prediction_min": -1100.0,
+                "prediction_max": -900.0,
+                "timezone": "America/Los_Angeles",
+                "nbc": compute_nbc_quarters(per_second).to_dict(),
+            }
+        ],
+        "instant": now,
+        "data_start": now.replace(second=0, microsecond=0) - timedelta(minutes=42),
+        "_fetched_at": now,
+        "_data_lag_secs": 2.0,
+    }
+
+
 
 
 class TestApp(unittest.TestCase):
@@ -54,8 +131,10 @@ class TestApp(unittest.TestCase):
     def test_health_endpoint(self):
         response = self.app.get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data.decode("utf-8"), "ok")
-        self.assertEqual(response.headers["Content-Type"], "text/plain")
+        self.assertEqual(response.headers["Content-Type"], "application/json")
+        data = json.loads(response.data)
+        self.assertIn(data["status"], ("ok", "degraded"))
+        self.assertIn("components", data)
 
     def test_index_json_mock(self):
         with mock_config():
@@ -123,7 +202,7 @@ class TestApp(unittest.TestCase):
         import app as app_mod
 
         with self._real_mode_config():
-            with patch("app.create_metrics", return_value=self._realistic_metrics()):
+            with patch("app.create_metrics", return_value=realistic_metrics()):
                 response = self.app.get("/", headers={"Accept": "application/json"})
         self.assertEqual(response.status_code, 200)
 
@@ -161,75 +240,20 @@ class TestApp(unittest.TestCase):
             self.assertEqual(result.status, "disabled")
             with app_mod._state.load_manager_lock:
                 app_mod._state.last_cycle_result = result
-            with patch("app.create_metrics", return_value=self._realistic_metrics()):
+            with patch("app.create_metrics", return_value=realistic_metrics()):
                 response = self.app.get("/", headers={"Accept": "application/json"})
         self.assertEqual(response.status_code, 200)
 
     @contextlib.contextmanager
     def _real_mode_config(self):
-        """Configure real (non-mock) mode and reset the LoadManager singleton.
-
-        The autouse clean_env fixture has already cleared config; this sets
-        real-mode values on top and resets the module-level singletons so the
-        test starts from a clean state. Restores on exit.
-        """
-        import app as app_mod
-        from config import Config
-
-        cfg = Config()
-        for key, value in {
-            "VUE_USERNAME": "",
-            "VUE_PASSWORD": "",
-            "MOCK": "False",
-            "MOCK_ERROR": "False",
-            "DEBUG": "False",
-            "LOAD_MANAGE_ENABLED": "False",
-            "LOAD_MANAGE_DRY_RUN": "True",
-            "LOAD_PLUG_CONTROLLER": "stub",
-            "LOAD_TESLA_CONTROLLER": "stub",
-        }.items():
-            cfg.set(key, value)
-        app_mod._state.load_manager = None
-        app_mod._state.load_manager_init_failed = False
-        app_mod._state.last_cycle_result = None
-        try:
+        """Configure real (non-mock) mode and reset the LoadManager singleton."""
+        with real_mode_config():
             yield
-        finally:
-            app_mod._state.load_manager = None
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = None
 
     @staticmethod
     def _realistic_metrics():
         """Return a metrics dict shaped like real-mode HourlyProjection.metrics."""
-        from mockdata import _generate_hour_seconds
-        from util import compute_nbc_quarters
-
-        now = datetime.now(timezone.utc)
-        per_second = _generate_hour_seconds(12345, 42, sign=-1.0)
-        return {
-            "api_response": {"total": timedelta(microseconds=750072)},
-            "debug": True,
-            "devices": [
-                {
-                    "gid": 12345,
-                    "lag": timedelta(seconds=2),
-                    "name": "METER",
-                    "minute_predicted": -100.0,
-                    "minutes_remaining": 18.0,
-                    "per_second_data": per_second,
-                    "prediction": -1000.0,
-                    "prediction_min": -1100.0,
-                    "prediction_max": -900.0,
-                    "timezone": "America/Los_Angeles",
-                    "nbc": compute_nbc_quarters(per_second).to_dict(),
-                }
-            ],
-            "instant": now,
-            "data_start": now.replace(second=0, microsecond=0) - timedelta(minutes=42),
-            "_fetched_at": now,
-            "_data_lag_secs": 2.0,
-        }
+        return realistic_metrics()
 
     def test_tou_endpoint_missing_start_date(self):
         response = self.app.get("/api/v1/tou")
@@ -315,12 +339,84 @@ class TestApp(unittest.TestCase):
         self.assertGreater(data["buckets"]["peak"], 0)
 
 
+
+# Sentinel for "use lm.run_cycle.return_value" in _lm_wired.
+_UNSET = object()
+
+
+def _cycle_result(**overrides):
+    """Full cycle-result payload as stored in _state.last_cycle_result."""
+    result = {
+        "status": "ok",
+        "qh": "QH1",
+        "predicted_wh": -800,
+        "adjusted_wh": -750,
+        "target_wh": -500,
+        "actions": [],
+        "diagnostics": {
+            "gap_wh": -300,
+            "hysteresis_wh": 50,
+            "seconds_remaining": 45,
+            "reason": "ok",
+            "pending_effects_count": 0,
+            "candidates": [],
+            "tesla_configured": False,
+            "tesla_state": None,
+            "tesla_error": None,
+            "tesla_login_url": None,
+            "plugs_configured": 0,
+        },
+        "sleep_hint": 30.0,
+        "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+    }
+    result.update(overrides)
+    return result
+
+
+def _make_lm(result, *, interval=30):
+    """Standard mocked LoadManager wired the way app.py expects."""
+    lm = unittest.mock.MagicMock()
+    lm.enabled = True
+    lm.dry_run = True
+    lm.target_wh = -500
+    lm.nbc_device = "test_nbc"
+    lm.state.to_dict.return_value = {}
+    if interval is not None:
+        lm.config_interval_secs = interval
+    if result is not None:
+        lm.run_cycle.return_value = result
+    return lm
+
+
 class TestLoadManagementEndpoints(unittest.TestCase):
-    """Tests for GET /api/v1/load/status."""
+    """Tests for GET /api/v1/load/status and the index endpoint's
+    load-management payload."""
 
     def setUp(self):
         self.app = app.test_client()
         self.app.testing = True
+
+    # --- shared builders -------------------------------------------------
+
+    @contextlib.contextmanager
+    def _lm_wired(self, lm, last_cycle_result=_UNSET):
+        """Install a LoadManager mock into app state under real-ish config.
+
+        last_cycle_result defaults to ``lm.run_cycle.return_value`` (what the
+        background loop would store after a cycle); pass an explicit value
+        (including None) to override.
+        """
+        import app as app_mod
+
+        with mock_config():
+            Config().set("LOAD_MANAGE_ENABLED", "True")
+            app_mod._state.load_manager = lm
+            app_mod._state.load_manager_init_failed = False
+            if last_cycle_result is _UNSET:
+                app_mod._state.last_cycle_result = lm.run_cycle.return_value
+            else:
+                app_mod._state.last_cycle_result = last_cycle_result
+            yield
 
     def test_load_status_503_when_not_initialized(self):
         """GET /load/status returns 503 when LoadManager is None."""
@@ -330,8 +426,6 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_load_status_success(self):
         """GET /load/status returns 200 with state payload."""
-        from datetime import datetime, timezone
-
         mock_lm = unittest.mock.MagicMock()
         mock_lm.enabled = True
         mock_lm.target_wh = -500
@@ -399,46 +493,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_includes_sleep_hint_meta(self):
         """Index HTML includes a meta tag with the sleep_hint value for JS."""
-        from config import Config
-        dc_config = Config()
+        lm = _make_lm(_cycle_result())
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "qh": "QH1",
-            "predicted_wh": -800,
-            "adjusted_wh": -750,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -448,32 +505,18 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_includes_top_level_sleep_hint(self):
         """Index JSON loadManagement includes top-level sleepHint."""
-        from config import Config
-        dc_config = Config()
+        lm = _make_lm(
+            {
+                "status": "ok",
+                "predicted_wh": -800,
+                "target_wh": -500,
+                "actions": [],
+                "sleep_hint": 30.0,
+                "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+            }
+        )
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -484,31 +527,18 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_fallback_sleep_hint_to_config_interval(self):
         """Index JSON falls back to config_interval_secs when lastCycleResult is empty."""
-        from config import Config
-        dc_config = Config()
+        # Minimal result without sleep_hint; lastCycleResult left empty so
+        # sleepHint should fall back to config_interval_secs.
+        lm = _make_lm(
+            {
+                "status": "ok",
+                "predicted_wh": -800,
+                "target_wh": -500,
+                "actions": [],
+            }
+        )
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        # lastCycleResult is empty — sleep_hint should fall back to config_interval_secs
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = None
+        with self._lm_wired(lm, last_cycle_result=None):
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -519,80 +549,29 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_missing_sleep_hint_no_crash(self):
         """Index HTML handles a cycle result without sleep_hint without crashing."""
-        from config import Config
-        dc_config = Config()
+        result = _cycle_result()
+        del result["sleep_hint"]  # No sleep_hint — should not cause a template error
+        lm = _make_lm(result)
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_result = {
-            "status": "ok",
-            "qh": "QH1",
-            "predicted_wh": -800,
-            "adjusted_wh": -750,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-            # No sleep_hint — should not cause a template error
-        }
-        mock_lm.run_cycle.return_value = mock_result
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_result
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
 
     def test_index_json_includes_sleep_hint_at(self):
         """Index JSON loadManagement includes sleepHintAt timestamp."""
-        from datetime import datetime
+        lm = _make_lm(
+            {
+                "status": "ok",
+                "predicted_wh": -800,
+                "target_wh": -500,
+                "actions": [],
+                "sleep_hint": 30.0,
+                "sleep_hint_at": "2025-01-15T12:00:00+00:00",
+            }
+        )
 
-        from config import Config
-        dc_config = Config()
-
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -606,32 +585,9 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_includes_sleep_hint_at_meta(self):
         """Index HTML includes a meta tag with the sleep_hint_at value for JS."""
-        from config import Config
-        dc_config = Config()
+        lm = _make_lm(_cycle_result())
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-            "sleep_hint": 30.0,
-            "sleep_hint_at": "2025-01-15T12:00:00+00:00",
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -641,32 +597,12 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_json_missing_sleep_hint_at_no_crash(self):
         """Index JSON handles missing sleepHintAt gracefully."""
-        from config import Config
-        dc_config = Config()
-
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
         # No sleep_hint_at in the result
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": -800,
-            "target_wh": -500,
-            "actions": [],
-            "sleep_hint": 30.0,
-        }
+        result = _cycle_result()
+        del result["sleep_hint_at"]
+        lm = _make_lm(result)
 
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(response.status_code, 200)
@@ -677,90 +613,23 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
     def test_index_html_missing_sleep_hint_at_no_crash(self):
         """Index HTML handles missing sleep_hint_at without crashing."""
-        from config import Config
-        dc_config = Config()
+        result = _cycle_result()
+        del result["sleep_hint_at"]  # No sleep_hint_at — should not crash
+        lm = _make_lm(result)
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.config_interval_secs = 30
-        mock_result = {
-            "status": "ok",
-            "qh": "QH1",
-            "predicted_wh": -800,
-            "adjusted_wh": -750,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-            "sleep_hint": 30.0,
-            # No sleep_hint_at — should not cause a template error
-        }
-        mock_lm.run_cycle.return_value = mock_result
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_result
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
 
     def test_index_html_handles_none_predicted_wh(self):
         """Index template renders when predicted_wh is None (no crash)."""
-        from config import Config
-        dc_config = Config()
+        result = _cycle_result(predicted_wh=None)
+        del result["sleep_hint"]
+        del result["sleep_hint_at"]
+        lm = _make_lm(result)
 
-        mock_lm = unittest.mock.MagicMock()
-        mock_lm.enabled = True
-        mock_lm.dry_run = True
-        mock_lm.target_wh = -500
-        mock_lm.nbc_device = "test_nbc"
-        mock_lm.state.to_dict.return_value = {}
-        mock_lm.run_cycle.return_value = {
-            "status": "ok",
-            "predicted_wh": None,
-            "target_wh": -500,
-            "actions": [],
-            "diagnostics": {
-                "gap_wh": -300,
-                "hysteresis_wh": 50,
-                "seconds_remaining": 45,
-                "reason": "ok",
-                "pending_effects_count": 0,
-                "candidates": [],
-                "tesla_configured": False,
-                "tesla_state": None,
-                "tesla_error": None,
-                "tesla_login_url": None,
-                "plugs_configured": 0,
-            },
-        }
-
-        with mock_config():
-            dc_config.set("LOAD_MANAGE_ENABLED", "True")
-            import app as app_mod
-
-            app_mod._state.load_manager = mock_lm
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+        with self._lm_wired(lm):
             response = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(response.status_code, 200)
@@ -1216,8 +1085,7 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
         self.assertIn("devices", result)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestLagRecalculation(unittest.TestCase):
     """Tests that lag is recalculated per request, not frozen by cache."""
 
     def setUp(self):
@@ -1250,8 +1118,8 @@ if __name__ == "__main__":
         data1 = json.loads(resp1.data)
         lag1 = self._lag_to_seconds(data1["devices"][0]["lag"])
 
-        # Small pause so elapsed time is measurable.
-        time.sleep(0.5)
+        # Small pause so the two requests are measurably distinct in time.
+        time.sleep(0.05)
 
         with mock_config():
             resp2 = self.app.get("/", headers={"Accept": "application/json"})
@@ -1382,6 +1250,26 @@ class TestSendErrorAlert(unittest.TestCase):
             app_mod._state.telegram_sender = None
 
 
+class _LoopStop:
+    """Patch helper: terminate one loop iteration via the stop event.
+
+    The loop now sleeps on ``app._stop_event`` instead of ``time.sleep``;
+    this preserves the old raise-from-sleep test contract.
+    """
+
+    def __init__(self, side_effect=None):
+        ev = MagicMock()
+        ev.is_set.return_value = False
+        ev.wait.side_effect = side_effect or InterruptedError("stop")
+        self._patch = patch("app._stop_event", ev)
+
+    def __enter__(self):
+        return self._patch.__enter__()
+
+    def __exit__(self, *exc_info):
+        return self._patch.__exit__(*exc_info)
+
+
 class TestLoadManagementLoopErrorHandling(unittest.TestCase):
     """Tests for _load_management_loop error handling."""
 
@@ -1410,7 +1298,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         app_mod._state.last_error_type = None
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+            with _LoopStop():
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1429,7 +1317,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         app_mod._state.consecutive_error_count = 0
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+            with _LoopStop():
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1462,7 +1350,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
         app_mod._state.telegram_sender = None
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=InterruptedError("stop")):
+            with _LoopStop():
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1492,7 +1380,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
                 raise InterruptedError("stop")
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=stop_after_n_sleeps):
+            with _LoopStop(stop_after_n_sleeps):
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1554,7 +1442,7 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
                 raise InterruptedError("stop")
 
         with patch("app._get_load_manager", return_value=mock_lm):
-            with patch("app.time.sleep", side_effect=capture_sleep):
+            with _LoopStop(capture_sleep):
                 with self.assertRaises(InterruptedError):
                     app_mod._load_management_loop()
 
@@ -1564,6 +1452,110 @@ class TestLoadManagementLoopErrorHandling(unittest.TestCase):
 
         app_mod._state.consecutive_error_count = 0
         app_mod._state.last_error_type = None
+
+
+class TestCooperativeShutdown(unittest.TestCase):
+    """request_shutdown() must promptly stop background services once.
+
+    Shutdown contract: a single signal (Ctrl-C / SIGTERM via the gunicorn
+    hooks) sets the stop event, wakes every sleeping background loop and SSE
+    stream immediately, and closes the LoadManager exactly once — so
+    interpreter finalization has nothing left to join and no second Ctrl-C
+    is needed.
+    """
+
+    def setUp(self):
+        import app as app_mod
+
+        self.app_mod = app_mod
+
+    def tearDown(self):
+        self.app_mod._stop_event.clear()
+
+    @staticmethod
+    def _make_success_lm():
+        from load_models import CycleResult, CycleDiagnostics
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.run_cycle.return_value = CycleResult(
+            status="ok",
+            sleep_hint=30.0,
+            sleep_hint_at="2026-01-01T12:00:00",
+            diagnostics=CycleDiagnostics(
+                gap_wh=0.0,
+                hysteresis_wh=3.0,
+                seconds_remaining=300,
+                data_point_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                reason="none",
+            ),
+        )
+        mock_lm._send_pending_notifications_sync = unittest.mock.MagicMock()
+        return mock_lm
+
+    def test_request_shutdown_sets_stop_event(self):
+        self.assertFalse(self.app_mod._stop_event.is_set())
+
+        self.app_mod.request_shutdown("test")
+
+        self.assertTrue(self.app_mod._stop_event.is_set())
+
+    def test_request_shutdown_idempotent(self):
+        """Second call must not re-close resources."""
+        mock_lm = unittest.mock.MagicMock()
+        self.app_mod._state.load_manager = mock_lm
+        self.app_mod._state.mqtt_subscriber_started = False
+        try:
+            with patch.object(
+                self.app_mod._state.sse_broadcaster, "close_all"
+            ) as spy_close:
+                with patch("mqtt_telemetry.stop_mqtt_subscriber") as spy_mqtt:
+                    self.app_mod.request_shutdown("first")
+                    self.app_mod.request_shutdown("second")
+
+            self.assertEqual(mock_lm.close.call_count, 1)
+            self.assertEqual(spy_close.call_count, 1)
+            # Stop is now UNCONDITIONAL (finding: an embedder may start the
+            # subscriber directly, bypassing the app-layer flag), and
+            # stop_mqtt_subscriber() itself is idempotent/safe-never-started.
+            # The second request_shutdown no-ops via the app-level stop event.
+            spy_mqtt.assert_called_once()
+        finally:
+            self.app_mod._state.load_manager = None
+
+    def test_loop_exits_promptly_on_shutdown_request(self):
+        """Loop must wake from its (30 s) sleep within ~2 s of a stop."""
+        mock_lm = self._make_success_lm()
+        self.app_mod._state.telegram_sender = None
+        self.app_mod._state.consecutive_error_count = 0
+
+        done = threading.Event()
+
+        def run():
+            try:
+                self.app_mod._load_management_loop()
+            finally:
+                done.set()
+
+        with patch("app._get_load_manager", return_value=mock_lm):
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            # Wait until the first cycle completed (loop parked in its sleep).
+            parked = False
+            for _ in range(250):
+                if self.app_mod._state.lm_last_cycle_finished_at is not None:
+                    parked = True
+                    break
+                time_module.sleep(0.02)
+            assert parked, "loop never finished its first cycle"
+
+            self.app_mod.request_shutdown("test-loop")
+            t.join(timeout=2.0)
+
+        self.assertFalse(
+            t.is_alive(),
+            "load loop ignored shutdown request for its full sleep interval",
+        )
+        self.app_mod._state.consecutive_error_count = 0
 
 
 class TestLoadManagerSharedCache(unittest.TestCase):
@@ -1580,64 +1572,11 @@ class TestLoadManagerSharedCache(unittest.TestCase):
     @contextlib.contextmanager
     def _enabled_real_mode(self):
         """Real-mode config with load management enabled; reset singletons."""
-        import app as app_mod
-        from config import Config
-
-        cfg = Config()
-        for key, value in {
-            "VUE_USERNAME": "",
-            "VUE_PASSWORD": "",
-            "MOCK": "False",
-            "MOCK_ERROR": "False",
-            "DEBUG": "False",
-            "LOAD_MANAGE_ENABLED": "True",
-            "LOAD_MANAGE_DRY_RUN": "True",
-            "LOAD_PLUG_CONTROLLER": "stub",
-            "LOAD_TESLA_CONTROLLER": "stub",
-            "LOAD_NBC_DEVICE": "METER",
-        }.items():
-            cfg.set(key, value)
-        app_mod._state.load_manager = None
-        app_mod._state.load_manager_init_failed = False
-        app_mod._state.last_cycle_result = None
-        try:
+        with real_mode_config(
+            LOAD_MANAGE_ENABLED="True",
+            LOAD_NBC_DEVICE="METER",
+        ):
             yield
-        finally:
-            app_mod._state.load_manager = None
-            app_mod._state.load_manager_init_failed = False
-            app_mod._state.last_cycle_result = None
-
-    @staticmethod
-    def _realistic_metrics():
-        """Return a metrics dict shaped like real-mode HourlyProjection.metrics."""
-        from mockdata import _generate_hour_seconds
-        from util import compute_nbc_quarters
-
-        now = datetime.now(timezone.utc)
-        per_second = _generate_hour_seconds(12345, 42, sign=-1.0)
-        return {
-            "api_response": {"total": timedelta(microseconds=750072)},
-            "debug": True,
-            "devices": [
-                {
-                    "gid": 12345,
-                    "lag": timedelta(seconds=2),
-                    "name": "METER",
-                    "minute_predicted": -100.0,
-                    "minutes_remaining": 18.0,
-                    "per_second_data": per_second,
-                    "prediction": -1000.0,
-                    "prediction_min": -1100.0,
-                    "prediction_max": -900.0,
-                    "timezone": "America/Los_Angeles",
-                    "nbc": compute_nbc_quarters(per_second).to_dict(),
-                }
-            ],
-            "instant": now,
-            "data_start": now.replace(second=0, microsecond=0) - timedelta(minutes=42),
-            "_fetched_at": now,
-            "_data_lag_secs": 2.0,
-        }
 
     def test_reader_uses_app_energy_cache(self):
         """NBCReader reads from the shared app-level EnergyCache, not a private one."""
@@ -1682,7 +1621,7 @@ class TestLoadManagerSharedCache(unittest.TestCase):
         with self._enabled_real_mode():
             with patch(
                 "app.create_metrics",
-                return_value=self._realistic_metrics(),
+                return_value=realistic_metrics(),
             ) as mock_metrics:
                 lm = app_mod._get_load_manager()
                 self.assertIsNotNone(lm)
@@ -1694,3 +1633,132 @@ class TestLoadManagerSharedCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestValidateDatesHygiene(unittest.TestCase):
+    """Injected clock + explicit-DST handling in date parsing (plan 3.8)."""
+
+    def setUp(self):
+        self.app = app.test_client()
+
+    def test_validate_dates_accepts_injected_clock(self):
+        """end_date defaults to the INJECTED clock's time, not raw datetime.now()."""
+        from app import _validate_dates
+        from clock import FakeClock
+
+        fake = FakeClock(datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc))
+        start, end = _validate_dates("2026-01-01", None, clock=fake)
+        self.assertEqual(end, fake.now())
+        self.assertIsNotNone(end.tzinfo)
+
+    def test_validate_dates_default_end_is_utc_aware(self):
+        """Without injection, end_date defaults to an aware UTC instant."""
+        from app import _validate_dates
+        from clock import RealClock
+
+        real = RealClock()
+        start, end = _validate_dates("2026-01-01", None)
+        self.assertIsNotNone(end.tzinfo)
+        self.assertLess(abs((end - real.now()).total_seconds()), 60)
+
+    def test_validate_dates_missing_start_aborts(self):
+        """Missing start_date aborts with 400 (werkzeug BadRequest)."""
+        from app import _validate_dates
+
+        with self.assertRaises(BadRequest):
+            _validate_dates(None, None)
+
+    def test_parse_date_rejects_nonexistent_spring_forward_time(self):
+        """A nonexistent local time (DST spring-forward gap) raises ValueError."""
+        import pytest
+        from app import parse_date_to_utc
+
+        with patch("app.get_timezone", return_value="America/Los_Angeles"):
+            with pytest.raises(ValueError):
+                # 2026-03-08 02:30 PST does not exist (clocks jump to 03:00).
+                parse_date_to_utc("2026-03-08T02:30:00")
+
+    def test_parse_date_rejects_ambiguous_fall_back_time(self):
+        """An ambiguous local time (DST fall-back overlap) raises ValueError."""
+        import pytest
+        from app import parse_date_to_utc
+
+        with patch("app.get_timezone", return_value="America/Los_Angeles"):
+            with pytest.raises(ValueError):
+                # 2026-11-01 01:30 occurs twice (PDT then PST).
+                parse_date_to_utc("2026-11-01T01:30:00")
+
+    def test_parse_date_unambiguous_local_time_still_parses(self):
+        """Ordinary local times still localize + convert to UTC correctly."""
+        from app import parse_date_to_utc
+
+        with patch("app.get_timezone", return_value="America/Los_Angeles"):
+            dt = parse_date_to_utc("2026-06-15T12:00:00")
+        self.assertEqual(dt.utcoffset(), timedelta(0))
+        self.assertEqual(dt.hour, 19)  # 12:00 PDT == 19:00 UTC
+
+
+class TestStallWatchdogWiring(unittest.TestCase):
+    """The LM loop must check the watchdog BEFORE refreshing finished_at.
+
+    Review #1: refreshing ``lm_last_cycle_finished_at`` immediately before
+    calling ``_check_stall_watchdog`` makes ``stalled_for ≈ 0`` every
+    iteration, so the CRITICAL branch was unreachable through the loop.
+    """
+
+    def setUp(self):
+        import app as app_mod
+
+        self._app = app_mod
+        app_mod._stall_critical_last_at = None
+        app_mod._state.lm_last_cycle_finished_at = None
+
+    def tearDown(self):
+        self._app._stall_critical_last_at = None
+        self._app._state.lm_last_cycle_finished_at = None
+
+    def test_loop_fires_watchdog_after_long_previous_iteration(self):
+        """A >300s iteration trips the watchdog at its END (before refresh)."""
+        import time as time_module
+        from datetime import timedelta
+
+        from config import Config
+
+        class _StopLoop(BaseException):
+            """Sentinel raised from patched sleep to exit the infinite loop."""
+
+        # Simulate: the PREVIOUS iteration finished 400s ago (e.g. run_cycle
+        # hung for ~7 min before finally returning). The next iteration's
+        # tail check must fire the CRITICAL watchdog.
+        self._app._state.lm_last_cycle_finished_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=400)
+        )
+
+        def fake_sleep(_secs):
+            raise _StopLoop()
+
+        stop_ev = MagicMock()
+        stop_ev.is_set.return_value = False
+        stop_ev.wait.side_effect = fake_sleep
+
+        with patch.object(
+            self._app, "_get_load_manager", return_value=None
+        ), patch("app._stop_event", stop_ev):
+            Config().set("LOAD_MANAGE_ENABLED", "True")
+            try:
+                with self.assertLogs("app", level="CRITICAL") as captured:
+                    with self.assertRaises(_StopLoop):
+                        self._app._load_management_loop()
+            finally:
+                Config().set("LOAD_MANAGE_ENABLED", "False")
+
+        criticals = [
+            r for r in captured.records if r.levelno == logging.CRITICAL
+        ]
+        self.assertTrue(
+            criticals,
+            "stall watchdog never fired through the loop wiring",
+        )
+        # After the firing check, finished_at must have been refreshed so
+        # the NEXT iteration measures only its own duration.
+        self.assertIsNotNone(self._app._state.lm_last_cycle_finished_at)

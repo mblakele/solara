@@ -101,6 +101,13 @@ TESLA_CHARGE_AMPS_MAX_DEFAULT: int = 48
 TESLA_NOMINAL_VOLTAGE: int = 240
 """Nominal mains voltage (V) used for watts/amps conversions."""
 
+TESLA_ZERO_AMPS_CLEAR_SAMPLES: int = 2
+"""Consecutive reported_amps==0 telemetry samples required to confirm the
+car actually stopped drawing power before clearing ``last_commanded_amps``.
+
+A single 0 A frame can be a stale or in-transit sample during ramp-up;
+clearing on it drops the in-flight delta and overstates surplus."""
+
 TESLA_TOKEN_REFRESH_INTERVAL_SECS: int = 7 * 3600
 """Proactive Tesla token-refresh window in seconds.
 

@@ -711,7 +711,7 @@ class TestTelegramDeviceWhitelist:
                     action="turn_off",
                     timestamp=now,
                     data_point_at=now,
-                    power_watts=1500.0,
+                    power_watts=-1500.0,
                     target_amps=None,
                 )
             ],

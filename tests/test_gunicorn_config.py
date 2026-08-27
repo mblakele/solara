@@ -1,0 +1,204 @@
+"""Tests for gunicorn shutdown hooks and app-level signal hook installation.
+
+Shutdown contract: gunicorn's ``post_worker_init`` hook must chain a
+cooperative-shutdown handler over the worker's installed signal handlers so
+one Ctrl-C/SIGTERM stops background services promptly, and ``worker_int`` /
+``worker_exit`` must funnel through ``app.request_shutdown``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+import signal
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import app as app_mod
+
+
+def _load_gunicorn_conf():
+    """Load gunicorn.conf.py (dotted filename needs explicit loading)."""
+    path = Path(__file__).resolve().parent.parent / "gunicorn.conf.py"
+    spec = importlib.util.spec_from_file_location("gunicorn_conf", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_HOOKED_SIGNALS = (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+class TestDeploymentConfiguration(unittest.TestCase):
+    """Deploy commands share one arbiter timeout via gunicorn.conf.py.
+
+    The timeout is pinned in ``gunicorn.conf.py`` (see
+    TestArbiterTimeoutSetting) so Render and Replit cannot drift. Startup
+    commands therefore must NOT carry their own ``--timeout`` override
+    (which would reintroduce per-environment divergence), and must load the
+    shared conf file so they also pick up the cooperative-shutdown hooks.
+    """
+
+    def _startup_commands(self) -> list[tuple[str, str]]:
+        """(source, command) pairs for each deployment environment."""
+        replit_config = (_PROJECT_ROOT / ".replit").read_text(encoding="utf-8")
+        render_config = (_PROJECT_ROOT / "render.yaml").read_text(encoding="utf-8")
+
+        return [
+            (
+                ".replit",
+                next(
+                    line.split("=", 1)[1]
+                    for line in replit_config.splitlines()
+                    if line.startswith("run = ")
+                ),
+            ),
+            (
+                "render.yaml",
+                next(
+                    line.split(":", 1)[1]
+                    for line in render_config.splitlines()
+                    if "startCommand:" in line
+                ),
+            ),
+        ]
+
+    def test_no_environment_overrides_the_shared_timeout(self):
+        for source, command in self._startup_commands():
+            with self.subTest(source=source):
+                self.assertIsNone(
+                    re.search(r"--timeout(?:=|\s+)\d+", command),
+                    f"{source} sets its own --timeout; the value is pinned "
+                    "in gunicorn.conf.py",
+                )
+
+    def test_all_environments_load_the_shared_conf(self):
+        for source, command in self._startup_commands():
+            with self.subTest(source=source):
+                self.assertIn(
+                    "-c gunicorn.conf.py",
+                    command,
+                    f"{source} must load gunicorn.conf.py so it shares the "
+                    "pinned timeout and shutdown hooks",
+                )
+
+
+class TestSignalHookInstallation(unittest.TestCase):
+    """install_shutdown_signal_hooks() chains over existing handlers."""
+
+    def setUp(self):
+        self._saved = {sig: signal.getsignal(sig) for sig in _HOOKED_SIGNALS}
+        app_mod._stop_event.clear()
+        app_mod._shutdown_hooks_installed = False
+        self.conf = _load_gunicorn_conf()
+
+    def tearDown(self):
+        for sig, handler in self._saved.items():
+            signal.signal(sig, handler)
+        app_mod._stop_event.clear()
+        app_mod._shutdown_hooks_installed = False
+
+    def test_post_worker_init_installs_callable_handlers(self):
+        # Give every hooked signal a recognizable callable predecessor
+        # (under pytest some default to SIG_DFL, which must stay untouched).
+        for sig in _HOOKED_SIGNALS:
+            signal.signal(sig, self._saved[sig] if callable(self._saved[sig])
+                          else signal.default_int_handler)
+        app_mod._state.shutdown_hooks_installed = False
+
+        self.conf.post_worker_init(MagicMock())
+
+        self.assertTrue(app_mod._shutdown_hooks_installed)
+        for sig in _HOOKED_SIGNALS:
+            handler = signal.getsignal(sig)
+            self.assertTrue(
+                callable(handler),
+                f"signal {sig} lost its handler after installation",
+            )
+            self.assertNotEqual(handler, self._saved[sig])
+
+    def test_install_is_idempotent(self):
+        self.conf.post_worker_init(MagicMock())
+        first = {sig: signal.getsignal(sig) for sig in _HOOKED_SIGNALS}
+
+        self.conf.post_worker_init(MagicMock())
+        second = {sig: signal.getsignal(sig) for sig in _HOOKED_SIGNALS}
+
+        self.assertEqual(first, second, "second install re-wrapped handlers")
+
+    def test_chained_handler_requests_shutdown_then_delegates(self):
+        delegated = []
+
+        def fake_previous(signum, frame):
+            delegated.append(signum)
+
+        # Install a recognizable predecessor for SIGTERM, then hook.
+        signal.signal(signal.SIGTERM, fake_previous)
+        app_mod._shutdown_hooks_installed = False
+        self.conf.post_worker_init(MagicMock())
+
+        handler = signal.getsignal(signal.SIGTERM)
+        handler(signal.SIGTERM, None)
+
+        self.assertTrue(app_mod._stop_event.is_set())
+        self.assertEqual(delegated, [signal.SIGTERM])
+
+    def test_non_callable_disposition_left_untouched(self):
+        signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+        app_mod._shutdown_hooks_installed = False
+
+        self.conf.post_worker_init(MagicMock())
+
+        self.assertIs(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
+
+
+class TestGunicornHooks(unittest.TestCase):
+    """worker_int/worker_exit funnel through app.request_shutdown."""
+
+    def setUp(self):
+        self.conf = _load_gunicorn_conf()
+
+    def test_worker_int_calls_request_shutdown(self):
+        with patch.object(app_mod, "request_shutdown") as spy:
+            self.conf.worker_int(MagicMock())
+        spy.assert_called_once_with("gunicorn:worker_int")
+
+    def test_worker_exit_calls_request_shutdown(self):
+        with patch.object(app_mod, "request_shutdown") as spy:
+            self.conf.worker_exit(MagicMock(), MagicMock())
+        spy.assert_called_once_with("gunicorn:worker_exit")
+
+
+class TestArbiterTimeoutSetting(unittest.TestCase):
+    """gunicorn.conf.py pins the arbiter watchdog above the app fetch bound.
+
+    The gthread worker heartbeats ~1s from its main loop regardless of pool
+    threads, so ``--timeout`` is a hung-worker guard, not a request limit.
+    It is pinned in gunicorn.conf.py (not per-deploy CLI flags) so every
+    environment shares one value, and kept well above EnergyCache's 30s
+    fetch bound so watchdog and application timeout can never converge.
+    """
+
+    def setUp(self):
+        self.conf = _load_gunicorn_conf()
+
+    def test_timeout_pinned_at_60(self):
+        self.assertEqual(self.conf.timeout, 60)
+
+    def test_timeout_materially_above_fetch_bound(self):
+        import inspect
+
+        from energy_cache import EnergyCache
+
+        fetch_default = inspect.signature(EnergyCache).parameters[
+            "fetch_timeout_secs"
+        ].default
+        self.assertGreaterEqual(
+            self.conf.timeout,
+            2 * fetch_default,
+            f"arbiter timeout {self.conf.timeout}s must be at least double "
+            f"the app fetch bound ({fetch_default}s)",
+        )

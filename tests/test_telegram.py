@@ -303,7 +303,7 @@ class TestNotificationEvent:
                     action="turn_off",
                     timestamp=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
                     data_point_at=datetime(2025, 6, 15, 14, 29, 0, tzinfo=timezone.utc),
-                    power_watts=1500,
+                    power_watts=-1500,
                 ),
                 PendingEffect(
                     device_name="tesla",

@@ -17,11 +17,13 @@ from typing import Any
 
 from clock import Clock, RealClock
 from constants import MIN_SLEEP_SECS, QUANTIZATION_CONFIDENCE_THRESHOLD
-from quantization import detect_quantization
+from quantization import detect_quantization, usable_window
 from util import (
     CompletedNBCPeriod,
+    QH_PERIOD_SECONDS,
     RetryableError,
     ceil_to_qh,
+    floor_to_qh,
     compute_nbc_quarters,
     qh_seconds_remaining,
 )
@@ -34,6 +36,14 @@ class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
 
     Ensures worker threads don't block process exit when shutdown(wait=False)
     is called while a worker is blocked in a system call.
+
+    Worker threads are deliberately NOT registered in
+    ``concurrent.futures.thread._threads_queues``: at interpreter exit,
+    ``_python_exit`` joins every registered thread (daemon or not), so a
+    worker blocked in an in-flight fetch (bounded by the fetch timeout) would
+    stall gunicorn worker shutdown for that whole duration. Unregistered
+    daemon threads are simply abandoned when the process exits, which matches
+    this class's contract of never blocking process exit.
     """
 
     def _adjust_thread_count(self) -> None:  # type: ignore[override]
@@ -88,7 +98,13 @@ class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
             )
             t.start()
             self._threads.add(t)  # type: ignore[attr-defined]
-            concurrent.futures.thread._threads_queues[t] = self._work_queue  # type: ignore[index]
+            # Deliberately NOT registering in
+            # concurrent.futures.thread._threads_queues: registration would
+            # make _python_exit join this thread at interpreter exit,
+            # blocking process shutdown on any in-flight fetch (see class
+            # docstring). Idle workers block on the work queue and die with
+            # the daemon thread at exit; the weakref above still wakes them
+            # when the executor is garbage-collected.
 
 
 def _root_cause(exc: BaseException) -> BaseException:
@@ -202,6 +218,9 @@ class EnergyCache:
         self._ttl_seconds: int = ttl_seconds
         self._clock: Clock = clock if clock is not None else RealClock()
         self._lock: threading.Lock = threading.Lock()
+        # Single-flight gate: serializes fetches WITHOUT holding _lock,
+        # so readers never block behind network I/O (plan 2.2).
+        self._fetch_lock: threading.Lock = threading.Lock()
         self._fetch_timeout_secs: int = fetch_timeout_secs
 
     # ------------------------------------------------------------------
@@ -599,12 +618,16 @@ class EnergyCache:
             quantization_confidence=qc,
         )
 
+        period_details = " ".join(
+            f"{p.start.isoformat()}={p.raw_wh:.2f}Wh" for p in deduped
+        )
         logger.debug(
             "EnergyCache compact: %d samples → %d samples, "
-            "%d completed periods",
+            "%d completed periods [%s]",
             len(samples),
             len(remaining_samples),
             len(deduped),
+            period_details,
         )
 
     def _merge_samples_replace(
@@ -789,9 +812,15 @@ class EnergyCache:
 
         Returns:
             Tuple of *(metrics_dict_or_none, was_fresh)*.
+
+        Locking contract (plan 2.2): the state lock ``_lock`` guards only
+        snapshot reads and store operations — never network I/O. Fetches
+        run under a separate single-flight gate (``_fetch_lock``) so
+        concurrent callers produce at most one fetch per refresh while
+        readers proceed uninterrupted.
         """
         with self._lock:
-            # Check if cache is valid (non-expired data exists).
+            # Fast path: serve a valid snapshot without any I/O.
             if not force and self._is_valid_unlocked(now):
                 result = self._build_result()
                 logger.debug(
@@ -803,7 +832,16 @@ class EnergyCache:
                 )
                 return result, False
 
-            # Fetch fresh data with timeout protection.
+        with self._fetch_lock:
+            # Double-check: another fetcher may have refreshed the cache
+            # while we waited on the single-flight gate.
+            with self._lock:
+                if not force and self._is_valid_unlocked(now):
+                    result = self._build_result()
+                    logger.debug("EnergyCache cache_hit after fetch gate")
+                    return result, False
+
+            # Fetch fresh data with timeout protection — outside _lock.
             fetch_start = _time_mod.monotonic()
             result = self._run_fetch_with_timeout(fetch_func)
             fetch_elapsed = _time_mod.monotonic() - fetch_start
@@ -813,18 +851,18 @@ class EnergyCache:
                 "ok" if result is not None else "None",
             )
 
-            if result is None:
-                # Timed out or fetch_func returned None — return stale cache
-                # if available, so callers get stale-but-valid data instead
-                # of crashing on None.
-                if self._data is not None:
-                    return self._build_result(), False
-                logger.warning(
-                    "EnergyCache: fetch failed and no stale cache available"
-                )
-                return (None, True)
+            with self._lock:
+                if result is None:
+                    # Timed out or raised — serve stale cache if available,
+                    # so callers get stale-but-valid data instead of
+                    # crashing on None.
+                    if self._data is not None:
+                        return self._build_result(), False
+                    logger.warning(
+                        "EnergyCache: fetch failed and no stale cache available"
+                    )
+                    return (None, True)
 
-            if result is not None:
                 new_samples: list[float] = []
 
                 # Extract per-second data from the result dict.
@@ -890,9 +928,6 @@ class EnergyCache:
 
                 return (result, True) if result is not None else (None, True)
 
-            # fetch_func returned None — keep existing cache data.
-            return (None, True)
-
     # ------------------------------------------------------------------
     # Quarter-hour extraction (caller holds lock when called from
     # get_current_qh, but we acquire it here too for standalone safety.)
@@ -922,6 +957,8 @@ class EnergyCache:
             samples = self._data.samples
             samples_len = len(samples)
             data_start = self._data.data_start
+            quantization_seconds = self._data.quantization_seconds
+            quantization_confidence = self._data.quantization_confidence
 
         if samples_len == 0:
             return None
@@ -942,14 +979,41 @@ class EnergyCache:
                 f"data_start {data_start} not aligned to QH boundary"
             )
 
-        # Use quantization-aware prediction window when available.
-        prediction_window_seconds: int | None = None
-        qs = self._data.quantization_seconds
-        qc = self._data.quantization_confidence
-        if qs is not None and qc is not None and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD:
-            prediction_window_seconds = qs
+        # Stale-QH guard: if the trailing (incomplete) chunk's wall window
+        # has already ended, the cache predates a quarter boundary — e.g. an
+        # API outage across :00/:15/:30/:45, exactly when stale serving
+        # matters. Extrapolating it with the wall-clock remainder would
+        # credit a full quarter of *future* energy to a window that is
+        # already over; report no incomplete QH instead (same contract as
+        # the qh1-complete branch below).
+        chunk_start = data_start + timedelta(
+            seconds=(samples_len // QH_PERIOD_SECONDS) * QH_PERIOD_SECONDS
+        )
+        if floor_to_qh(now) >= chunk_start + timedelta(seconds=QH_PERIOD_SECONDS):
+            logger.info(
+                "EnergyCache get_current_qh: cached window starting %s ended "
+                "before %s; reporting no incomplete QH",
+                chunk_start,
+                now,
+            )
+            return None
 
-        nbc = compute_nbc_quarters(samples, prediction_window_seconds)
+        # Use quantization-aware prediction window when available. The
+        # shared guard rejects the flat-data N=2 artifact (plan 3.2).
+        prediction_window_seconds: int | None = usable_window(
+            quantization_seconds,
+            quantization_confidence,
+        )
+
+        # One time base (plan 3.3): extrapolate with wall-clock remaining
+        # so prediction and downstream decision math agree even when data
+        # lag makes sample count diverge from elapsed time.
+        wall_remaining = qh_seconds_remaining(now)
+        nbc = compute_nbc_quarters(
+            samples,
+            prediction_window_seconds,
+            seconds_remaining_override=wall_remaining,
+        )
 
         # Map from attribute names to QH labels for fallback lookup.
         _qh_attrs = [("qh1", "QH1"), ("qh2", "QH2"), ("qh3", "QH3"), ("qh4", "QH4")]
@@ -1012,30 +1076,29 @@ class EnergyCache:
         """
         if self._data is None:
             return interval_seconds
-        if self._data.quantization_confidence is None or self._data.quantization_confidence < QUANTIZATION_CONFIDENCE_THRESHOLD:
+        data = self._data
+        # Single source of truth (plan 3.2): the shared guard rejects
+        # sub-MIN-window artifacts (flat-data N=2 at confidence 1.0) that
+        # the raw inline check used to let through.
+        quantum = usable_window(data.quantization_seconds, data.quantization_confidence)
+        if quantum is None:
             return interval_seconds
 
         # Early-exit: data older than 2× quantum → sleep minimum.
-        if (
-            self._data.last_sample_at is not None
-            and self._data.quantization_seconds is not None
-        ):
-            data_age = (now - self._data.last_sample_at).total_seconds()
-            if data_age > 2 * self._data.quantization_seconds:
+        if data.last_sample_at is not None:
+            data_age = (now - data.last_sample_at).total_seconds()
+            if data_age > 2 * quantum:
                 return MIN_SLEEP_SECS
 
         # At this point quantization fields are guaranteed to be set.
-        assert self._data.data_start is not None
-        assert self._data.quantization_seconds is not None
-        assert self._data.quantization_offset is not None
+        assert data.data_start is not None
+        assert data.quantization_offset is not None
 
         # quantization offset is relative to data_start.
-        offset_start = self._data.data_start + timedelta(seconds=self._data.quantization_offset)
+        offset_start = data.data_start + timedelta(seconds=data.quantization_offset)
         seconds_from_start = (now - offset_start).total_seconds()
-        seconds_in_period = seconds_from_start % self._data.quantization_seconds
-        seconds_remaining = (
-            self._data.quantization_seconds - seconds_in_period
-        ) % self._data.quantization_seconds
+        seconds_in_period = seconds_from_start % quantum
+        seconds_remaining = (quantum - seconds_in_period) % quantum
         logger.debug(
             "EnergyCache.sleep_interval_adjust: %.1f > %.1f",
             interval_seconds,

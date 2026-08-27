@@ -5,7 +5,9 @@ Covers:
   - compute_nbc_quarter prediction window behavior
 """
 
+import json
 import unittest
+from pathlib import Path
 
 import pytest
 
@@ -214,3 +216,240 @@ class TestRetryableError:
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# =============================================================================
+# Atomic persistence (plan subtask 2.3, fixes R3)
+# =============================================================================
+
+
+class TestAtomicWriteJson:
+    """atomic_write_json must never expose partial or corrupt files."""
+
+    def test_roundtrip_writes_parseable_json(self, tmp_path):
+        from util import atomic_write_json
+
+        target = tmp_path / "out.json"
+        atomic_write_json(target, {"refresh_token": "r", "expires": 5})
+        assert json.loads(target.read_text(encoding="utf-8")) == {
+            "refresh_token": "r",
+            "expires": 5,
+        }
+
+    def test_failed_serialization_leaves_original_intact(self, tmp_path):
+        """A mid-write failure preserves the previous file and cleans up."""
+        from util import atomic_write_json
+
+        target = tmp_path / "tokens.json"
+        target.write_text('{"keep": true}', encoding="utf-8")
+
+        with pytest.raises(TypeError):
+            atomic_write_json(target, {"bad": object()})
+
+        assert json.loads(target.read_text(encoding="utf-8")) == {"keep": True}
+        leftovers = list(tmp_path.glob("*.tmp"))
+        assert leftovers == [], f"temp files leaked: {leftovers}"
+
+    def test_concurrent_writers_converge_to_one_valid_file(self, tmp_path):
+        """N racing writers leave exactly one parseable payload behind."""
+        import threading
+
+        from util import atomic_write_json
+
+        target = tmp_path / "shared.json"
+        barrier = threading.Barrier(8)
+
+        def writer(i: int) -> None:
+            barrier.wait()
+            atomic_write_json(target, {"writer": i})
+
+        threads = [
+            threading.Thread(target=writer, args=(i,)) for i in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        assert isinstance(payload.get("writer"), int)
+
+    def test_owner_only_permissions(self, tmp_path):
+        """Credential files must not be world/group readable."""
+        import stat
+
+        from util import atomic_write_json
+
+        target = tmp_path / "secret.json"
+        atomic_write_json(target, {"access_token": "x"})
+        mode = stat.S_IMODE(target.stat().st_mode)
+        assert mode & 0o077 == 0, f"perms too open: {oct(mode)}"
+
+    def test_accepts_str_paths(self, tmp_path):
+        from util import atomic_write_json
+
+        target = tmp_path / "s.json"
+        atomic_write_json(str(target), {"ok": 1})
+        assert json.loads(target.read_text(encoding="utf-8")) == {"ok": 1}
+
+
+class TestAtomicWriteText:
+    """Text twin for the fleet-telemetry timestamp dotfile."""
+
+    def test_roundtrip_and_replace(self, tmp_path):
+        from util import atomic_write_text
+
+        target = tmp_path / "dotfile"
+        atomic_write_text(target, "first\n")
+        assert target.read_text(encoding="utf-8") == "first\n"
+        atomic_write_text(target, "second\n")
+        assert target.read_text(encoding="utf-8") == "second\n"
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").exists(),
+    reason="/proc is required to map fds to open paths (Linux)",
+)
+class TestAtomicWriteDirectoryFsync:
+    """os.replace alone is not durable: until the *directory* entry is
+    fsynced, a crash/power loss can lose the rename itself and revert the
+    file to its previous contents even though the new data reached disk."""
+
+    def test_directory_is_fsynced_after_replace(self, tmp_path, monkeypatch):
+        """The final fsync in an atomic write must target the parent dir."""
+        import os
+
+        from util import atomic_write_text
+
+        real_fsync = os.fsync
+        synced_paths: list[str] = []
+
+        def spying_fsync(fd: int) -> None:
+            try:
+                # /proc maps each open fd to its path while it is open.
+                synced_paths.append(os.readlink(f"/proc/self/fd/{fd}"))
+            except OSError:  # pragma: no cover - fd vanished mid-test
+                synced_paths.append("<unmapped>")
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", spying_fsync)
+
+        target = tmp_path / "tokens.json"
+        atomic_write_text(target, "payload\n")
+
+        # Two barriers total: file data first, then the rename via its dir.
+        assert len(synced_paths) == 2, (
+            f"expected 2 fsyncs (file, then dir), saw {synced_paths}"
+        )
+        tmp_file_path, dir_path = synced_paths
+        assert tmp_file_path.startswith(str(tmp_path)), (
+            f"first fsync must be the temp file, saw {tmp_file_path}"
+        )
+        assert dir_path == str(tmp_path), (
+            f"last fsync must target the destination directory {tmp_path}, "
+            f"saw {dir_path}"
+        )
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX directory fds are unsupported on Windows",
+    )
+    def test_fsync_directory_helper_accepts_real_dir(self, tmp_path):
+        """_fsync_directory runs cleanly against a live directory."""
+        from util import _fsync_directory
+
+        _fsync_directory(tmp_path)  # must not raise
+
+
+class TestAtomicPersistenceWiring:
+    """Production credential writes go through the atomic helpers."""
+
+    def test_save_tesla_tokens_uses_atomic_write(self, tmp_path, monkeypatch):
+        import load_controllers
+        from load_controllers import save_tesla_tokens
+
+        calls: list[tuple] = []
+
+        def fake_atomic(path, data):
+            calls.append((path, data))
+
+        monkeypatch.setattr(
+            load_controllers, "atomic_write_json", fake_atomic
+        )
+        tokens_path = tmp_path / ".tesla-tokens.json"
+        save_tesla_tokens("rt", "at", 12345, tokens_path=tokens_path)
+        assert calls, "save_tesla_tokens must use atomic_write_json"
+        written_path, written_data = calls[0]
+        assert Path(written_path) == tokens_path
+        assert written_data == {
+            "refresh_token": "rt",
+            "access_token": "at",
+            "expires": 12345,
+        }
+
+    def test_dotfile_write_uses_atomic_text(self, tmp_path, monkeypatch):
+        import load_manager as lm_mod
+
+        recorded: dict[str, str] = {}
+
+        def fake_atomic(path, text):
+            recorded["path"] = str(path)
+            recorded["text"] = text
+
+        monkeypatch.setattr(lm_mod, "atomic_write_text", fake_atomic)
+
+        dotfile = tmp_path / ".fleet-telemetry-provisioned"
+        assert hasattr(lm_mod, "_write_fleet_telemetry_dotfile")
+        lm_mod._write_fleet_telemetry_dotfile(dotfile)
+        assert Path(recorded["path"]) == dotfile
+        assert recorded["text"].endswith("\n")
+
+
+# =============================================================================
+# Unified time base for QH extrapolation (plan subtask 3.3, fixes A3)
+# =============================================================================
+
+
+class TestSecondsRemainingOverride:
+    """compute_nbc_quarter must accept a wall-clock remaining override."""
+
+    def test_compute_nbc_quarter_honors_override(self):
+        from util import compute_nbc_quarter
+
+        values = [0.001] * 100
+        default = compute_nbc_quarter(values)
+        overridden = compute_nbc_quarter(
+            values, seconds_remaining_override=300
+        )
+
+        assert default.remaining_seconds == 800
+        assert overridden.remaining_seconds == 300
+        expected = default.raw_wh + 300 * default.prediction_w
+        assert overridden.predicted_wh == pytest.approx(expected)
+
+    def test_negative_override_clamped_to_zero(self):
+        from util import compute_nbc_quarter
+
+        q = compute_nbc_quarter(
+            [0.001] * 100, seconds_remaining_override=-5
+        )
+        assert q.remaining_seconds == 0
+        assert q.predicted_wh == pytest.approx(q.raw_wh)
+
+    def test_override_ignored_for_complete_quarter(self):
+        from util import compute_nbc_quarter
+
+        q = compute_nbc_quarter(
+            [0.001] * 900, seconds_remaining_override=123
+        )
+        assert q.complete is True
+
+    def test_quarters_passthrough_applies_to_qh1_only(self):
+        from util import compute_nbc_quarters
+
+        values = [0.001] * (900 + 100)
+        qset = compute_nbc_quarters(
+            values, seconds_remaining_override=250
+        )
+        assert qset.qh1.remaining_seconds == 250
+        assert qset.qh2.complete is True

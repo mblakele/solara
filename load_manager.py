@@ -8,12 +8,14 @@ and TeslaAuthError exception.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, time, timezone
+import itertools
 import logging
 import sys
 import threading
 import time as _time_mod
+import uuid
 
 # Third-party imports.
 from typing import Any, Callable
@@ -29,9 +31,7 @@ from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
-    MIN_QUANTIZATION_WINDOW_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
-    QUANTIZATION_CONFIDENCE_THRESHOLD,
     STALE_DATA_THRESHOLD_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
@@ -47,6 +47,8 @@ from config_loader import (
     load_vocolinc_credentials,
     load_vocolinc_plugs_from_file,
 )
+
+from util import atomic_write_text
 
 from load_controllers import (
     CompositePlugController,
@@ -82,6 +84,7 @@ from load_models import (
 )
 
 from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder, DecideContext
+from quantization import usable_window
 
 from energy_cache import EnergyCache
 
@@ -143,6 +146,31 @@ logger = logging.getLogger(__name__)
 
 _no_telemetry_warn_cycle: int = 0
 _NO_TELEMETRY_WARN_INTERVAL = 10
+
+# === Cycle correlation (plan 1.3) ===
+# Boot-scoped id prefix + per-process monotonic counter, e.g. "c17-a3f9".
+# Scope decision (a): ids tag the LM layer only — pipeline stages, NBC
+# reader, actions, and serialized payloads. EnergyCache/fetch-layer logs
+# stay untagged; get_or_fetch() is cycle-agnostic by design.
+_BOOT_ID = uuid.uuid4().hex[:4]
+_cycle_counter = itertools.count(1)
+
+
+def _next_cycle_id() -> str:
+    """Return the next cycle correlation id (e.g. ``c17-a3f9``)."""
+    return f"c{next(_cycle_counter)}-{_BOOT_ID}"
+
+
+def _write_fleet_telemetry_dotfile(dotfile_path: Any) -> None:
+    """Record fleet-telemetry provisioning time atomically.
+
+    Args:
+        dotfile_path: Destination path (e.g. mqtt_telemetry's
+            ``_FLEET_TELEMETRY_DOTFILE``).
+    """
+    atomic_write_text(
+        dotfile_path, datetime.now(tz=timezone.utc).isoformat() + "\n"
+    )
 
 
 # === LoadManager Orchestrator ===
@@ -322,7 +350,8 @@ class LoadManager:
 
         # Load the telegram.devices whitelist for notification gating.
         # Dict maps device name (lowercased) → set of allowed action types.
-        # None means no whitelist configured (backward-compatible: no gating).
+        # None means no whitelist configured: notifications are BLOCKED
+        # (fail-closed), not ungated — matches validate_telegram_devices().
         tg_config = device_config.get_telegram_config()
         if tg_config:
             self._telegram_alert_on_auth_error = tg_config.get("alert_on_auth_error", True)
@@ -402,16 +431,10 @@ class LoadManager:
         if nbc is None:
             return DEFAULT_PREDICTION_WINDOW_SECS
         ec = getattr(nbc, 'energy_cache', None)
-        if ec is not None and ec.data is not None:
-            qs = ec.quantization_seconds
-            qc = ec.quantization_confidence
-            if (
-                qs is not None
-                and qs >= MIN_QUANTIZATION_WINDOW_SECS
-                and qc is not None
-                and qc >= QUANTIZATION_CONFIDENCE_THRESHOLD
-            ):
-                return qs
+        if ec is not None:
+            window = usable_window(ec.quantization_seconds, ec.quantization_confidence)
+            if window is not None:
+                return window
         return DEFAULT_PREDICTION_WINDOW_SECS
 
     def _quantization_diagnostics(self) -> dict[str, Any]:
@@ -638,7 +661,7 @@ class LoadManager:
             if effect.device_name == "tesla" and effect.action == "set_amps":
                 prev_amps = self.state.last_commanded_amps
                 new_amps = effect.target_amps
-                self.state.last_commanded_amps = new_amps
+                self.state.record_tesla_amp_command(new_amps)
                 if new_amps is not None and (
                     prev_amps is None or new_amps > prev_amps
                 ):
@@ -666,9 +689,9 @@ class LoadManager:
                         new_amps,
                     )
             elif effect.device_name == "tesla" and effect.action in ("turn_off", "turn_on"):
-                self.state.last_commanded_amps = None
+                self.state.record_tesla_amp_command(None)
                 self.state.clear_tesla_settle_effects()
-            self.state.pending_effects.append(effect)
+            self.state.add_effect(effect)
 
         # Sync Tesla entry in devices from live vehicle state
         self.state.sync_tesla_device_state(ctx.tesla_state)
@@ -1385,9 +1408,16 @@ class LoadManager:
             )
             return False
         if not actions:
+            # Operator-facing sign convention (deliberate, do NOT "fix"):
+            # NBC-signed — negative = excess solar, positive = grid draw —
+            # matching how predictions are displayed everywhere else.
+            # This is the OPPOSITE of the engine-internal control gap
+            # (target_wh - predicted_wh) in CycleDiagnostics/gapminder logs.
+            # See docs/LOADMANAGER.md and arch-review-pr-code-review.md #7.
             gap_wh = predicted_wh - target_wh
             logger.info(
-                "Telegram notification skipped: no actions (gap=%+.1f Wh)",
+                "Telegram notification skipped: no actions "
+                "(gap=%+.1f Wh, positive=grid draw)",
                 gap_wh,
             )
             return False
@@ -1526,9 +1556,13 @@ class LoadManager:
             )
             return
         if not actions:
+            # Operator-facing sign convention (deliberate, do NOT "fix"):
+            # NBC-signed — negative = excess solar, positive = grid draw.
+            # See the twin comment in _fire_telegram_notification.
             gap_wh = predicted_wh - target_wh
             logger.info(
-                "Telegram notification skipped: no actions (gap=%+.1f Wh)",
+                "Telegram notification skipped: no actions "
+                "(gap=%+.1f Wh, positive=grid draw)",
                 gap_wh,
             )
             return
@@ -1940,10 +1974,6 @@ class LoadManager:
         succeeded_effects: list[PendingEffect] = []
         results: list[PendingEffect] = []
         for action in actions:
-            # Suppress Tesla turn_on when active telemetry confirms charging.
-            # The callback updates telemetry with a ~10 s delay; if the car is
-            # confirmed charging, dispatching a turn_on action is wasteful and
-            # defeats the purpose of the telemetry feedback loop.
             if dry_run:
                 logger.info(
                     "[DRY-RUN] Would execute: %s on %s",
@@ -1990,7 +2020,10 @@ class LoadManager:
             try:
                 await self.tesla_ctrl.close()
             except Exception:  # pylint: disable=broad-exception-caught
-                pass
+                logger.debug(
+                    "Failed to close Tesla controller during session cleanup",
+                    exc_info=True,
+                )
         if self.telegram_sender is not None:
             client = getattr(self.telegram_sender, "_telegram_client", None)
             if client is not None:
@@ -1999,7 +2032,10 @@ class LoadManager:
                     try:
                         await session.close()
                     except Exception:  # pylint: disable=broad-exception-caught
-                        pass
+                        logger.debug(
+                            "Failed to close Telegram session during cleanup",
+                            exc_info=True,
+                        )
                     client._session = None
 
     @staticmethod
@@ -2143,13 +2179,23 @@ class LoadManager:
         with self._lock:
             self._check_config_changes()
 
-            ctx = CycleContext(now=self._clock.now(), force=force)
+            ctx = CycleContext(
+                now=self._clock.now(), force=force, cycle_id=_next_cycle_id()
+            )
+
+            def _finalize(res: CycleResult) -> CycleResult:
+                """Attach the correlation id and stage timings to a result."""
+                return replace(
+                    res, cycle_id=ctx.cycle_id, timings=dict(ctx.timings)
+                )
+
             # DEBUG: fires every ~30 s even when a cycle_early_exit /
             # cycle_complete event immediately follows; the boundary events
             # carry the signal, so the start marker stays at DEBUG.
-            logger.debug("cycle_start force=%s",
-                         force,
-                         extra={"event": "cycle_start", "force": force})
+            logger.debug("cycle_start id=%s force=%s",
+                         ctx.cycle_id, force,
+                         extra={"event": "cycle_start", "force": force,
+                                "cycle_id": ctx.cycle_id})
 
             _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=enabled_check force=%s", force)
@@ -2159,8 +2205,9 @@ class LoadManager:
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "enabled_check",
                                    "status": result.status,
-                                   "reason": result.diagnostics.reason if result.diagnostics else "none"})
-                return result
+                                   "reason": result.diagnostics.reason if result.diagnostics else "none",
+                                   "cycle_id": ctx.cycle_id})
+                return _finalize(result)
             ctx.timings["enabled_check"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2176,8 +2223,9 @@ class LoadManager:
                             stage2_result.status, stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "nbc_fetch",
                                    "status": stage2_result.status,
-                                   "reason": stage2_result.diagnostics.reason if stage2_result.diagnostics else "none"})
-                return stage2_result
+                                   "reason": stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",
+                                   "cycle_id": ctx.cycle_id})
+                return _finalize(stage2_result)
             ctx.timings["nbc_fetch"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2188,8 +2236,9 @@ class LoadManager:
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "pending_check",
                                    "status": result.status,
-                                   "reason": result.diagnostics.reason if result.diagnostics else "none"})
-                return result
+                                   "reason": result.diagnostics.reason if result.diagnostics else "none",
+                                   "cycle_id": ctx.cycle_id})
+                return _finalize(result)
             ctx.timings["pending_check"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2212,8 +2261,9 @@ class LoadManager:
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "commit",
                                    "status": result.status,
-                                   "reason": result.diagnostics.reason if result.diagnostics else "none"})
-                return result
+                                   "reason": result.diagnostics.reason if result.diagnostics else "none",
+                                   "cycle_id": ctx.cycle_id})
+                return _finalize(result)
             ctx.timings["commit"] = _time_mod.perf_counter() - _t0
 
             _t0 = _time_mod.perf_counter()
@@ -2221,14 +2271,15 @@ class LoadManager:
             result = self._stage_build_result(ctx)
             ctx.timings["build_result"] = _time_mod.perf_counter() - _t0
             reason = result.diagnostics.reason if result.diagnostics else "none"
-            logger.info("cycle_complete status=%s reason=%s actions=%d sleep_hint=%.1f timings=%s",
-                        result.status, reason, len(result.actions), result.sleep_hint, ctx.timings,
-                        extra={"event": "cycle_complete", "status": result.status,
+            logger.info("cycle_complete id=%s status=%s reason=%s actions=%d sleep_hint=%.1f timings=%s",
+                        ctx.cycle_id, result.status, reason, len(result.actions), result.sleep_hint, ctx.timings,
+                        extra={"event": "cycle_complete", "cycle_id": ctx.cycle_id,
+                               "status": result.status,
                                "reason": reason, "actions_count": len(result.actions),
                                "sleep_hint": result.sleep_hint, "timings": ctx.timings,
                                "gap_wh": ctx.gap_wh, "adjusted_wh": ctx.adjusted_wh,
                                "predicted_wh": ctx.predicted_wh, "qh_name": ctx.qh_name})
-            return result
+            return _finalize(result)
 
     async def _execute_action(self, action: PendingEffect) -> bool:
         """Execute a single pending action against the appropriate controller.
@@ -2244,7 +2295,9 @@ class LoadManager:
                 return await self._execute_tesla_action(action)
             return await self._execute_plug_action(action)
         except Exception as e:
-            logger.error("Failed to execute action %s: %s", action, e)
+            logger.error(
+                "Failed to execute action %s: %s", action, e, exc_info=True
+            )
             return False
 
     async def _execute_plug_action(self, action: PendingEffect) -> bool:
@@ -2299,7 +2352,9 @@ class LoadManager:
                 self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
                 return False
             except Exception as e:
-                logger.error("Failed to set Tesla charge amps: %s", e)
+                logger.error(
+                    "Failed to set Tesla charge amps: %s", e, exc_info=True
+                )
                 return False
         logger.warning("Unknown Tesla action: %s", action.action)
         return False
@@ -2324,7 +2379,9 @@ class LoadManager:
             self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
             return False
         except Exception as e:
-            logger.error("Failed to stop Tesla charging: %s", e)
+            logger.error(
+                "Failed to stop Tesla charging: %s", e, exc_info=True
+            )
             return False
 
     def close(self) -> None:
@@ -2398,9 +2455,7 @@ class LoadManager:
             asyncio.run(fleet_telemetry_config_create(self.tesla_ctrl, config))
             logger.info("provision_fleet_telemetry: Provisioning succeeded.")
             from mqtt_telemetry import _FLEET_TELEMETRY_DOTFILE
-            _FLEET_TELEMETRY_DOTFILE.write_text(
-                datetime.now(tz=timezone.utc).isoformat() + "\n"
-            )
+            _write_fleet_telemetry_dotfile(_FLEET_TELEMETRY_DOTFILE)
             logger.info(
                 "provision_fleet_telemetry: wrote dotfile %s",
                 _FLEET_TELEMETRY_DOTFILE,

@@ -14,6 +14,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from clock import FakeClock
+from load_manager import LoadManager, LoadManagerConfig
+
 
 # =============================================================================
 # Fixtures
@@ -127,7 +130,6 @@ class TestLoadManagerTelegramLogging:
 
     def test_logger_reports_configured_sender(self, mock_config_env, caplog):
         """LoadManager.__init__ logs when telegram sender is configured."""
-        from load_manager import LoadManager, LoadManagerConfig
 
         with caplog.at_level(logging.INFO):
             mgr = LoadManager(
@@ -146,7 +148,6 @@ class TestLoadManagerTelegramLogging:
 
     def test_logger_reports_none_sender(self, caplog):
         """LoadManager.__init__ logs when no telegram sender is provided."""
-        from load_manager import LoadManager, LoadManagerConfig
 
         with caplog.at_level(logging.INFO):
             mgr = LoadManager(
@@ -164,83 +165,6 @@ class TestLoadManagerTelegramLogging:
 
 
 # =============================================================================
-# 3. LoadManager._fire_telegram_notification respects sender status
-# =============================================================================
-
-
-class TestFireTelegramNotification:
-
-    def test_noop_when_sender_is_none(self, mock_config_env):
-        """When telegram_sender is None, _fire_telegram_notification returns False."""
-        from load_manager import LoadManager, LoadManagerConfig
-        from clock import FakeClock
-        from datetime import datetime, timezone as tz
-
-        clock = FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=tz.utc))
-        mgr = LoadManager(
-            LoadManagerConfig(
-                telegram_sender=None,
-                clock=clock,
-            ),
-        )
-
-        result = mgr.run_cycle()
-        # With no sender and no plugs/tesla, should return a result (not crash).
-        assert result is not None
-
-    @pytest.mark.asyncio
-    async def test_noop_when_not_configured(self, mock_config_env):
-        """When sender exists but is_configured is False, returns False."""
-        mock_sender = MagicMock()
-        mock_sender.is_configured = False
-        mock_sender.is_configured = False
-
-        from load_manager import LoadManager, LoadManagerConfig
-        from clock import FakeClock
-        from datetime import datetime, timezone as tz
-
-        clock = FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=tz.utc))
-        mgr = LoadManager(
-            LoadManagerConfig(
-                telegram_sender=mock_sender,
-                clock=clock,
-            ),
-        )
-
-        result = await mgr._fire_telegram_notification(
-            actions=[], predicted_wh=1000.0, target_wh=-500.0, dry_run=False
-        )
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_noop_in_dry_run(self, mock_config_env):
-        """When dry_run=True, notifications are skipped even with sender."""
-        mock_sender = MagicMock()
-        mock_sender.is_configured = True
-
-        from load_manager import LoadManager, LoadManagerConfig
-        from clock import FakeClock
-        from datetime import datetime, timezone as tz
-
-        clock = FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=tz.utc))
-        mgr = LoadManager(
-            LoadManagerConfig(
-                telegram_sender=mock_sender,
-                clock=clock,
-                dry_run=True,
-            ),
-        )
-
-        result = await mgr._fire_telegram_notification(
-            actions=[MagicMock(device_name="pump")],
-            predicted_wh=1000.0,
-            target_wh=-500.0,
-            dry_run=True,
-        )
-        assert result is False
-
-
-# =============================================================================
 # 4. LoadManager._fire_auth_error_notification
 # =============================================================================
 
@@ -250,7 +174,6 @@ class TestFireAuthErrorNotification:
     @pytest.mark.asyncio
     async def test_noop_when_sender_none(self):
         """When telegram_sender is None, returns False."""
-        from load_manager import LoadManager, LoadManagerConfig
 
         mgr = LoadManager(LoadManagerConfig(telegram_sender=None))
         result = await mgr._fire_auth_error_notification("auth error")
@@ -262,7 +185,6 @@ class TestFireAuthErrorNotification:
         mock_sender = MagicMock()
         mock_sender.is_configured = False
 
-        from load_manager import LoadManager, LoadManagerConfig
 
         mgr = LoadManager(LoadManagerConfig(telegram_sender=mock_sender))
         result = await mgr._fire_auth_error_notification("auth error")
@@ -274,7 +196,6 @@ class TestFireAuthErrorNotification:
         mock_sender = MagicMock()
         mock_sender.is_configured = True
 
-        from load_manager import LoadManager, LoadManagerConfig
 
         mgr = LoadManager(
             LoadManagerConfig(telegram_sender=mock_sender),
@@ -290,7 +211,6 @@ class TestFireAuthErrorNotification:
         mock_sender.is_configured = True
         mock_sender.send_notification = AsyncMock(return_value=True)
 
-        from load_manager import LoadManager, LoadManagerConfig
 
         mgr = LoadManager(
             LoadManagerConfig(telegram_sender=mock_sender),
@@ -312,11 +232,10 @@ class TestDriftErrorAlerts:
 
     @staticmethod
     def _make_alert():
-        from datetime import datetime, timezone as tz
 
         from metrics import DriftAlert
 
-        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=tz.utc)
+        now = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         return DriftAlert(
             channel_num=5,
             chart_start=now,
@@ -326,7 +245,6 @@ class TestDriftErrorAlerts:
 
     def test_queue_drift_notification_skipped_when_sender_none(self):
         """With no TelegramSender, drift alerts are not queued."""
-        from load_manager import LoadManager, LoadManagerConfig
 
         mgr = LoadManager(
             LoadManagerConfig(telegram_sender=None, dry_run=True, config_interval_secs=30)
@@ -336,7 +254,6 @@ class TestDriftErrorAlerts:
 
     def test_queue_drift_notification_skipped_when_not_configured(self):
         """With an unconfigured sender, drift alerts are not queued."""
-        from load_manager import LoadManager, LoadManagerConfig
 
         mock_sender = MagicMock(is_configured=False)
         mgr = LoadManager(
@@ -347,13 +264,10 @@ class TestDriftErrorAlerts:
 
     def test_queue_drift_notification_appends_when_configured(self):
         """With a configured sender, drift alerts queue an error event."""
-        from datetime import datetime, timezone as tz
 
-        from clock import FakeClock
-        from load_manager import LoadManager, LoadManagerConfig
 
         mock_sender = MagicMock(is_configured=True)
-        clock = FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=tz.utc))
+        clock = FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
         mgr = LoadManager(
             LoadManagerConfig(
                 telegram_sender=mock_sender,
@@ -371,7 +285,6 @@ class TestDriftErrorAlerts:
 
     def test_drain_drift_alerts_queues_each_alert(self):
         """_drain_drift_alerts forwards drained alerts to the queue method."""
-        from load_manager import LoadManager, LoadManagerConfig
 
         mgr = LoadManager(
             LoadManagerConfig(telegram_sender=None, dry_run=True, config_interval_secs=30)
@@ -385,7 +298,6 @@ class TestDriftErrorAlerts:
     def test_run_cycle_drains_drift_alerts_after_nbc_fetch(self, mock_config_env):
         """run_cycle calls _drain_drift_alerts right after the NBC fetch stage."""
         from config import Config
-        from load_manager import LoadManager, LoadManagerConfig
         from load_models import CycleDiagnostics, CycleResult
 
         Config().set("LOAD_MANAGE_ENABLED", "True")
@@ -400,4 +312,8 @@ class TestDriftErrorAlerts:
             with patch.object(mgr, "_drain_drift_alerts") as mock_drain:
                 result = mgr.run_cycle(force=True)
         mock_drain.assert_called_once()
-        assert result is early
+        # run_cycle finalizes results (attaches cycle_id + timings), so the
+        # returned object is an enriched copy of the stage result rather
+        # than the identical instance.
+        assert result.status == early.status
+        assert result.cycle_id

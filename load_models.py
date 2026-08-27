@@ -237,6 +237,28 @@ class PendingEffect:
     suppress_action: Literal["turn_off", "turn_on"] | None = None
     qh_name: str | None = None
 
+    def __post_init__(self) -> None:
+        """Enforce the signed power invariant (plan 3.4).
+
+        ``power_watts`` is the expected impact on net load: turn_on adds
+        load (>= 0 W), turn_off sheds it (<= 0 W). Enforcing this at
+        construction closes the phantom-load bug where a turned-OFF plug
+        was counted as ADDED load by ``estimated_current_wh``.
+        Tesla set_amps effects are exempt — their impact is accounted
+        separately via ``tesla_inflight_wh``.
+        """
+        if self.action == "turn_on" and self.power_watts < 0:
+            raise ValueError(
+                f"turn_on effect for {self.device_name} must have "
+                f"power_watts >= 0, got {self.power_watts}"
+            )
+        if self.action == "turn_off" and self.power_watts > 0:
+            raise ValueError(
+                f"turn_off effect for {self.device_name} must have "
+                f"power_watts <= 0, got {self.power_watts}. Negate the "
+                "device's rated watts so estimated_current_wh subtracts it."
+            )
+
 
 @dataclass
 class TeslaState:
@@ -289,6 +311,12 @@ def parse_charge_amps(raw: Any) -> int | None:
     Handles both wrapped (``{"value": ...}``) and raw numeric formats.
     Shared by the MQTT snapshot parser and the REST-init fallback so the
     envelope-unwrap + rounding logic lives in exactly one place.
+
+    Rounding note: Python's ``round()`` uses banker's rounding (ties go to
+    the even neighbor — 14.5 → 14, 15.5 → 16). Exact .5 floats are
+    practically unreachable from Tesla telemetry (amps arrive as e.g.
+    15.999), and half-even is deterministic and unbiased, so no explicit
+    tie-breaking policy is needed here.
 
     Args:
         raw: Raw ChargeAmps telemetry value.
@@ -656,6 +684,9 @@ class CycleResult:
         pending_effects_count: Number of pending effects at cycle time.
         candidates: List of candidate devices considered for action,
             or None if not computed.
+        cycle_id: Correlation id for this cycle (boot-uuid prefix +
+            monotonic counter), or None on legacy results.
+        timings: Wall-clock seconds per pipeline stage, or None.
     """
 
     status: CycleStatus
@@ -672,6 +703,8 @@ class CycleResult:
     gap_wh: float | None = None
     pending_effects_count: int | None = None
     candidates: list[CandidateDetail] | None = None
+    cycle_id: str | None = None
+    timings: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -713,6 +746,8 @@ class CycleResult:
                 if self.candidates
                 else None
             ),
+            "cycle_id": self.cycle_id,
+            "timings": dict(self.timings) if self.timings else None,
         }
 
 
@@ -776,6 +811,9 @@ class CycleContext:
 
     # Timing
     timings: dict[str, float] = field(default_factory=dict)
+
+    # Correlation (1.3): stable within one cycle, unique across cycles.
+    cycle_id: str = ""
 
 
 # === Exception Types ===

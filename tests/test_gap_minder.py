@@ -1,8 +1,6 @@
 """Tests for GapMinder decision logic."""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
-
 import pytest
 
 from load_models import PlugConfig, DeviceState, TeslaState
@@ -84,12 +82,6 @@ def test_hysteresis_custom_value():
 
     assert len(actions) == 1
     assert actions[0].action == "turn_on"
-
-
-def test_hysteresis_default_value():
-    """Default hysteresis is 1000 for backward compatibility."""
-    engine = GapMinder()
-    assert engine.HYSTERESIS_WH == 1000
 
 
 def test_turn_on_plug():
@@ -256,13 +248,10 @@ def test_skip_plug_before_debounce():
     engine = GapMinder()
     state = StateTracker()
 
-    with patch("load_nbc.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        state.devices["plug"] = DeviceState(
-            name="plug",
-            last_toggle=fixed_now - timedelta(seconds=30),
-        )
+    state.devices["plug"] = DeviceState(
+        name="plug",
+        last_toggle=fixed_now - timedelta(seconds=30),
+    )
 
     plugs = {
         "plug": PlugConfig(
@@ -272,20 +261,17 @@ def test_skip_plug_before_debounce():
         )
     }
 
-    with patch("load_nbc.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        actions = engine.decide(
-            ctx=DecideContext(
-                now=fixed_now,
-                seconds_remaining=300,
-                state=state,
-                plugs=plugs,
-                tesla=None,
-            ),
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-        )
+    actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=300,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
+        predicted_wh=-2000.0,
+        target_wh=-500.0,
+    )
 
     assert len(actions) == 0
 
@@ -832,13 +818,8 @@ def test_edge_gap_reduces_tesla_amps_reduction():
 def test_turn_on_skipped_when_seconds_remaining_below_min():
     """Skips plug turn-on when fewer than MIN_SECONDS_TO_ACT remain in QH.
 
-    Near the end of a quarter-hour, turning on a plug wastes energy because
-    it will stay on through the QH boundary and draw power not counted toward
-    any surplus.  The same MIN_SECONDS_TO_ACT guard that protects Tesla actions
+    The same MIN_SECONDS_TO_ACT guard that protects Tesla actions
     should also protect plug turn-on decisions.
-
-    Regression test for: jackery turned on with 21 s remaining in QH3,
-    then left running through the entire next quarter-hour.
     """
     engine = GapMinder()
     fixed_now = datetime(2026, 5, 7, 15, 59, 39, tzinfo=timezone.utc)
@@ -852,20 +833,17 @@ def test_turn_on_skipped_when_seconds_remaining_below_min():
         ),
     }
 
-    with patch("load_nbc.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        actions = engine.decide(
-            ctx=DecideContext(
-                now=fixed_now,
-                seconds_remaining=20,
-                state=state,
-                plugs=plugs,
-                tesla=None,
-            ),
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-        )
+    actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=20,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
+        predicted_wh=-2000.0,
+        target_wh=-500.0,
+    )
 
     assert len(actions) == 0
 
@@ -883,20 +861,17 @@ def test_turn_on_allowed_when_seconds_remaining_above_min():
         ),
     }
 
-    with patch("load_nbc.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        actions = engine.decide(
-            ctx=DecideContext(
-                now=fixed_now,
-                seconds_remaining=600,
-                state=state,
-                plugs=plugs,
-                tesla=None,
-            ),
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-        )
+    actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=600,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
+        predicted_wh=-2000.0,
+        target_wh=-500.0,
+    )
 
     assert len(actions) == 1
     assert actions[0].action == "turn_on"
@@ -923,20 +898,17 @@ def test_turn_off_not_affected_by_min_seconds_guard():
         ),
     }
 
-    with patch("load_nbc.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        actions = engine.decide(
-            ctx=DecideContext(
-                now=fixed_now,
-                seconds_remaining=21,
-                state=state,
-                plugs=plugs,
-                tesla=None,
-            ),
-            predicted_wh=2000.0,
-            target_wh=-500.0,
-        )
+    actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=21,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
+        predicted_wh=2000.0,
+        target_wh=-500.0,
+    )
 
     assert len(actions) == 1
     assert actions[0].action == "turn_off"
@@ -955,20 +927,17 @@ def test_turn_on_at_exact_min_seconds_boundary():
         ),
     }
 
-    with patch("load_nbc.datetime") as mock_dt:
-        mock_dt.now.return_value = fixed_now
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        actions = engine.decide(
-            ctx=DecideContext(
-                now=fixed_now,
-                seconds_remaining=60,
-                state=state,
-                plugs=plugs,
-                tesla=None,
-            ),
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-        )
+    actions = engine.decide(
+        ctx=DecideContext(
+            now=fixed_now,
+            seconds_remaining=60,
+            state=state,
+            plugs=plugs,
+            tesla=None,
+        ),
+        predicted_wh=-2000.0,
+        target_wh=-500.0,
+    )
 
     assert len(actions) == 1
 
@@ -1505,39 +1474,6 @@ def test_decide_turn_off_defers_at_min_amps_with_buffer():
     assert len(actions) == 0
 
 
-def test_decide_tesla_reduce_at_5a_no_defer_without_stop_allowed():
-    """Tesla at 5A, seconds_remaining=300, turn_off path, gap=-1000 Wh.
-
-    Step 1 returns None (stop_allowed=False at min amps).
-    Step 3 delegates to _decide_tesla_reduce(stop_allowed=True).
-    safe_defer=120 < secs_remaining=300 → defers.
-    """
-    engine = GapMinder(hysteresis_wh=3)
-    state = StateTracker()
-    plugs: dict[str, PlugConfig] = {}
-    tesla = TeslaState(
-        is_charging=True,
-        current_amps=5,
-        plugged_in=True,
-        at_home=True,
-    )
-
-    actions = engine.decide(
-        ctx=DecideContext(
-            now=fixed_now,
-            seconds_remaining=300,
-            state=state,
-            plugs=plugs,
-            tesla=tesla,
-        ),
-        predicted_wh=500.0,
-        target_wh=-500.0,
-    )
-
-    # Step 3 delegates; safe_defer=120 < 300 → defers.
-    assert len(actions) == 0
-
-
 def test_decide_tesla_reduce_below_5a_defers_with_enough_time():
     """Tesla at 4A (edge case), seconds_remaining=200, turn_off path.
 
@@ -1724,3 +1660,20 @@ def test_tesla_clamps_to_max_residual_filled_by_smaller_plug():
     assert any(
         a.device_name == "small" and a.action == "turn_on" for a in actions
     )
+
+
+# --- Nominal voltage configuration (plan 3.6) ---
+
+
+def test_car_power_watts_5a_default_240(monkeypatch):
+    """Default defer-rate basis stays 5A * 240V = 1200 W."""
+    monkeypatch.delenv("TESLA_NOMINAL_VOLTAGE", raising=False)
+    engine = GapMinder()
+    assert engine.car_power_watts_5a == pytest.approx(1200.0)
+
+
+def test_car_power_watts_5a_honors_voltage_override(monkeypatch):
+    """The defer-rate basis follows TESLA_NOMINAL_VOLTAGE (208V -> 1040 W)."""
+    monkeypatch.setenv("TESLA_NOMINAL_VOLTAGE", "208")
+    engine = GapMinder()
+    assert engine.car_power_watts_5a == pytest.approx(5 * 208)

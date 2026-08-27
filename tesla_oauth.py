@@ -51,6 +51,38 @@ def _json_response(payload: object) -> Response:
     return resp
 
 
+def prune_expired_oauth_states(now: float | None = None) -> int:
+    """Remove expired state tokens from ``_oauth_states``.
+
+    Without this sweep the dict grows without bound: entries are added on
+    every initiate and removed only when their callback arrives (R8).
+
+    Args:
+        now: Current unix timestamp; defaults to the real clock.
+
+    Returns:
+        Number of expired entries removed.
+    """
+    current = _time_module.time() if now is None else now
+    # Snapshot the items with a single C-level list() call: iterating the
+    # live dict through a Python comprehension can be suspended by a thread
+    # switch while an /auth/initiate request inserts, raising
+    # "dictionary changed size during iteration" (review #6). list() over a
+    # dict view does not release the GIL, so the snapshot is atomic.
+    expired = [
+        key
+        for key, expiry in list(_oauth_states.items())
+        if expiry <= current
+    ]
+    removed = 0
+    for key in expired:
+        # pop (not del): a callback thread may have consumed this state
+        # between the snapshot and now.
+        if _oauth_states.pop(key, None) is not None:
+            removed += 1
+    return removed
+
+
 @bp.route("/api/v1/tesla/auth/initiate")
 def tesla_auth_initiate() -> ResponseReturnValue:
     """Initiate Tesla OAuth flow.
@@ -81,6 +113,7 @@ def tesla_auth_initiate() -> ResponseReturnValue:
         })
 
     state_token = secrets.token_urlsafe(32)
+    prune_expired_oauth_states()
     _oauth_states[state_token] = _time_module.time() + 600  # expire in 10 minutes
 
     try:

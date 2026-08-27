@@ -142,6 +142,9 @@ project-root
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
                            # _AppState runtime singletons, start_background_services()
 ├── wsgi.py                # Gunicorn entry point: app = create_app(); start_background_services()
+├── gunicorn.conf.py       # Gunicorn hooks: post_worker_init chains cooperative-shutdown
+                           # signal handlers; worker_int/worker_exit call app.request_shutdown();
+                           # timeout = 60 pins the arbiter watchdog (2x the 30s fetch bound)
 ├── clock.py               # Clock protocol (now()) with FakeClock for tests
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
                            # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
@@ -170,10 +173,16 @@ project-root
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
 ├── load_nbc.py            # NBCReader, StateTracker, GapMinder bin-packing, Tesla decisions
+ ├── logfmt.py              # Structured log formatters: render extra= fields as
+ │                          #   [key=value ...] suffixes (default) or JSON lines
+ │                          #   (LOG_FORMAT=json); wired into app.py handlers
  ├── mockdata.py            # Test data generation utilities
- ├── mqtt_telemetry.py      # Tesla MQTT message parsing (on_message, tesla_state_from_snapshot)
+ ├── mqtt_telemetry.py      # Tesla MQTT message parsing (on_message, tesla_state_from_snapshot);
+ │                          # idempotent start_mqtt_subscriber() (lock + live-thread check);
+ │                          # generation token isolates superseded sessions after restart
   ├── quantization.py        # Detect N-second constant-value windows (quantization) in per-second data
   ├── sse_event.py            # SSEBroadcaster thread-safe pub/sub + event_stream generator for Flask
+                              # (close_all() wakes blocked streams on shutdown; sentinel never yielded)
 ├── telegram.py            # TelegramSender, NotificationEvent, config loading helpers
 ├── telegram_client.py     # Async Telegram Bot API client using aiohttp
 ├── util.py                # Shared utilities (JSON helpers, timezone handling)
@@ -242,6 +251,18 @@ project-root
   `Location` is absent in the snapshot. Delegates to controller's `init_tesla_state()`
   (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
 - Data models in `load_models.py`
+- `nominal_voltage()` in `load_nbc.py` — deferred-config resolver for the
+  `TESLA_NOMINAL_VOLTAGE` env (default 240; invalid/non-positive falls back
+  with a WARNING). All StateTracker amp↔watt conversions and
+  `GapMinder.car_power_watts_5a` read it per-call. Do not reintroduce
+  import-time voltage constants into conversion math.
+- `StateTracker.record_tesla_amp_command()` / `tesla_inflight_wh()` zero-amp
+  confirmation (plan 3.5): a single reported 0 A frame does NOT clear
+  `last_commanded_amps` — only `TESLA_ZERO_AMPS_CLEAR_SAMPLES` (2)
+  consecutive zeros do, and until then the full commanded delta stays
+  accounted. The 1 A ramp-up gate credits the unconfirmed portion
+  (`commanded − reported`) instead of returning 0. Tests asserting an
+  instant clear or a ramp-up zero encode the old bug — do not restore them.
 - Shared fleet-telemetry parsing helpers in `load_models.py` (`unwrap_telemetry_value`,
   `parse_charge_amps`) — single home for the `{"value": ...}` envelope unwrap + amps
   rounding, used by `mqtt_telemetry.py` (`on_message`, `tesla_state_from_snapshot`,
@@ -251,6 +272,17 @@ project-root
   `_ensure_api` create/update branches respectively)
 - `create_app()` factory + routes in `app.py` (module-level `app` singleton; no
   background threads start at import time)
+- Cooperative shutdown (single-interrupt exit): `_stop_event` + idempotent
+  `request_shutdown(reason)` in `app.py` — sets the stop event every background
+  loop waits on (`_load_management_loop` sleeps via `_stop_event.wait()`, not
+  `time.sleep()`), wakes SSE streams via `SSEBroadcaster.close_all()`, stops the
+  MQTT subscriber (`mqtt_telemetry.stop_mqtt_subscriber()`), and closes the
+  LoadManager exactly once. `install_shutdown_signal_hooks()` chains those calls
+  over existing SIGINT/SIGQUIT/SIGTERM handlers; wired by `gunicorn.conf.py`
+  hooks (`post_worker_init`/`worker_int`/`worker_exit`) and the `__main__`
+  block. Rationale: concurrent.futures joins all executor threads (daemon or
+  not) at interpreter exit, so a blocked SSE stream used to hang shutdown until
+  a second Ctrl-C.
 - `start_background_services()` in `app.py` — explicitly starts the MQTT subscriber
   and load-management thread; called from `wsgi.py` and the `__main__` block, never
   at import time (so tests can import the module safely)
@@ -282,7 +314,7 @@ project-root
 - Telegram sender in `telegram.py` (`TelegramSender`, `NotificationEvent`)
 - SSE broadcaster and endpoint tests in `tests/test_sse.py` (`SSEBroadcaster`, `event_stream`)
 - Pipeline stage tests in `tests/test_pipeline_stages.py`
-- CycleContext tests in `tests/test_cycle_context.py`
+- CycleContext usage is covered by the pipeline stage tests (`tests/test_pipeline_stages.py`)
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 - Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
@@ -297,6 +329,12 @@ project-root
 - Actions are determined by comparing adjusted predicted_wh against target_wh (default -50 Wh)
 - Three action types: "turn_on", "turn_off", "set_amps"
 - Algorithm uses bin-packing to fit eligible loads into the surplus gap
+- Turn-off shedding is deliberately unguarded (design decision, not an
+  oversight): no MIN_SECONDS_TO_ACT floor and no overshoot cap —
+  `_decide_turn_off` turns plugs off until `remaining_reduction <= 0`, even
+  for negligible in-quarter savings near the QH boundary. Asserted by
+  tests/test_gap_minder.py; do not add turn-off guards without revisiting
+  this decision.
 
 ### Dry-Run Mode
 - Controlled by LOAD_MANAGE_DRY_RUN env var (currently True in .env line 10)
@@ -348,6 +386,21 @@ project-root
 - Tesla notifications use device-specific format: `🔌 Tesla charging stopped` / `⚡ Tesla charging started` / `🔋 Tesla charge amps → N A`
 
 ### EnergyCache & Incremental Fetch
+
+**⚠️ Contiguity axiom (deliberate design decision):** per-second samples are
+strictly contiguous at 1 s from `data_start` — sample `i` occurred at exactly
+`data_start + timedelta(seconds=i)`, and every bucket is present, non-null,
+and finite. The upstream Emporia API is trusted to return complete windows;
+interior gaps / null buckets are ruled out by design and **no count-vs-span,
+interior-gap, or null-bucket validation exists anywhere in the pipeline — do
+not add defensive gap detection without revisiting this axiom first.**
+Everything below depends on it: pruning maps index → time arithmetically,
+compaction chunks purely by count (`samples[offset:offset+900]`), QH splitting
+is count-based (`values_len % 900`), and `_data_lag_secs` is *derived* from the
+count (`instant − (data_start + len(samples))`, metrics.py), so lag measures
+tail freshness only and cannot reveal interior gaps. Only the window *head* is
+validated (`firstUsageInstant != chart_start` drift check).
+
 - `EnergyCache` (energy_cache.py) stores per-second energy samples with metadata in a
   frozen `EnergyCacheData` dataclass:
   - `samples`: list[float] — per-second Wh values
@@ -408,9 +461,6 @@ When asked to plan changes, break tasks into subtasks that each fit within a
 files or ~200 lines of code, split it into sequential subtasks and plan them
 separately. Document each subtask in the overall plan file in your agent's plan directory.
 
-## Plan files
-When writing or updating plan files in your agent's plan directory (`.opencode/plans/*.md` or `.mimocode/plans/*.md`), always use bash (e.g. `cat > .opencode/plans/foo.md << 'EOF'...` or `cat > .mimocode/plans/foo.md << 'EOF'...`)
-rather than the Write or Edit tools, which fail due to path matching issues.
 
 ### Plan Implementation
 
@@ -458,7 +508,7 @@ is required (e.g. CI, or after changing test-relevant code).
 | Lint | `uv run pylint *.py` |
 | Type check | `uv run mypy` |
 | Dev server | `uv run python app.py` |
-| Production-like server | `gunicorn --reload --worker-class=gthread --threads=4 --timeout=31 --bind 127.0.0.1:8000 wsgi:app` |
+| Production-like server | `gunicorn --reload -c gunicorn.conf.py --worker-class=gthread --threads=4 --bind 127.0.0.1:8000 wsgi:app` |
 
 The dev server reads credentials from `.env` (`VUE_USERNAME`, `VUE_PASSWORD`).
 Ensure that file is present and sourced before running.

@@ -12,8 +12,11 @@ DeviceConfigError when the file exists but is malformed or empty.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _DEVICES_FILE = Path(__file__).parent / "devices.json"
 
@@ -43,8 +46,10 @@ def _load() -> dict[str, Any]:
     except FileNotFoundError:
         _cache = {}
         return _cache
-    except OSError:
-        # Permission denied, encoding error, etc.
+    except OSError as e:
+        # Permission denied, encoding error, etc. — distinguishable from a
+        # missing file only if we say so.
+        logger.error("Failed to read devices.json: %s", e, exc_info=True)
         _cache = {}
         return _cache
 

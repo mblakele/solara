@@ -56,11 +56,11 @@ class TestCreateApp:
         app = app_mod.create_app()
         assert app.config["SOLARA_CONFIG"] is app_mod._config
 
-    def test_health_serves_ok(self):
+    def test_health_serves_json_status(self):
         app = app_mod.create_app()
         resp = app.test_client().get("/health")
         assert resp.status_code == 200
-        assert resp.data == b"ok"
+        assert resp.get_json()["status"] == "ok"
 
     def test_index_serves_html_in_mock_mode(self):
         app = app_mod.create_app()
@@ -91,6 +91,33 @@ class TestBackgroundServices:
         mock_mqtt.assert_called_once_with()
         mock_lm.assert_called_once_with()
 
+    def test_start_background_services_twice_starts_mqtt_once(self):
+        """Repeated calls must not double-start MQTT (mirror of the lm guard).
+
+        Spies ``mqtt_telemetry.start_mqtt_subscriber`` (the actual session
+        creator, also self-guarded) rather than app's thin wrapper, so the
+        assertion reflects real subscriber creation. Load management is left
+        disabled (its guard predates this one). Saves/restores the startup
+        flags so module-level state does not leak into other tests.
+        """
+        saved = (
+            app_mod._state.mqtt_subscriber_started,
+            app_mod._state.lm_thread_started,
+        )
+        app_mod._state.mqtt_subscriber_started = False
+        app_mod._state.lm_thread_started = False
+        try:
+            with patch("mqtt_telemetry.start_mqtt_subscriber") as mock_mqtt:
+                Config().set("LOAD_TESLA_CONTROLLER", "real")
+
+                app_mod.start_background_services()
+                app_mod.start_background_services()
+
+            mock_mqtt.assert_called_once()
+        finally:
+            app_mod._state.mqtt_subscriber_started = saved[0]
+            app_mod._state.lm_thread_started = saved[1]
+
 
 class TestWsgiEntrypoint:
     """wsgi.py exposes a fully constructed app for gunicorn."""
@@ -101,4 +128,4 @@ class TestWsgiEntrypoint:
         assert isinstance(wsgi.app, Flask)
         resp = wsgi.app.test_client().get("/health")
         assert resp.status_code == 200
-        assert resp.data == b"ok"
+        assert "status" in resp.get_json()

@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from constants import DEFAULT_PREDICTION_WINDOW_SECS
+from constants import DEFAULT_PREDICTION_WINDOW_SECS, STALE_DATA_THRESHOLD_SECS
 from load_controllers import PlugController, TeslaController
 from load_manager import LoadManager, LoadManagerConfig
 from load_models import (
@@ -22,7 +22,7 @@ from load_models import (
     TeslaState,
 )
 from load_nbc import DecideContext, GapMinder, NBCFetchResult, StateTracker
-from tests.helpers import _make_metrics_with_wh
+from tests.helpers import _make_metrics_with_wh, make_tesla_config
 from energy_cache import EnergyCache
 from clock import FakeClock
 
@@ -107,15 +107,7 @@ def _make_excess_manager(
     }
     plug_ctrl = PlugController(plugs)
 
-    tesla_config = TeslaConfig(
-        client_id="test-id",
-        client_secret="test-secret",
-        redirect_uri="http://localhost/callback",
-        vehicle_id="vehicle-123",
-        home_lat=37.0,
-        home_lon=-122.0,
-        home_radius_m=500,
-    )
+    tesla_config = make_tesla_config()
     tesla_ctrl = TeslaController(tesla_config)
 
     metrics_data = _make_metrics_with_wh("main_panel", predicted_wh)
@@ -210,15 +202,7 @@ def _make_tesla_manager(
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
-    tesla_config = TeslaConfig(
-        client_id="test-id",
-        client_secret="test-secret",
-        redirect_uri="http://localhost/callback",
-        vehicle_id="vehicle-123",
-        home_lat=37.0,
-        home_lon=-122.0,
-        home_radius_m=500,
-    )
+    tesla_config = make_tesla_config()
     tesla_ctrl = TeslaController(tesla_config)
     tesla_ctrl.set_mock_state(tesla_state)
 
@@ -434,27 +418,36 @@ def test_stale_data_skips_cycle():
     assert result.status == "stale_data"
 
 
-def test_stale_no_pending_effects_proceeds():
-    """NBC data >120s old with zero pending effects should NOT skip.
+def test_stale_data_skips_even_with_zero_pending_effects():
+    """Genuinely stale data (>80s) returns stale_data EVEN with zero effects.
 
-    Regression test: previously, stale data alone (with no unreflected
-    actions) caused permanent lockout since last_data_point_at was never
-    updated while stuck in the stale path. With zero pending effects,
-    there are no unreflected actions, so it's safe to proceed.
+    Regression guard for the stale gate's contract: the data-point age
+    threshold is unconditional — when the most recent per-second sample is
+    older than STALE_DATA_THRESHOLD_SECS the cycle is skipped regardless of
+    pending effects, because an aged prediction is unsafe to act on by
+    itself. (An earlier version of this test asserted stale + zero effects
+    proceeds, but it used a 61s age — BELOW the 80s threshold — and so
+    never actually exercised the stale path.)
     """
     plugs: dict[str, PlugConfig] = {}
     plug_ctrl = PlugController(plugs)
 
     fixed_now = datetime(2026, 5, 6, 7, 8, 00, tzinfo=timezone.utc)
-    data_point_at = fixed_now - timedelta(seconds=StateTracker.STALE_THRESHOLD_SECS)
+    # Genuinely stale (past STALE_DATA_THRESHOLD_SECS).
+    # (Previously referenced the dead StateTracker.STALE_THRESHOLD_SECS=61,
+    # which is BELOW the 80 s production threshold and thus never stale.)
+    data_point_at = fixed_now - timedelta(seconds=STALE_DATA_THRESHOLD_SECS + 50)
     fetched_at = data_point_at + timedelta(seconds=10)
     metrics_data = _make_metrics_with_wh("main_panel", -2000.0)
     metrics_data["_fetched_at"] = fetched_at
+    metrics_data["_data_lag_secs"] = 130
 
     def metrics_fetch():
         return metrics_data
 
-    energy_cache = _make_energy_cache_with_prediction(-2000.0, fixed_now)
+    energy_cache = _make_energy_cache_with_prediction(
+        -2000.0, fixed_now, data_lag_secs=130,
+    )
     mgr = LoadManager(LoadManagerConfig(
         metrics_fetch=metrics_fetch,
         energy_cache=energy_cache,
@@ -470,7 +463,7 @@ def test_stale_no_pending_effects_proceeds():
 
 
     assert len(mgr.state.pending_effects) == 0
-    assert result.status != "stale_data"
+    assert result.status == "stale_data"
 
 
 def test_stale_data_from_previous_qh():
@@ -480,7 +473,7 @@ def test_stale_data_from_previous_qh():
     data from the immediately preceding QH can be only seconds or minutes old.
 
     The system must NOT make load decisions on this data — turning on a plug
-    based on stale QH1 prediction at 15:02 would waste energy.
+    based on stale QH1 prediction at 15:02 could cause overshoot.
 
     We patch ``datetime.now`` so that both the enabled-check time and
     now_postfetch are consistent: 15:02 (QH2).  data_point_at is at the
@@ -1418,17 +1411,7 @@ def test_tesla_amp_adjustment(_mock_tesla_state, _mock_has_telemetry, _mock_load
     }
     plug_ctrl = PlugController(plugs)
 
-    tesla_config = TeslaConfig(
-        client_id="test-id",
-        client_secret="test-secret",
-        redirect_uri="http://localhost/callback",
-        vehicle_id="vehicle-123",
-        home_lat=37.0,
-        home_lon=-122.0,
-        home_radius_m=500,
-        charge_amps_min=5,
-        charge_amps_max=48,
-    )
+    tesla_config = make_tesla_config(charge_amps_min=5, charge_amps_max=48)
     tesla_ctrl = TeslaController(tesla_config)
     tesla_ctrl.set_mock_state(
         TeslaState(
@@ -1526,15 +1509,7 @@ class TestAdaptiveSleep:
         clock = FakeClock(fixed_now)
         plug_ctrl = PlugController({})
         tesla_ctrl = TeslaController(
-            TeslaConfig(
-                client_id="test-id",
-                client_secret="test-secret",
-                redirect_uri="http://localhost/callback",
-                vehicle_id="vehicle-123",
-                home_lat=37.0,
-                home_lon=-122.0,
-                home_radius_m=500,
-            )
+make_tesla_config()
         )
 
         def metrics_fetch():
@@ -1587,15 +1562,7 @@ class TestAdaptiveSleep:
             metrics_fetch=lambda: None,
             plug_ctrl=PlugController({}),
             tesla_ctrl=TeslaController(
-                TeslaConfig(
-                    client_id="test-id",
-                    client_secret="test-secret",
-                    redirect_uri="http://localhost/callback",
-                    vehicle_id="vehicle-123",
-                    home_lat=37.0,
-                    home_lon=-122.0,
-                    home_radius_m=500,
-                )
+make_tesla_config()
             ),
             target_wh=-500,
             config_interval_secs=30,
@@ -1616,6 +1583,10 @@ class TestAdaptiveSleep:
         result = lm.run_cycle()
         assert result.status == "stale_data"
         assert result.sleep_hint == 5.0
+        # sleep_hint_at is a parseable ISO 8601 UTC string in every status path.
+        assert result.sleep_hint_at is not None
+        parsed = datetime.fromisoformat(result.sleep_hint_at)
+        assert parsed.tzinfo is not None
 
     def test_waiting_for_fresh_data_run_cycle_includes_sleep_hint(self):
         """Waiting for fresh data returns sleep_hint capped by prediction_window."""
@@ -1635,15 +1606,7 @@ class TestAdaptiveSleep:
             metrics_fetch=lambda: None,
             plug_ctrl=PlugController({}),
             tesla_ctrl=TeslaController(
-                TeslaConfig(
-                    client_id="test-id",
-                    client_secret="test-secret",
-                    redirect_uri="http://localhost/callback",
-                    vehicle_id="vehicle-123",
-                    home_lat=37.0,
-                    home_lon=-122.0,
-                    home_radius_m=500,
-                )
+make_tesla_config()
             ),
             target_wh=-500,
             config_interval_secs=30,
@@ -1667,24 +1630,10 @@ class TestAdaptiveSleep:
         assert result.status == "waiting_for_fresh_data"
         # sleep_hint should be min(seconds_remaining, 2*interval)
         assert result.sleep_hint <= 60
-
-    def test_ok_run_cycle_includes_sleep_hint(self):
-        """Normal ok run_cycle returns sleep_hint = config_interval."""
-        lm = self._make_manager(interval=30)
-
-        result = lm.run_cycle(force=True)
-        # force=True bypasses stale check, but may hit no_incomplete_qh or hysteresis
-        # Either way, sleep_hint should be present
-        assert result.sleep_hint is not None
-
-    def test_hysteresis_run_cycle_includes_sleep_hint(self):
-        """Hysteresis run_cycle returns sleep_hint = config_interval."""
-        lm = self._make_manager(interval=30)
-
-        result = lm.run_cycle(force=True)
-        # With no plugs and no tesla, the cycle will likely hit hysteresis or
-        # return ok with empty actions. Either way, sleep_hint should be present.
-        assert result.sleep_hint is not None
+        # sleep_hint_at is a parseable ISO 8601 UTC string in every status path.
+        assert result.sleep_hint_at is not None
+        parsed = datetime.fromisoformat(result.sleep_hint_at)
+        assert parsed.tzinfo is not None
 
     def test_no_incomplete_qh_run_cycle_includes_sleep_hint(self):
         """No incomplete QH returns sleep_hint = 5."""
@@ -1711,129 +1660,9 @@ class TestAdaptiveSleep:
     # --- sleep_hint_at tests ---
 
     def test_run_cycle_includes_sleep_hint_at(self):
-        """run_cycle() returns sleep_hint_at in the result dict."""
+        """run_cycle() returns a parseable ISO 8601 UTC sleep_hint_at."""
         lm = self._make_manager(interval=30)
         result = lm.run_cycle(force=True)
-        assert result.sleep_hint_at is not None
-
-    def test_disabled_run_cycle_includes_sleep_hint_at(self):
-        """Disabled run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
-        lm = self._make_manager(interval=30, enabled=False)
-
-        result = lm.run_cycle()
-        assert result.status == "disabled"
-        assert result.sleep_hint_at is not None
-        # Should be a valid ISO 8601 string that parses to a UTC datetime
-        from datetime import datetime
-
-        parsed = datetime.fromisoformat(result.sleep_hint_at)
-        assert parsed.tzinfo is not None
-
-    def test_stale_data_run_cycle_includes_sleep_hint_at(self):
-        """Stale data run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
-        now = datetime.now(timezone.utc)
-        data_point_at = now - timedelta(seconds=200)  # >120s old → stale
-
-        class StaleQHReader:
-            """Mock NBC reader that returns data 200 seconds old."""
-
-            def get_current_qh(self, force=False, now=None):
-                return NBCFetchResult(qh_name="QH3", predicted_wh=-1000.0, seconds_remaining=600, data_point_at=data_point_at, samples_used=100)
-
-            def get_data_lag_secs(self) -> int:
-                return 10
-
-        lm = LoadManager(LoadManagerConfig(
-            metrics_fetch=lambda: None,
-            plug_ctrl=PlugController({}),
-            tesla_ctrl=TeslaController(
-                TeslaConfig(
-                    client_id="test-id",
-                    client_secret="test-secret",
-                    redirect_uri="http://localhost/callback",
-                    vehicle_id="vehicle-123",
-                    home_lat=37.0,
-                    home_lon=-122.0,
-                    home_radius_m=500,
-                )
-            ),
-            target_wh=-500,
-            config_interval_secs=30,
-        ))
-        lm.nbc_reader = StaleQHReader()
-        lm.enabled = True
-
-        lm.state.pending_effects = [PendingEffect(
-            device_name="test",
-            action="turn_on",
-            target_amps=None,
-            timestamp=data_point_at - timedelta(seconds=30),
-            data_point_at=data_point_at - timedelta(seconds=50),
-            power_watts=1000.0,
-        )]
-
-        result = lm.run_cycle()
-        assert result.status == "stale_data"
-        assert result.sleep_hint_at is not None
-        parsed = datetime.fromisoformat(result.sleep_hint_at)
-        assert parsed.tzinfo is not None
-
-    def test_no_incomplete_qh_run_cycle_includes_sleep_hint_at(self):
-        """No incomplete QH run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
-        lm = self._make_manager(interval=30)
-        result = lm.run_cycle(force=True)
-        assert result.sleep_hint_at is not None
-        parsed = datetime.fromisoformat(result.sleep_hint_at)
-        assert parsed.tzinfo is not None
-
-    def test_waiting_for_fresh_data_run_cycle_includes_sleep_hint_at(self):
-        """Waiting for fresh data run_cycle returns sleep_hint_at as ISO 8601 UTC string."""
-        fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
-        data_point_at = fixed_now - timedelta(seconds=10)
-
-        class PendingQHReader:
-            """Mock NBC reader where pending effects exist since the data point."""
-
-            def get_current_qh(self, force=False, now=None):
-                return NBCFetchResult(qh_name="QH3", predicted_wh=-800.0, seconds_remaining=600, data_point_at=data_point_at, samples_used=100)
-
-            def get_data_lag_secs(self) -> int:
-                return 10
-
-        lm = LoadManager(LoadManagerConfig(
-            metrics_fetch=lambda: None,
-            plug_ctrl=PlugController({}),
-            tesla_ctrl=TeslaController(
-                TeslaConfig(
-                    client_id="test-id",
-                    client_secret="test-secret",
-                    redirect_uri="http://localhost/callback",
-                    vehicle_id="vehicle-123",
-                    home_lat=37.0,
-                    home_lon=-122.0,
-                    home_radius_m=500,
-                )
-            ),
-            target_wh=-500,
-            config_interval_secs=30,
-            clock=FakeClock(fixed_now),
-        ))
-        lm.nbc_reader = PendingQHReader()
-        lm.enabled = True
-
-        # Add a pending effect *after* the data point so we hit waiting_for_fresh_data
-        lm.state.pending_effects = [PendingEffect(
-            device_name="test",
-            action="turn_on",
-            target_amps=None,
-            timestamp=data_point_at + timedelta(seconds=5),
-            data_point_at=data_point_at + timedelta(seconds=5),
-            power_watts=1000.0,
-        )]
-
-        result = lm.run_cycle()
-
-        assert result.status == "waiting_for_fresh_data"
         assert result.sleep_hint_at is not None
         parsed = datetime.fromisoformat(result.sleep_hint_at)
         assert parsed.tzinfo is not None

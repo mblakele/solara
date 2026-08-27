@@ -115,23 +115,37 @@ Finally, start a local server with:
 uv run python app.py
 ```
 
-For development work you may prefer this:
+This runs Flask's built-in development server (with background services —
+MQTT telemetry and the load manager — already started). The output looks
+like this:
+
+```
+ * Serving Flask app 'app'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8000
+Press CTRL+C to quit
+```
+
+For development work you may prefer gunicorn with auto-reload, which
+matches production behavior (threaded worker, cooperative shutdown):
 
 ```
 gunicorn --reload \
     --reload-extra-file .env \
     --reload-extra-file templates \
-    --worker-class=gthread --threads=4 --timeout=0 \
+    -c gunicorn.conf.py --worker-class=gthread --threads=4 \
     wsgi:app
 ```
 
-The output should look something like this:
+Its output looks like this:
 
 ```
-[2022-08-27 11:01:41 -0700] [67121] [INFO] Starting gunicorn 20.1.0
-[2022-08-27 11:01:41 -0700] [67121] [INFO] Listening at: http://127.0.0.1:8000 (67121)
-[2022-08-27 11:01:41 -0700] [67121] [INFO] Using worker: sync
-[2022-08-27 11:01:41 -0700] [67123] [INFO] Booting worker with pid: 67123
+[2026-08-24 04:56:00 +0000] [15341] [INFO] Starting gunicorn 26.0.0
+[2026-08-24 04:56:00 +0000] [15341] [INFO] Listening at: http://127.0.0.1:8000 (15341)
+[2026-08-24 04:56:00 +0000] [15341] [INFO] Using worker: gthread
+[2026-08-24 04:56:00 +0000] [15342] [INFO] Booting worker with pid: 15342
 ```
 
 Test the server by opening the `Listening at:` link from the output.

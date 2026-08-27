@@ -8,30 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from clock import Clock, FakeClock, RealClock
-
-
-class TestClockProtocol:
-    """Clock protocol structural subtyping tests."""
-
-    def test_realclock_is_clock(self):
-        """RealClock must satisfy the Clock protocol (duck typing)."""
-        clock: Clock = RealClock()
-        assert clock is not None
-
-    def test_fakeclock_is_clock(self):
-        """FakeClock must satisfy the Clock protocol (duck typing)."""
-        clock: Clock = FakeClock()
-        assert clock is not None
-
-    def test_any_now_callable_is_clock(self):
-        """Any object with a now() method returning datetime must be a Clock."""
-        class MinimalClock:
-            def now(self) -> datetime:
-                return datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-        clock: Clock = MinimalClock()
-        assert isinstance(clock.now(), datetime)
+from clock import FakeClock, RealClock
 
 
 class TestRealClock:
@@ -197,14 +174,6 @@ class TestLoadManagerClockInjection:
         clock = FakeClock(self.FIXED)
         config = LoadManagerConfig(clock=clock, enabled=False)
         lm = LoadManager(config)
-        assert lm._clock is clock
-
-    def test_constructor_accepts_clock_via_config(self):
-        """LoadManager must accept a Clock via LoadManagerConfig."""
-        from load_manager import LoadManager, LoadManagerConfig
-
-        clock = FakeClock(self.FIXED)
-        lm = LoadManager(LoadManagerConfig(clock=clock, enabled=False))
         assert lm._clock is clock
 
     def test_defaults_to_realclock(self):

@@ -57,6 +57,31 @@ class TestDaemonThreadPoolExecutor:
         # That's expected — cancel_futures only affects pending queue items.
         assert future.running() or future.done()
 
+    def test_threads_not_registered_for_interpreter_exit_join(self) -> None:
+        """Worker threads must be invisible to concurrent.futures' exit join.
+
+        At interpreter exit, ``concurrent.futures.thread._python_exit``
+        joins every thread registered in ``_threads_queues`` — daemon or
+        not. An in-flight fetch (up to the 30 s fetch timeout) in such a
+        registered daemon worker used to block gunicorn worker shutdown for
+        that whole duration. Since these threads are daemon by design and
+        the executor's contract is "must not block process exit", they must
+        not be registered there.
+        """
+        from concurrent.futures import thread as cf_thread
+
+        executor = DaemonThreadPoolExecutor(max_workers=1)
+        try:
+            executor.submit(lambda: None).result(timeout=5.0)
+
+            registered = set(cf_thread._threads_queues)  # noqa: SLF001
+            overlap = executor._threads & registered  # noqa: SLF001
+            assert not overlap, (
+                f"daemon executor threads registered for exit-join: {overlap}"
+            )
+        finally:
+            executor.shutdown(wait=False)
+
 
 @pytest.mark.slow
 class TestEnergyCacheThreadLeakFix:
@@ -64,13 +89,13 @@ class TestEnergyCacheThreadLeakFix:
 
     def test_timeout_does_not_leak_threads(self) -> None:
         """_run_fetch_with_timeout should not leave zombie threads on timeout."""
-        cache = EnergyCache(fetch_timeout_secs=1)  # 1 second timeout
+        cache = EnergyCache(fetch_timeout_secs=0.1)
 
         # Track active thread count before
         initial_threads = threading.active_count()
 
         def slow_fetch() -> dict[str, Any]:
-            time.sleep(2.0)  # Longer than timeout
+            time.sleep(0.25)  # Longer than timeout
             return {"per_second_data": [1.0], "data_start": None}
 
         # This should timeout and return None
@@ -78,7 +103,7 @@ class TestEnergyCacheThreadLeakFix:
         assert result is None
 
         # Give some time for any threads to clean up
-        time.sleep(0.2)
+        time.sleep(0.05)
 
         # Thread count should not have grown permanently.
         # Allow small variance (+2) for pytest/asyncio test runner threads.
