@@ -978,6 +978,7 @@ class StateTracker:
                 "timestamp": eff.timestamp.isoformat(),
                 "data_point_at": eff.data_point_at.isoformat(),
                 "power_watts": eff.power_watts,
+                "target_amps": eff.target_amps,
             } for eff in self.snapshot_effects()],
             "last_data_point_at": (self.last_data_point_at.isoformat()
                                    if self.last_data_point_at else None),

@@ -1,0 +1,156 @@
+{# Forecast cards partial — rendered server-side for the index page and the
+   SSE-activated live updates (`/?partial=metrics`). Keep the rendering logic
+   in Jinja so the client only swaps HTML fragments (single source of truth).
+#}
+{% if freshness %}
+<div class="freshness" id="data-freshness"
+     data-lag-at="{{ freshness.lag_at }}"
+     data-lag="{{ freshness.age_secs }}"
+     data-next="{{ freshness.next_update_secs }}"
+     data-warn="{{ freshness.warn_secs }}"
+     data-stale="{{ freshness.stale_secs }}"
+     data-live="{{ '1' if freshness.live else '0' }}"
+     data-status="{{ freshness.status }}">
+  <span id="live-indicator" class="live-indicator" data-state="off" hidden>live</span>
+  <span class="freshness__dot" aria-hidden="true"></span>
+  <span class="freshness__text">data <b class="freshness__age">{{ freshness.age_secs }}s</b> old · next ~<b class="freshness__next">{{ freshness.next_update_secs }}s</b></span>
+</div>
+{% endif %}
+{% for vd in metrics.devices %}
+  {% if vd.nbc %}
+  {% set qh1 = vd.nbc.get("QH1") %}
+  {% set diag = load_management.last_cycle_result.diagnostics if load_management and load_management.last_cycle_result else none %}
+  <article class="forecast">
+    <header class="forecast__header">
+      <div class="forecast__heading">
+        <span class="device-name">{{ vd.name }}</span>
+      </div>
+    </header>
+
+    <div class="forecast__value {{ 'forecast__value--gen' if qh1.predicted_wh is not none and qh1.predicted_wh < 0 else 'forecast__value--load' }}">
+      {% if qh1.predicted_wh is not none %}
+      {{ "%+.0f" % (qh1.predicted_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period">forecast this period</span>
+      {% else %}
+      <span class="forecast__placeholder">—</span>
+      {% endif %}
+    </div>
+
+    <div class="sparkline">{{ vd.per_second_data | default([]) | per_second_sparkline(bucket_secs=quantization_seconds | default(1)) | safe }}</div>
+
+    {% set w = 60 * qh1.prediction_w if qh1.prediction_w is not none else none %}
+    <dl class="details">
+      <div class="details__stat">
+        <dt>Period</dt>
+        <dd>{{ "%+.0f" % (qh1.raw_wh) }}</dd>
+      </div>
+      <div class="details__stat">
+        <dt>Wh/min</dt>
+        <dd>
+          {%- if w is none -%}—{%- elif w < 10 -%}{{ "%+.1f" % w }}{%- else -%}{{ "%+.0f" % w }}{%- endif -%}
+        </dd>
+      </div>
+      <div class="details__stat">
+        <dt>Watts</dt>
+        <dd>{% if w is none %}—{% else %}{{ "%.0f" % (60 * w) }}{% endif %}</dd>
+      </div>
+    </dl>
+
+    <div class="history" aria-label="Earlier quarter-hours">
+      <div class="demand__label">Recent Periods</div>
+      {% set hist_target = load_management.get("target_wh") if load_management else none %}
+      {% set hist_hyst = diag.hysteresis_wh if diag else none %}
+      {% for qh_key in ["QH2", "QH3", "QH4"] %}
+      {% set qh = vd.nbc.get(qh_key) %}
+      {% if qh is not none and qh is not false %}
+      {% set pill_class = "" %}
+      {% if hist_target is not none and hist_hyst is not none %}
+      {% if qh.raw_wh > hist_target + hist_hyst %}
+      {% set pill_class = " history__pill--load" %}
+      {% elif qh.raw_wh < hist_target - hist_hyst %}
+      {% set pill_class = " history__pill--gen" %}
+      {% endif %}
+      {% endif %}
+      <span class="history__pill{{ pill_class }}">{{ "%+.0f" % (qh.raw_wh) }}</span>
+      {% endif %}
+      {% endfor %}
+    </div>
+
+    {% set active = namespace(devices=[]) %}
+    {% if load_management and load_management.state and load_management.state.devices %}
+    {% for name, dev in load_management.state.devices.items() %}
+    {% if dev.actual_state %}
+    {% set label = name %}
+    {% if dev.current_amps is not none %}
+    {% set label = name ~ " (" ~ dev.current_amps ~ ")" %}
+    {% endif %}
+    {% set active.devices = active.devices + [label] %}
+    {% endif %}
+    {% endfor %}
+    {% endif %}
+
+    {% set pending = namespace(effects=[]) %}
+    {% if load_management and load_management.state and load_management.state.pending_effects %}
+    {% set devices = load_management.state.devices if load_management.state.devices else {} %}
+    {% for effect in load_management.state.pending_effects %}
+    {% set dev = devices.get(effect.device_name) %}
+    {% set label = effect.device_name %}
+    {# Annotate each effect with the state implied by the action taken.
+       Amps are shown when available (Tesla); otherwise derive (on)/(off)
+       from the action itself — this is reliable even when actual_state is
+       None (post-decision before the next sync). #}
+    {% if dev is not none and dev.current_amps is not none %}
+    {% set label = effect.device_name ~ " (" ~ dev.current_amps ~ ")" %}
+    {% elif effect.action == "turn_on" %}
+    {% set label = effect.device_name ~ " (on)" %}
+    {% elif effect.action == "turn_off" %}
+    {% set label = effect.device_name ~ " (off)" %}
+    {% endif %}
+    {% set pending.effects = pending.effects + [label] %}
+    {% endfor %}
+    {% endif %}
+
+    {% if active.devices or pending.effects %}
+    <div class="device-state">
+      {% if active.devices %}
+      <div class="device-state__line">
+        <span class="demand__label">Active devices</span>
+        <span>{{ active.devices | join(", ") }}</span>
+      </div>
+      {% endif %}
+      {% if pending.effects %}
+      <div class="device-state__line">
+        <span class="demand__label">Pending effects</span>
+        <span>{{ pending.effects | join(", ") }}</span>
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% if diag is not none and qh1.predicted_wh is not none %}
+    {# EV charging amps implied by the predicted energy over the remaining
+       period (matches the iOS client): amps = predictedWh / hours / -240. #}
+    {% set hours = (qh1.remaining_seconds or 0) / 3600.0 %}
+    {% set car_amps = (qh1.predicted_wh / hours / -240.0) if hours > 0 else none %}
+    {% if qh1.predicted_wh > 0 %}
+    <div class="demand">
+      <span class="demand__label">reduce usage if possible</span>
+      <ul class="demand__list">
+        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
+      </ul>
+    </div>
+    {% elif qh1.predicted_wh < diag.hysteresis_wh %}
+    {% set shower_min = (qh1.predicted_wh / 81.0) | abs %}
+    {% set laundry_min = (qh1.predicted_wh / 88.0) | abs %}
+    <div class="demand">
+      <span class="demand__label">Surplus ideas</span>
+      <ul class="demand__list">
+        <li>⚡🚿 {{ "%.1f" % shower_min }} min</li>
+        <li>⚡👕 {{ "%.1f" % laundry_min }} min</li>
+        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
+      </ul>
+    </div>
+    {% endif %}
+    {% endif %}
+  </article>
+  {% endif %}
+{% endfor %}

@@ -2,6 +2,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time as time_module
 import unittest
@@ -187,9 +188,10 @@ class TestApp(unittest.TestCase):
         with mock_config():
             response = self.app.get("/", headers={"Accept": "text/html"})
         self.assertEqual(response.status_code, 200)
-        # The word 'MOCK' might not be in the HTML if it's using the values directly.
-        # Let's check for some characteristic HTML instead.
-        self.assertIn(b"response time", response.data)
+        # The redesigned forecast template renders per-device forecast cards.
+        data = response.data.decode("utf-8")
+        self.assertIn("forecast this period", data)
+        self.assertIn('class="forecast"', data)
 
     def test_index_real_mode_lm_disabled(self):
         """Index returns 200 in real mode when load management is disabled.
@@ -205,6 +207,65 @@ class TestApp(unittest.TestCase):
             with patch("app.create_metrics", return_value=realistic_metrics()):
                 response = self.app.get("/", headers={"Accept": "application/json"})
         self.assertEqual(response.status_code, 200)
+
+    def test_index_html_renders_per_second_sparkline(self):
+        """Index HTML embeds an inline SVG sparkline per device."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        data = response.data.decode("utf-8")
+        self.assertIn("<svg", data)
+        self.assertIn("</svg>", data)
+        # Mock generation samples are negative, so the sparkline should render
+        # at least one green generation bar.
+        self.assertIn("#2ca02c", data)
+
+    def test_index_html_missing_per_second_data_no_crash(self):
+        """Template renders a device without per_second_data (default guard)."""
+        from flask import render_template
+
+        metrics = realistic_metrics()
+        for dev in metrics["devices"]:
+            dev.pop("per_second_data", None)
+        with app.test_request_context():
+            html = render_template(
+                "index.html",
+                metrics=metrics,
+                load_management=None,
+                refresh_secs=None,
+            )
+        self.assertIn("</html>", html)
+        # The guard renders an empty svg even without per_second_data.
+        self.assertIn("</svg>", html)
+
+    def _forecast_value_markup(self, predicted_wh: float) -> str:
+        """Render the index template and return the forecast-value markup."""
+        from flask import render_template
+
+        nbc = realistic_metrics()["devices"][0]["nbc"]
+        # Keep QH1's shape but override predicted_wh to control the sign.
+        nbc = {"QH1": dict(nbc["QH1"], predicted_wh=predicted_wh)}
+        metrics = {"devices": [{"name": "dev", "nbc": nbc, "per_second_data": [0.001]}]}
+        with app.test_request_context():
+            html = render_template(
+                "index.html",
+                metrics=metrics,
+                load_management=None,
+                refresh_secs=None,
+            )
+        return html
+
+    def test_forecast_value_green_for_negative_prediction(self):
+        """Forecast value carries the generation style for negative predicted_wh."""
+        html = self._forecast_value_markup(-500.0)
+        self.assertIn("forecast__value forecast__value--gen", html)
+        self.assertIn("-500<span class=\"forecast__unit\">Wh</span>", html)
+
+    def test_forecast_value_blue_for_positive_prediction(self):
+        """Forecast value carries the consumption style for positive predicted_wh."""
+        html = self._forecast_value_markup(500.0)
+        self.assertIn("forecast__value forecast__value--load", html)
+        self.assertIn("+500<span class=\"forecast__unit\">Wh</span>", html)
 
     def test_index_real_mode_lm_out_of_time_range(self):
         """Index returns 200 when LM is configured but outside its time range.
@@ -1069,11 +1130,133 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
                     {"devices": [], "api_response": {}, "instant": None},
                     True,
                 )
+                mock_cache.data = None
                 mock_cache.samples = []
                 resp = self.app.get("/", headers={"Accept": "text/html"})
 
         self.assertEqual(resp.status_code, 200)
         self.assertIn(b'http-equiv="refresh"', resp.data.lower())
+
+    def test_index_refresh_interval_from_quantization(self):
+        """Index uses the detected quantization window as the refresh interval."""
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.get_or_fetch.return_value = (
+                    {"devices": [{"name": "test"}], "api_response": {}, "instant": None},
+                    True,
+                )
+                mock_cache.data = EnergyCacheData(
+                    samples=[0.0] * 900,
+                    data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                    last_sample_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    last_fetch_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    sample_count=900,
+                    quantization_seconds=30,
+                    quantization_offset=0,
+                    quantization_confidence=1.0,
+                )
+                resp = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b'content="30"', resp.data)
+
+    def _quantized_real_mode_metrics(self):
+        """Metrics with a full 300-sample device window for bucket checks."""
+        metrics = realistic_metrics()
+        for dev in metrics["devices"]:
+            dev["per_second_data"] = [0.001] * 300
+        return metrics
+
+    def test_index_sparkline_buckets_to_quantization_window(self):
+        """Index sparkline downsamples to the detected quantization window."""
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+
+        metrics = self._quantized_real_mode_metrics()
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.samples = None
+                mock_cache.get_or_fetch.return_value = (metrics, True)
+                mock_cache.data = EnergyCacheData(
+                    samples=[0.0] * 900,
+                    data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                    last_sample_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    last_fetch_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    sample_count=900,
+                    quantization_seconds=30,
+                    quantization_offset=0,
+                    quantization_confidence=1.0,
+                )
+                resp = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        # 300 samples bucketed at 30 s -> 10 bars, each 30 s of data plus a
+        # 1 s seam overlap, tiling the full 300-unit view at real positions.
+        widths = re.findall(r'<rect[^>]*\bwidth="([0-9.]+)"', html)
+        self.assertEqual(widths.count("31.00"), 10)
+        self.assertIn('<rect x="0.00"', html)
+        self.assertIn('<rect x="270.00"', html)
+
+    def test_sse_metrics_partial_buckets_by_quantization(self):
+        """The SSE metrics fragment shares the quantization bucket window."""
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+
+        metrics = self._quantized_real_mode_metrics()
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.samples = None
+                mock_cache.get_or_fetch.return_value = (metrics, True)
+                mock_cache.data = EnergyCacheData(
+                    samples=[0.0] * 900,
+                    data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                    last_sample_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    last_fetch_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    sample_count=900,
+                    quantization_seconds=30,
+                    quantization_offset=0,
+                    quantization_confidence=1.0,
+                )
+                resp = self.app.get(
+                    "/?partial=metrics", headers={"Accept": "text/html"}
+                )
+
+        self.assertEqual(resp.status_code, 200)
+        widths = re.findall(
+            r'<rect[^>]*\bwidth="([0-9.]+)"', resp.data.decode("utf-8")
+        )
+        self.assertEqual(widths.count("31.00"), 10)
+
+    def test_index_sparkline_stays_per_second_without_quantization(self):
+        """Without a quantization window the sparkline keeps per-second bars."""
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+
+        metrics = self._quantized_real_mode_metrics()
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.samples = None
+                mock_cache.get_or_fetch.return_value = (metrics, True)
+                mock_cache.data = EnergyCacheData(
+                    samples=[0.0] * 900,
+                    data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                    last_sample_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    last_fetch_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    sample_count=900,
+                    quantization_seconds=None,
+                    quantization_offset=None,
+                    quantization_confidence=None,
+                )
+                resp = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        widths = re.findall(r'<rect[^>]*\bwidth="([0-9.]+)"', html)
+        self.assertEqual(widths.count("1.00"), 300)
 
     def test_index_enrich_metrics_for_sse_none_input(self):
         """_enrich_metrics_for_sse handles None input without crashing."""
@@ -1762,3 +1945,843 @@ class TestStallWatchdogWiring(unittest.TestCase):
         # After the firing check, finished_at must have been refreshed so
         # the NEXT iteration measures only its own duration.
         self.assertIsNotNone(self._app._state.lm_last_cycle_finished_at)
+
+
+class TestIndexMobileAndLive(unittest.TestCase):
+    """Mobile-app index: viewport/safe-area meta, static assets, and the
+    SSE-driven partial-fragment endpoints used for in-place live updates.
+
+    The static file assertions verify the CSS/JS that implement the
+    mobile-first design system and the EventSource live-update client.
+    """
+
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
+
+    @staticmethod
+    def _lm_wired_state():
+        """Install a mocked LoadManager into app state for LM-enabled pages."""
+        import app as app_mod
+
+        lm = _make_lm(_cycle_result())
+        Config().set("LOAD_MANAGE_ENABLED", "True")
+        app_mod._state.load_manager = lm
+        app_mod._state.load_manager_init_failed = False
+        app_mod._state.last_cycle_result = lm.run_cycle.return_value
+        return lm
+
+    @staticmethod
+    def _static_text(name):
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "static" / name
+        return path.read_text(encoding="utf-8")
+
+    def test_index_html_mobile_viewport_meta(self):
+        """Index HTML carries the mobile-first viewport meta tag."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn(
+            '<meta name="viewport" content="width=device-width, '
+            'initial-scale=1, viewport-fit=cover">',
+            html,
+        )
+
+    def test_index_html_theme_color_meta(self):
+        """Index HTML carries light/dark theme-color meta for browser chrome."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('name="theme-color"', html)
+        self.assertIn('media="(prefers-color-scheme: dark)"', html)
+
+    def test_index_html_apple_standalone_meta(self):
+        """Index HTML opts into iOS standalone (add-to-home-screen) mode."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('name="apple-mobile-web-app-capable"', html)
+        self.assertIn('content="yes"', html)
+
+    def test_index_html_links_static_assets(self):
+        """CSS and JS are referenced with relative paths so the dashboard
+        works behind a transparent nginx proxy mounting the app under a
+        path prefix (e.g. /solara/)."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('href="static/style.css"', html)
+        self.assertIn('src="static/app.js"', html)
+
+    def test_index_html_has_live_section_ids(self):
+        """The sections swapped by SSE carry stable ids."""
+        with mock_config():
+            self._lm_wired_state()
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('id="metrics-section"', html)
+        self.assertIn('id="load-management-section"', html)
+
+    def test_partial_metrics_returns_fragment_only(self):
+        """GET /?partial=metrics returns just the forecast fragment."""
+        with mock_config():
+            response = self.app.get(
+                "/?partial=metrics", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('class="forecast"', html)
+        self.assertNotIn("<!DOCTYPE", html)
+        self.assertNotIn("<title", html)
+        self.assertNotIn('http-equiv="refresh"', html)
+
+    def test_partial_load_returns_fragment_only(self):
+        """GET /?partial=load returns just the load-management fragment."""
+        with mock_config():
+            self._lm_wired_state()
+            response = self.app.get(
+                "/?partial=load", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn("Load Management", html)
+        self.assertIn('id="load-management-section"', html)
+        self.assertNotIn("<!DOCTYPE", html)
+
+    def test_partial_load_disabled_returns_empty_200(self):
+        """GET /?partial=load with LM disabled returns an empty 200 fragment."""
+        with mock_config():
+            response = self.app.get(
+                "/?partial=load", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"")
+
+    def test_partial_invalid_returns_400(self):
+        """GET /?partial=<unknown> is rejected."""
+        with mock_config():
+            response = self.app.get(
+                "/?partial=bogus", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 400)
+
+    def test_static_css_has_mobile_features(self):
+        """style.css contains the mobile design-system features."""
+        css = self._static_text("style.css")
+        self.assertIn("prefers-color-scheme", css)
+        self.assertIn("safe-area-inset", css)
+        self.assertIn("-webkit-tap-highlight-color", css)
+        self.assertIn("clamp(", css)
+        self.assertIn("repeat(auto-fit", css)
+
+    def test_static_app_js_subscribes_to_sse(self):
+        """app.js wires EventSource('/stream/status') to the partial endpoints."""
+        js = self._static_text("app.js")
+        self.assertIn("EventSource", js)
+        self.assertIn("/stream/status", js)
+        self.assertIn("partial=metrics", js)
+        self.assertIn("partial=load", js)
+
+
+class TestLoadManagementSectionDebug(unittest.TestCase):
+    """The legacy Load Management dashboard section is kept but only
+    displayed when debug mode is enabled (metrics.debug), in both the full
+    page and the SSE-swapped /?partial=load fragment."""
+
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
+
+    @contextlib.contextmanager
+    def _lm_wired_real_mode(self, debug):
+        """Real-mode config with LM enabled and a controllable debug flag."""
+        import app as app_mod
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            lm = _make_lm(_cycle_result())
+            Config().set("LOAD_MANAGE_ENABLED", "True")
+            app_mod._state.load_manager = lm
+            app_mod._state.load_manager_init_failed = False
+            app_mod._state.last_cycle_result = lm.run_cycle.return_value
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.get_or_fetch.return_value = (
+                    {
+                        "devices": [],
+                        "api_response": {},
+                        "instant": None,
+                        "debug": debug,
+                    },
+                    True,
+                )
+                mock_cache.data = None
+                yield
+
+    def test_index_hides_load_management_when_debug_off(self):
+        """Real mode without debug hides the LM section even when LM runs."""
+        with self._lm_wired_real_mode(debug=False):
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(
+            'id="load-management-section"', response.data.decode("utf-8")
+        )
+
+    def test_index_shows_load_management_when_debug_on(self):
+        """Real mode with debug renders the LM section."""
+        with self._lm_wired_real_mode(debug=True):
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            'id="load-management-section"', response.data.decode("utf-8")
+        )
+
+    def test_partial_load_hidden_when_debug_off(self):
+        """/?partial=load returns an empty fragment when debug is off."""
+        with self._lm_wired_real_mode(debug=False):
+            response = self.app.get(
+                "/?partial=load", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"")
+
+    def test_partial_load_shown_when_debug_on(self):
+        """/?partial=load returns the LM section when debug is on."""
+        with self._lm_wired_real_mode(debug=True):
+            response = self.app.get(
+                "/?partial=load", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            'id="load-management-section"', response.data.decode("utf-8")
+        )
+
+
+class TestDataFreshness(unittest.TestCase):
+    """Data-freshness strip: surfaces how old the per-second data is and the
+    expected cadence of the next update, unobtrusively.
+
+    The strip is server-rendered (templates/_metrics.html) and ticked
+    client-side (static/app.js). It doubles as the signal the JS client uses
+    to decide whether SSE is a continuous driver (load management enabled:
+    keep the page live) or a one-shot snapshot (load management disabled:
+    keep the server auto-refresh / JS reload timer alive).
+    """
+
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
+
+    @staticmethod
+    def _freshness(metrics_data, load_management, refresh_secs, now=None):
+        import app as app_mod
+
+        return app_mod._metrics_freshness_payload(
+            metrics_data, load_management, refresh_secs, now=now
+        )
+
+    @staticmethod
+    def _now() -> datetime:
+        return datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    # --- _metrics_freshness_payload unit tests -------------------------
+
+    def test_freshness_payload_none_when_no_devices(self):
+        """No devices means there is nothing fresh/stale to report."""
+        payload = self._freshness({"devices": [], "api_response": {}}, {}, None, self._now())
+        self.assertIsNone(payload)
+
+    def test_freshness_payload_none_when_devices_lack_lag(self):
+        """Devices without a lag field (e.g. cached shape) yield no strip."""
+        payload = self._freshness(
+            {"devices": [{"name": "test"}]}, {}, None, self._now()
+        )
+        self.assertIsNone(payload)
+
+    def test_freshness_payload_age_is_worst_device(self):
+        """Age is the max lag across devices (the oldest data wins)."""
+        devices = [
+            {"name": "a", "lag": timedelta(seconds=12)},
+            {"name": "b", "lag": timedelta(seconds=2)},
+        ]
+        payload = self._freshness({"devices": devices}, {}, None, self._now())
+        self.assertEqual(payload["age_secs"], 12)
+        self.assertEqual(payload["status"], "fresh")
+        # No LM and no quantization: fall back to the client reload cadence.
+        self.assertEqual(payload["next_update_secs"], 120)
+        # Refresh-driven pages get generous thresholds: the Emporia data
+        # typically arrives 120-180 s late, so amber starts at 5 min.
+        self.assertEqual(payload["warn_secs"], 300)
+        self.assertEqual(payload["stale_secs"], 420)
+        self.assertFalse(payload["live"])
+        self.assertIsInstance(payload["lag_at"], int)
+
+    def test_freshness_payload_status_thresholds(self):
+        """No-LM thresholds: amber at 5 min, stale at 7 min (data arrives
+        120-180 s late and the page reloads on its own cadence)."""
+        cases = [
+            (12, "fresh"),
+            (250, "fresh"),
+            (300, "aging"),
+            (360, "aging"),
+            (419, "aging"),
+            (420, "stale"),
+            (600, "stale"),
+        ]
+        for lag_secs, expected in cases:
+            devices = [{"name": "a", "lag": timedelta(seconds=lag_secs)}]
+            payload = self._freshness({"devices": devices}, {}, None, self._now())
+            self.assertEqual(
+                payload["status"], expected, f"lag={lag_secs}s -> {payload['status']}"
+            )
+
+    def test_freshness_payload_status_thresholds_lm(self):
+        """LM thresholds: amber at 3 min, stale at 5 min (the ~30 s cycle
+        keeps lag around 45-120 s, so a missed cycle is flagged sooner)."""
+        lm = {"sleep_hint": 30.0}
+        cases = [
+            (12, "fresh"),
+            (179, "fresh"),
+            (180, "aging"),
+            (240, "aging"),
+            (299, "aging"),
+            (300, "stale"),
+            (480, "stale"),
+        ]
+        for lag_secs, expected in cases:
+            devices = [{"name": "a", "lag": timedelta(seconds=lag_secs)}]
+            payload = self._freshness({"devices": devices}, lm, None, self._now())
+            self.assertEqual(
+                payload["status"], expected, f"lag={lag_secs}s -> {payload['status']}"
+            )
+
+    def test_freshness_payload_next_uses_refresh_secs_when_lm_off(self):
+        """Without LM, next-update comes from the quantization reload window."""
+        devices = [{"name": "a", "lag": timedelta(seconds=6)}]
+        payload = self._freshness({"devices": devices}, {}, 30, self._now())
+        self.assertEqual(payload["next_update_secs"], 30)
+        self.assertFalse(payload["live"])
+
+    def test_freshness_payload_next_uses_lm_sleep_hint(self):
+        """With LM the next update is the sleep hint of the last cycle."""
+        devices = [{"name": "a", "lag": timedelta(seconds=6)}]
+        lm = {"sleep_hint": 27.5}
+        payload = self._freshness({"devices": devices}, lm, 30, self._now())
+        self.assertEqual(payload["next_update_secs"], 28)
+        # SSE-driven pages get tighter thresholds: amber at 3 min, red at 5.
+        self.assertEqual(payload["warn_secs"], 180)
+        self.assertEqual(payload["stale_secs"], 300)
+        self.assertTrue(payload["live"])
+
+    # --- page / fragment rendering -------------------------------------
+
+    def test_index_html_has_freshness_strip(self):
+        """Mock-mode index carries the freshness strip (LM off, fallback 120s)."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('id="data-freshness"', html)
+        self.assertIn('data-live="0"', html)
+        self.assertIn('data-status="fresh"', html)
+        self.assertIn('data-next="120"', html)
+        # No-LM thresholds ride on the strip so the client ticks with them.
+        self.assertIn('data-warn="300"', html)
+        self.assertIn('data-stale="420"', html)
+        self.assertIn("data <b class=", html)
+        self.assertIn("old", html)
+
+    def test_index_html_freshness_live_when_lm_enabled(self):
+        """LM-enabled pages mark the strip as SSE-driven with the sleep hint."""
+        with mock_config():
+            TestIndexMobileAndLive._lm_wired_state()
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('data-live="1"', html)
+        self.assertIn('data-next="30"', html)
+        self.assertIn('data-warn="180"', html)
+        self.assertIn('data-stale="300"', html)
+
+    def test_index_html_freshness_stale(self):
+        """Real-mode data with lag past the stale threshold renders 'stale'."""
+        import app as app_mod
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.get_or_fetch.return_value = (
+                    {
+                        "devices": [{"name": "meter", "lag": timedelta(seconds=450)}],
+                        "api_response": {},
+                        "instant": None,
+                    },
+                    True,
+                )
+                mock_cache.data = None
+                response = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('data-status="stale"', response.data.decode("utf-8"))
+
+    def test_index_freshness_next_from_quantization_lm_off(self):
+        """LM-off keeps the reload cadence: next = quantization window."""
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.get_or_fetch.return_value = (
+                    {
+                        "devices": [{"name": "meter", "lag": timedelta(seconds=6)}],
+                        "api_response": {},
+                        "instant": None,
+                    },
+                    True,
+                )
+                mock_cache.data = EnergyCacheData(
+                    samples=[0.0] * 900,
+                    data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                    last_sample_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    last_fetch_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    sample_count=900,
+                    quantization_seconds=30,
+                    quantization_offset=0,
+                    quantization_confidence=1.0,
+                )
+                response = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('data-live="0"', html)
+        self.assertIn('data-next="30"', html)
+        # The meta refresh must stay: no LM means the page reloads on its own.
+        self.assertIn(b'content="30"', response.data)
+
+    def test_partial_metrics_includes_freshness_strip(self):
+        """The SSE-swapped metrics fragment carries the same strip."""
+        with mock_config():
+            response = self.app.get(
+                "/?partial=metrics", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('id="data-freshness"', html)
+
+    def test_partial_load_marks_sse_driven(self):
+        """The load fragment tells the client SSE is a continuous driver."""
+        with mock_config():
+            TestIndexMobileAndLive._lm_wired_state()
+            response = self.app.get(
+                "/?partial=load", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('data-live="1"', response.data.decode("utf-8"))
+
+    def test_live_indicator_nested_in_freshness_strip(self):
+        """The live badge is part of the freshness strip, not the header."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        # The badge renders inside the freshness div...
+        strip = html.split('id="data-freshness"', 1)[1].split("</div>", 1)[0]
+        self.assertIn('id="live-indicator"', strip)
+        # ...and the header no longer carries it.
+        header = html.split("</header>", 1)[0]
+        self.assertNotIn("live-indicator", header)
+
+    def test_static_app_js_reapplies_live_badge_after_swap(self):
+        """app.js re-applies the live badge after each fragment swap, since
+        the server re-renders it hidden inside the swapped-in strip."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn("applyLiveBadge", js)
+        self.assertIn("document.getElementById('live-indicator')", js)
+        self.assertIn("if (live) {\n          applyLiveBadge()", js)
+
+    # --- client-side wiring --------------------------------------------
+
+    def test_static_app_js_ticks_freshness(self):
+        """app.js ticks the age and next-update countdown server-rendered,
+        using the per-mode warn/stale thresholds the server emits."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn("tickFreshness", js)
+        self.assertIn("data-freshness", js)
+        self.assertIn("data-lag-at", js)
+        self.assertIn("data-warn", js)
+        self.assertIn("data-stale", js)
+
+    def test_static_app_js_gates_live_on_sse_driver(self):
+        """app.js only cancels auto-refresh when the page is SSE-driven."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn('[data-live="1"]', js)
+
+    def test_static_css_styles_freshness_strip(self):
+        """style.css styles the freshness strip and its status colors."""
+        css = TestIndexMobileAndLive._static_text("style.css")
+        self.assertIn(".freshness", css)
+        self.assertIn("data-status", css)
+
+
+class TestSurplusIdeasLayout(unittest.TestCase):
+    """Surplus ideas on the dashboard: the label and the idea pills flow on a
+    single inline row (wrapping on narrow screens) — like 'Recent Periods' or
+    'Active devices' — with each idea as a shaded pill.
+    """
+
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
+
+    def test_static_css_surplus_ideas_single_line(self):
+        """The surplus ideas flow inline (label + pills) and wrap, with no
+        dashed top divider carrying into the section."""
+        css = TestIndexMobileAndLive._static_text("style.css")
+        # The demand block puts the label and the pills on one line.
+        demand_block = css.split(".demand {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: flex;", demand_block)
+        self.assertIn("flex-wrap: wrap;", demand_block)
+        self.assertNotIn("border-top", demand_block)
+        # The list itself is a wrapping row of pills, not a vertical stack.
+        list_block = css.split(".demand__list {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: flex;", list_block)
+        self.assertIn("flex-wrap: wrap;", list_block)
+        self.assertNotIn("flex-direction: column;", list_block)
+        # Shaded cell look, mirroring the QH2/QH3/QH4 history pills.
+        li_block = css.split(".demand__list li {", 1)[1].split("}", 1)[0]
+        self.assertIn("background: var(--color-sunken);", li_block)
+        self.assertIn("border-radius: var(--radius-pill);", li_block)
+
+    def test_static_css_no_divider_above_active_devices(self):
+        """The device-state section ('Active devices') carries no top divider."""
+        css = TestIndexMobileAndLive._static_text("style.css")
+        block = css.split(".device-state {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("border-top", block)
+
+    def test_surplus_ideas_render_as_own_list_items(self):
+        """Surplus ideas render as three separate <li> items."""
+        from flask import render_template
+
+        import app as app_mod
+
+        metrics = realistic_metrics()
+        nbc = metrics["devices"][0]["nbc"]
+        nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0))
+        metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
+        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        with app_mod.app.test_request_context():
+            html = render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=load_management,
+                freshness=None,
+            )
+        self.assertIn("ideas", html)
+        self.assertIn("<li>", html)
+
+    def test_positive_gap_reduce_usage_replaces_surplus_ideas(self):
+        """A positive Wh gap renders the demand section as 'reduce usage if
+        possible' with only the car-amps idea pill."""
+        from flask import render_template
+
+        import app as app_mod
+
+        metrics = realistic_metrics()
+        nbc = metrics["devices"][0]["nbc"]
+        nbc = dict(
+            nbc, QH1=dict(nbc["QH1"], predicted_wh=+800.0, remaining_seconds=900)
+        )
+        metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
+        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        with app_mod.app.test_request_context():
+            html = render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=load_management,
+                freshness=None,
+            )
+        self.assertIn("reduce usage if possible", html)
+        self.assertNotIn("Surplus ideas", html)
+        # Only the car-amps idea renders.
+        self.assertIn("Amps 240V", html)
+        self.assertNotIn(" min", html)
+
+    def test_surplus_car_amps_uses_remaining_period_seconds(self):
+        """Car amps follow the iOS formula: predictedWh / hours / -240.0, where
+        hours = remaining seconds in the period / 3600."""
+        from flask import render_template
+
+        import app as app_mod
+
+        metrics = realistic_metrics()
+        nbc = metrics["devices"][0]["nbc"]
+        # -800 Wh over a full 900 s (0.25 h) at 240 V -> +13.3 A of charge
+        # headroom: -800 / 0.25 / -240 = 13.33.
+        nbc = dict(
+            nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0, remaining_seconds=900)
+        )
+        metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
+        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        with app_mod.app.test_request_context():
+            html = render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=load_management,
+                freshness=None,
+            )
+        self.assertIn("+13.3 Amps 240V</li>", html)
+
+    def test_positive_gap_car_amps_sign_and_value(self):
+        """A positive gap yields signed amps (deficit reads negative): +800 Wh
+        over 0.25 h -> 800 / 0.25 / -240 = -13.3 A."""
+        from flask import render_template
+
+        import app as app_mod
+
+        metrics = realistic_metrics()
+        nbc = metrics["devices"][0]["nbc"]
+        nbc = dict(
+            nbc, QH1=dict(nbc["QH1"], predicted_wh=+800.0, remaining_seconds=900)
+        )
+        metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
+        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        with app_mod.app.test_request_context():
+            html = render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=load_management,
+                freshness=None,
+            )
+        self.assertIn("-13.3 Amps 240V</li>", html)
+
+    def test_car_amps_placeholder_when_no_time_remaining(self):
+        """No time left in the period (or missing remaining_seconds) renders
+        the em-dash placeholder instead of dividing by zero."""
+        from flask import render_template
+
+        import app as app_mod
+
+        metrics = realistic_metrics()
+        nbc = metrics["devices"][0]["nbc"]
+        nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0, remaining_seconds=0))
+        metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
+        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        with app_mod.app.test_request_context():
+            html = render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=load_management,
+                freshness=None,
+            )
+        self.assertIn("—</li>", html)
+
+
+class TestActiveDevicesPendingEffects(unittest.TestCase):
+    """The device-state section just above 'Surplus ideas' shows active
+    devices and pending effects, with Tesla charging amps in parentheses.
+    """
+
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
+
+    def _render_with_effects(self, devices: dict, effects: list) -> str:
+        """Render _metrics.html with custom devices and pending effects.
+
+        Args:
+            devices: Dict of device_name → {actual_state, current_amps, ...}.
+            effects: List of {device_name, action, target_amps} dicts.
+
+        Returns:
+            Rendered HTML string.
+        """
+        from flask import render_template
+        import app as app_mod
+
+        metrics = realistic_metrics()
+        nbc = metrics["devices"][0]["nbc"]
+        nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0))
+        metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
+        load_management = {
+            "last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}},
+            "state": {"devices": devices, "pending_effects": effects},
+        }
+        with app_mod.app.test_request_context():
+            return render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=load_management,
+                freshness=None,
+            )
+
+    def test_lists_active_devices_with_tesla_amps(self):
+        """Active devices show their names, Tesla with current amps in parens."""
+        html = self._render_with_effects(
+            devices={
+                "water_heater": {"actual_state": True, "current_amps": None},
+                "pool_pump": {"actual_state": True, "current_amps": None},
+                "hot_tub": {"actual_state": False, "current_amps": None},
+                "tesla": {"actual_state": True, "current_amps": 5},
+            },
+            effects=[],
+        )
+        self.assertIn("Active devices", html)
+        self.assertIn("water_heater", html)
+        self.assertIn("pool_pump", html)
+        self.assertIn("tesla (5)", html)
+
+    def test_lists_pending_effects_with_device_state(self):
+        """Pending effects show the device's state after the action: (on),
+        (off), or the Tesla's charging amps in parentheses."""
+        html = self._render_with_effects(
+            devices={
+                "water_heater": {"actual_state": True, "current_amps": None},
+                "pool_pump": {"actual_state": True, "current_amps": None},
+                "hot_tub": {"actual_state": False, "current_amps": None},
+                "tesla": {"actual_state": True, "current_amps": 5},
+            },
+            effects=[
+                {"device_name": "water_heater", "action": "turn_on",
+                 "target_amps": None},
+                {"device_name": "hot_tub", "action": "turn_off",
+                 "target_amps": None},
+                {"device_name": "tesla", "action": "set_amps",
+                 "target_amps": 16},
+            ],
+        )
+        self.assertIn("Pending effects", html)
+        self.assertIn("water_heater (on)", html)
+        self.assertIn("hot_tub (off)", html)
+        self.assertIn("tesla (5)", html)
+
+    def test_pending_effects_annotate_from_action_not_actual_state(self):
+        """Pending effects show (on)/(off) derived from the action taken,
+        not from actual_state which can be None right after a decision."""
+        # actual_state=None on all devices (post-decision before next sync)
+        html = self._render_with_effects(
+            devices={
+                "water_heater": {"actual_state": None, "current_amps": None},
+                "hot_tub": {"actual_state": None, "current_amps": None},
+                "tesla": {"actual_state": None, "current_amps": None},
+            },
+            effects=[
+                {"device_name": "water_heater", "action": "turn_on",
+                 "target_amps": None},
+                {"device_name": "hot_tub", "action": "turn_off",
+                 "target_amps": None},
+                {"device_name": "tesla", "action": "set_amps",
+                 "target_amps": 16},
+            ],
+        )
+        self.assertIn("Pending effects", html)
+        self.assertIn("water_heater (on)", html)
+        self.assertIn("hot_tub (off)", html)
+
+    def test_section_sits_above_surplus_ideas(self):
+        """The device-state section renders directly above 'Surplus ideas'."""
+        html = self._render_with_effects(
+            devices={
+                "water_heater": {"actual_state": True, "current_amps": None},
+                "pool_pump": {"actual_state": True, "current_amps": None},
+                "hot_tub": {"actual_state": False, "current_amps": None},
+                "tesla": {"actual_state": True, "current_amps": 5},
+            },
+            effects=[],
+        )
+        self.assertLess(html.index("Active devices"), html.index("Surplus ideas"))
+
+    def test_static_css_styles_device_state(self):
+        """style.css styles the device-state section and its lines."""
+        css = TestIndexMobileAndLive._static_text("style.css")
+        self.assertIn(".device-state", css)
+        self.assertIn(".device-state__line", css)
+
+    def test_recent_periods_pills_tint_outside_envelope(self):
+        """QH pills outside the target±hysteresis envelope get a load (blue)
+        or gen (green) tint; pills inside stay grey."""
+        from flask import render_template
+        import app as app_mod
+
+        def qh(raw: float) -> dict:
+            return {
+                "raw_wh": raw,
+                "wh": raw,
+                "predicted_wh": raw,
+                "prediction_w": raw / 60.0,
+                "complete": True,
+            }
+
+        metrics = {
+            "devices": [
+                {
+                    "name": "METER",
+                    "nbc": {
+                        "QH1": qh(-50.0),
+                        "QH2": qh(10.0),    # above target+hyst (-25) -> load
+                        "QH3": qh(-100.0),  # below target-hyst (-75) -> gen
+                        "QH4": qh(-50.0),   # within envelope -> grey
+                    },
+                }
+            ]
+        }
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {"diagnostics": {"hysteresis_wh": 25.0}},
+        }
+        with app_mod.app.test_request_context():
+            html = render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=load_management,
+                freshness=None,
+            )
+        self.assertIn(
+            '<span class="history__pill history__pill--load">+10</span>', html
+        )
+        self.assertIn(
+            '<span class="history__pill history__pill--gen">-100</span>', html
+        )
+        self.assertIn('<span class="history__pill">-50</span>', html)
+
+    def test_recent_periods_pills_grey_when_no_envelope(self):
+        """Without target/hysteresis data, all pills stay the default grey."""
+        from flask import render_template
+        import app as app_mod
+
+        def qh(raw: float) -> dict:
+            return {
+                "raw_wh": raw,
+                "wh": raw,
+                "predicted_wh": raw,
+                "prediction_w": raw / 60.0,
+                "complete": True,
+            }
+
+        metrics = {
+            "devices": [
+                {
+                    "name": "METER",
+                    "nbc": {
+                        "QH1": qh(-50.0),
+                        "QH2": qh(10.0),
+                        "QH3": qh(-100.0),
+                        "QH4": qh(-50.0),
+                    },
+                }
+            ]
+        }
+        with app_mod.app.test_request_context():
+            html = render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=None,
+                freshness=None,
+            )
+        self.assertIn('<span class="history__pill">+10</span>', html)
+        self.assertIn('<span class="history__pill">-100</span>', html)
+        self.assertNotIn("history__pill--load", html)
+        self.assertNotIn("history__pill--gen", html)

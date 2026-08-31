@@ -41,11 +41,20 @@ from flask import (
 )
 from flask.typing import ResponseReturnValue
 
+from chart import per_second_sparkline
 from config import Config, _config, get_timezone
 from clock import Clock, RealClock
-from constants import STALE_DATA_THRESHOLD_SECS
+from constants import (
+    FRESHNESS_LIVE_STALE_SECS,
+    FRESHNESS_LIVE_WARN_SECS,
+    FRESHNESS_RELOAD_STALE_SECS,
+    FRESHNESS_RELOAD_WARN_SECS,
+    METRICS_UPDATE_FALLBACK_SECS,
+    STALE_DATA_THRESHOLD_SECS,
+)
 
 from energy_cache import EnergyCache
+from quantization import usable_window
 import logfmt
 from metrics import (
     create_metrics,
@@ -194,6 +203,82 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
             devices[0]["per_second_data"] = accumulated
     metrics_data["devices"] = [_trim_output_device(d) for d in metrics_data.get("devices", [])]
     return metrics_data
+
+
+def _metrics_freshness_payload(
+    metrics_data: dict[str, Any],
+    load_management: dict,
+    refresh_secs: int | None,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Compute the data-freshness strip payload for the dashboard.
+
+    Unobtrusive single-line status: how old the per-second data is (the
+    worst device lag) and when to expect the next update. The values are
+    rendered into the ``_metrics.html`` fragment and ticked client-side by
+    ``static/app.js``. The ``live`` flag doubles as the client's signal for
+    whether SSE is a continuous driver (load management enabled: keep the
+    page live) or a one-shot snapshot (load management disabled: keep the
+    server auto-refresh / JS reload timer alive).
+
+    Args:
+        metrics_data: Metrics dict enriched by ``_enrich_metrics_for_sse``
+            (device ``lag`` values are timedeltas).
+        load_management: Load-management payload dict (empty when disabled).
+        refresh_secs: Server auto-refresh interval in seconds, or None.
+        now: Render-time clock (defaults to datetime.now(timezone.utc)).
+
+    Returns:
+        Dict with ``age_secs``, ``status``, ``next_update_secs``,
+        ``lag_at`` (epoch ms), ``live`` and the mode-aware
+        ``warn_secs``/``stale_secs`` thresholds; None when there are no
+        devices (nothing meaningful to report).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    lag_secs: list[float] = []
+    for device in metrics_data.get("devices", []):
+        lag = device.get("lag")
+        if lag is not None:
+            lag_secs.append(lag.total_seconds())
+    if not lag_secs:
+        return None
+
+    age_secs = max(lag_secs)
+    # Thresholds are mode-aware: refresh-driven pages (no load management)
+    # see data arrive 120-180 s late, while SSE-driven pages (load
+    # management) keep lag around 45-120 s on a ~30 s cycle. The client
+    # ticks with the same warn/stale values via data-warn/data-stale.
+    live = bool(load_management)
+    warn_secs = FRESHNESS_LIVE_WARN_SECS if live else FRESHNESS_RELOAD_WARN_SECS
+    stale_secs = FRESHNESS_LIVE_STALE_SECS if live else FRESHNESS_RELOAD_STALE_SECS
+    if age_secs >= stale_secs:
+        status = "stale"
+    elif age_secs >= warn_secs:
+        status = "aging"
+    else:
+        status = "fresh"
+
+    next_update_secs: int | None = None
+    if load_management:
+        sleep_hint = load_management.get("sleep_hint")
+        if sleep_hint is not None:
+            next_update_secs = max(1, int(round(float(sleep_hint))))
+    if next_update_secs is None and refresh_secs is not None and refresh_secs > 0:
+        next_update_secs = int(refresh_secs)
+    if next_update_secs is None:
+        next_update_secs = METRICS_UPDATE_FALLBACK_SECS
+
+    return {
+        "age_secs": int(round(age_secs)),
+        "status": status,
+        "next_update_secs": next_update_secs,
+        "lag_at": int(now.timestamp() * 1000),
+        "live": live,
+        "warn_secs": warn_secs,
+        "stale_secs": stale_secs,
+    }
 
 
 # The template_folder and static_folder default to 'templates' and 'static'
@@ -408,9 +493,27 @@ def index() -> ResponseReturnValue:
     # Gather load management state for display
     load_management = _build_load_management_payload()
 
-    # check for default html first, to handle missing Accept header.
-    if request.accept_mimetypes.accept_html:
+    # Live-update fragments: the SSE client fetches these to swap sections
+    # in place. Kept as plain HTML fragments so rendering stays in Jinja.
+    partial = request.args.get("partial")
+
+    # Refresh cadence for the page: the detected quantization window (when
+    # present) drives both the server-side meta refresh and the freshness
+    # strip's "next update" expectation. The same window is passed to the
+    # templates so the sparkline downsamples to the quantized sample size
+    # (wide bars instead of a sub-pixel per-second grating). Only HTML
+    # rendering (full page or fragments) consumes it, so JSON clients skip
+    # the cache read entirely.
+    if partial is not None or request.accept_mimetypes.accept_html:
         refresh_secs: int | None = None
+        quantization_seconds: int | None = None
+        cache_data = _state.energy_cache.data
+        if cache_data is not None:
+            quantization_seconds = usable_window(
+                cache_data.quantization_seconds,
+                cache_data.quantization_confidence,
+            )
+            refresh_secs = quantization_seconds
         if not metrics_data.get("devices"):
             # First-boot API outage: the 500 retry page is dead for
             # real-data paths (RetryableMetricsException is downgraded to a
@@ -418,6 +521,40 @@ def index() -> ResponseReturnValue:
             # empty dashboard renders with a 200. Auto-refresh it so it
             # self-heals when data arrives — no manual reload needed.
             refresh_secs = 5
+        freshness = _metrics_freshness_payload(
+            metrics_data, load_management, refresh_secs, now=now
+        )
+    else:
+        refresh_secs = None
+        quantization_seconds = None
+        freshness = None
+
+    if partial is not None:
+        if not request.accept_mimetypes.accept_html:
+            abort(406)
+        if partial == "metrics":
+            return render_template(
+                "_metrics.html",
+                metrics=metrics_data,
+                load_management=load_management,
+                freshness=freshness,
+                quantization_seconds=quantization_seconds,
+            )
+        if partial == "load":
+            if not load_management or not metrics_data.get("debug"):
+                # The legacy Load Management section only renders when debug
+                # mode is enabled; otherwise the client simply clears (or
+                # leaves absent) the section.
+                return ""
+            return render_template(
+                "_load_management.html",
+                load_management=load_management,
+            )
+        abort(400)
+
+    # check for default html first, to handle missing Accept header.
+    if request.accept_mimetypes.accept_html:
+        if not metrics_data.get("devices"):
             logger.warning(
                 "index: serving empty dashboard (no devices); auto-refreshing in %ds",
                 refresh_secs,
@@ -427,6 +564,8 @@ def index() -> ResponseReturnValue:
             metrics=metrics_data,
             load_management=load_management,
             refresh_secs=refresh_secs,
+            freshness=freshness,
+            quantization_seconds=quantization_seconds,
         )
 
     if request.accept_mimetypes.accept_json:
@@ -1201,6 +1340,7 @@ def create_app() -> Flask:
     # Register Tesla OAuth routes.
     application.register_blueprint(bp)
     application.jinja_env.filters["astimezonestr"] = astimezone_filter
+    application.jinja_env.filters["per_second_sparkline"] = per_second_sparkline
     application.json = CustomJSONProvider(application)
     application.register_error_handler(RetryableMetricsException, error_retryable)
     application.add_url_rule("/", "index", index)

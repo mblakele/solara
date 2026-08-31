@@ -1,0 +1,141 @@
+{# Load management section partial — rendered server-side for the index page
+   and the SSE-activated live updates (`/?partial=load`). Only rendered when
+   ``load_management`` is non-empty (see index.html include guard).
+#}
+<section id="load-management-section" class="load-management card container" aria-label="Load management" data-live="1">
+  <header class="load-management__header">
+    <h2>Load Management</h2>
+  </header>
+
+  <dl class="kv">
+    <div class="kv__row">
+      <dt>Enabled</dt>
+      <dd>
+        {% if load_management.enabled is sameas false %}
+          no
+        {% elif load_management.enabled is sameas true %}
+          yes
+        {% else %}
+          {{ "%.02d:%02d" % (load_management.enabled[0].hour, load_management.enabled[0].minute) }}–{{ "%.02d:%02d" % (load_management.enabled[1].hour, load_management.enabled[1].minute) }}
+        {% endif %}
+      </dd>
+    </div>
+    <div class="kv__row">
+      <dt>Dry Run</dt>
+      <dd>{{ "yes" if load_management.dry_run else "no" }}</dd>
+    </div>
+    <div class="kv__row">
+      <dt>Target Wh</dt>
+      <dd>{{ "%.0f" % load_management.target_wh }}</dd>
+    </div>
+  </dl>
+
+  {% if load_management.last_cycle_result %}
+  <h3 class="section-heading">Last Cycle</h3>
+  <dl class="kv">
+    <div class="kv__row">
+      <dt>Status</dt>
+      <dd class="{{ 'status--ok' if load_management.last_cycle_result.status in ['ok', 'dry-run'] else 'status--err' if load_management.last_cycle_result.status == 'stale_data' else 'status--warn' }}">
+        {{ load_management.last_cycle_result.status }}
+      </dd>
+    </div>
+    {% if load_management.last_cycle_result.predicted_wh is not none %}
+    <div class="kv__row">
+      <dt>Predicted Wh</dt>
+      <dd>{{ "%.0f" % load_management.last_cycle_result.predicted_wh }}</dd>
+    </div>
+    {% endif %}
+  </dl>
+
+  {% if load_management.last_cycle_result.diagnostics %}
+  {% set diag = load_management.last_cycle_result.diagnostics %}
+  <h3 class="section-heading">Diagnostics</h3>
+  <dl class="kv">
+    {% if diag.gap_wh is not none %}
+    <div class="kv__row">
+      <dt>Gap Wh</dt>
+      <dd class="{{ 'status--ok' if diag.reason == 'ok' else 'status--warn' }}">{{ "%.0f" % diag.gap_wh }}</dd>
+    </div>
+    {% endif %}
+    <div class="kv__row">
+      <dt>Hysteresis Wh</dt>
+      <dd>{{ diag.hysteresis_wh }}</dd>
+    </div>
+    {% if diag.seconds_remaining is not none %}
+    <div class="kv__row">
+      <dt>Seconds Remaining</dt>
+      <dd>{{ diag.seconds_remaining }}</dd>
+    </div>
+    {% endif %}
+    {% if diag.pending_effects_count is defined and diag.pending_effects_count is not none %}
+    <div class="kv__row">
+      <dt>Pending Effects</dt>
+      <dd class="{{ 'status--err' if diag.pending_effects_count > 0 else '' }}">{{ diag.pending_effects_count }}</dd>
+    </div>
+    {% endif %}
+    <div class="kv__row">
+      <dt>Reason</dt>
+      <dd class="{{ 'status--ok' if diag.reason == 'ok' else 'status--warn' if diag.reason in ['hysteresis', 'no_candidates', 'no_eligible', 'loads_too_large'] else 'status--err' }}">{{ diag.reason }}</dd>
+    </div>
+  </dl>
+
+  {% if diag.tesla_state %}
+  <dl class="kv">
+    <div class="kv__row">
+      <dt>Tesla</dt>
+      <dd>
+        {% if diag.tesla_state.is_charging %}charging{% else %}not charging{% endif %}
+        {% if diag.tesla_state.current_amps is not none %}({{ diag.tesla_state.current_amps }}A){% endif %}
+        {% if diag.tesla_state.plugged_in %}plugged{% else %}unplugged{% endif %}
+        {% if diag.tesla_state.at_home %}at home{% else %}away{% endif %}
+      </dd>
+    </div>
+  </dl>
+  {% endif %}
+
+  {% if diag.candidates %}
+  <h3 class="section-heading">Candidates</h3>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Watts</th>
+          <th>Capacity Wh</th>
+          <th>Can Toggle</th>
+          <th>Desired</th>
+          <th>Actual</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in diag.candidates %}
+        <tr>
+          <td>{{ c.name }}</td>
+          <td class="num">{{ c.power_watts }}</td>
+          <td class="num">{{ c.capacity_wh }}</td>
+          <td class="num {{ 'status--ok' if c.can_toggle else 'status--warn' }}">
+            {{ 'yes' if c.can_toggle else 'no' }}
+          </td>
+          <td>{{ c.desired_state if c.get('desired_state') is not none else '-' }}</td>
+          <td>{{ c.actual_state if c.get('actual_state') is not none else '-' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% endif %}
+
+  {% if load_management.last_cycle_result.actions %}
+  <h3 class="section-heading">Actions</h3>
+  <ul class="actions">
+    {% for action in load_management.last_cycle_result.actions %}
+    <li class="actions__item">
+      <span>{{ action.device }}</span>
+      <span class="actions__type">{{ action.action }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% endif %}
+</section>
