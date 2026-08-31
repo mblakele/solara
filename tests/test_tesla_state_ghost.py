@@ -100,3 +100,35 @@ class TestGhostTeslaAmps:
         assert state is not None
         assert state.is_charging is False
         assert state.current_amps in (0, None)
+
+    def test_preserves_last_known_at_home_when_location_absent(self):
+        """When Location is absent but _last_tesla_at_home is seeded, the
+        not-charging state must preserve the known at_home value.
+
+        This is the most common real-world path: telemetry charge state ticks
+        at 15 s intervals while Location arrives on a slower 120 s interval.
+        """
+        mgr = _make_lm_with_real_ctrl()
+        # Previously seeded (from an earlier Location/REST snapshot).
+        mgr._last_tesla_at_home = True  # noqa: SLF001
+
+        telemetry_snapshot = {
+            "ChargeAmps": None,
+            "DetailedChargeState": None,
+        }
+        with patch("load_manager.has_telemetry", return_value=True), patch(
+            "load_manager.get_telemetry_snapshot", return_value=telemetry_snapshot
+        ), patch.object(
+            mgr.tesla_ctrl, "init_tesla_state", return_value=None,
+        ) as mock_init:
+            state, error, url = asyncio.run(mgr._fetch_tesla_state_async())
+
+        assert error is None
+        assert url is None
+        assert state is not None
+        assert state.is_charging is False
+        assert state.current_amps in (0, None)
+        assert state.plugged_in is False
+        # at_home preserved from the seeded value, no REST round-trip needed.
+        assert state.at_home is True
+        mock_init.assert_not_called()

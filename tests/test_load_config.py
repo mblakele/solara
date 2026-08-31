@@ -1699,7 +1699,7 @@ def test_fetch_tesla_state_async_passes_timeout_zero(mock_config):
 
 
 @patch("config._lookup")
-def test_fetch_tesla_state_async_falls_through_on_incomplete_telemetry(
+def test_incomplete_telemetry_unseeded_location_falls_back_to_rest_not_charging(
     mock_config,
 ):
     """When telemetry is incomplete (no parseable charging state, no Location),

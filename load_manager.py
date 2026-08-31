@@ -162,6 +162,29 @@ def _next_cycle_id() -> str:
     return f"c{next(_cycle_counter)}-{_BOOT_ID}"
 
 
+def _not_charging_state(*, at_home: bool) -> TeslaState:
+    """Build the idle/disconnected Tesla state (vehicle is NOT charging).
+
+    Central helper used by :meth:`LoadManager._fetch_tesla_state_async` when live
+    telemetry reports no parseable charging state (no ``DetailedChargeState`` and
+    no positive ``ChargeAmps``). The vehicle is not drawing current, so the
+    ``current_amps`` / ``plugged_in`` fields are fixed at 0 / False regardless of
+    ``at_home`` (which depends on the vehicle's location).
+
+    Args:
+        at_home: Whether the vehicle is at the configured home location.
+
+    Returns:
+        A ``TeslaState`` representing an idle / disconnected vehicle.
+    """
+    return TeslaState(
+        is_charging=False,
+        current_amps=0,
+        plugged_in=False,
+        at_home=at_home,
+    )
+
+
 def _write_fleet_telemetry_dotfile(dotfile_path: Any) -> None:
     """Record fleet-telemetry provisioning time atomically.
 
@@ -1292,27 +1315,19 @@ class LoadManager:
                 # as authoritative — it may hold a ghost "charging @ N A" from
                 # an earlier session (bugs/2026-08-31-ghost-tesla-amps.log).
                 # Represent reality as idle/disconnected, preserving at_home.
-                telemetry_state = TeslaState(
-                    is_charging=False,
-                    current_amps=0,
-                    plugged_in=False,
-                    at_home=False,
-                )
                 if "Location" in telemetry_snapshot:
                     at_home = _compute_at_home_from_location(telemetry_snapshot)
                     self._last_tesla_at_home = at_home
-                    return TeslaState(
-                        is_charging=False, current_amps=0, plugged_in=False,
-                        at_home=at_home,
-                    ), None, None
+                    return _not_charging_state(at_home=at_home), None, None
                 if self._last_tesla_at_home is not None:
-                    return TeslaState(
-                        is_charging=False, current_amps=0, plugged_in=False,
+                    return _not_charging_state(
                         at_home=self._last_tesla_at_home,
                     ), None, None
                 # Location and at_home are unseeded — fall through to the REST
-                # fallback below to seed _last_tesla_at_home, then merge the
-                # REST at_home into the (not-charging) telemetry state.
+                # fallback below to seed _last_tesla_at_home. The REST merge
+                # (below) folds ``rest_state.at_home`` into the not-charging
+                # telemetry state, discarding the placeholder at_home=False.
+                telemetry_state = _not_charging_state(at_home=False)
 
         # REST fallback to seed _last_tesla_at_home and/or obtain location.
         if not isinstance(self.tesla_ctrl, RealTeslaController):
@@ -1348,6 +1363,11 @@ class LoadManager:
                     plugged_in=telemetry_state.plugged_in,
                     at_home=rest_state.at_home,
                 ), None, None
+            # Reached only when there is no telemetry to contradict it (e.g.
+            # has_telemetry() is False) or Location is present — NOT from the
+            # not-charging else branch above (there telemetry_state is not None
+            # and Location is absent, so the merge just above always runs and
+            # the charging "ghost" is never returned).
             return rest_state, None, None
 
         # REST failed — fall back to telemetry state if available.
