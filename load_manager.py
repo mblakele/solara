@@ -60,6 +60,7 @@ from load_controllers import (
     load_tesla_tokens,
 )
 from mqtt_telemetry import (
+    _compute_at_home_from_location,
     get_field_update_at,
     get_telemetry_snapshot,
     has_telemetry,
@@ -1283,9 +1284,35 @@ class LoadManager:
                 # (15s interval) before Location (120s interval) so the
                 # telemetry fast path would otherwise return at_home=False
                 # without ever reaching the REST fallback below.
-            # Telemetry exists but no parseable state yet (e.g. only
-            # DetailedChargeState="Disconnected" without ChargeAmps).
-            # Fall through to the controller's cached state.
+            else:
+                # Live telemetry is present but reports no parseable charging
+                # state (no DetailedChargeState AND no positive ChargeAmps), so
+                # the vehicle is NOT charging / is disconnected. Do NOT fall
+                # all the way through to the controller's cached `_init_state`
+                # as authoritative — it may hold a ghost "charging @ N A" from
+                # an earlier session (bugs/2026-08-31-ghost-tesla-amps.log).
+                # Represent reality as idle/disconnected, preserving at_home.
+                telemetry_state = TeslaState(
+                    is_charging=False,
+                    current_amps=0,
+                    plugged_in=False,
+                    at_home=False,
+                )
+                if "Location" in telemetry_snapshot:
+                    at_home = _compute_at_home_from_location(telemetry_snapshot)
+                    self._last_tesla_at_home = at_home
+                    return TeslaState(
+                        is_charging=False, current_amps=0, plugged_in=False,
+                        at_home=at_home,
+                    ), None, None
+                if self._last_tesla_at_home is not None:
+                    return TeslaState(
+                        is_charging=False, current_amps=0, plugged_in=False,
+                        at_home=self._last_tesla_at_home,
+                    ), None, None
+                # Location and at_home are unseeded — fall through to the REST
+                # fallback below to seed _last_tesla_at_home, then merge the
+                # REST at_home into the (not-charging) telemetry state.
 
         # REST fallback to seed _last_tesla_at_home and/or obtain location.
         if not isinstance(self.tesla_ctrl, RealTeslaController):
