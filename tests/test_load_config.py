@@ -1699,12 +1699,17 @@ def test_fetch_tesla_state_async_passes_timeout_zero(mock_config):
 
 
 @patch("config._lookup")
-def test_fetch_tesla_state_async_falls_through_on_incomplete_telemetry(
+def test_incomplete_telemetry_unseeded_location_falls_back_to_rest_not_charging(
     mock_config,
 ):
-    """When telemetry has ChargeAmps but no DetailedChargeState, the fast
-    path returns None and we fall through to init_tesla_state() instead
-    of returning (None, None, None) immediately."""
+    """When telemetry is incomplete (no parseable charging state, no Location),
+    we fall through to init_tesla_state() to seed at_home — but the returned
+    state must reflect the live telemetry (NOT charging), never a stale cached
+    charging state.
+
+    Regression: the old code returned the controller's cached `_init_state`
+    verbatim (a ghost "charging @ N A"); see
+    bugs/2026-08-31-ghost-tesla-amps.log."""
     from load_controllers import RealTeslaController
 
     tesla_cfg = TeslaConfig(
@@ -1717,7 +1722,7 @@ def test_fetch_tesla_state_async_falls_through_on_incomplete_telemetry(
         home_radius_m=500,
     )
     ctrl = RealTeslaController(tesla_cfg)
-    expected_state = TeslaState(
+    rest_state = TeslaState(
         is_charging=True, current_amps=12, plugged_in=True, at_home=True,
     )
 
@@ -1739,14 +1744,23 @@ def test_fetch_tesla_state_async_falls_through_on_incomplete_telemetry(
             ):
                 with patch.object(
                     ctrl, "init_tesla_state",
-                    return_value=expected_state,
+                    return_value=rest_state,
                 ) as mock_init:
                     result = asyncio.run(mgr._fetch_tesla_state_async())
 
     assert mock_init.called, (
-        "init_tesla_state should be called when telemetry is incomplete"
+        "init_tesla_state should still be called when telemetry is "
+        "incomplete and location is unseeded (to seed at_home)"
     )
     result_state, result_err, result_url = result
-    assert result_state is expected_state
+    assert result_state is not None
+    # Live telemetry says not charging → must not resurrect the ghost state.
+    assert result_state.is_charging is False, (
+        f"Expected is_charging=False (telemetry says not charging), got "
+        f"{result_state.is_charging}"
+    )
+    assert result_state.current_amps in (0, None)
+    # at_home is seeded from the REST fallback (location).
+    assert result_state.at_home is True
     assert result_err is None
     assert result_url is None
