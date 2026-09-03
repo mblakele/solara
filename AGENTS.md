@@ -285,8 +285,14 @@ project-root
 - `_fetch_tesla_state_async()` in `load_manager.py` — fetches Tesla state from MQTT
   telemetry with a fast path; returns telemetry state as long as `ChargeAmts` is present
   (does NOT require `Location`). Preserves `at_home` from `_last_tesla_at_home` when
-  `Location` is absent in the snapshot. Delegates to controller's `init_tesla_state()`
+  `Location` is absent in the snapshot. When live telemetry is present but parses to
+  `None` (no `DetailedChargeState` and no positive `ChargeAmps`), the vehicle is treated
+  as idle/disconnected — a not-charging `TeslaState` is returned (`current_amps=0`,
+  `plugged_in=False`, `at_home` from live `Location` or `_last_tesla_at_home`) and the
+  controller's stale cached `_init_state` is NOT used as an answer (ghost-guard;
+  bugs/2026-08-31-ghost-tesla-amps.log). Delegates to controller's `init_tesla_state()`
   (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
+  or when `at_home` is unseeded and `Location` is absent (to seed location)
 - Data models in `load_models.py`
 - `nominal_voltage()` in `load_nbc.py` — deferred-config resolver for the
   `TESLA_NOMINAL_VOLTAGE` env (default 240; invalid/non-positive falls back
