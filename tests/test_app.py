@@ -2428,9 +2428,8 @@ class TestDataFreshness(unittest.TestCase):
 
 
 class TestSurplusIdeasLayout(unittest.TestCase):
-    """Surplus ideas on the dashboard: the label and the idea pills flow on a
-    single inline row (wrapping on narrow screens) — like 'Recent Periods' or
-    'Devices' — with each idea as a shaded pill.
+    """Ideas on the dashboard: the label sits above a 2x2 pill grid —
+    like 'Recent Periods' or 'Devices' — with each idea as a shaded pill.
     """
 
     def setUp(self):
@@ -2438,19 +2437,18 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         self.app.testing = True
 
     def test_static_css_surplus_ideas_single_line(self):
-        """The surplus ideas flow inline (label + pills) and wrap, with no
+        """The ideas section stacks label above a 2x2 pill grid, with no
         dashed top divider carrying into the section."""
         css = TestIndexMobileAndLive._static_text("style.css")
-        # The demand block puts the label and the pills on one line.
+        # The demand block stacks label above the grid.
         demand_block = css.split(".demand {", 1)[1].split("}", 1)[0]
         self.assertIn("display: flex;", demand_block)
-        self.assertIn("flex-wrap: wrap;", demand_block)
+        self.assertIn("flex-direction: column;", demand_block)
         self.assertNotIn("border-top", demand_block)
-        # The list itself is a wrapping row of pills, not a vertical stack.
+        # The list itself is a 2-column grid.
         list_block = css.split(".demand__list {", 1)[1].split("}", 1)[0]
-        self.assertIn("display: flex;", list_block)
-        self.assertIn("flex-wrap: wrap;", list_block)
-        self.assertNotIn("flex-direction: column;", list_block)
+        self.assertIn("display: grid;", list_block)
+        self.assertIn("repeat(2, 1fr)", list_block)
         # Shaded cell look, mirroring the QH2/QH3/QH4 history pills.
         li_block = css.split(".demand__list li {", 1)[1].split("}", 1)[0]
         self.assertIn("background: var(--color-sunken);", li_block)
@@ -2463,7 +2461,7 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         self.assertNotIn("border-top", block)
 
     def test_surplus_ideas_render_as_own_list_items(self):
-        """Surplus ideas render as three separate <li> items."""
+        """Ideas render as three separate <li> items under an 'Ideas' label."""
         from flask import render_template
 
         import app as app_mod
@@ -2480,7 +2478,7 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 load_management=load_management,
                 freshness=None,
             )
-        self.assertIn("ideas", html)
+        self.assertIn(">Ideas<", html)
         self.assertIn("<li>", html)
 
     def test_positive_gap_reduce_usage_replaces_surplus_ideas(self):
@@ -2505,7 +2503,7 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 freshness=None,
             )
         self.assertIn("reduce usage if possible", html)
-        self.assertNotIn("Surplus ideas", html)
+        self.assertNotIn(">Ideas<", html)
         # Only the car-amps idea renders.
         self.assertIn("Amps 240V", html)
         self.assertNotIn(" min", html)
@@ -2664,7 +2662,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         self.assertIn("Devices", html)
         self.assertIn("device-pill--pending-on", html)
         self.assertIn("device-pill--pending-off", html)
-        self.assertIn("tesla (5)", html)
+        self.assertIn("tesla (5&gt;16)", html)
         self.assertNotIn("(on)", html)
         self.assertNotIn("(off)", html)
 
@@ -2691,6 +2689,20 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         self.assertIn("device-pill--pending-on", html)
         self.assertIn("device-pill--pending-off", html)
 
+    def test_tesla_pending_set_amps_shows_old_to_new(self):
+        """Tesla with a pending set_amps shows old>new amps in parens."""
+        html = self._render_with_effects(
+            devices={
+                "tesla": {"actual_state": True, "current_amps": 10},
+            },
+            effects=[
+                {"device_name": "tesla", "action": "set_amps",
+                 "target_amps": 6},
+            ],
+        )
+        # Jinja autoescapes `>` to `&gt;`; the browser renders `tesla (10>6)`.
+        self.assertIn("tesla (10&gt;6)", html)
+
     def test_tesla_stopped_or_unavailable_renders_grey_without_amps(self):
         """Tesla stopped (0A) or unavailable renders grey with plain name."""
         html = self._render_with_effects(
@@ -2710,7 +2722,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         self.assertIn(">tesla</li>", html)
 
     def test_section_sits_above_surplus_ideas(self):
-        """The Devices grid renders directly above 'Surplus ideas'."""
+        """The Devices grid renders directly above 'Ideas'."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2720,7 +2732,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             },
             effects=[],
         )
-        self.assertLess(html.index("Devices"), html.index("Surplus ideas"))
+        self.assertLess(html.index("Devices"), html.index(">Ideas<"))
 
     def test_static_css_styles_device_state(self):
         """style.css styles the devices grid, two-per-line pills, and states."""

@@ -116,15 +116,21 @@
         {% set pill_class = "device-pill--on" %}
         {% endif %}
         {# Label: plain device name for plugs (state carried by color);
-           Tesla appends amps in parens when charging. #}
+           Tesla appends amps in parens when charging, or old>new while a
+           set_amps effect is pending. #}
         {% set label = name %}
         {% if name == "tesla" %}
-        {% set amps = dev.current_amps %}
-        {% if amps is none %}
+        {% set current = dev.current_amps %}
+        {% if pending_action == "set_amps" and pending_amps is not none and pending_amps != 0 and current is not none and current != 0 and pending_amps != current %}
+        {% set label = name ~ " (" ~ current ~ ">" ~ pending_amps ~ ")" %}
+        {% else %}
+        {% set amps = current %}
+        {% if amps is none or amps == 0 %}
         {% set amps = pending_amps %}
         {% endif %}
         {% if amps is not none and amps != 0 %}
         {% set label = name ~ " (" ~ amps ~ ")" %}
+        {% endif %}
         {% endif %}
         {% endif %}
         <li class="device-pill {{ pill_class }}">{{ label }}</li>
@@ -149,7 +155,7 @@
     {% set shower_min = (qh1.predicted_wh / 81.0) | abs %}
     {% set laundry_min = (qh1.predicted_wh / 88.0) | abs %}
     <div class="demand">
-      <span class="demand__label">Surplus ideas</span>
+      <span class="demand__label">Ideas</span>
       <ul class="demand__list">
         <li>⚡🚿 {{ "%.1f" % shower_min }} min</li>
         <li>⚡👕 {{ "%.1f" % laundry_min }} min</li>

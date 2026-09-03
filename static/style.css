@@ -275,9 +275,9 @@ body {
 
 .demand {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
+  flex-direction: column;
   gap: var(--space-xs);
+  font-size: 0.85rem;
 }
 
 .demand__label {
@@ -291,8 +291,8 @@ body {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: var(--space-xs);
   font-size: 0.85rem;
 }
@@ -302,6 +302,8 @@ body {
   border-radius: var(--radius-pill);
   padding: 0.3rem 0.75rem;
   font-variant-numeric: tabular-nums;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 
 /* Devices section: single grid listing every configured device as a pill,
