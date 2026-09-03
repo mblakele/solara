@@ -64,7 +64,7 @@
     <div class="demand">
       <span class="demand__label">reduce usage if possible</span>
       <ul class="demand__list">
-        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
+        <li>🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
       </ul>
     </div>
     {% elif qh1.predicted_wh < diag.hysteresis_wh %}
@@ -75,7 +75,7 @@
       <ul class="demand__list">
         <li>⚡🚿 {{ "%.1f" % shower_min }} min</li>
         <li>⚡👕 {{ "%.1f" % laundry_min }} min</li>
-        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
+        <li>🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
       </ul>
     </div>
     {% endif %}
@@ -146,7 +146,7 @@
     {% endif %}
 
     <div class="history" aria-label="Earlier quarter-hours">
-      <div class="demand__label">Recent Periods</div>
+      <div class="demand__label">Recent</div>
       {% set hist_target = load_management.get("target_wh") if load_management else none %}
       {% set hist_hyst = diag.hysteresis_wh if diag else none %}
       {% for qh_key in ["QH2", "QH3", "QH4"] %}

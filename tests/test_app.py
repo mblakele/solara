@@ -2429,7 +2429,7 @@ class TestDataFreshness(unittest.TestCase):
 
 class TestSurplusIdeasLayout(unittest.TestCase):
     """Ideas on the dashboard: the label sits above a 2x2 pill grid —
-    like 'Recent Periods' or 'Devices' — with each idea as a shaded pill.
+    like 'Recent' or 'Devices' — with each idea as a shaded pill.
     """
 
     def setUp(self):
@@ -2722,7 +2722,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         self.assertIn(">tesla</li>", html)
 
     def test_section_sits_above_surplus_ideas(self):
-        """Ideas render above Devices, which render above Recent Periods."""
+        """Ideas render above Devices, which render above Recent."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2733,7 +2733,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             effects=[],
         )
         self.assertLess(html.index(">Ideas<"), html.index("Devices"))
-        self.assertLess(html.index("Devices"), html.index("Recent Periods"))
+        self.assertLess(html.index("Devices"), html.index("Recent"))
 
     def test_static_css_styles_device_state(self):
         """style.css styles the devices grid, two-per-line pills, and states."""
@@ -2748,7 +2748,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         grid_block = css.split(".device-grid__list {", 1)[1].split("}", 1)[0]
         self.assertIn("repeat(2, 1fr)", grid_block)
 
-    def test_recent_periods_pills_tint_outside_envelope(self):
+    def test_recent_pills_tint_outside_envelope(self):
         """QH pills outside the target±hysteresis envelope get a load (blue)
         or gen (green) tint; pills inside stay grey."""
         from flask import render_template
@@ -2795,7 +2795,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         )
         self.assertIn('<span class="history__pill">-50</span>', html)
 
-    def test_recent_periods_pills_grey_when_no_envelope(self):
+    def test_recent_pills_grey_when_no_envelope(self):
         """Without target/hysteresis data, all pills stay the default grey."""
         from flask import render_template
         import app as app_mod
