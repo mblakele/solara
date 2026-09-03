@@ -2430,7 +2430,7 @@ class TestDataFreshness(unittest.TestCase):
 class TestSurplusIdeasLayout(unittest.TestCase):
     """Surplus ideas on the dashboard: the label and the idea pills flow on a
     single inline row (wrapping on narrow screens) — like 'Recent Periods' or
-    'Active devices' — with each idea as a shaded pill.
+    'Devices' — with each idea as a shaded pill.
     """
 
     def setUp(self):
@@ -2457,9 +2457,9 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         self.assertIn("border-radius: var(--radius-pill);", li_block)
 
     def test_static_css_no_divider_above_active_devices(self):
-        """The device-state section ('Active devices') carries no top divider."""
+        """The devices grid section carries no top divider."""
         css = TestIndexMobileAndLive._static_text("style.css")
-        block = css.split(".device-state {", 1)[1].split("}", 1)[0]
+        block = css.split(".device-grid {", 1)[1].split("}", 1)[0]
         self.assertNotIn("border-top", block)
 
     def test_surplus_ideas_render_as_own_list_items(self):
@@ -2581,8 +2581,8 @@ class TestSurplusIdeasLayout(unittest.TestCase):
 
 
 class TestActiveDevicesPendingEffects(unittest.TestCase):
-    """The device-state section just above 'Surplus ideas' shows active
-    devices and pending effects, with Tesla charging amps in parentheses.
+    """The unified Devices grid shows every configured device as a pill, two
+    per line, with Tesla charging amps in parentheses.
     """
 
     def setUp(self):
@@ -2619,7 +2619,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             )
 
     def test_lists_active_devices_with_tesla_amps(self):
-        """Active devices show their names, Tesla with current amps in parens."""
+        """Devices grid shows every device; on is green, off grey, Tesla with amps."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2629,14 +2629,22 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             },
             effects=[],
         )
-        self.assertIn("Active devices", html)
+        self.assertIn("Devices", html)
+        self.assertNotIn("Active devices", html)
+        self.assertNotIn("Pending effects", html)
         self.assertIn("water_heater", html)
         self.assertIn("pool_pump", html)
+        self.assertIn("hot_tub", html)
         self.assertIn("tesla (5)", html)
+        # State carried by color, not parenthesised on/off text.
+        self.assertNotIn("(on)", html)
+        self.assertNotIn("(off)", html)
+        self.assertIn("device-pill--on", html)
+        self.assertIn("device-pill--off", html)
+        self.assertIn("device-grid__list", html)
 
     def test_lists_pending_effects_with_device_state(self):
-        """Pending effects show the device's state after the action: (on),
-        (off), or the Tesla's charging amps in parentheses."""
+        """Pending turn_off renders blue, turn_on/set_amps the grey-green mix."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2653,14 +2661,16 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
                  "target_amps": 16},
             ],
         )
-        self.assertIn("Pending effects", html)
-        self.assertIn("water_heater (on)", html)
-        self.assertIn("hot_tub (off)", html)
+        self.assertIn("Devices", html)
+        self.assertIn("device-pill--pending-on", html)
+        self.assertIn("device-pill--pending-off", html)
         self.assertIn("tesla (5)", html)
+        self.assertNotIn("(on)", html)
+        self.assertNotIn("(off)", html)
 
     def test_pending_effects_annotate_from_action_not_actual_state(self):
-        """Pending effects show (on)/(off) derived from the action taken,
-        not from actual_state which can be None right after a decision."""
+        """Pending colors derive from the action taken, not actual_state which
+        can be None right after a decision."""
         # actual_state=None on all devices (post-decision before next sync)
         html = self._render_with_effects(
             devices={
@@ -2677,12 +2687,30 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
                  "target_amps": 16},
             ],
         )
-        self.assertIn("Pending effects", html)
-        self.assertIn("water_heater (on)", html)
-        self.assertIn("hot_tub (off)", html)
+        self.assertIn("Devices", html)
+        self.assertIn("device-pill--pending-on", html)
+        self.assertIn("device-pill--pending-off", html)
+
+    def test_tesla_stopped_or_unavailable_renders_grey_without_amps(self):
+        """Tesla stopped (0A) or unavailable renders grey with plain name."""
+        html = self._render_with_effects(
+            devices={
+                "tesla": {"actual_state": False, "current_amps": 0},
+            },
+            effects=[],
+        )
+        self.assertIn(">tesla</li>", html)
+        self.assertIn("device-pill--off", html)
+        html = self._render_with_effects(
+            devices={
+                "tesla": {"actual_state": None, "current_amps": None},
+            },
+            effects=[],
+        )
+        self.assertIn(">tesla</li>", html)
 
     def test_section_sits_above_surplus_ideas(self):
-        """The device-state section renders directly above 'Surplus ideas'."""
+        """The Devices grid renders directly above 'Surplus ideas'."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2692,13 +2720,20 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             },
             effects=[],
         )
-        self.assertLess(html.index("Active devices"), html.index("Surplus ideas"))
+        self.assertLess(html.index("Devices"), html.index("Surplus ideas"))
 
     def test_static_css_styles_device_state(self):
-        """style.css styles the device-state section and its lines."""
+        """style.css styles the devices grid, two-per-line pills, and states."""
         css = TestIndexMobileAndLive._static_text("style.css")
-        self.assertIn(".device-state", css)
-        self.assertIn(".device-state__line", css)
+        self.assertIn(".device-grid", css)
+        self.assertIn(".device-grid__list", css)
+        self.assertIn(".device-pill--on", css)
+        self.assertIn(".device-pill--off", css)
+        self.assertIn(".device-pill--pending-off", css)
+        self.assertIn(".device-pill--pending-on", css)
+        # Two devices per line.
+        grid_block = css.split(".device-grid__list {", 1)[1].split("}", 1)[0]
+        self.assertIn("repeat(2, 1fr)", grid_block)
 
     def test_recent_periods_pills_tint_outside_envelope(self):
         """QH pills outside the target±hysteresis envelope get a load (blue)

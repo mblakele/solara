@@ -75,54 +75,61 @@
       {% endfor %}
     </div>
 
-    {% set active = namespace(devices=[]) %}
     {% if load_management and load_management.state and load_management.state.devices %}
-    {% for name, dev in load_management.state.devices.items() %}
-    {% if dev.actual_state %}
-    {% set label = name %}
-    {% if dev.current_amps is not none %}
-    {% set label = name ~ " (" ~ dev.current_amps ~ ")" %}
-    {% endif %}
-    {% set active.devices = active.devices + [label] %}
-    {% endif %}
-    {% endfor %}
-    {% endif %}
-
-    {% set pending = namespace(effects=[]) %}
-    {% if load_management and load_management.state and load_management.state.pending_effects %}
-    {% set devices = load_management.state.devices if load_management.state.devices else {} %}
-    {% for effect in load_management.state.pending_effects %}
-    {% set dev = devices.get(effect.device_name) %}
-    {% set label = effect.device_name %}
-    {# Annotate each effect with the state implied by the action taken.
-       Amps are shown when available (Tesla); otherwise derive (on)/(off)
-       from the action itself — this is reliable even when actual_state is
-       None (post-decision before the next sync). #}
-    {% if dev is not none and dev.current_amps is not none %}
-    {% set label = effect.device_name ~ " (" ~ dev.current_amps ~ ")" %}
-    {% elif effect.action == "turn_on" %}
-    {% set label = effect.device_name ~ " (on)" %}
-    {% elif effect.action == "turn_off" %}
-    {% set label = effect.device_name ~ " (off)" %}
-    {% endif %}
-    {% set pending.effects = pending.effects + [label] %}
-    {% endfor %}
-    {% endif %}
-
-    {% if active.devices or pending.effects %}
-    <div class="device-state">
-      {% if active.devices %}
-      <div class="device-state__line">
-        <span class="demand__label">Active devices</span>
-        <span>{{ active.devices | join(", ") }}</span>
-      </div>
-      {% endif %}
-      {% if pending.effects %}
-      <div class="device-state__line">
-        <span class="demand__label">Pending effects</span>
-        <span>{{ pending.effects | join(", ") }}</span>
-      </div>
-      {% endif %}
+    <div class="device-grid">
+      <span class="demand__label">Devices</span>
+      <ul class="device-grid__list">
+        {% for name, dev in load_management.state.devices.items() %}
+        {% set pending = namespace(action=none, amps=none) %}
+        {% for effect in load_management.state.pending_effects or [] %}
+        {% if effect.device_name == name %}
+        {% set pending.action = effect.action %}
+        {% set pending.amps = effect.target_amps %}
+        {% endif %}
+        {% endfor %}
+        {% set pending_action = pending.action %}
+        {% set pending_amps = pending.amps %}
+        {# Pill color: pending turn_off -> blue, pending turn_on / set_amps ->
+           grey-green mix, otherwise on -> faded green, off -> grey. Tesla
+           counts as on (green) only when charging; stopped or unavailable
+           renders grey. #}
+        {% set pill_class = "device-pill--off" %}
+        {% if pending_action == "turn_off" %}
+        {% set pill_class = "device-pill--pending-off" %}
+        {% elif pending_action == "turn_on" %}
+        {% set pill_class = "device-pill--pending-on" %}
+        {% elif pending_action == "set_amps" %}
+        {% if pending_amps is not none and pending_amps == 0 %}
+        {% set pill_class = "device-pill--pending-off" %}
+        {% else %}
+        {% set pill_class = "device-pill--pending-on" %}
+        {% endif %}
+        {% elif name == "tesla" %}
+        {% if dev.current_amps is not none %}
+        {% if dev.current_amps > 0 %}
+        {% set pill_class = "device-pill--on" %}
+        {% endif %}
+        {% elif dev.actual_state %}
+        {% set pill_class = "device-pill--on" %}
+        {% endif %}
+        {% elif dev.actual_state %}
+        {% set pill_class = "device-pill--on" %}
+        {% endif %}
+        {# Label: plain device name for plugs (state carried by color);
+           Tesla appends amps in parens when charging. #}
+        {% set label = name %}
+        {% if name == "tesla" %}
+        {% set amps = dev.current_amps %}
+        {% if amps is none %}
+        {% set amps = pending_amps %}
+        {% endif %}
+        {% if amps is not none and amps != 0 %}
+        {% set label = name ~ " (" ~ amps ~ ")" %}
+        {% endif %}
+        {% endif %}
+        <li class="device-pill {{ pill_class }}">{{ label }}</li>
+        {% endfor %}
+      </ul>
     </div>
     {% endif %}
 
