@@ -751,6 +751,36 @@ class CycleResult:
         }
 
 
+@dataclass(frozen=True)
+class AsyncPhaseResult:
+    """Outcome of one load-management async phase.
+
+    Replaces the previous 8-tuple returned by
+    ``LoadManager._cycle_async_phase()`` so call sites read named fields
+    instead of positional indexes. Field order matches the old tuple order
+    to keep the migration mechanical.
+
+    Attributes:
+        tesla_state: Current Tesla state, or None when unavailable.
+        tesla_error: Error message from Tesla API, or None.
+        tesla_login_url: OAuth login URL when re-auth is needed, or None.
+        succeeded_effects: Actions that were successfully executed.
+        actions: All actions decided by this cycle (including dry-run).
+        gap_wh: Gap corrected with the live Tesla in-flight contribution.
+        adjusted_wh: Adjusted Wh corrected with the in-flight contribution.
+        sentinel_on: True when a sentinel device was found on during sync.
+    """
+
+    tesla_state: TeslaState | None = None
+    tesla_error: str | None = None
+    tesla_login_url: str | None = None
+    succeeded_effects: list[PendingEffect] = field(default_factory=list)
+    actions: list[PendingEffect] = field(default_factory=list)
+    gap_wh: float = 0.0
+    adjusted_wh: float = 0.0
+    sentinel_on: bool = False
+
+
 # === Pipeline Context (Direction A) ===
 
 

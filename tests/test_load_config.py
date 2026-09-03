@@ -1392,12 +1392,10 @@ def test_cycle_no_actions_when_sentinel_on(mock_config):
             # engine.decide should NOT be called
             mock_decide.assert_not_called()
 
-    # Returns 8-tuple: (tesla_state, tesla_error, tesla_login_url,
-    # succeeded_effects, results, gap_wh, adjusted_wh, sentinel_on)
-    _, _, _, succeeded_effects, results, _, _, sentinel_on = result
-    assert succeeded_effects == []
-    assert results == []
-    assert sentinel_on is True
+    # Returns AsyncPhaseResult with succeeded_effects, actions, sentinel_on.
+    assert result.succeeded_effects == []
+    assert result.actions == []
+    assert result.sentinel_on is True
 
 
 @patch("config._lookup")
@@ -1502,10 +1500,9 @@ def test_sentinel_state_still_tracked(mock_config):
     assert dev.desired_state is True
 
     # But no actions were taken
-    _, _, _, succeeded_effects, results, _, _, sentinel_on = result
-    assert succeeded_effects == []
-    assert results == []
-    assert sentinel_on is True
+    assert result.succeeded_effects == []
+    assert result.actions == []
+    assert result.sentinel_on is True
 
 
 @patch("config._lookup")

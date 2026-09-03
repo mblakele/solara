@@ -9,7 +9,7 @@ import pytest
 
 from load_controllers import RealTeslaController, TeslaController
 from load_manager import LoadManager, LoadManagerConfig
-from load_models import CycleContext, PendingEffect, TeslaAuthError
+from load_models import AsyncPhaseResult, CycleContext, PendingEffect, TeslaAuthError
 from load_nbc import NBCFetchResult
 
 
@@ -403,9 +403,9 @@ class TestStageBuildResult:
 class TestStageAsyncPhase:
     """_stage_async_phase() — Stage 5 of the pipeline.
 
-    Calls _cycle_async_phase via asyncio.run() and unpacks the 8-tuple
-    into ctx fields. Mutates ctx.gap_wh and ctx.adjusted_wh with corrected
-    values from the async phase.
+    Calls _cycle_async_phase via asyncio.run() and applies the
+    AsyncPhaseResult fields onto ctx, overwriting ctx.gap_wh and
+    ctx.adjusted_wh with corrected values from the async phase.
     """
 
     def test_returns_none(self, lm: LoadManager, ctx: CycleContext):
@@ -417,15 +417,15 @@ class TestStageAsyncPhase:
         ctx.qh_name = "QH2"
         ctx.data_point_at = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         with patch.object(lm, "_cycle_async_phase") as mock_async:
-            mock_async.return_value = (
-                None,   # tesla_state
-                None,   # tesla_error
-                None,   # tesla_login_url
-                [],     # succeeded_effects
-                [],     # results
-                500.0,  # gap_wh (corrected)
-                -500.0, # adjusted_wh (corrected)
-                False,  # sentinel_on
+            mock_async.return_value = AsyncPhaseResult(
+                tesla_state=None,
+                tesla_error=None,
+                tesla_login_url=None,
+                succeeded_effects=[],
+                actions=[],
+                gap_wh=500.0,
+                adjusted_wh=-500.0,
+                sentinel_on=False,
             )
             result = lm._stage_async_phase(ctx)
         assert result is None
@@ -441,15 +441,15 @@ class TestStageAsyncPhase:
         ctx.qh_name = "QH2"
         ctx.data_point_at = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
         with patch.object(lm, "_cycle_async_phase") as mock_async:
-            mock_async.return_value = (
-                None,   # tesla_state
-                "err",  # tesla_error
-                "url",  # tesla_login_url
-                [],     # succeeded_effects
-                [],     # actions
-                300.0,  # gap_wh (corrected)
-                -700.0, # adjusted_wh (corrected)
-                True,   # sentinel_on
+            mock_async.return_value = AsyncPhaseResult(
+                tesla_state=None,
+                tesla_error="err",
+                tesla_login_url="url",
+                succeeded_effects=[],
+                actions=[],
+                gap_wh=300.0,
+                adjusted_wh=-700.0,
+                sentinel_on=True,
             )
             lm._stage_async_phase(ctx)
         assert ctx.tesla_state is None
@@ -478,8 +478,8 @@ class TestStageAsyncPhase:
             patch.object(lm, "_cycle_async_phase") as mock_async,
             patch.object(lm.tesla_ctrl, "reset_session") as mock_reset,
         ):
-            mock_async.return_value = (
-                None, None, None, [], [], 500.0, -500.0, False,
+            mock_async.return_value = AsyncPhaseResult(
+                gap_wh=500.0, adjusted_wh=-500.0, sentinel_on=False
             )
             lm._stage_async_phase(ctx)
         mock_reset.assert_called_once()

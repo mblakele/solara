@@ -18,7 +18,7 @@ import time as _time_mod
 import uuid
 
 # Third-party imports.
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 import pytz
 
@@ -71,10 +71,12 @@ from mqtt_telemetry import (
 from load_models import (
     AbstractPlugController,
     AbstractTeslaController,
+    AsyncPhaseResult,
     CandidateDetail,
     CycleContext,
     CycleDiagnostics,
     CycleResult,
+    CycleStatus,
     DeviceState,
     FleetTelemetryProvisionConfig,
     PendingEffect,
@@ -160,6 +162,9 @@ _cycle_counter = itertools.count(1)
 def _next_cycle_id() -> str:
     """Return the next cycle correlation id (e.g. ``c17-a3f9``)."""
     return f"c{next(_cycle_counter)}-{_BOOT_ID}"
+
+
+_T = TypeVar("_T")
 
 
 def _not_charging_state(*, at_home: bool) -> TeslaState:
@@ -512,18 +517,7 @@ class LoadManager:
             return self.enabled
 
         start_time, end_time = self.enabled
-        tz_name = device_config.get_timezone()
-        try:
-            local_tz = pytz.timezone(tz_name)
-        except pytz.exceptions.UnknownTimeZoneError:
-            local_tz = pytz.timezone("America/Los_Angeles")
-
-        if now.tzinfo is None:
-            now_local = local_tz.localize(now)
-        else:
-            now_local = now.astimezone(local_tz)
-
-        current_time = now_local.time()
+        current_time = self._local_time(now).time()
         return start_time <= current_time < end_time
 
     def _stage_enabled_check(
@@ -536,22 +530,11 @@ class LoadManager:
         """
         if self.is_enabled_at(ctx.now):
             return None
-        return CycleResult(
-            status="disabled",
-            diagnostics=CycleDiagnostics(
-                gap_wh=None,
-                hysteresis_wh=self.engine.HYSTERESIS_WH,
-                seconds_remaining=None,
-                data_point_at=None,
-                reason=self._disabled_reason("run_cycle"),
-                tesla_configured=self.tesla_ctrl is not None,
-                tesla_state=None,
-                tesla_error=None,
-                plugs_configured=list(self.plugs.keys()),
-                **self._quantization_diagnostics(),
-            ),
-            sleep_hint=self.config_interval_secs,
-            sleep_hint_at=ctx.now.isoformat(),
+        return self._early_exit(
+            ctx,
+            "disabled",
+            self._disabled_reason("run_cycle"),
+            self.config_interval_secs,
         )
 
     def _stage_nbc_fetch(
@@ -573,41 +556,15 @@ class LoadManager:
         fetch_start = _time_mod.perf_counter()
         qh_result = self.nbc_reader.get_current_qh(force=True, now=ctx.now)
         if qh_result is None:
-            return CycleResult(
-                status="no_incomplete_qh",
-                diagnostics=CycleDiagnostics(
-                    gap_wh=None,
-                    hysteresis_wh=self.engine.HYSTERESIS_WH,
-                    seconds_remaining=None,
-                    data_point_at=None,
-                    reason="no_incomplete_qh",
-                    tesla_configured=self.tesla_ctrl is not None,
-                    tesla_state=None,
-                    tesla_error=None,
-                    plugs_configured=list(self.plugs.keys()),
-                    **self._quantization_diagnostics(),
-                ),
-                sleep_hint=DEFAULT_SLEEP_HINT_SECS,
-                sleep_hint_at=ctx.now.isoformat(),
+            return self._early_exit(
+                ctx, "no_incomplete_qh", "no_incomplete_qh",
+                DEFAULT_SLEEP_HINT_SECS,
             )
         if (qh_result.samples_used is not None
                 and qh_result.samples_used < MIN_SAMPLES_FOR_PREDICTION):
-            return CycleResult(
-                status="no_incomplete_qh",
-                diagnostics=CycleDiagnostics(
-                    gap_wh=None,
-                    hysteresis_wh=self.engine.HYSTERESIS_WH,
-                    seconds_remaining=None,
-                    data_point_at=None,
-                    reason="insufficient_samples",
-                    tesla_configured=self.tesla_ctrl is not None,
-                    tesla_state=None,
-                    tesla_error=None,
-                    plugs_configured=list(self.plugs.keys()),
-                    **self._quantization_diagnostics(),
-                ),
-                sleep_hint=DEFAULT_SLEEP_HINT_SECS,
-                sleep_hint_at=ctx.now.isoformat(),
+            return self._early_exit(
+                ctx, "no_incomplete_qh", "insufficient_samples",
+                DEFAULT_SLEEP_HINT_SECS,
             )
         ctx.qh_name = qh_result.qh_name
         ctx.predicted_wh = qh_result.predicted_wh
@@ -652,30 +609,20 @@ class LoadManager:
         or None to continue to _stage_build_result.
         """
         if ctx.sentinel_on:
-            return CycleResult(
-                status="disabled",
+            return self._early_exit(
+                ctx,
+                "disabled",
+                "sentinel_on",
+                self.config_interval_secs,
                 qh=ctx.qh_name,
                 predicted_wh=ctx.predicted_wh,
                 adjusted_wh=ctx.adjusted_wh,
                 target_wh=self.target_wh,
-                actions=[],
-                diagnostics=CycleDiagnostics(
-                    gap_wh=None,
-                    hysteresis_wh=self.engine.HYSTERESIS_WH,
-                    seconds_remaining=ctx.seconds_remaining,
-                    data_point_at=ctx.data_point_at,
-                    reason="sentinel_on",
-                    pending_effects_count=0,
-                    tesla_configured=self.tesla_ctrl is not None,
-                    tesla_state=None,
-                    tesla_error=None,
-                    plugs_configured=list(self.plugs.keys()),
-                    sentinel_names=list(self.sentinel_names),
-                    sentinel_on=True,
-                    **self._quantization_diagnostics(),
-                ),
-                sleep_hint=self.config_interval_secs,
-                sleep_hint_at=ctx.now_postfetch.isoformat() if ctx.now_postfetch else "",
+                seconds_remaining=ctx.seconds_remaining,
+                data_point_at=ctx.data_point_at,
+                pending_effects_count=0,
+                sentinel_names=list(self.sentinel_names),
+                sentinel_on=True,
             )
 
         # Commit succeeded effects to state
@@ -724,37 +671,24 @@ class LoadManager:
         gap_wh = ctx.gap_wh
         assert gap_wh is not None
         if abs(gap_wh) <= self.engine.HYSTERESIS_WH:
-            sentinel_on = any(
-                self.state.devices.get(
-                    name, DeviceState(name=name)
-                ).actual_state is True
-                for name in self.sentinel_names
-            )
-            return CycleResult(
-                status="dry-run" if self.dry_run else "ok",
+            return self._early_exit(
+                ctx,
+                "dry-run" if self.dry_run else "ok",
+                "hysteresis",
+                self.config_interval_secs,
                 qh=ctx.qh_name,
                 predicted_wh=ctx.predicted_wh,
                 adjusted_wh=ctx.adjusted_wh,
                 target_wh=self.target_wh,
-                actions=[],
-                diagnostics=CycleDiagnostics(
-                    gap_wh=gap_wh,
-                    hysteresis_wh=self.engine.HYSTERESIS_WH,
-                    seconds_remaining=ctx.seconds_remaining,
-                    data_point_at=ctx.data_point_at,
-                    reason="hysteresis",
-                    pending_effects_count=len(self.state.pending_effects),
-                    tesla_configured=self.tesla_ctrl is not None,
-                    tesla_state=_tesla_state_to_dict(ctx.tesla_state),
-                    tesla_error=ctx.tesla_error,
-                    tesla_login_url=ctx.tesla_login_url,
-                    plugs_configured=list(self.plugs.keys()),
-                    sentinel_names=list(self.sentinel_names),
-                    sentinel_on=sentinel_on,
-                    **self._quantization_diagnostics(),
-                ),
-                sleep_hint=self.config_interval_secs,
-                sleep_hint_at=now_postfetch.isoformat(),
+                gap_wh=gap_wh,
+                seconds_remaining=ctx.seconds_remaining,
+                data_point_at=ctx.data_point_at,
+                pending_effects_count=len(self.state.pending_effects),
+                tesla_state=ctx.tesla_state,
+                tesla_error=ctx.tesla_error,
+                tesla_login_url=ctx.tesla_login_url,
+                sentinel_names=list(self.sentinel_names),
+                sentinel_on=self.is_sentinel_on(),
             )
 
         return None
@@ -809,12 +743,7 @@ class LoadManager:
                 tesla_login_url=ctx.tesla_login_url,
                 plugs_configured=list(self.plugs.keys()),
                 sentinel_names=list(self.sentinel_names),
-                sentinel_on=any(
-                    self.state.devices.get(
-                        name, DeviceState(name=name)
-                    ).actual_state is True
-                    for name in self.sentinel_names
-                ),
+                sentinel_on=self.is_sentinel_on(),
                 telemetry_registered=has_telemetry(),
                 active_tesla_telemetry=active_telemetry,
                 tesla_command_offline=self._vehicle_offline_this_cycle,
@@ -835,7 +764,7 @@ class LoadManager:
         """Stage 5: Run the async portion of the cycle.
 
         Resets the Tesla controller session, then runs _cycle_async_phase
-        via asyncio.run(). Unpacks the 8-tuple result into ctx fields,
+        via asyncio.run(). Applies the AsyncPhaseResult fields onto ctx,
         overwriting ctx.gap_wh and ctx.adjusted_wh with corrected values
         from the async phase. Always returns None.
         """
@@ -855,21 +784,20 @@ class LoadManager:
 
         if self.telegram_sender is not None:
             self.telegram_sender.reset_session()
-        (
-            ctx.tesla_state,
-            ctx.tesla_error,
-            ctx.tesla_login_url,
-            ctx.succeeded_effects,
-            ctx.actions,
-            ctx.gap_wh,
-            ctx.adjusted_wh,
-            ctx.sentinel_on,
-        ) = asyncio.run(
+        res = asyncio.run(
             self._cycle_async_phase(
                 gap_wh, adjusted_wh, now_postfetch, seconds_remaining,
                 self.dry_run, qh_name, data_point_at=data_point_at,
             )
         )
+        ctx.tesla_state = res.tesla_state
+        ctx.tesla_error = res.tesla_error
+        ctx.tesla_login_url = res.tesla_login_url
+        ctx.succeeded_effects = res.succeeded_effects
+        ctx.actions = res.actions
+        ctx.gap_wh = res.gap_wh
+        ctx.adjusted_wh = res.adjusted_wh
+        ctx.sentinel_on = res.sentinel_on
 
     def _stage_pending_check(
         self, ctx: CycleContext
@@ -890,43 +818,16 @@ class LoadManager:
         assert now_postfetch is not None  # guaranteed by Stage 2
 
         tesla_configured = self.tesla_ctrl is not None
-        plugs_configured = list(self.plugs.keys())
 
         if data_point_at is None:
-            candidate_details = self._build_candidate_details(
-                now_postfetch, seconds_remaining or 0, None, None, tesla_configured
-            )
-            return CycleResult(
-                status="no_incomplete_qh",
-                diagnostics=CycleDiagnostics(
-                    gap_wh=None,
-                    hysteresis_wh=self.engine.HYSTERESIS_WH,
-                    seconds_remaining=None,
-                    data_point_at=None,
-                    reason="no_incomplete_qh",
-                    tesla_configured=tesla_configured,
-                    tesla_state=None,
-                    tesla_error=None,
-                    plugs_configured=plugs_configured,
-                    **self._quantization_diagnostics(),
-                ),
-                sleep_hint=DEFAULT_SLEEP_HINT_SECS,
-                sleep_hint_at=now_postfetch.isoformat(),
+            # No incomplete QH — no candidates to report.
+            return self._early_exit(
+                ctx, "no_incomplete_qh", "no_incomplete_qh",
+                DEFAULT_SLEEP_HINT_SECS,
             )
 
         # Stale-data gate: data_point_age > STALE_DATA_THRESHOLD_SECS (accounting for Emporia lag).
         data_lag = self.nbc_reader.get_data_lag_secs()
-        base_diag: dict[str, Any] = {
-            "gap_wh": None,
-            "hysteresis_wh": self.engine.HYSTERESIS_WH,
-            "seconds_remaining": seconds_remaining,
-            "data_point_at": data_point_at,
-            "tesla_configured": tesla_configured,
-            "tesla_state": None,
-            "tesla_error": None,
-            "plugs_configured": plugs_configured,
-            **self._quantization_diagnostics(),
-        }
         if now_postfetch - data_point_at > timedelta(seconds=STALE_DATA_THRESHOLD_SECS):
             pruned = self.state.prune_old_effects(data_point_at, now_postfetch)
             if pruned > 0:
@@ -942,16 +843,14 @@ class LoadManager:
                        "pending_effects_count": pending_count, "reason": "stale_data",
                        "data_point_at": data_point_at.isoformat()},
             )
-            return CycleResult(
-                status="stale_data",
-                diagnostics=CycleDiagnostics(
-                    **base_diag,  # type: ignore[arg-type]
-                    reason="stale_data",
-                    pending_effects_count=pending_count,
-                    candidates=candidate_details,
-                ),
-                sleep_hint=DEFAULT_SLEEP_HINT_SECS,
-                sleep_hint_at=now_postfetch.isoformat(),
+            return self._early_exit(
+                ctx,
+                "stale_data",
+                "stale_data",
+                DEFAULT_SLEEP_HINT_SECS,
+                seconds_remaining=seconds_remaining,
+                data_point_at=data_point_at,
+                pending_effects_count=pending_count,
                 candidates=candidate_details,
             )
 
@@ -970,16 +869,14 @@ class LoadManager:
                 extra={"event": "cycle_previous_qh", "data_point_at": data_point_at.isoformat(),
                        "pending_effects_count": len(self.state.pending_effects)},
             )
-            return CycleResult(
-                status="stale_data",
-                diagnostics=CycleDiagnostics(
-                    **base_diag,  # type: ignore[arg-type]
-                    reason="previous_qh",
-                    pending_effects_count=len(self.state.pending_effects),
-                    candidates=candidate_details,
-                ),
-                sleep_hint=DEFAULT_SLEEP_HINT_SECS,
-                sleep_hint_at=now_postfetch.isoformat(),
+            return self._early_exit(
+                ctx,
+                "stale_data",
+                "previous_qh",
+                DEFAULT_SLEEP_HINT_SECS,
+                seconds_remaining=seconds_remaining,
+                data_point_at=data_point_at,
+                pending_effects_count=len(self.state.pending_effects),
                 candidates=candidate_details,
             )
 
@@ -988,7 +885,7 @@ class LoadManager:
         # the charging may have started externally after the last NBC data
         # point.  In that case the prediction doesn't include this load, so
         # wait for fresh data before making any decisions.
-        if tesla_configured and data_point_at is not None:
+        if tesla_configured:
             charge_last_update = get_field_update_at("ChargeAmps")
             if charge_last_update is not None and charge_last_update > data_point_at:
                 snapshot = get_telemetry_snapshot()
@@ -1012,29 +909,22 @@ class LoadManager:
                                "charge_seen_at": charge_last_update.isoformat(),
                                "data_point_at": data_point_at.isoformat()},
                     )
-                    return CycleResult(
-                        status="waiting_for_fresh_data",
-                        diagnostics=CycleDiagnostics(
-                            **base_diag,
-                            reason="external_tesla_charge",
-                            pending_effects_count=len(self.state.pending_effects),
-                            candidates=candidate_details,
-                        ),
-                        sleep_hint=min(
-                            seconds_remaining or 0,
-                            self._resolve_prediction_window(),
-                        ),
-                        sleep_hint_at=(now_postfetch + timedelta(seconds=min(
-                            seconds_remaining or 0,
-                            self._resolve_prediction_window(),
-                        ))).isoformat(),
+                    wait_hint, wait_hint_at = self._waiting_sleep_hint(
+                        seconds_remaining, now_postfetch
+                    )
+                    return self._early_exit(
+                        ctx,
+                        "waiting_for_fresh_data",
+                        "external_tesla_charge",
+                        wait_hint,
+                        seconds_remaining=seconds_remaining,
+                        data_point_at=data_point_at,
+                        pending_effects_count=len(self.state.pending_effects),
                         candidates=candidate_details,
+                        sleep_hint_at=wait_hint_at,
                     )
 
-        nbc_timestamp = data_point_at
-        if nbc_timestamp is not None and self.state.has_pending_effect_since(
-            nbc_timestamp
-        ):
+        if self.state.has_pending_effect_since(data_point_at):
             self.state.prune_old_effects(data_point_at, now_postfetch)
             pending_count = len(self.state.pending_effects)
             candidate_details = self._build_candidate_details(
@@ -1047,21 +937,19 @@ class LoadManager:
                        "pending_effects_count": pending_count,
                        "seconds_remaining": seconds_remaining},
             )
-            return CycleResult(
-                status="waiting_for_fresh_data",
-                diagnostics=CycleDiagnostics(
-                    **base_diag,  # type: ignore[arg-type]
-                    reason="waiting_for_fresh_data",
-                    pending_effects_count=pending_count,
-                    candidates=candidate_details,
-                ),
-                sleep_hint=min(
-                    seconds_remaining or 0, self._resolve_prediction_window()
-                ),
-                sleep_hint_at=(now_postfetch + timedelta(seconds=min(
-                    seconds_remaining or 0, self._resolve_prediction_window()
-                ))).isoformat(),
+            wait_hint, wait_hint_at = self._waiting_sleep_hint(
+                seconds_remaining, now_postfetch
+            )
+            return self._early_exit(
+                ctx,
+                "waiting_for_fresh_data",
+                "waiting_for_fresh_data",
+                wait_hint,
+                seconds_remaining=seconds_remaining,
+                data_point_at=data_point_at,
+                pending_effects_count=pending_count,
                 candidates=candidate_details,
+                sleep_hint_at=wait_hint_at,
             )
 
         return None
@@ -1079,6 +967,181 @@ class LoadManager:
             return f"[{source}] outside_time_range({start_str}-{end_str})"
         return "disabled"
 
+    def _local_time(self, now: datetime) -> datetime:
+        """Convert a timestamp to device-local wall time.
+
+        Naive inputs are interpreted as device-local wall time; aware
+        inputs are converted. Single home for the timezone resolution
+        shared by is_enabled_at() and _is_device_in_time_range().
+
+        Args:
+            now: The moment to convert.
+
+        Returns:
+            The same moment in the device timezone.
+        """
+        tz_name = device_config.get_timezone()
+        try:
+            local_tz = pytz.timezone(tz_name)
+        except pytz.exceptions.UnknownTimeZoneError:
+            local_tz = pytz.timezone("America/Los_Angeles")
+        if now.tzinfo is None:
+            return local_tz.localize(now)
+        return now.astimezone(local_tz)
+
+    def _eligible_plugs(
+        self, now: datetime
+    ) -> tuple[dict[str, PlugConfig], list[str]]:
+        """Split plugs into engine-eligible and out-of-range names.
+
+        Sentinels never participate in decisions; per-device time ranges
+        filter the rest. Single home for the eligibility filter.
+
+        Args:
+            now: Current datetime.
+
+        Returns:
+            Tuple of (eligible plugs by name, out-of-range plug names).
+        """
+        eligible: dict[str, PlugConfig] = {}
+        outside_range: list[str] = []
+        for name, plug in self.plugs.items():
+            if name in self.sentinel_names:
+                continue  # sentinels never participate in decisions
+            if self._is_device_in_time_range(now, plug.time_range):
+                eligible[name] = plug
+            else:
+                outside_range.append(name)
+        return eligible, outside_range
+
+    def is_sentinel_on(self) -> bool:
+        """Return True when any sentinel device is currently on.
+
+        Single home for the sentinel check shared by the async phase,
+        the commit stage, and the result builder.
+        """
+        return any(
+            self.state.devices.get(name, DeviceState(name=name)).actual_state
+            is True
+            for name in self.sentinel_names
+        )
+
+    def _is_tesla_in_range(self, now: datetime) -> bool:
+        """Check if Tesla is within its configured time range, if any.
+
+        Args:
+            now: Current datetime.
+
+        Returns:
+            True when no Tesla config/time range exists or now is inside it.
+        """
+        time_range = self.tesla_config.time_range if self.tesla_config else None
+        return self._is_device_in_time_range(now, time_range)
+
+    def _early_exit(
+        self,
+        ctx: CycleContext,
+        status: CycleStatus,
+        reason: str,
+        sleep_hint: float,
+        *,
+        qh: str | None = None,
+        predicted_wh: float | None = None,
+        adjusted_wh: float | None = None,
+        target_wh: int | None = None,
+        gap_wh: float | None = None,
+        seconds_remaining: int | None = None,
+        data_point_at: datetime | None = None,
+        pending_effects_count: int | None = None,
+        candidates: list[CandidateDetail] | None = None,
+        tesla_state: TeslaState | None = None,
+        tesla_error: str | None = None,
+        tesla_login_url: str | None = None,
+        sentinel_names: list[str] | None = None,
+        sentinel_on: bool = False,
+        sleep_hint_at: str | None = None,
+    ) -> CycleResult:
+        """Build an early-exit CycleResult with shared diagnostics defaults.
+
+        Fills hysteresis, target default, plug list, Tesla-configured flag,
+        and quantization diagnostics identically for every pipeline
+        short-circuit so stages only pass what differs.
+
+        Args:
+            ctx: Current pipeline context (provides the sleep_hint_at
+                default: now_postfetch when set, else now).
+            status: Cycle status for the result.
+            reason: Human-readable short-circuit reason.
+            sleep_hint: Seconds to wait before the next cycle.
+            qh: Current quarter-hour identifier, if known.
+            predicted_wh: Raw NBC prediction, if known.
+            adjusted_wh: Pending-effect-adjusted prediction, if known.
+            target_wh: Target Wh threshold, if known.
+            gap_wh: Predicted surplus/deficit, if known.
+            seconds_remaining: Seconds left in the current QH, if known.
+            data_point_at: Most recent NBC data point, if known.
+            pending_effects_count: Pending effects at exit time, if known.
+            candidates: Candidate device details, if computed.
+            tesla_state: Tesla state snapshot, if available.
+            tesla_error: Tesla error message, if any.
+            tesla_login_url: Tesla OAuth URL, if re-auth is needed.
+            sentinel_names: Sentinel plug names, if relevant.
+            sentinel_on: True when a sentinel device is on.
+            sleep_hint_at: ISO-8601 wake timestamp; defaults from ctx.
+
+        Returns:
+            CycleResult with diagnostics attached.
+        """
+        if sleep_hint_at is None:
+            base = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
+            sleep_hint_at = base.isoformat()
+        return CycleResult(
+            status=status,
+            qh=qh,
+            predicted_wh=predicted_wh,
+            adjusted_wh=adjusted_wh,
+            target_wh=target_wh,
+            actions=[],
+            diagnostics=CycleDiagnostics(
+                gap_wh=gap_wh,
+                hysteresis_wh=self.engine.HYSTERESIS_WH,
+                seconds_remaining=seconds_remaining,
+                data_point_at=data_point_at,
+                reason=reason,
+                pending_effects_count=pending_effects_count,
+                tesla_configured=self.tesla_ctrl is not None,
+                tesla_state=_tesla_state_to_dict(tesla_state),
+                tesla_error=tesla_error,
+                tesla_login_url=tesla_login_url,
+                plugs_configured=list(self.plugs.keys()),
+                candidates=candidates,
+                sentinel_names=sentinel_names,
+                sentinel_on=sentinel_on,
+                **self._quantization_diagnostics(),
+            ),
+            sleep_hint=sleep_hint,
+            sleep_hint_at=sleep_hint_at,
+            candidates=candidates,
+        )
+
+    def _waiting_sleep_hint(
+        self, seconds_remaining: int | None, now: datetime
+    ) -> tuple[float, str]:
+        """Short sleep hint capped at the prediction window, with wake time.
+
+        Used by waiting_for_fresh_data exits so the next cycle re-checks
+        promptly instead of sleeping a full interval.
+
+        Args:
+            seconds_remaining: Seconds left in the current QH, if known.
+            now: Base time for the wake timestamp.
+
+        Returns:
+            Tuple of (sleep_hint_secs, sleep_hint_at_iso).
+        """
+        hint = min(seconds_remaining or 0, self._resolve_prediction_window())
+        return hint, (now + timedelta(seconds=hint)).isoformat()
+
     def _is_device_in_time_range(
         self, now: datetime, time_range: tuple[time, time] | None
     ) -> bool:
@@ -1095,14 +1158,7 @@ class LoadManager:
         if time_range is None:
             return True
         start_time, end_time = time_range
-        tz_name = device_config.get_timezone()
-        try:
-            local_tz = pytz.timezone(tz_name)
-        except pytz.exceptions.UnknownTimeZoneError:
-            local_tz = pytz.timezone("America/Los_Angeles")
-
-        now_local = now.astimezone(local_tz)
-        current_time = now_local.time()
+        current_time = self._local_time(now).time()
 
         in_range = start_time <= current_time < end_time
         return in_range
@@ -1167,9 +1223,7 @@ class LoadManager:
                 tesla_fields["current_amps"] = tesla_state.current_amps
                 tesla_fields["plugged_in"] = tesla_state.plugged_in
                 tesla_fields["at_home"] = tesla_state.at_home
-            if self.tesla_config and not self._is_device_in_time_range(
-                now, self.tesla_config.time_range
-            ):
+            if not self._is_tesla_in_range(now):
                 tesla_fields["reason"] = "outside_time_range"
             candidate_details.append(CandidateDetail(**tesla_fields))  # type: ignore[arg-type]
 
@@ -1232,11 +1286,7 @@ class LoadManager:
 
         # Check Tesla eligibility for turn-off scenarios
         if not gap_positive and tesla_state is not None:
-            tesla_in_range = self._is_device_in_time_range(
-                now,
-                self.tesla_config.time_range if self.tesla_config else None,
-            )
-            if tesla_in_range and tesla_state.is_charging:
+            if self._is_tesla_in_range(now) and tesla_state.is_charging:
                 has_eligible = True
 
         if not has_eligible:
@@ -1767,114 +1817,57 @@ class LoadManager:
                     event.event_type,
                 )
 
-    async def _cycle_async_phase(
-        self,
-        gap_wh: float,
-        adjusted_wh: float,
-        now: datetime,
-        seconds_remaining: int,
-        dry_run: bool,
-        qh_name: str | None = None,
-        data_point_at: datetime | None = None,
-    ) -> tuple[
-        TeslaState | None,
-        str | None,
-        str | None,
-        list[PendingEffect],
-        list[PendingEffect],
-        float,
-        float,
-        bool,
-    ]:
-        """Run the async portion of a cycle in a single event loop.
-
-        Syncs plug states from controllers, fetches Tesla state, calls decide()
-        with that state, then executes all resulting actions. Consolidating into
-        one coroutine means one event loop per cycle instead of one per action.
-
-        Tesla amp-change effects have no power_watts so they're excluded from
-        estimated_current_wh(). After fetching the vehicle state we recompute
-        the in-flight contribution via tesla_inflight_wh() and fold it into
-        corrected_adjusted_wh before calling decide(), so the gap never
-        drifts as seconds_remaining shrinks.
+    async def _async_sync_and_check_sentinel(self) -> AsyncPhaseResult | None:
+        """Sync plug states and short-circuit when a sentinel is on.
 
         Returns:
-            Tuple of (tesla_state, tesla_error, tesla_login_url,
-            succeeded_effects, results, gap_wh, adjusted_wh, sentinel_on).
-            The final bool is True when any sentinel device was detected on
-            during sync, allowing the caller to disable the cycle.
+            AsyncPhaseResult to return immediately, or None to continue.
         """
-        try:
-            return await self._cycle_async_phase_body(
-                gap_wh, adjusted_wh, now, seconds_remaining,
-                dry_run, qh_name=qh_name, data_point_at=data_point_at,
-            )
-        finally:
-            await self._cleanup_sessions()
-
-    async def _cycle_async_phase_body(
-        self,
-        # pylint: disable=too-many-locals
-        _gap_wh: float,
-        adjusted_wh: float,
-        now: datetime,
-        seconds_remaining: int,
-        dry_run: bool,
-        qh_name: str | None = None,
-        data_point_at: datetime | None = None,
-    ) -> tuple[
-        TeslaState | None,
-        str | None,
-        str | None,
-        list[PendingEffect],
-        list[PendingEffect],
-        float,
-        float,
-        bool,
-    ]:
-        """Body of _cycle_async_phase, extracted for try/finally cleanup."""
-        self._vehicle_offline_this_cycle = False
         # Sync actual plug states before making decisions so the engine sees
         # external changes (user toggles, other automations, etc.)
         await self._sync_plug_states()
-
-        # If any sentinel device is on, disable load management entirely.
         # Placed after _sync_plug_states so device state is populated.
-        sentinel_on: bool = any(
-            self.state.devices.get(name, DeviceState(name=name)).actual_state
-            is True
-            for name in self.sentinel_names
+        if not self.is_sentinel_on():
+            return None
+        logger.info(
+            "[_cycle_async_phase] sentinel device is on, disabling load management"
         )
-        if sentinel_on:
-            logger.info(
-                "[_cycle_async_phase] sentinel device is on, disabling load management"
-            )
-            return (
-                None,
-                None,
-                None,
-                [],
-                [],
-                0.0,
-                0.0,
-                True,
-            )
+        return AsyncPhaseResult(sentinel_on=True)
 
-        tesla_state, tesla_error, tesla_login_url = (
-            await self._fetch_tesla_state_async()
-        )
-
-        # Alert on Tesla auth errors (dedup by message text to avoid spam).
+    def _record_tesla_auth_error(
+        self, tesla_error: str | None, tesla_login_url: str | None
+    ) -> None:
+        """Alert on Tesla auth errors (dedup by message text to avoid spam)."""
         if tesla_error is not None and tesla_error != self._last_auth_error_msg:
             self._last_auth_error_msg = tesla_error
             self._queue_auth_error_notification(tesla_error, tesla_login_url)
         elif tesla_error is None:
             self._last_auth_error_msg = None  # reset dedup on success
 
-        # Fold live Tesla in-flight contribution into the gap.  Tesla set_amps
-        # effects are excluded from estimated_current_wh() so this live
-        # recalculation prevents the adjustment from drifting as
-        # seconds_remaining shrinks.
+    def _correct_gap_with_inflight(
+        self,
+        adjusted_wh: float,
+        tesla_state: TeslaState | None,
+        seconds_remaining: int,
+        now: datetime,
+        data_point_at: datetime | None,
+    ) -> tuple[float, float]:
+        """Fold live Tesla in-flight Wh into the gap.
+
+        Tesla set_amps effects are excluded from estimated_current_wh() so
+        this live recalculation prevents the adjustment from drifting as
+        seconds_remaining shrinks.
+
+        Args:
+            adjusted_wh: Pending-effect-adjusted prediction.
+            tesla_state: Current Tesla state, or None.
+            seconds_remaining: Seconds left in the current quarter-hour.
+            now: Current wall-clock time.
+            data_point_at: Current NBC data-point-at timestamp.
+
+        Returns:
+            Tuple of (corrected_adjusted_wh, corrected_gap_wh).
+        """
         tesla_reported = tesla_state.current_amps if tesla_state is not None else None
         inflight_wh = self.state.tesla_inflight_wh(
             tesla_reported, seconds_remaining, now=now, data_point_at=data_point_at,
@@ -1890,32 +1883,45 @@ class LoadManager:
                    "corrected_adjusted_wh": corrected_adjusted_wh,
                    "last_commanded_amps": self.state.last_commanded_amps},
         )
+        return corrected_adjusted_wh, corrected_gap_wh
 
-        # Hysteresis guard uses corrected gap so in-flight Tesla draw is counted.
-        if abs(corrected_gap_wh) <= self.engine.HYSTERESIS_WH:
-            return tesla_state, tesla_error, tesla_login_url, [], [], corrected_gap_wh, corrected_adjusted_wh, False
+    def _suppressed_by_settle(
+        self,
+        corrected_gap_wh: float,
+        now: datetime,
+        qh_name: str | None,
+        data_point_at: datetime | None,
+    ) -> bool:
+        """Return True when a Tesla settle window suppresses this decision.
 
-        # ── Settle-window suppression ──────────────────────────────────────────
-        # After a Tesla amp increase the NBC prediction needs a few cycles to
-        # absorb the new load — the Emporia API data lags behind wall-clock time
-        # by ~60 s, so some of the fetch history is still at the old amp level.
-        # Combined with solar variability this can produce a large apparent
-        # deficit on the very first post-confirmation cycle, triggering an
-        # unwarranted cascade of plug shutoffs and Tesla stop.
-        #
-        # Similarly, after an amp decrease the prediction still includes the
-        # now-removed load, producing a large apparent surplus that would
-        # trigger re-enabling loads that were just turned off (bounce-back).
-        #
-        # Suppress decisions while the relevant settle window is active AND
-        # the apparent gap is below ``TESLA_SETTLE_SUPPRESS_WH``.  Large
-        # genuine gaps (e.g. new QH, clouds) still fire immediately; the
-        # QH-name check inside each ``is_settling_*`` method auto-expires
-        # the window on a QH transition.
-        settle_now = now
+        After a Tesla amp increase the NBC prediction needs a few cycles to
+        absorb the new load — the Emporia API data lags behind wall-clock time
+        by ~60 s, so some of the fetch history is still at the old amp level.
+        Combined with solar variability this can produce a large apparent
+        deficit on the very first post-confirmation cycle, triggering an
+        unwarranted cascade of plug shutoffs and Tesla stop.
+
+        Similarly, after an amp decrease the prediction still includes the
+        now-removed load, producing a large apparent surplus that would
+        trigger re-enabling loads that were just turned off (bounce-back).
+
+        Suppression applies while the relevant settle window is active AND
+        the apparent gap is below ``TESLA_SETTLE_SUPPRESS_WH``. Large
+        genuine gaps (e.g. new QH, clouds) still fire immediately; the
+        QH-name check auto-expires the window on a QH transition.
+
+        Args:
+            corrected_gap_wh: Gap after Tesla in-flight correction.
+            now: Current wall-clock time.
+            qh_name: Current QH name for QH-boundary expiry.
+            data_point_at: Current NBC data-point-at timestamp.
+
+        Returns:
+            True when the decision should be suppressed.
+        """
         # ── Post-increase: suppress turn-off ──
         increase_eff = self.state.get_active_tesla_settle(
-            settle_now, current_qh=qh_name, data_point_at=data_point_at,
+            now, current_qh=qh_name, data_point_at=data_point_at,
             direction="increase",
         )
         if (
@@ -1925,7 +1931,7 @@ class LoadManager:
         ):
             settle_remaining = (
                 self.state.effective_settle_secs
-                - (settle_now - increase_eff.timestamp).total_seconds()
+                - (now - increase_eff.timestamp).total_seconds()
             )
             logger.info(
                 "[_cycle_async_phase] suppressing turn-off: settling after Tesla "
@@ -1933,19 +1939,10 @@ class LoadManager:
                 corrected_gap_wh,
                 settle_remaining,
             )
-            return (
-                tesla_state,
-                tesla_error,
-                tesla_login_url,
-                [],
-                [],
-                corrected_gap_wh,
-                corrected_adjusted_wh,
-                False,
-            )
+            return True
         # ── Post-decrease: suppress turn-on ──
         decrease_eff = self.state.get_active_tesla_settle(
-            settle_now, current_qh=qh_name, data_point_at=data_point_at,
+            now, current_qh=qh_name, data_point_at=data_point_at,
             direction="decrease",
         )
         if (
@@ -1954,7 +1951,7 @@ class LoadManager:
         ):
             settle_remaining = (
                 self.state.effective_settle_secs
-                - (settle_now - decrease_eff.timestamp).total_seconds()
+                - (now - decrease_eff.timestamp).total_seconds()
             )
             logger.info(
                 "[_cycle_async_phase] suppressing turn-on: settling after Tesla "
@@ -1962,44 +1959,57 @@ class LoadManager:
                 corrected_gap_wh,
                 settle_remaining,
             )
-            return (
-                tesla_state,
-                tesla_error,
-                tesla_login_url,
-                [],
-                [],
-                corrected_gap_wh,
-                corrected_adjusted_wh,
-                False,
-            )
+            return True
+        return False
 
+    def _eligible_for_decision(
+        self, now: datetime, tesla_state: TeslaState | None
+    ) -> tuple[dict[str, PlugConfig], TeslaState | None]:
+        """Filter engine candidates by time range.
+
+        Args:
+            now: Current wall-clock time.
+            tesla_state: Current Tesla state, or None.
+
+        Returns:
+            Tuple of (eligible plugs by name, eligible Tesla state or None).
+        """
         # Filter plugs by per-device time range: only eligible plugs reach the engine.
-        eligible_plugs: dict[str, PlugConfig] = {}
-        outside_range: list[str] = []
-        for name, plug in self.plugs.items():
-            if name in self.sentinel_names:
-                continue  # sentinels never participate in decisions
-            if self._is_device_in_time_range(now, plug.time_range):
-                eligible_plugs[name] = plug
-            else:
-                outside_range.append(name)
-
+        eligible_plugs, outside_range = self._eligible_plugs(now)
         # Log which devices were filtered out by time range (once per cycle).
         if outside_range:
             logger.debug("Outside time range: %s", ", ".join(outside_range))
-
         # Tesla is only a candidate if within its time range.
         eligible_tesla: TeslaState | None = tesla_state
-        if (
-            tesla_state is not None
-            and self.tesla_config is not None
-            and not self._is_device_in_time_range(
-                now, self.tesla_config.time_range
-            )
-        ):
+        if tesla_state is not None and not self._is_tesla_in_range(now):
             eligible_tesla = None
+        return eligible_plugs, eligible_tesla
 
-        actions = self.engine.decide(
+    def _decide_actions(
+        self,
+        eligible_plugs: dict[str, PlugConfig],
+        eligible_tesla: TeslaState | None,
+        corrected_adjusted_wh: float,
+        now: datetime,
+        seconds_remaining: int,
+        dry_run: bool,
+        data_point_at: datetime | None,
+    ) -> list[PendingEffect]:
+        """Run GapMinder.decide() with the eligible candidates.
+
+        Args:
+            eligible_plugs: Time-range-filtered plugs by name.
+            eligible_tesla: Time-range-filtered Tesla state, or None.
+            corrected_adjusted_wh: Prediction after in-flight correction.
+            now: Current wall-clock time.
+            seconds_remaining: Seconds left in the current quarter-hour.
+            dry_run: When True, decide without mutating device state.
+            data_point_at: Current NBC data-point-at timestamp.
+
+        Returns:
+            List of decided PendingEffect actions.
+        """
+        return self.engine.decide(
             ctx=DecideContext(
                 now=now,
                 seconds_remaining=seconds_remaining,
@@ -2018,6 +2028,18 @@ class LoadManager:
             target_wh=self.target_wh,
         )
 
+    async def _run_actions(
+        self, actions: list[PendingEffect], dry_run: bool
+    ) -> tuple[list[PendingEffect], list[PendingEffect]]:
+        """Execute decided actions (or log them in dry-run mode).
+
+        Args:
+            actions: Decided actions to run.
+            dry_run: When True, log without executing.
+
+        Returns:
+            Tuple of (succeeded_effects, all decided results).
+        """
         succeeded_effects: list[PendingEffect] = []
         results: list[PendingEffect] = []
         for action in actions:
@@ -2033,6 +2055,92 @@ class LoadManager:
                 if success:
                     succeeded_effects.append(action)
                     results.append(action)
+        return succeeded_effects, results
+
+    async def _cycle_async_phase(
+        self,
+        gap_wh: float,
+        adjusted_wh: float,
+        now: datetime,
+        seconds_remaining: int,
+        dry_run: bool,
+        qh_name: str | None = None,
+        data_point_at: datetime | None = None,
+    ) -> AsyncPhaseResult:
+        """Run the async portion of a cycle in a single event loop.
+
+        Syncs plug states from controllers, fetches Tesla state, calls decide()
+        with that state, then executes all resulting actions. Consolidating into
+        one coroutine means one event loop per cycle instead of one per action.
+
+        Tesla amp-change effects have no power_watts so they're excluded from
+        estimated_current_wh(). After fetching the vehicle state we recompute
+        the in-flight contribution via tesla_inflight_wh() and fold it into
+        corrected_adjusted_wh before calling decide(), so the gap never
+        drifts as seconds_remaining shrinks.
+
+        Returns:
+            AsyncPhaseResult with Tesla state, decided/executed actions, the
+            corrected gap values, and the sentinel flag (True when a sentinel
+            device was detected on during sync, allowing the caller to
+            disable the cycle).
+        """
+        try:
+            return await self._cycle_async_phase_body(
+                gap_wh, adjusted_wh, now, seconds_remaining,
+                dry_run, qh_name=qh_name, data_point_at=data_point_at,
+            )
+        finally:
+            await self._cleanup_sessions()
+
+    async def _cycle_async_phase_body(
+        self,
+        _gap_wh: float,
+        adjusted_wh: float,
+        now: datetime,
+        seconds_remaining: int,
+        dry_run: bool,
+        qh_name: str | None = None,
+        data_point_at: datetime | None = None,
+    ) -> AsyncPhaseResult:
+        """Body of _cycle_async_phase, extracted for try/finally cleanup."""
+        self._vehicle_offline_this_cycle = False
+        if (early := await self._async_sync_and_check_sentinel()):
+            return early
+        tesla_state, tesla_error, tesla_login_url = (
+            await self._fetch_tesla_state_async()
+        )
+        self._record_tesla_auth_error(tesla_error, tesla_login_url)
+        corrected_adjusted_wh, corrected_gap_wh = self._correct_gap_with_inflight(
+            adjusted_wh, tesla_state, seconds_remaining, now, data_point_at
+        )
+        # Hysteresis guard uses corrected gap so in-flight Tesla draw is counted.
+        if abs(corrected_gap_wh) <= self.engine.HYSTERESIS_WH:
+            return AsyncPhaseResult(
+                tesla_state=tesla_state,
+                tesla_error=tesla_error,
+                tesla_login_url=tesla_login_url,
+                gap_wh=corrected_gap_wh,
+                adjusted_wh=corrected_adjusted_wh,
+            )
+        if self._suppressed_by_settle(
+            corrected_gap_wh, now, qh_name, data_point_at
+        ):
+            return AsyncPhaseResult(
+                tesla_state=tesla_state,
+                tesla_error=tesla_error,
+                tesla_login_url=tesla_login_url,
+                gap_wh=corrected_gap_wh,
+                adjusted_wh=corrected_adjusted_wh,
+            )
+        eligible_plugs, eligible_tesla = self._eligible_for_decision(
+            now, tesla_state
+        )
+        actions = self._decide_actions(
+            eligible_plugs, eligible_tesla, corrected_adjusted_wh,
+            now, seconds_remaining, dry_run, data_point_at,
+        )
+        succeeded_effects, results = await self._run_actions(actions, dry_run)
 
         # Queue Telegram notification for successful plug actions.
         # The actual send happens synchronously after run_cycle() releases the lock,
@@ -2054,7 +2162,15 @@ class LoadManager:
         if self.tesla_ctrl is not None and hasattr(self.tesla_ctrl, "maybe_refresh_token"):
             await self.tesla_ctrl.maybe_refresh_token()
 
-        return tesla_state, tesla_error, tesla_login_url, succeeded_effects, results, corrected_gap_wh, corrected_adjusted_wh, False
+        return AsyncPhaseResult(
+            tesla_state=tesla_state,
+            tesla_error=tesla_error,
+            tesla_login_url=tesla_login_url,
+            succeeded_effects=succeeded_effects,
+            actions=results,
+            gap_wh=corrected_gap_wh,
+            adjusted_wh=corrected_adjusted_wh,
+        )
 
     async def _cleanup_sessions(self) -> None:
         """Close aiohttp sessions held by controllers.
@@ -2197,6 +2313,28 @@ class LoadManager:
                     config_changes.env_changed,
                 )
 
+    def _timed(
+        self, ctx: CycleContext, stage: str, fn: Callable[..., _T],
+        *args: Any, **kwargs: Any,
+    ) -> _T:
+        """Run a pipeline stage and record its wall-clock duration.
+
+        Args:
+            ctx: Current pipeline context (receives the timing).
+            stage: Stage name for ctx.timings.
+            fn: Stage callable to invoke.
+            *args: Positional args for fn.
+            **kwargs: Keyword args for fn.
+
+        Returns:
+            Whatever fn returns.
+        """
+        start = _time_mod.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            ctx.timings[stage] = _time_mod.perf_counter() - start
+
     def run_cycle(self, force: bool = False) -> CycleResult:
         """Execute one load management cycle. Returns a CycleResult.
 
@@ -2244,10 +2382,10 @@ class LoadManager:
                          extra={"event": "cycle_start", "force": force,
                                 "cycle_id": ctx.cycle_id})
 
-            _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=enabled_check force=%s", force)
-            if (result := self._stage_enabled_check(ctx)):
-                ctx.timings["enabled_check"] = _time_mod.perf_counter() - _t0
+            if (result := self._timed(
+                ctx, "enabled_check", self._stage_enabled_check, ctx
+            )):
                 logger.info("cycle_early_exit stage=enabled_check status=%s reason=%s",
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "enabled_check",
@@ -2255,16 +2393,15 @@ class LoadManager:
                                    "reason": result.diagnostics.reason if result.diagnostics else "none",
                                    "cycle_id": ctx.cycle_id})
                 return _finalize(result)
-            ctx.timings["enabled_check"] = _time_mod.perf_counter() - _t0
 
-            _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=nbc_fetch")
-            stage2_result = self._stage_nbc_fetch(ctx)
+            stage2_result = self._timed(
+                ctx, "nbc_fetch", self._stage_nbc_fetch, ctx
+            )
             # Escalate any persistent Emporia drift detected during the fetch
             # to ERROR + one-time Telegram alert, on both the success and
             # early-exit paths.
             self._drain_drift_alerts()
-            ctx.timings["nbc_fetch"] = _time_mod.perf_counter() - _t0
             if stage2_result:
                 logger.info("cycle_early_exit stage=nbc_fetch status=%s reason=%s",
                             stage2_result.status, stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",
@@ -2273,12 +2410,11 @@ class LoadManager:
                                    "reason": stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",
                                    "cycle_id": ctx.cycle_id})
                 return _finalize(stage2_result)
-            ctx.timings["nbc_fetch"] = _time_mod.perf_counter() - _t0
 
-            _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=pending_check")
-            if (result := self._stage_pending_check(ctx)):
-                ctx.timings["pending_check"] = _time_mod.perf_counter() - _t0
+            if (result := self._timed(
+                ctx, "pending_check", self._stage_pending_check, ctx
+            )):
                 logger.info("cycle_early_exit stage=pending_check status=%s reason=%s",
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "pending_check",
@@ -2286,24 +2422,17 @@ class LoadManager:
                                    "reason": result.diagnostics.reason if result.diagnostics else "none",
                                    "cycle_id": ctx.cycle_id})
                 return _finalize(result)
-            ctx.timings["pending_check"] = _time_mod.perf_counter() - _t0
 
-            _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=compute_gap predicted=%.1f",
                          ctx.predicted_wh)
-            self._stage_compute_gap(ctx)
-            ctx.timings["compute_gap"] = _time_mod.perf_counter() - _t0
+            self._timed(ctx, "compute_gap", self._stage_compute_gap, ctx)
 
-            _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=async_phase")
-            self._stage_async_phase(ctx)
-            ctx.timings["async_phase"] = _time_mod.perf_counter() - _t0
+            self._timed(ctx, "async_phase", self._stage_async_phase, ctx)
 
-            _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=commit sentinel=%s effects=%d",
                          ctx.sentinel_on, len(ctx.succeeded_effects))
-            if (result := self._stage_commit(ctx)):
-                ctx.timings["commit"] = _time_mod.perf_counter() - _t0
+            if (result := self._timed(ctx, "commit", self._stage_commit, ctx)):
                 logger.info("cycle_early_exit stage=commit status=%s reason=%s",
                             result.status, result.diagnostics.reason if result.diagnostics else "none",
                             extra={"event": "cycle_early_exit", "stage": "commit",
@@ -2311,12 +2440,11 @@ class LoadManager:
                                    "reason": result.diagnostics.reason if result.diagnostics else "none",
                                    "cycle_id": ctx.cycle_id})
                 return _finalize(result)
-            ctx.timings["commit"] = _time_mod.perf_counter() - _t0
 
-            _t0 = _time_mod.perf_counter()
             logger.debug("cycle_stage=build_result")
-            result = self._stage_build_result(ctx)
-            ctx.timings["build_result"] = _time_mod.perf_counter() - _t0
+            result = self._timed(
+                ctx, "build_result", self._stage_build_result, ctx
+            )
             reason = result.diagnostics.reason if result.diagnostics else "none"
             logger.info("cycle_complete id=%s status=%s reason=%s actions=%d sleep_hint=%.1f timings=%s",
                         ctx.cycle_id, result.status, reason, len(result.actions), result.sleep_hint, ctx.timings,
@@ -2356,6 +2484,25 @@ class LoadManager:
         logger.warning("Unknown plug action: %s", action.action)
         return False
 
+    def _mark_vehicle_offline(self) -> None:
+        """Flag the cycle when the last Tesla command hit VehicleOffline."""
+        if (
+            self.tesla_ctrl is not None
+            and self.tesla_ctrl._last_command_vehicle_offline
+        ):
+            self._vehicle_offline_this_cycle = True
+
+    def _handle_tesla_auth_error(self, error: TeslaAuthError) -> None:
+        """Queue a Telegram auth-error notification for a Tesla failure.
+
+        Args:
+            error: The auth error raised by the controller.
+        """
+        assert self.tesla_ctrl is not None
+        self._queue_auth_error_notification(
+            str(error), self.tesla_ctrl.get_login_url()
+        )
+
     async def _execute_tesla_action(self, action: PendingEffect) -> bool:
         """Execute a Tesla charging action.
 
@@ -2392,11 +2539,10 @@ class LoadManager:
             clamped_amps = min(clamped_amps, GapMinder.HARD_MAX_AMPS)
             try:
                 result = await self.tesla_ctrl.set_charge_amps(clamped_amps)
-                if self.tesla_ctrl._last_command_vehicle_offline:
-                    self._vehicle_offline_this_cycle = True
+                self._mark_vehicle_offline()
                 return result
             except TeslaAuthError as e:
-                self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
+                self._handle_tesla_auth_error(e)
                 return False
             except Exception as e:
                 logger.error(
@@ -2419,11 +2565,10 @@ class LoadManager:
         assert self.tesla_ctrl is not None
         try:
             result = await self.tesla_ctrl.stop_charging()
-            if self.tesla_ctrl._last_command_vehicle_offline:
-                self._vehicle_offline_this_cycle = True
+            self._mark_vehicle_offline()
             return result
         except TeslaAuthError as e:
-            self._queue_auth_error_notification(str(e), self.tesla_ctrl.get_login_url())
+            self._handle_tesla_auth_error(e)
             return False
         except Exception as e:
             logger.error(
