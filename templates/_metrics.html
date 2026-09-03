@@ -55,25 +55,31 @@
       </div>
     </dl>
 
-    <div class="history" aria-label="Earlier quarter-hours">
-      <div class="demand__label">Recent Periods</div>
-      {% set hist_target = load_management.get("target_wh") if load_management else none %}
-      {% set hist_hyst = diag.hysteresis_wh if diag else none %}
-      {% for qh_key in ["QH2", "QH3", "QH4"] %}
-      {% set qh = vd.nbc.get(qh_key) %}
-      {% if qh is not none and qh is not false %}
-      {% set pill_class = "" %}
-      {% if hist_target is not none and hist_hyst is not none %}
-      {% if qh.raw_wh > hist_target + hist_hyst %}
-      {% set pill_class = " history__pill--load" %}
-      {% elif qh.raw_wh < hist_target - hist_hyst %}
-      {% set pill_class = " history__pill--gen" %}
-      {% endif %}
-      {% endif %}
-      <span class="history__pill{{ pill_class }}">{{ "%+.0f" % (qh.raw_wh) }}</span>
-      {% endif %}
-      {% endfor %}
+    {% if diag is not none and qh1.predicted_wh is not none %}
+    {# EV charging amps implied by the predicted energy over the remaining
+       period (matches the iOS client): amps = predictedWh / hours / -240. #}
+    {% set hours = (qh1.remaining_seconds or 0) / 3600.0 %}
+    {% set car_amps = (qh1.predicted_wh / hours / -240.0) if hours > 0 else none %}
+    {% if qh1.predicted_wh > 0 %}
+    <div class="demand">
+      <span class="demand__label">reduce usage if possible</span>
+      <ul class="demand__list">
+        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
+      </ul>
     </div>
+    {% elif qh1.predicted_wh < diag.hysteresis_wh %}
+    {% set shower_min = (qh1.predicted_wh / 81.0) | abs %}
+    {% set laundry_min = (qh1.predicted_wh / 88.0) | abs %}
+    <div class="demand">
+      <span class="demand__label">Ideas</span>
+      <ul class="demand__list">
+        <li>⚡🚿 {{ "%.1f" % shower_min }} min</li>
+        <li>⚡👕 {{ "%.1f" % laundry_min }} min</li>
+        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
+      </ul>
+    </div>
+    {% endif %}
+    {% endif %}
 
     {% if load_management and load_management.state and load_management.state.devices %}
     <div class="device-grid">
@@ -139,31 +145,25 @@
     </div>
     {% endif %}
 
-    {% if diag is not none and qh1.predicted_wh is not none %}
-    {# EV charging amps implied by the predicted energy over the remaining
-       period (matches the iOS client): amps = predictedWh / hours / -240. #}
-    {% set hours = (qh1.remaining_seconds or 0) / 3600.0 %}
-    {% set car_amps = (qh1.predicted_wh / hours / -240.0) if hours > 0 else none %}
-    {% if qh1.predicted_wh > 0 %}
-    <div class="demand">
-      <span class="demand__label">reduce usage if possible</span>
-      <ul class="demand__list">
-        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
-      </ul>
+    <div class="history" aria-label="Earlier quarter-hours">
+      <div class="demand__label">Recent Periods</div>
+      {% set hist_target = load_management.get("target_wh") if load_management else none %}
+      {% set hist_hyst = diag.hysteresis_wh if diag else none %}
+      {% for qh_key in ["QH2", "QH3", "QH4"] %}
+      {% set qh = vd.nbc.get(qh_key) %}
+      {% if qh is not none and qh is not false %}
+      {% set pill_class = "" %}
+      {% if hist_target is not none and hist_hyst is not none %}
+      {% if qh.raw_wh > hist_target + hist_hyst %}
+      {% set pill_class = " history__pill--load" %}
+      {% elif qh.raw_wh < hist_target - hist_hyst %}
+      {% set pill_class = " history__pill--gen" %}
+      {% endif %}
+      {% endif %}
+      <span class="history__pill{{ pill_class }}">{{ "%+.0f" % (qh.raw_wh) }}</span>
+      {% endif %}
+      {% endfor %}
     </div>
-    {% elif qh1.predicted_wh < diag.hysteresis_wh %}
-    {% set shower_min = (qh1.predicted_wh / 81.0) | abs %}
-    {% set laundry_min = (qh1.predicted_wh / 88.0) | abs %}
-    <div class="demand">
-      <span class="demand__label">Ideas</span>
-      <ul class="demand__list">
-        <li>⚡🚿 {{ "%.1f" % shower_min }} min</li>
-        <li>⚡👕 {{ "%.1f" % laundry_min }} min</li>
-        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
-      </ul>
-    </div>
-    {% endif %}
-    {% endif %}
   </article>
   {% endif %}
 {% endfor %}

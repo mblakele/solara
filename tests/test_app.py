@@ -2722,7 +2722,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         self.assertIn(">tesla</li>", html)
 
     def test_section_sits_above_surplus_ideas(self):
-        """The Devices grid renders directly above 'Ideas'."""
+        """Ideas render above Devices, which render above Recent Periods."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2732,7 +2732,8 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             },
             effects=[],
         )
-        self.assertLess(html.index("Devices"), html.index(">Ideas<"))
+        self.assertLess(html.index(">Ideas<"), html.index("Devices"))
+        self.assertLess(html.index("Devices"), html.index("Recent Periods"))
 
     def test_static_css_styles_device_state(self):
         """style.css styles the devices grid, two-per-line pills, and states."""
