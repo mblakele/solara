@@ -664,8 +664,24 @@ class LoadManager:
                 self.state.clear_tesla_settle_effects()
             self.state.add_effect(effect)
 
-        # Sync Tesla entry in devices from live vehicle state
+        # Sync Tesla entry in devices from live vehicle state.
+        # When configured but unavailable (offline / no telemetry yet), keep
+        # a grey off entry so the dashboard still lists Tesla.
         self.state.sync_tesla_device_state(ctx.tesla_state)
+        if (
+            ctx.tesla_state is None
+            and self.tesla_ctrl is not None
+            and "tesla" not in self.state.devices
+        ):
+            self.state.set_device_state(
+                "tesla",
+                DeviceState(
+                    name="tesla",
+                    actual_state=False,
+                    current_amps=None,
+                    desired_state=False,
+                ),
+            )
 
         # Hysteresis check
         gap_wh = ctx.gap_wh
