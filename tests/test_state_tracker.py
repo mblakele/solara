@@ -420,6 +420,14 @@ class TestTeslaTelemetryState:
         assert "tesla_telemetry_state" in d
         assert d["tesla_telemetry_state"] is None
 
+    def test_to_dict_includes_target_amps_in_pending_effects(self) -> None:
+        """to_dict() carries target_amps so the dashboard can show Tesla amps
+        for a pending set_amps effect."""
+        tracker = StateTracker()
+        tracker.pending_effects.append(make_settle_effect(age_secs=0, target_amps=16))
+        d = tracker.to_dict()
+        assert d["pending_effects"][0]["target_amps"] == 16
+
 
 class TestTeslaInflightWh:
     """Tests for StateTracker.tesla_inflight_wh()."""

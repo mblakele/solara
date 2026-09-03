@@ -59,6 +59,22 @@ requires technical precision.
 
 To ensure code quality and prevent regressions, all development must follow a strict **Test-First (Red-Green-Refactor)** workflow. You are prohibited from modifying production code until a failing test has been established. You are prohibited from attempting to diagnose, fix, or design a fix for any bug until a failing test has been written. Test first!
 
+### Layout Experiments (Exemption)
+
+Iterating on **presentation** — template markup, CSS, and visual structure —
+is exploratory by nature: you often don't know what "correct" looks like until
+you render it and look, so there is no meaningful failing test to write up
+front. For those changes you may **skip the Red-Green ceremony**:
+
+- No failing test is required before touching `templates/`, `static/style.css`,
+  or presentation-only changes to markup.
+- Still run the full verification gate (`uv run pylint *.py`, `uv run mypy`,
+  `uv run pytest`) after the change, and update any existing tests that assert
+  on the changed markup so the suite stays green.
+- The exemption covers **presentation only**. Any change that alters behavior,
+  logic, data shape, or API contracts must still follow the full Red-Green-
+  Refactor protocol below.
+
 ### Mandatory Pre-Code Checklist
 Before writing any production code, confirm:
 1. A failing test exists that reproduces the bug or defines the new behavior.
@@ -146,6 +162,21 @@ project-root
                            # signal handlers; worker_int/worker_exit call app.request_shutdown();
                            # timeout = 60 pins the arbiter watchdog (2x the 30s fetch bound)
 ├── clock.py               # Clock protocol (now()) with FakeClock for tests
+├── chart.py               # Server-side SVG generation for the per-second energy
+                           # sparkline (per_second_sparkline): bar height = magnitude,
+                           # color = sign (green generation, blue consumption); flush
+                           # bars tile slots edge-to-edge (no gap). Samples are
+                           # bucketed by the quantization window (quantization_seconds,
+                           # typically 30 s) so each bar is many viewBox units wide —
+                           # a sub-pixel per-second grating has nowhere to alias
+                           # against the device pixel grid when CSS scales the SVG
+                           # (moire); bucketed bars overhang the next by 1 s so
+                           # anti-aliased seams at shared edges are repainted solid,
+                           # and the svg root carries shape-rendering="crispEdges"
+                           # so every edge snaps onto whole device pixels (no AA
+                           # hairlines even above shorter neighbors); always laid
+                           # out for a full 300-second window (partial windows render
+                           # left-aligned at real time positions, blank right)
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
                            # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
 ├── config_loader.py       # Config loading helpers (load_tesla_config,
@@ -190,7 +221,13 @@ project-root
 ├── render.yaml            # Render.com deployment configuration
 ├── env.example            # Template for required environment variables
 ├── tests/                 # All pytest tests
-├── templates/             # Jinja2 HTML templates (index, TOU, error pages)
+├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
+                           # _metrics.html/_load_management.html are SSE-swappable fragments
+                           # (the metrics fragment carries the #data-freshness strip; the
+                           # sparkline filter receives quantization_seconds to feed
+                           # chart.per_second_sparkline's bucket_secs downsampling)
+├── static/                # Mobile-first design system (style.css) and the SSE dashboard
+                           # client (app.js) wiring EventSource → fragment swaps + freshness ticker
 ├── docs/                  # Supplementary documentation (e.g., LOADMANAGER.md, SSE_STREAMING.md, architecture.md)
 ├── devices.json           # Local device configuration — never commit
 ├── .env                   # Local secrets — never commit
@@ -293,6 +330,15 @@ project-root
   and load-management thread; called from `wsgi.py` and the `__main__` block, never
   at import time (so tests can import the module safely)
 - `_setup_file_logging()` in `app.py` — creates `RotatingFileHandler` when `LOG_FILE` is configured
+- `_metrics_freshness_payload()` in `app.py` — computes the dashboard
+  data-freshness strip (worst device lag + next-update cadence) rendered into
+  `_metrics.html`; returns None when no devices. The `live` flag tells the
+  client whether SSE is a continuous driver (load management enabled) or a
+  one-shot snapshot (keep the server auto-refresh / JS reload timer alive);
+  it also selects the mode-aware warn/stale thresholds emitted as
+  `data-warn`/`data-stale`.
+  Cadence resolution: load-management sleep hint → quantization refresh
+  window → `METRICS_UPDATE_FALLBACK_SECS` (120 s)
 - Test data generation in `mockdata.py`
 - Quantization detection in `quantization.py`
 - Timezones in `util.py`
@@ -351,6 +397,11 @@ project-root
 
 ### Index Endpoint
 - `index()` in app.py serves HTML or JSON based on Accept header
+- Static assets (`static/style.css`, `static/app.js`) are referenced with
+  **relative paths** (not `url_for` absolute paths) so the dashboard works
+  behind a transparent nginx proxy that mounts the app under a path prefix
+  (e.g. `/solara/`); the SSE `?partial=` fetches in `app.js` are likewise
+  relative
 - Returns model.metrics which includes:
   - devices: list with gid, lag, name, prediction, nbc (clock-boundary quarter-hour data),
     prev_hour_data
@@ -358,6 +409,36 @@ project-root
   - instant: timestamp
 - Template templates/index.html displays NBC QH1-QH4 values with dynamic time-range labels,
   minute/hour usage, predictions
+- The metrics section (`_metrics.html`) opens with a data-freshness strip
+  (`#data-freshness`): worst device lag + next-update cadence, ticked by
+  `static/app.js`; status colors fresh → aging → stale against mode-aware
+  thresholds in `constants.py` — `FRESHNESS_RELOAD_WARN/STALE_SECS` (300/420,
+  load management disabled) and `FRESHNESS_LIVE_WARN/STALE_SECS` (180/300,
+  load management enabled), emitted as `data-warn`/`data-stale` so the client
+  ticks with the same values. Its `data-live` flag ("1" when load management
+  is enabled) tells the SSE client whether to cancel page auto-refresh
+  (continuous driver) or keep the meta refresh / JS reload timer (one-shot
+  snapshot)
+- The legacy "Load Management" section (`_load_management.html`,
+  `#load-management-section`) is kept but only **displayed when debug mode is
+  enabled** (`metrics.debug` in the full page; `metrics_data["debug"]` gates
+  the `/?partial=load` fragment). Load management itself keeps running and the
+  freshness strip still drives live SSE updates regardless — the section is a
+  diagnostics view, not the live driver
+- The "Surplus ideas" block (`_metrics.html` `.demand__list`) renders the
+  label and the idea pills inline on one line (wrapping on narrow screens),
+  like "Recent Periods" / "Active devices"; each idea is its own shaded
+  pill (`.demand__list li`), matching the QH2/QH3/QH4 `.history__pill` look.
+  Neither `.demand` nor `.device-state` carries a dashed top divider —
+  this footer region is divider-free (spacing comes from `margin-top`).
+- Just above that, `.device-state` lists active devices and pending effects
+  as comma-separated text lines ("Active devices", "Pending effects").
+  Both lines annotate each device with its state in parentheses: Tesla
+  charging amps (`current_amps`, as reported) when present, otherwise
+  `(on)` / `(off)` from `actual_state` (purely from the serialized state in
+  `load_management.state.devices` — `StateTracker.to_dict()`). Pending
+  effects look up the same device state by name, so a `set_amps` effect
+  shows the reported amps rather than the commanded `target_amps`.
 
 ### Device State Tracking
  - StateTracker class (load_nbc.py lines 315–578) maintains:

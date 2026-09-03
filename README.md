@@ -132,7 +132,7 @@ For development work you may prefer gunicorn with auto-reload, which
 matches production behavior (threaded worker, cooperative shutdown):
 
 ```
-gunicorn --reload \
+uv run gunicorn --reload \
     --reload-extra-file .env \
     --reload-extra-file templates \
     -c gunicorn.conf.py --worker-class=gthread --threads=4 \

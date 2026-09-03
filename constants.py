@@ -10,7 +10,37 @@ from __future__ import annotations
 
 STALE_DATA_THRESHOLD_SECS: int = 80
 """Maximum age (in seconds) of a per-second data point before we consider
-the NBC prediction stale and skip the load management cycle."""
+the NBC prediction stale and skip the load management cycle. Note: the
+dashboard freshness strip uses its own mode-aware thresholds
+(FRESHNESS_RELOAD/LIVE_*); this constant gates load-management actions."""
+
+FRESHNESS_RELOAD_WARN_SECS: int = 300
+"""Dashboard freshness strip, refresh-driven pages (load management
+disabled): data at or past this age (5 min) is shown as ``aging`` (amber).
+Without load management the Emporia data typically arrives 120-180 s late
+and the page reloads on its own cadence, so normal operation stays green
+through ~5 min (worst-case age right before a reload)."""
+
+FRESHNESS_RELOAD_STALE_SECS: int = 420
+"""Dashboard freshness strip, refresh-driven pages (load management
+disabled): data at or past this age (7 min) is shown as ``stale`` (red)."""
+
+FRESHNESS_LIVE_WARN_SECS: int = 180
+"""Dashboard freshness strip, SSE-driven pages (load management enabled):
+data at or past this age (3 min) is shown as ``aging`` (amber). The ~30 s
+load-management cycle keeps lag around 45-120 s, so 3 min of no update
+means several cycles were missed."""
+
+FRESHNESS_LIVE_STALE_SECS: int = 300
+"""Dashboard freshness strip, SSE-driven pages (load management enabled):
+data at or past this age (5 min) is shown as ``stale`` (red) — updates
+have clearly stopped."""
+
+METRICS_UPDATE_FALLBACK_SECS: int = 120
+"""Expected seconds until the next dashboard update when nothing else
+defines a cadence: no load management (no cycle-driven fetch) and no
+detected quantization window. Mirrors the 2-minute fallback reload timer
+in ``static/app.js``."""
 
 PRUNE_WINDOW_SECS: int = 3600
 """Samples older than this many seconds are pruned from EnergyCache."""

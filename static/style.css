@@ -1,0 +1,499 @@
+/* solara dashboard — mobile-first design system.
+ *
+ * The page is a read-mostly dashboard, so the system favours large, calm,
+ * high-contrast readouts over dense tables. Layout is fluid (clamp() type,
+ * auto-fit grid) and adapts to notched phones via env(safe-area-inset-*).
+ */
+
+:root {
+  --color-bg: #f4f6fa;
+  --color-surface: #ffffff;
+  --color-sunken: #eaf0f6;
+  --color-border: #d8dfe8;
+  --color-text: #1c2733;
+  --color-text-muted: #5b6b7c;
+  --color-gen: #2ca02c;               /* generation (solar export) */
+  --color-load: #1f77b4;              /* consumption (grid import) */
+  --color-ok: #2ca02c;
+  --color-warn: #b45309;
+  --color-warn-bg: #fdf2e3;
+  --color-err: #dc2626;
+  --radius-card: 16px;
+  --radius-sm: 8px;
+  --radius-pill: 999px;
+  --shadow-card: 0 1px 2px rgb(16 24 40 / 0.05), 0 1px 3px rgb(16 24 40 / 0.10);
+  --space-xs: 0.375rem;
+  --space-sm: 0.75rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2rem;
+  --content-max: 68rem;
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #0d1117;
+    --color-surface: #161b22;
+    --color-sunken: #0d1117;
+    --color-border: #30363d;
+    --color-text: #e6edf3;
+    --color-text-muted: #99a6b3;
+    --color-warn: #e6a23c;
+    --color-warn-bg: #2a2114;
+    --shadow-card: 0 1px 2px rgb(0 0 0 / 0.45);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: 1rem;
+  line-height: 1.5;
+  color: var(--color-text);
+  background: var(--color-bg);
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+  /* Keep content clear of notches / home indicators on all phones. */
+  padding:
+    max(0.75rem, env(safe-area-inset-top))
+    max(0.75rem, env(safe-area-inset-right))
+    max(1rem, env(safe-area-inset-bottom))
+    max(0.75rem, env(safe-area-inset-left));
+}
+
+.container {
+  max-width: var(--content-max);
+  margin-inline: auto;
+}
+
+/* ── App bar ───────────────────────────────────────────────────────────── */
+.app-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  margin: var(--space-xs) 0 var(--space-md);
+}
+
+.app-bar__title {
+  margin: 0;
+  font-size: clamp(1.1rem, 3vw, 1.5rem);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.live-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--color-ok);
+}
+
+.live-indicator[hidden] {
+  display: none;
+}
+
+.live-indicator::before {
+  content: "";
+  width: 0.6em;
+  height: 0.6em;
+  border-radius: 50%;
+  background: var(--color-ok);
+}
+
+/* ── Forecast cards ────────────────────────────────────────────────────── */
+.metrics-wrap {
+  padding-bottom: var(--space-xl);
+}
+
+.metrics {
+  display: grid;
+  gap: var(--space-md);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+  align-items: start;
+}
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  padding: var(--space-lg);
+}
+
+.forecast {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.forecast__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.forecast__heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.device-name {
+  font-weight: 650;
+  font-size: clamp(1rem, 2.5vw, 1.15rem);
+  overflow-wrap: anywhere;
+}
+
+.instruction {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+/* Small label on the same line as the forecast value ("forecast this
+   period"), sized relative to the large value and allowed to wrap. */
+.forecast__period {
+  display: inline-block;
+  font-size: clamp(0.75rem, 2.5vw, 0.95rem);
+  font-weight: 500;
+  color: var(--color-text-muted);
+  margin-left: 0.5em;
+  overflow-wrap: anywhere;
+  vertical-align: baseline;
+  max-width: 14em;
+}
+
+.forecast__value {
+  font-size: clamp(3.6rem, 15vw, 5.4rem);
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.forecast__value--gen {
+  color: var(--color-gen);
+}
+
+.forecast__value--load {
+  color: var(--color-load);
+}
+
+.forecast__unit {
+  font-size: 0.5em;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--color-text-muted);
+  margin-left: 0.25em;
+}
+
+.forecast__placeholder {
+  color: var(--color-text-muted);
+}
+
+.sparkline {
+  margin: 0;
+}
+
+.sparkline svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: var(--color-sunken);
+}
+
+.details {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-sm);
+  margin: 0;
+}
+
+.details__stat {
+  background: var(--color-sunken);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm);
+  text-align: center;
+  min-width: 0;
+}
+
+.details__stat dt {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+.details__stat dd {
+  margin: var(--space-xs) 0 0;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.history {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.history__pill {
+  background: var(--color-sunken);
+  border-radius: var(--radius-pill);
+  padding: 0.2rem 0.65rem;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* "Recent Periods" pills that fell outside the target hysteresis envelope:
+   load-side (above the envelope) tinted blue, gen-side (below) tinted green. */
+.history__pill--load {
+  background: color-mix(in srgb, var(--color-sunken) 78%, var(--color-load));
+}
+
+.history__pill--gen {
+  background: color-mix(in srgb, var(--color-sunken) 78%, var(--color-gen));
+}
+
+.demand {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-xs);
+}
+
+.demand__label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+.demand__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  font-size: 0.85rem;
+}
+
+.demand__list li {
+  background: var(--color-sunken);
+  border-radius: var(--radius-pill);
+  padding: 0.3rem 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Device-state section (active devices / pending effects), rendered just
+   above the surplus-ideas block. */
+.device-state {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  font-size: 0.85rem;
+}
+
+.device-state__line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-xs);
+}
+
+/* ── Data freshness strip ──────────────────────────────────────────────── */
+.freshness {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  width: fit-content;
+  margin: 0 0 var(--space-md);
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-pill);
+  background: var(--color-sunken);
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.freshness__dot {
+  flex: none;
+  width: 0.6em;
+  height: 0.6em;
+  border-radius: 50%;
+  background: var(--color-ok);
+}
+
+.freshness[data-status="aging"] .freshness__dot {
+  background: var(--color-warn);
+}
+
+.freshness[data-status="stale"] .freshness__dot {
+  background: var(--color-err);
+}
+
+.freshness__text b {
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+.freshness .live-indicator {
+  white-space: nowrap;
+}
+
+/* ── Load management ───────────────────────────────────────────────────── */
+.load-management {
+  margin: var(--space-lg) auto;
+}
+
+.load-management__header h2 {
+  margin: 0 0 var(--space-md);
+  font-size: clamp(1.05rem, 3vw, 1.3rem);
+}
+
+.section-heading {
+  margin: var(--space-lg) 0 var(--space-sm);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-muted);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: var(--space-sm);
+  margin: 0;
+}
+
+.kv__row {
+  background: var(--color-sunken);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm) var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.kv__row dt {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+.kv__row dd {
+  margin: 0;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.status--ok {
+  color: var(--color-ok);
+}
+
+.status--warn {
+  color: var(--color-warn);
+}
+
+.status--err {
+  color: var(--color-err);
+}
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.data-table {
+  width: 100%;
+  min-width: 34rem;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 0.5rem var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.data-table th {
+  background: var(--color-sunken);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+.data-table td.num {
+  text-align: right;
+}
+
+.actions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.actions__item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-sm);
+  background: var(--color-sunken);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem var(--space-md);
+  font-size: 0.9rem;
+}
+
+.actions__type {
+  font-weight: 600;
+}
+
+/* ── Debug output ──────────────────────────────────────────────────────── */
+.debug {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  margin-top: var(--space-lg);
+}
+
+.debug pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ── Motion preferences ────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
