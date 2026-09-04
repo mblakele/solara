@@ -2470,7 +2470,12 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         nbc = metrics["devices"][0]["nbc"]
         nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0))
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": 750.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2494,7 +2499,12 @@ class TestSurplusIdeasLayout(unittest.TestCase):
             nbc, QH1=dict(nbc["QH1"], predicted_wh=+800.0, remaining_seconds=900)
         )
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": -850.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2509,21 +2519,26 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         self.assertNotIn(" min", html)
 
     def test_surplus_car_amps_uses_remaining_period_seconds(self):
-        """Car amps follow the iOS formula: predictedWh / hours / -240.0, where
-        hours = remaining seconds in the period / 3600."""
+        """Car amps follow gap Wh over remaining time: gapWh / hours / 240,
+        where hours = remaining seconds in the period / 3600."""
         from flask import render_template
 
         import app as app_mod
 
         metrics = realistic_metrics()
         nbc = metrics["devices"][0]["nbc"]
-        # -800 Wh over a full 900 s (0.25 h) at 240 V -> +13.3 A of charge
-        # headroom: -800 / 0.25 / -240 = 13.33.
+        # 750 Wh surplus over a full 900 s (0.25 h) at 240 V -> +12.5 A of
+        # charge headroom: 750 / 0.25 / 240 = 12.5.
         nbc = dict(
             nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0, remaining_seconds=900)
         )
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": 750.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2531,11 +2546,11 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 load_management=load_management,
                 freshness=None,
             )
-        self.assertIn("+13.3 Amps 240V</li>", html)
+        self.assertIn("+12.5 Amps 240V</li>", html)
 
     def test_positive_gap_car_amps_sign_and_value(self):
-        """A positive gap yields signed amps (deficit reads negative): +800 Wh
-        over 0.25 h -> 800 / 0.25 / -240 = -13.3 A."""
+        """A deficit gap yields signed amps: -850 Wh over 0.25 h ->
+        -850 / 0.25 / 240 = -14.2 A."""
         from flask import render_template
 
         import app as app_mod
@@ -2546,7 +2561,12 @@ class TestSurplusIdeasLayout(unittest.TestCase):
             nbc, QH1=dict(nbc["QH1"], predicted_wh=+800.0, remaining_seconds=900)
         )
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": -850.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2554,7 +2574,7 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 load_management=load_management,
                 freshness=None,
             )
-        self.assertIn("-13.3 Amps 240V</li>", html)
+        self.assertIn("-14.2 Amps 240V</li>", html)
 
     def test_car_amps_placeholder_when_no_time_remaining(self):
         """No time left in the period (or missing remaining_seconds) renders
@@ -2567,7 +2587,12 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         nbc = metrics["devices"][0]["nbc"]
         nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0, remaining_seconds=0))
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": 750.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2605,7 +2630,10 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0))
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
         load_management = {
-            "last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}},
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": 750.0}
+            },
             "state": {"devices": devices, "pending_effects": effects},
         }
         with app_mod.app.test_request_context():
