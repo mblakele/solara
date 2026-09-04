@@ -75,3 +75,24 @@ def test_fallback_derives_gap_from_target() -> None:
     html = _render(predicted_wh=-800.0, gap_wh=None, target_wh=-50.0)
     assert "9.3" in html
     assert "+12.5 Amps 240V" in html
+
+
+def test_ideas_hide_values_below_one() -> None:
+    """Only ideas >= 1.0 render: gap 85 gives shower 1.0 and car 1.4."""
+    html = _render(predicted_wh=-135.0, gap_wh=85.0, target_wh=-50.0)
+    assert ">Ideas<" in html
+    # 85/81 = 1.05 -> shows; 85/88 = 0.97 -> hidden.
+    assert "🚿" in html
+    assert "👕" not in html
+    # 85/0.25/240 = 1.42 -> shows.
+    assert "Amps 240V" in html
+
+
+def test_ideas_section_hidden_when_all_below_one() -> None:
+    """Gap above hysteresis but every idea < 1.0 hides the section."""
+    html = _render(
+        predicted_wh=-60.0, gap_wh=10.0, target_wh=-50.0, hysteresis_wh=5.0
+    )
+    # 10/81 = 0.1, 10/88 = 0.1, 10/0.25/240 = 0.17: all hidden.
+    assert ">Ideas<" not in html
+    assert "reduce usage if possible" not in html

@@ -2577,8 +2577,8 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         self.assertIn("-14.2 Amps 240V</li>", html)
 
     def test_car_amps_placeholder_when_no_time_remaining(self):
-        """No time left in the period (or missing remaining_seconds) renders
-        the em-dash placeholder instead of dividing by zero."""
+        """No time left hides the car idea (no divide by zero); other ideas
+        still render."""
         from flask import render_template
 
         import app as app_mod
@@ -2600,7 +2600,9 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 load_management=load_management,
                 freshness=None,
             )
-        self.assertIn("—</li>", html)
+        self.assertIn(">Ideas<", html)
+        self.assertNotIn("Amps 240V", html)
+        self.assertIn("9.3", html)
 
 
 class TestActiveDevicesPendingEffects(unittest.TestCase):

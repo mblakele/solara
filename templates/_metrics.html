@@ -78,14 +78,19 @@
     {% elif gap_wh > hyst %}
     {% set shower_min = (gap_wh / 81.0) | abs %}
     {% set laundry_min = (gap_wh / 88.0) | abs %}
+    {% set show_shower = shower_min >= 1.0 %}
+    {% set show_laundry = laundry_min >= 1.0 %}
+    {% set show_car = car_amps is not none and (car_amps | abs) >= 1.0 %}
+    {% if show_shower or show_laundry or show_car %}
     <div class="demand">
       <span class="demand__label">Ideas</span>
       <ul class="demand__list">
-        <li>⚡🚿 {{ "%.1f" % shower_min }} min</li>
-        <li>⚡👕 {{ "%.1f" % laundry_min }} min</li>
-        <li>🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
+        {% if show_shower %}<li>⚡🚿 {{ "%.1f" % shower_min }} min</li>{% endif %}
+        {% if show_laundry %}<li>⚡👕 {{ "%.1f" % laundry_min }} min</li>{% endif %}
+        {% if show_car %}<li>🚗 {{ "%+.1f" % car_amps }} Amps 240V</li>{% endif %}
       </ul>
     </div>
+    {% endif %}
     {% endif %}
     {% endif %}
     {% endif %}
