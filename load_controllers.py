@@ -151,22 +151,6 @@ class TeslaController(AbstractTeslaController):
         """No-op authentication stub."""
         logger.debug("TeslaController.authenticate() [stub]")
 
-    async def is_at_home(self) -> bool:
-        """Return stored at_home flag."""
-        return self._state.at_home
-
-    async def is_plugged_in(self) -> bool:
-        """Return stored plugged_in flag."""
-        return self._state.plugged_in
-
-    async def start_charging(self) -> bool:
-        """Set charging state to True and log the action."""
-        logger.debug("TeslaController.start_charging() [stub]")
-        self._state.is_charging = True
-        if self._state.current_amps is None:
-            self._state.current_amps = self.config.charge_amps_min
-        return True
-
     async def stop_charging(self) -> bool:
         """Set charging state to False and log the action."""
         logger.debug("TeslaController.stop_charging() [stub]")

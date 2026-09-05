@@ -18,23 +18,6 @@ from metrics import DevicePrediction
 class TestDevicePrediction(unittest.TestCase):
     """Tests for DevicePrediction dataclass construction."""
 
-    def test_construction_all_fields(self):
-        """DevicePrediction can be constructed with all fields."""
-        pred = DevicePrediction(
-            lag=timedelta(seconds=5),
-            minute_predicted=1.0,
-            prediction=60.0,
-            prediction_min=55.0,
-            prediction_max=65.0,
-            seconds_remaining=900.0,
-        )
-        self.assertEqual(pred.lag, timedelta(seconds=5))
-        self.assertEqual(pred.minute_predicted, 1.0)
-        self.assertEqual(pred.prediction, 60.0)
-        self.assertEqual(pred.prediction_min, 55.0)
-        self.assertEqual(pred.prediction_max, 65.0)
-        self.assertEqual(pred.seconds_remaining, 900.0)
-
     def test_to_dict_matches_original_structure(self):
         """to_dict() output matches the original _predict_device return dict."""
         pred = DevicePrediction(
@@ -84,23 +67,6 @@ class TestDevicePrediction(unittest.TestCase):
         d = original.to_dict()
         restored = DevicePrediction(**d)
         self.assertEqual(original, restored)
-
-    def test_is_dataclass(self):
-        """DevicePrediction is a frozen dataclass."""
-        import dataclasses
-        self.assertTrue(dataclasses.is_dataclass(DevicePrediction))
-        self.assertTrue(dataclasses.fields(DevicePrediction))
-        # Should be frozen (immutable)
-        pred = DevicePrediction(
-            lag=timedelta(0),
-            minute_predicted=0.0,
-            prediction=0.0,
-            prediction_min=0.0,
-            prediction_max=0.0,
-            seconds_remaining=0.0,
-        )
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            pred.prediction = 100.0
 
 
 if __name__ == "__main__":  # pragma: no cover

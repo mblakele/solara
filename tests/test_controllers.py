@@ -148,16 +148,6 @@ def test_set_mock_state(stub_tesla_config):
     assert not state.at_home
 
 
-def test_start_charging(stub_tesla_config):
-    """start_charging sets is_charging and current_amps."""
-    ctrl = TeslaController(stub_tesla_config)
-    result = asyncio.run(ctrl.start_charging())
-    assert result
-    state = asyncio.run(ctrl.get_charging_state())
-    assert state.is_charging
-    assert state.current_amps == 5
-
-
 def test_stop_charging(stub_tesla_config):
     """stop_charging clears is_charging and current_amps."""
     ctrl = TeslaController(stub_tesla_config)
@@ -193,6 +183,21 @@ def test_abstract_tesla_interface_is_command_only():
     for method in ("is_at_home", "is_plugged_in", "start_charging", "get_charging_state"):
         assert not hasattr(AbstractTeslaController, method), (
             f"AbstractTeslaController.{method} must be removed (deprecated REST polling)"
+        )
+
+
+def test_stub_tesla_has_no_polling_methods(stub_tesla_config):
+    """The stub exposes no polling/start methods beyond the observation hook.
+
+    is_at_home/is_plugged_in/start_charging are dead: production reads
+    vehicle state from MQTT, and the load manager must never start charging.
+    (get_charging_state stays as the stub's test-observation hook for the
+    live stop_charging/set_charge_amps methods.)
+    """
+    ctrl = TeslaController(stub_tesla_config)
+    for method in ("is_at_home", "is_plugged_in", "start_charging"):
+        assert not hasattr(ctrl, method), (
+            f"TeslaController.{method} must be removed (dead stub method)"
         )
 
 
@@ -251,39 +256,6 @@ def test_set_charge_amps_starts_charging(stub_tesla_config):
     state = asyncio.run(ctrl.get_charging_state())
     assert state.is_charging
     assert state.current_amps == 24
-
-
-def test_is_at_home_returns_mock_value(stub_tesla_config):
-    """is_at_home returns the mocked value."""
-    ctrl = TeslaController(stub_tesla_config)
-    result = asyncio.run(ctrl.is_at_home())
-    assert not result
-
-    ctrl.set_mock_state(
-        TeslaState(
-            is_charging=False,
-            current_amps=None,
-            plugged_in=False,
-            at_home=False,
-        )
-    )
-    result = asyncio.run(ctrl.is_at_home())
-    assert not result
-
-
-def test_is_plugged_in_returns_mock_value(stub_tesla_config):
-    """is_plugged_in returns the mocked value."""
-    ctrl = TeslaController(stub_tesla_config)
-    ctrl.set_mock_state(
-        TeslaState(
-            is_charging=False,
-            current_amps=None,
-            plugged_in=True,
-            at_home=True,
-        )
-    )
-    result = asyncio.run(ctrl.is_plugged_in())
-    assert result
 
 
 def test_authenticate_noop(stub_tesla_config):

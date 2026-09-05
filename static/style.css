@@ -275,9 +275,9 @@ body {
 
 .demand {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
+  flex-direction: column;
   gap: var(--space-xs);
+  font-size: 0.85rem;
 }
 
 .demand__label {
@@ -291,8 +291,8 @@ body {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: var(--space-xs);
   font-size: 0.85rem;
 }
@@ -302,22 +302,59 @@ body {
   border-radius: var(--radius-pill);
   padding: 0.3rem 0.75rem;
   font-variant-numeric: tabular-nums;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 
-/* Device-state section (active devices / pending effects), rendered just
-   above the surplus-ideas block. */
-.device-state {
+/* Devices section: single grid listing every configured device as a pill,
+   two per line. State is carried by color, not parenthesised text:
+   on -> faded green, off -> grey, pending turn_off -> faded blue,
+   pending turn_on / set_amps -> static grey-green mix, sentinel on ->
+   red (sentinels never show pending colors). */
+.device-grid {
   display: flex;
   flex-direction: column;
   gap: var(--space-xs);
   font-size: 0.85rem;
 }
 
-.device-state__line {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
+.device-grid__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: var(--space-xs);
+}
+
+.device-pill {
+  border-radius: var(--radius-pill);
+  padding: 0.3rem 0.75rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.device-pill--on {
+  background: color-mix(in srgb, var(--color-sunken) 78%, var(--color-gen));
+}
+
+.device-pill--off {
+  background: var(--color-sunken);
+  color: var(--color-text-muted);
+}
+
+.device-pill--pending-off {
+  background: color-mix(in srgb, var(--color-sunken) 78%, var(--color-load));
+}
+
+.device-pill--pending-on {
+  background: color-mix(in srgb, var(--color-sunken) 50%, var(--color-gen));
+}
+
+.device-pill--sentinel-on {
+  background: var(--color-err);
+  color: #fff;
 }
 
 /* ── Data freshness strip ──────────────────────────────────────────────── */

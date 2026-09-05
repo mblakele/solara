@@ -14,7 +14,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from energy_cache import EnergyCache
 from config import Config
@@ -359,11 +359,436 @@ class NBCReader:
         return None
 
 
+class EffectStore:
+    """Thread-safe list of pending effects with dual-age expiry queries.
+
+    Owns the ``pending_effects`` list plus its own ``RLock`` so effect
+    bookkeeping no longer shares ``StateTracker``'s device lock. The
+    prune/has-since/count window mirrors ``StateTracker``'s adaptive
+    prediction window — ``StateTracker`` propagates it on every call
+    (and on ``apply_prediction_window``), while standalone users get
+    the construction-time ``window_secs`` default.
+    """
+
+    def __init__(
+        self, window_secs: int = DEFAULT_PREDICTION_WINDOW_SECS
+    ) -> None:
+        """Initialize an empty store.
+
+        Args:
+            window_secs: Dual-age expiry window in seconds.
+        """
+        self.window_secs = window_secs
+        self._lock = threading.RLock()
+        self._effects: list[PendingEffect] = []
+
+    def _resolve_window(self, window_secs: int | None) -> int:
+        """Return the explicit window or fall back to the stored default."""
+        return self.window_secs if window_secs is None else window_secs
+
+    def add(self, effect: PendingEffect) -> None:
+        """Append a pending effect under the store lock.
+
+        Args:
+            effect: The executed-action record to append.
+        """
+        with self._lock:
+            self._effects.append(effect)
+
+    def snapshot(self) -> list[PendingEffect]:
+        """Return an atomic copy of pending effects for readers."""
+        with self._lock:
+            return list(self._effects)
+
+    def has_since(
+        self, nbc_timestamp: datetime, window_secs: int | None = None
+    ) -> bool:
+        """Return True if any effect is newer than the NBC timestamp.
+
+        Checks both the wall-clock timestamp and the data-point-at
+        timestamp with a ``window_secs`` buffer, so effects taken just
+        before the NBC data point still count as not-yet-reflected.
+
+        Args:
+            nbc_timestamp: The NBC data-point-at timestamp to compare against.
+            window_secs: Override expiry window; defaults to the stored one.
+
+        Returns:
+            True if any effect has either timestamp within the window
+            after ``nbc_timestamp``.
+        """
+        window = self._resolve_window(window_secs)
+        buffer = timedelta(seconds=window)
+        with self._lock:
+            effects = list(self._effects)
+        for effect in effects:
+            if effect.timestamp > nbc_timestamp - buffer:
+                return True
+            if effect.data_point_at > nbc_timestamp - buffer:
+                return True
+        return False
+
+    def count_since(
+        self, nbc_timestamp: datetime, window_secs: int | None = None
+    ) -> int:
+        """Return the number of effects taken after the given timestamp.
+
+        Uses the same buffer as :meth:`has_since` so the count reflects
+        the same set of effects that triggers the waiting path.
+
+        Args:
+            nbc_timestamp: The NBC data-point-at timestamp to compare against.
+            window_secs: Override expiry window; defaults to the stored one.
+
+        Returns:
+            Count of effects whose wall-clock or data-point-at timestamp
+            is within the window after ``nbc_timestamp``.
+        """
+        window = self._resolve_window(window_secs)
+        buffer = timedelta(seconds=window)
+        with self._lock:
+            effects = list(self._effects)
+        return sum(
+            1 for eff in effects
+            if eff.timestamp > nbc_timestamp - buffer
+            or eff.data_point_at > nbc_timestamp - buffer
+        )
+
+    def prune(
+        self,
+        data_point_at: datetime,
+        now: datetime,
+        window_secs: int | None = None,
+    ) -> int:
+        """Remove effects old by both wall-clock and data-point age.
+
+        An effect is pruned when it is over ``window_secs`` old by
+        **both** measures (wall clock and data-point-at). Effects newer
+        than the current data point are always retained.
+
+        Args:
+            data_point_at: Timestamp of the most recent per-second data point.
+            now: Current wall-clock time.
+            window_secs: Override expiry window; defaults to the stored one.
+
+        Returns:
+            Number of effects removed.
+        """
+        window = self._resolve_window(window_secs)
+        wall_cutoff = now - timedelta(seconds=window)
+        dp_cutoff = data_point_at - timedelta(seconds=window)
+        with self._lock:
+            before = len(self._effects)
+            self._effects = [
+                eff for eff in self._effects
+                if eff.timestamp >= wall_cutoff
+                or eff.data_point_at >= dp_cutoff
+                or eff.timestamp > data_point_at
+            ]
+            return before - len(self._effects)
+
+    def latest_for(self, device_name: str) -> PendingEffect | None:
+        """Return the most recent effect targeting a device.
+
+        Args:
+            device_name: Device name to search for.
+
+        Returns:
+            The newest matching effect, or None if none exist.
+        """
+        with self._lock:
+            effects = list(self._effects)
+        for eff in reversed(effects):
+            if eff.device_name == device_name:
+                return eff
+        return None
+
+    def clear_tesla_set_amps(self) -> None:
+        """Remove Tesla set_amps effects, preserving turn_on/turn_off."""
+        with self._lock:
+            self._effects = [
+                eff for eff in self._effects
+                if not (eff.device_name == "tesla" and eff.action == "set_amps")
+            ]
+
+
+class TeslaSettleTracker:
+    """Tracks an in-flight Tesla amp command and its settle window.
+
+    Owns ``last_commanded_amps`` plus the zero-sample confirmation counter,
+    querying an :class:`EffectStore` for command history and settle effects.
+    ``window_secs`` mirrors ``StateTracker``'s adaptive prediction window —
+    ``StateTracker`` propagates committed changes via
+    ``apply_prediction_window``.
+    """
+
+    def __init__(
+        self, effects: EffectStore, window_secs: int = DEFAULT_PREDICTION_WINDOW_SECS
+    ) -> None:
+        """Initialize the tracker.
+
+        Args:
+            effects: Shared effect store for command/settle history.
+            window_secs: Settle window in seconds.
+        """
+        self.effects = effects
+        self.window_secs = window_secs
+        self.last_commanded_amps: int | None = None
+        # Consecutive reported_amps==0 samples seen for the current command.
+        # A single 0 A telemetry frame is not enough to confirm the car
+        # stopped — see inflight_wh() (plan 3.5).
+        self._zero_amp_samples: int = 0
+
+    def record_command(self, amps: int | None) -> None:
+        """Record a commanded Tesla amp level and reset zero-amp confirmation.
+
+        Resetting the zero-sample counter here prevents a count accumulated
+        against an earlier command from instantly clearing the fresh one on
+        its first 0 A frame.
+
+        Args:
+            amps: The newly commanded amp level, or None to clear the
+                recorded command.
+        """
+        self.last_commanded_amps = amps
+        self._zero_amp_samples = 0
+
+    def inflight_wh(
+        self, reported_amps: int | None, seconds_remaining: int,
+        now: datetime,
+        data_point_at: datetime | None = None,
+    ) -> float:
+        """Compute the still-unconfirmed Tesla amp-change contribution.
+
+        Recomputed fresh every cycle using the vehicle API's reported
+        current_amps, so the adjustment decays correctly as seconds_remaining
+        shrinks rather than being frozen at command time.
+
+        Returns zero when no amp command is in flight or the car has already
+        reached the commanded level (confirmed by vehicle API).
+
+        Args:
+            reported_amps: current_amps from the vehicle API this cycle.
+            seconds_remaining: Seconds left in the current quarter-hour.
+            now: Current wall-clock time (injected so tests can pin it).
+            data_point_at: Current NBC data-point-at timestamp. When provided,
+                the data-point-at age is checked alongside wall-clock age for
+                the 1A stale-clearing gate. ``None`` falls back to
+                wall-clock-only.
+
+        Returns:
+            Wh still expected from the in-flight amp delta.
+        """
+        if self.last_commanded_amps is None or reported_amps is None:
+            return 0.0
+        if reported_amps == 0:
+            return self._inflight_zero(seconds_remaining)
+        # Any non-zero report resets the zero-amp confirmation counter.
+        self._zero_amp_samples = 0
+        if reported_amps == 1:
+            return self._inflight_one_amp(
+                seconds_remaining, now, data_point_at=data_point_at
+            )
+        delta = self.last_commanded_amps - reported_amps
+        if delta == 0:
+            return 0.0
+        # After both settle windows expire, if the car still hasn't reached
+        # the commanded level, treat the command as unsuccessful and clear
+        # the stale state so it doesn't distort the gap forever.
+        # Only fires when at least one settle effect was ever recorded — tests
+        # that set last_commanded_amps directly without pending effects
+        # still compute the delta as expected.
+        has_settle = any(
+            eff.device_name == "tesla" and eff.action == "set_amps"
+            and eff.direction is not None
+            for eff in self.effects.snapshot()
+        )
+        if (has_settle
+                and not self.is_settling(now, data_point_at=data_point_at,
+                                        direction="increase")
+                and not self.is_settling(now, data_point_at=data_point_at,
+                                        direction="decrease")):
+            logger.debug(
+                "[tesla_inflight_wh] settle expired — clearing stale last_commanded_amps=%d "
+                "(reported=%d)",
+                self.last_commanded_amps, reported_amps,
+            )
+            self.last_commanded_amps = None
+            self._zero_amp_samples = 0
+            return 0.0
+        return StateTracker.delta_amps_to_wh(delta, seconds_remaining)
+
+    def _inflight_zero(self, seconds_remaining: int) -> float:
+        """Handle a reported 0 A frame.
+
+        A single zero frame can be stale or in-transit while the car is
+        still ramping, so the command is only cleared after
+        ``TESLA_ZERO_AMPS_CLEAR_SAMPLES`` consecutive zero samples. Until
+        then the full commanded delta stays accounted.
+
+        Args:
+            seconds_remaining: Seconds left in the current quarter-hour.
+
+        Returns:
+            Wh still expected from the in-flight amp delta.
+        """
+        self._zero_amp_samples += 1
+        if self._zero_amp_samples >= TESLA_ZERO_AMPS_CLEAR_SAMPLES:
+            self.last_commanded_amps = None
+            self._zero_amp_samples = 0
+            return 0.0
+        # Unconfirmed stop — keep accounting for the full commanded delta.
+        assert self.last_commanded_amps is not None
+        return StateTracker.delta_amps_to_wh(
+            self.last_commanded_amps, seconds_remaining,
+        )
+
+    def _inflight_one_amp(
+        self, seconds_remaining: int, now: datetime,
+        data_point_at: datetime | None = None,
+    ) -> float:
+        """Handle a reported 1 A frame during possible ramp-up.
+
+        During ramp-up the car briefly reports 1 A — treat as stale only
+        when the command was issued long enough ago that the car should
+        have reached a higher level by now. The settle window considers
+        both wall-clock age and data-point-at age.
+
+        Args:
+            seconds_remaining: Seconds left in the current quarter-hour.
+            now: Current wall-clock time.
+            data_point_at: Current NBC data-point-at timestamp, or None.
+
+        Returns:
+            Wh still expected from the unconfirmed portion of the delta,
+            or 0.0 when the 1 A report is treated as stale (clearing the
+            recorded command).
+        """
+        assert self.last_commanded_amps is not None
+        latest_cmd = self.effects.latest_for("tesla")
+        if latest_cmd is not None:
+            elapsed_wall = (now - latest_cmd.timestamp).total_seconds()
+            if elapsed_wall < self.window_secs:
+                # Recent command — car is ramping up, don't clear.
+                # Credit the unconfirmed portion so surplus is not
+                # overstated after an amp increase (plan 3.5).
+                return StateTracker.delta_amps_to_wh(
+                    self.last_commanded_amps - 1,
+                    seconds_remaining,
+                )
+            # Wall clock expired — check data-point-at age.
+            if (data_point_at is not None
+                    and latest_cmd.data_point_at is not None):
+                elapsed_data = (
+                    data_point_at - latest_cmd.data_point_at
+                ).total_seconds()
+                if elapsed_data < self.window_secs:
+                    return StateTracker.delta_amps_to_wh(
+                        self.last_commanded_amps - 1,
+                        seconds_remaining,
+                    )
+        # No recent command (or command age exceeds settle window) —
+        # treat as stale and clear.
+        self.last_commanded_amps = None
+        self._zero_amp_samples = 0
+        return 0.0
+
+    def _find_active(
+        self, now: datetime, current_qh: str | None = None,
+        data_point_at: datetime | None = None,
+        direction: str = "increase",
+    ) -> PendingEffect | None:
+        """Return the active settle effect for the given direction, or None.
+
+        Finds the most recent Tesla "set_amps" effect with the matching
+        ``direction`` and checks whether it is still active using dual-age
+        expiry (wall clock + data-point-at) and QH-boundary expiry.
+
+        Args:
+            now: Current wall-clock timestamp.
+            current_qh: Current QH name; if different from the QH in which
+                the effect was recorded, the window is treated as expired.
+            data_point_at: Current NBC data-point-at timestamp. When provided,
+                the data-point-at age is checked alongside wall-clock age.
+            direction: "increase" or "decrease" — which settle window to check.
+
+        Returns:
+            The active settle effect, or None if no active settle exists.
+        """
+        for eff in reversed(self.effects.snapshot()):
+            if (eff.device_name == "tesla" and eff.action == "set_amps"
+                    and eff.direction == direction):
+                if current_qh is not None and eff.qh_name != current_qh:
+                    return None
+                elapsed_wall = (now - eff.timestamp).total_seconds()
+                if elapsed_wall < self.window_secs:
+                    return eff
+                if (data_point_at is not None
+                        and eff.data_point_at is not None):
+                    elapsed_data = (
+                        data_point_at - eff.data_point_at
+                    ).total_seconds()
+                    if elapsed_data < self.window_secs:
+                        return eff
+                return None
+        return None
+
+    def get_active(
+        self, now: datetime, current_qh: str | None = None,
+        data_point_at: datetime | None = None,
+        direction: str = "increase",
+    ) -> PendingEffect | None:
+        """Return the active settle effect for the given direction, or None.
+
+        Like :meth:`is_settling` but returns the effect itself so callers
+        can access its timestamp for logging or diagnostics.
+
+        Args:
+            now: Current wall-clock timestamp.
+            current_qh: Current QH name for QH-boundary expiry.
+            data_point_at: Current NBC data-point-at timestamp.
+            direction: "increase" or "decrease".
+
+        Returns:
+            The active settle effect, or None if no active settle exists.
+        """
+        return self._find_active(
+            now, current_qh=current_qh, data_point_at=data_point_at,
+            direction=direction,
+        )
+
+    def is_settling(
+        self, now: datetime, current_qh: str | None = None,
+        data_point_at: datetime | None = None,
+        direction: str = "increase",
+    ) -> bool:
+        """Return True if we are in the settle window for the given direction.
+
+        Args:
+            now: Current wall-clock timestamp.
+            current_qh: Current QH name; if different from the QH in which the
+                effect was recorded, the window is treated as expired.
+            data_point_at: Current NBC data-point-at timestamp. When provided,
+                the data-point-at age is checked alongside wall-clock age.
+            direction: "increase" or "decrease" — which settle window to check.
+
+        Returns:
+            True if turn-off (increase) or turn-on (decrease) decisions should
+            be suppressed.
+        """
+        return self._find_active(
+            now, current_qh=current_qh, data_point_at=data_point_at,
+            direction=direction,
+        ) is not None
+
+
 class StateTracker:
     # Too many public methods (24/20): StateTracker is the state facade over
-    # device states, pending effects, and Tesla command/settle tracking —
-    # each method is a small, independently tested operation. Splitting it
-    # would scatter related state transitions without reducing complexity.
+    # device states, Tesla command/settle tracking, and prediction-window
+    # adaptation. The pending-effects list itself lives in EffectStore
+    # (above) — StateTracker keeps thin delegating methods (add_effect,
+    # prune_old_effects, has_pending_effect_since, ...) so existing
+    # call-sites and tests keep working unchanged.
     # pylint: disable=too-many-public-methods
     """In-memory state of managed devices and pending effects."""
 
@@ -464,19 +889,44 @@ class StateTracker:
         # contract; do not call them from request paths.
         self._state_lock = threading.RLock()
         self.devices: dict[str, DeviceState] = {}
-        self.pending_effects: list[PendingEffect] = []
+        self._effects = EffectStore(window_secs=prediction_window_seconds)
+        self.settle = TeslaSettleTracker(
+            self._effects, window_secs=prediction_window_seconds
+        )
         self.last_data_point_at: datetime | None = None
         self.last_nbc_predicted_wh: float | None = None
-        self.last_commanded_amps: int | None = None
-        # Consecutive reported_amps==0 samples seen for the current command.
-        # A single 0 A telemetry frame is not enough to confirm the car
-        # stopped — see tesla_inflight_wh() (plan 3.5).
-        self._zero_amp_samples: int = 0
         # Fleet-telemetry push callbacks replace REST reads of Tesla state.
         self.tesla_telemetry_state: TeslaVehicleTelemetry | None = None
         self.has_fresh_telemetry: bool = False
         # Whether fleet-telemetry push has been registered via the callback API.
         self.registered: bool = False
+
+    @property
+    def last_commanded_amps(self) -> int | None:
+        """Last commanded Tesla amp level (legacy compat).
+
+        Owned by :attr:`settle`; setting it directly (as tests do) writes
+        through to the settle tracker.
+        """
+        return self.settle.last_commanded_amps
+
+    @last_commanded_amps.setter
+    def last_commanded_amps(self, value: int | None) -> None:
+        self.settle.last_commanded_amps = value
+
+    @property
+    def pending_effects(self) -> list[PendingEffect]:
+        """Live pending-effects list (legacy compat).
+
+        New code should use :meth:`add_effect` / :meth:`snapshot_effects`;
+        direct list mutation bypasses the store lock exactly as before.
+        """
+        return self._effects._effects
+
+    @pending_effects.setter
+    def pending_effects(self, value: list[PendingEffect]) -> None:
+        with self._effects._lock:
+            self._effects._effects = list(value)
 
     def snapshot_devices(self) -> dict[str, DeviceState]:
         """Return an atomic copy of device states for cross-thread readers.
@@ -490,8 +940,7 @@ class StateTracker:
 
     def snapshot_effects(self) -> list[PendingEffect]:
         """Return an atomic copy of pending effects for cross-thread readers."""
-        with self._state_lock:
-            return list(self.pending_effects)
+        return self._effects.snapshot()
 
     def set_device_state(self, name: str, state: DeviceState) -> None:
         """Insert or replace a device state under the state lock.
@@ -509,8 +958,7 @@ class StateTracker:
         Args:
             effect: The executed-action record to append.
         """
-        with self._state_lock:
-            self.pending_effects.append(effect)
+        self._effects.add(effect)
 
     def apply_prediction_window(self, prediction_window_seconds: int) -> None:
         """Resolve the prediction/settle window from quantization data.
@@ -540,6 +988,8 @@ class StateTracker:
             self._window_candidate_confirmations += 1
             if self._window_candidate_confirmations >= 2:
                 self._pending_effect_min_secs = prediction_window_seconds
+                self._effects.window_secs = prediction_window_seconds
+                self.settle.window_secs = prediction_window_seconds
                 self._window_candidate = None
                 self._window_candidate_confirmations = 0
         else:
@@ -566,7 +1016,7 @@ class StateTracker:
             Adjusted Wh estimate including all pending effect deltas.
         """
         adjusted = nbc_predicted_wh
-        for effect in self.pending_effects:
+        for effect in self._effects.snapshot():
             if effect.device_name == "tesla" and effect.action == "set_amps":
                 continue
             adjusted += StateTracker.watts_to_wh(effect.power_watts, seconds_remaining)
@@ -580,128 +1030,34 @@ class StateTracker:
     ) -> float:
         """Compute the still-unconfirmed Tesla amp-change contribution.
 
-        Recomputed fresh every cycle using the vehicle API's reported
-        current_amps, so the adjustment decays correctly as seconds_remaining
-        shrinks rather than being frozen at command time.
-
-        Returns zero when no amp command is in flight or the car has already
-        reached the commanded level (confirmed by vehicle API).
-
-        A reported 0 A frame is not trusted immediately: the command is only
-        cleared after ``TESLA_ZERO_AMPS_CLEAR_SAMPLES`` consecutive zero
-        samples, and until then the full commanded delta stays accounted.
-
-        If the car reports 1 A during the settle window after a recent command,
-        it is considered to be ramping up (not stale) and ``last_commanded_amps``
-        is preserved while the unconfirmed portion of the delta is credited.
-        The settle window considers both wall-clock age and
-        data-point-at age — the ramp-up status is preserved if **either**
-        measure is still within ``effective_settle_secs``.
+        Delegates to :attr:`settle`; see
+        :meth:`TeslaSettleTracker.inflight_wh` for the full contract.
 
         Args:
             reported_amps: current_amps from the vehicle API this cycle.
             seconds_remaining: Seconds left in the current quarter-hour.
             now: Current wall-clock time (injected so tests can pin it).
-            data_point_at: Current NBC data-point-at timestamp.  When provided,
-                the data-point-at age is checked alongside wall-clock age for
-                the 1A stale-clearing gate.  ``None`` falls back to
-                wall-clock-only.
+            data_point_at: Current NBC data-point-at timestamp.
 
         Returns:
             Wh still expected from the in-flight amp delta.
         """
-        if self.last_commanded_amps is None or reported_amps is None:
-            return 0.0
-        resolve_now = now
-        # Car reports 0 A: not immediately trusted as "stopped" — a single
-        # zero frame can be stale or in-transit while the car is still
-        # ramping. Only after TESLA_ZERO_AMPS_CLEAR_SAMPLES consecutive
-        # zero samples is the command cleared (plan 3.5).
-        if reported_amps == 0:
-            self._zero_amp_samples += 1
-            if self._zero_amp_samples >= TESLA_ZERO_AMPS_CLEAR_SAMPLES:
-                self.last_commanded_amps = None
-                self._zero_amp_samples = 0
-                return 0.0
-            # Unconfirmed stop — keep accounting for the full commanded delta.
-            return StateTracker.delta_amps_to_wh(
-                self.last_commanded_amps, seconds_remaining,
-            )
-        # Any non-zero report resets the zero-amp confirmation counter.
-        self._zero_amp_samples = 0
-        latest_cmd = self._latest_tesla_command()
-        # Car is at 1 A: gate the stale-clearing behind a recency check.
-        # During ramp-up the car briefly reports 1A — treat as stale only
-        # when the command was issued long enough ago that the car should
-        # have reached a higher level by now.
-        if reported_amps == 1:
-            if latest_cmd is not None:
-                elapsed_wall = (resolve_now - latest_cmd.timestamp).total_seconds()
-                if elapsed_wall < self.effective_settle_secs:
-                    # Recent command — car is ramping up, don't clear.
-                    # Credit the unconfirmed portion so surplus is not
-                    # overstated after an amp increase (plan 3.5).
-                    return StateTracker.delta_amps_to_wh(
-                        self.last_commanded_amps - reported_amps,
-                        seconds_remaining,
-                    )
-                # Wall clock expired — check data-point-at age.
-                if (data_point_at is not None
-                        and latest_cmd.data_point_at is not None):
-                    elapsed_data = (
-                        data_point_at - latest_cmd.data_point_at
-                    ).total_seconds()
-                    if elapsed_data < self.effective_settle_secs:
-                        return StateTracker.delta_amps_to_wh(
-                            self.last_commanded_amps - reported_amps,
-                            seconds_remaining,
-                        )
-            # No recent command (or command age exceeds settle window) —
-            # treat as stale and clear.
-            self.last_commanded_amps = None
-            self._zero_amp_samples = 0
-            return 0.0
-        delta = self.last_commanded_amps - reported_amps
-        if delta == 0:
-            return 0.0
-        # After both settle windows expire, if the car still hasn't reached
-        # the commanded level, treat the command as unsuccessful and clear
-        # the stale state so it doesn't distort the gap forever.
-        # Only fires when at least one settle effect was ever recorded — tests
-        # that set last_commanded_amps directly without pending effects
-        # still compute the delta as expected.
-        has_settle = any(
-            eff.device_name == "tesla" and eff.action == "set_amps"
-            and eff.direction is not None
-            for eff in self.pending_effects
+        return self.settle.inflight_wh(
+            reported_amps, seconds_remaining, now,
+            data_point_at=data_point_at,
         )
-        if (has_settle
-                and not self.is_settling(resolve_now, data_point_at=data_point_at, direction="increase")
-                and not self.is_settling(resolve_now, data_point_at=data_point_at, direction="decrease")):
-            logger.debug(
-                "[tesla_inflight_wh] settle expired — clearing stale last_commanded_amps=%d "
-                "(reported=%d)",
-                self.last_commanded_amps, reported_amps,
-            )
-            self.last_commanded_amps = None
-            self._zero_amp_samples = 0
-            return 0.0
-        return StateTracker.delta_amps_to_wh(delta, seconds_remaining)
 
     def record_tesla_amp_command(self, amps: int | None) -> None:
         """Record a commanded Tesla amp level and reset zero-amp confirmation.
 
-        Called by the load manager when a ``set_amps`` action commits (or a
-        turn_on/turn_off clears the command). Resetting the zero-sample
-        counter here prevents a count accumulated against an earlier command
-        from instantly clearing the fresh one on its first 0 A frame.
+        Delegates to :attr:`settle`; see
+        :meth:`TeslaSettleTracker.record_command`.
 
         Args:
             amps: The newly commanded amp level, or None to clear the
                 recorded command.
         """
-        self.last_commanded_amps = amps
-        self._zero_amp_samples = 0
+        self.settle.record_command(amps)
 
     def sync_tesla_device_state(
         self, tesla_state: TeslaState | None,
@@ -741,10 +1097,7 @@ class StateTracker:
         Returns:
             The most recent Tesla effect, or None if none exist.
         """
-        for eff in reversed(self.pending_effects):
-            if eff.device_name == "tesla":
-                return eff
-        return None
+        return self._effects.latest_for("tesla")
 
     def get_active_tesla_settle(
         self, now: datetime, current_qh: str | None = None,
@@ -765,23 +1118,10 @@ class StateTracker:
         Returns:
             The active settle effect, or None if no active settle exists.
         """
-        for eff in reversed(self.pending_effects):
-            if (eff.device_name == "tesla" and eff.action == "set_amps"
-                    and eff.direction == direction):
-                if current_qh is not None and eff.qh_name != current_qh:
-                    return None
-                elapsed_wall = (now - eff.timestamp).total_seconds()
-                if elapsed_wall < self.effective_settle_secs:
-                    return eff
-                if (data_point_at is not None
-                        and eff.data_point_at is not None):
-                    elapsed_data = (
-                        data_point_at - eff.data_point_at
-                    ).total_seconds()
-                    if elapsed_data < self.effective_settle_secs:
-                        return eff
-                return None
-        return None
+        return self.settle.get_active(
+            now, current_qh=current_qh, data_point_at=data_point_at,
+            direction=direction,
+        )
 
     def is_settling(
         self, now: datetime, current_qh: str | None = None,
@@ -808,23 +1148,10 @@ class StateTracker:
             True if turn-off (increase) or turn-on (decrease) decisions should
             be suppressed.
         """
-        for eff in reversed(self.pending_effects):
-            if (eff.device_name == "tesla" and eff.action == "set_amps"
-                    and eff.direction == direction):
-                if current_qh is not None and eff.qh_name != current_qh:
-                    return False
-                elapsed_wall = (now - eff.timestamp).total_seconds()
-                if elapsed_wall < self.effective_settle_secs:
-                    return True
-                if (data_point_at is not None
-                        and eff.data_point_at is not None):
-                    elapsed_data = (
-                        data_point_at - eff.data_point_at
-                    ).total_seconds()
-                    if elapsed_data < self.effective_settle_secs:
-                        return True
-                return False
-        return False
+        return self.settle.is_settling(
+            now, current_qh=current_qh, data_point_at=data_point_at,
+            direction=direction,
+        )
 
     def clear_tesla_settle_effects(self) -> None:
         """Remove Tesla set_amps effects from pending_effects.
@@ -833,11 +1160,7 @@ class StateTracker:
         which supersedes any prior amp-change effects. Only removes "set_amps"
         effects — turn_on/turn_off effects are preserved.
         """
-        with self._state_lock:
-            self.pending_effects = [
-                eff for eff in self.pending_effects
-                if not (eff.device_name == "tesla" and eff.action == "set_amps")
-            ]
+        self._effects.clear_tesla_set_amps()
 
     def has_pending_effect_since(self, nbc_timestamp: datetime) -> bool:
         """Return True if we took an action after the NBC timestamp by either measure.
@@ -855,14 +1178,9 @@ class StateTracker:
             True if any effect has either timestamp within ``prediction_window_seconds``
             after ``nbc_timestamp``.
         """
-        buffer = timedelta(seconds=self._pending_effect_min_secs)
-        for effect in self.pending_effects:
-            if effect.timestamp > nbc_timestamp - buffer:
-                return True
-            if effect.data_point_at > nbc_timestamp - buffer:
-                return True
-
-        return False
+        return self._effects.has_since(
+            nbc_timestamp, window_secs=self._pending_effect_min_secs
+        )
 
     def pending_since_count(self, nbc_timestamp: datetime) -> int:
         """Return the number of effects taken after the given timestamp.
@@ -878,11 +1196,8 @@ class StateTracker:
             Count of effects whose wall clock or data-point-at timestamp is
             within ``prediction_window_seconds`` after ``nbc_timestamp``.
         """
-        buffer = timedelta(seconds=self._pending_effect_min_secs)
-        return sum(
-            1 for eff in self.pending_effects
-            if eff.timestamp > nbc_timestamp - buffer
-            or eff.data_point_at > nbc_timestamp - buffer
+        return self._effects.count_since(
+            nbc_timestamp, window_secs=self._pending_effect_min_secs
         )
 
     def prune_old_effects(
@@ -908,17 +1223,9 @@ class StateTracker:
         Returns:
             Number of effects removed.
         """
-        wall_cutoff = now - timedelta(seconds=self._pending_effect_min_secs)
-        dp_cutoff = data_point_at - timedelta(seconds=self._pending_effect_min_secs)
-        with self._state_lock:
-            before = len(self.pending_effects)
-            self.pending_effects = [
-                eff for eff in self.pending_effects
-                if eff.timestamp >= wall_cutoff
-                or eff.data_point_at >= dp_cutoff
-                or eff.timestamp > data_point_at
-            ]
-            return before - len(self.pending_effects)
+        return self._effects.prune(
+            data_point_at, now, window_secs=self._pending_effect_min_secs
+        )
 
     def can_toggle(
         self, device_name: str, now: datetime, turning_on: bool = True
@@ -1022,19 +1329,109 @@ class DecideContext:
     requires_home_check: bool = True
 
 
-class GapMinder:
-    """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
+def make_plug_effect(
+    name: str,
+    action: Literal["turn_on", "turn_off"],
+    power_watts: float,
+    now: datetime,
+    data_point_at: datetime | None = None,
+) -> PendingEffect:
+    """Build a plug PendingEffect with the signed power invariant applied.
+
+    Centralizes construction so ``turn_off`` always negates the rated watts
+    (plan 3.4) instead of relying on each call site to remember the sign.
+
+    Args:
+        name: Plug configuration name.
+        action: "turn_on" (adds load) or "turn_off" (sheds load).
+        power_watts: Rated plug draw in watts (always non-negative).
+        now: Wall-clock timestamp for the effect.
+        data_point_at: NBC data-point-at timestamp; defaults to ``now``.
+
+    Returns:
+        The constructed PendingEffect.
+
+    Raises:
+        ValueError: If ``action`` is not "turn_on" or "turn_off".
+    """
+    if action == "turn_on":
+        signed_watts = power_watts
+    elif action == "turn_off":
+        signed_watts = -power_watts
+    else:
+        raise ValueError(f"Unknown plug action {action!r} for {name}")
+    return PendingEffect(
+        device_name=name,
+        action=action,
+        timestamp=now,
+        data_point_at=data_point_at or now,
+        power_watts=signed_watts,
+    )
+
+
+def make_tesla_set_amps(
+    target_amps: int,
+    amp_delta: float,
+    now: datetime,
+    data_point_at: datetime | None = None,
+) -> PendingEffect:
+    """Build a Tesla set_amps PendingEffect.
+
+    Args:
+        target_amps: Commanded charge amps.
+        amp_delta: Amp change vs. the reported level (drives power_watts).
+        now: Wall-clock timestamp for the effect.
+        data_point_at: NBC data-point-at timestamp; defaults to ``now``.
+
+    Returns:
+        The constructed PendingEffect.
+    """
+    return PendingEffect(
+        device_name="tesla",
+        action="set_amps",
+        timestamp=now,
+        data_point_at=data_point_at or now,
+        power_watts=StateTracker.amps_to_watts(amp_delta),
+        target_amps=target_amps,
+    )
+
+
+def make_tesla_stop(
+    current_amps: int | None,
+    now: datetime,
+    data_point_at: datetime | None = None,
+) -> PendingEffect:
+    """Build a Tesla turn_off PendingEffect shedding the full charge draw.
+
+    Args:
+        current_amps: Reported charge amps (None counts as zero draw).
+        now: Wall-clock timestamp for the effect.
+        data_point_at: NBC data-point-at timestamp; defaults to ``now``.
+
+    Returns:
+        The constructed PendingEffect.
+    """
+    return PendingEffect(
+        device_name="tesla",
+        action="turn_off",
+        timestamp=now,
+        data_point_at=data_point_at or now,
+        power_watts=-StateTracker.amps_to_watts(current_amps),
+    )
+
+
+class TeslaDecider:
+    """Tesla amp-adjustment decisions extracted from GapMinder.
+
+    Owns the charge-amp limits plus the increase/reduce/stop logic so
+    GapMinder keeps only plug bin-packing. GapMinder delegates its legacy
+    ``_decide_tesla_*`` methods here to keep existing call sites working.
+    """
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
     MAX_DEFER_SECS = 120          # cap on the safe defer window
     HARD_MAX_AMPS = TESLA_HARD_MAX_AMPS
     """Absolute max — never exceed, regardless of config."""
-    # During the post-amp-increase settle window, suppress turn-off decisions
-    # only if the apparent deficit is below this threshold.  Deficits larger
-    # than this are treated as genuine even during the settle period (e.g. a
-    # new QH starting with Tesla at a high amp level that immediately overwhelms
-    # solar production).
-    TESLA_SETTLE_SUPPRESS_WH = 240
 
     @property
     def car_power_watts_5a(self) -> float:
@@ -1047,346 +1444,30 @@ class GapMinder:
 
     def __init__(
         self,
-        hysteresis_wh: int | None = None,
         charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT,
         charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
     ) -> None:
-        """Initialize the GapMinder.
+        """Initialize the decider.
 
         Args:
-            hysteresis_wh: Hysteresis threshold in Wh. When None, defaults to
-                1000 for backward compatibility.
             charge_amps_min: Minimum Tesla charge amps before turning off
                 instead of reducing further. Defaults to 5.
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
-                to 48.
+                to 48, clamped to HARD_MAX_AMPS.
         """
-        # Backward-compat default hysteresis of 1000 Wh; the load manager
-        # passes a config-derived value (abs(target_wh) * 1/3) in production.
-        self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else 1000
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
-        logger.info(
-            "GapMinder: charge_amps_min=%d charge_amps_max=%d (config provided %d)",
-            self.charge_amps_min, self.charge_amps_max, charge_amps_max,
-            extra={"event": "gapminder_init", "charge_amps_min": self.charge_amps_min,
-                   "charge_amps_max": self.charge_amps_max, "config_charge_amps_max": charge_amps_max},
-        )
 
-    def _safe_defer_secs(self, remaining_reduction: float) -> int:
-        """Calculate the safe defer window in seconds.
-
-        The defer window represents how long the Tesla can safely draw at 5A
-        before its energy consumption exceeds the gap.  If the quarter-hour
-        has more time remaining than this window, we defer stopping (we have
-        buffer to stop later).  If less time remains, we stop immediately.
-
-        Args:
-            remaining_reduction: The gap in Wh (always positive — deficit to reduce).
-
-        Returns:
-            Maximum defer window in seconds, capped at MAX_DEFER_SECS.
-        """
-        return int(
-            min(self.MAX_DEFER_SECS, remaining_reduction / (self.car_power_watts_5a / 3600))
-        )
-
-    def decide(
-        self,
-        ctx: DecideContext,
-        predicted_wh: float,
-        target_wh: float,
-    ) -> list[PendingEffect]:
-        """Decide what actions to take based on the predicted Wh and target Wh.
-
-        Args:
-            ctx: Decision context containing time, state, devices, and Tesla info.
-            predicted_wh: The predicted Wh for the current quarter-hour.
-            target_wh: The target Wh to achieve (negative = surplus).
-
-        Returns:
-            List of PendingEffect objects representing actions to take.
-        """
-        gap = target_wh - predicted_wh
-        abs_gap = abs(gap)
-
-        if abs_gap <= self.HYSTERESIS_WH:
-            logger.info(
-                "gapminder_hysteresis gap=%.1f hysteresis=%d no_action_needed",
-                gap, self.HYSTERESIS_WH,
-                extra={"event": "gapminder_hysteresis", "gap_wh": gap, "hysteresis_wh": self.HYSTERESIS_WH},
-            )
-            return []
-
-        if gap > 0:
-            edge_gap = gap - self.HYSTERESIS_WH  # aim for lower edge of deadband
-            logger.info(
-                "gapminder_decide direction=turn_on gap=%.1f edge_gap=%.1f hysteresis=%d",
-                gap, edge_gap, self.HYSTERESIS_WH,
-                extra={"event": "gapminder_decide", "direction": "turn_on", "gap_wh": gap, "edge_gap_wh": edge_gap, "hysteresis_wh": self.HYSTERESIS_WH},
-            )
-            return self._decide_turn_on(ctx, edge_gap)
-
-        edge_gap = abs_gap - self.HYSTERESIS_WH  # aim for upper edge of deadband
-        logger.info(
-            "gapminder_decide direction=turn_off gap=%.1f edge_gap=%.1f hysteresis=%d",
-            abs(gap), edge_gap, self.HYSTERESIS_WH,
-            extra={"event": "gapminder_decide", "direction": "turn_off", "gap_wh": abs(gap), "edge_gap_wh": edge_gap, "hysteresis_wh": self.HYSTERESIS_WH},
-        )
-        return self._decide_turn_off(
-            ctx, edge_gap,
-        )
-
-    def _decide_turn_on(self, ctx: DecideContext, gap: float) -> list[PendingEffect]:
-        """Turn on eligible loads to absorb excess solar.
-
-        Args:
-            ctx: Decision context.
-            gap: The Wh surplus to absorb.
-
-        Returns:
-            List of PendingEffect objects.
-        """
-        actions: list[PendingEffect] = []
-        if ctx.seconds_remaining < MIN_SECONDS_TO_ACT:
-            logger.debug(
-                "[_decide_turn_on] skipped (too little time: %d sec)",
-                ctx.seconds_remaining,
-            )
-            return actions
-
-        remaining_gap = gap
-
-        # Collect eligible loads that are currently off
-        candidates: list[tuple[int, str, Any]] = []
-
-        for name, plug in ctx.plugs.items():
-            if not ctx.state.can_toggle(name, ctx.now, turning_on=True):
-                logger.debug(
-                    "[_decide_turn_on] %s: skipped (debounce)",
-                    name,
-                )
-                continue
-            dev_state = ctx.state.devices.get(name)
-            if dev_state and dev_state.desired_state is True:
-                continue  # already on
-            candidates.append((plug.priority, name, plug))
-
-        # Higher priority number = more important; sort descending so most
-        # important eligible plugs are turned on first.
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        for _, name, plug in candidates:
-            capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
-            if capacity <= remaining_gap:
-                logger.debug(
-                    "[_decide_turn_on] %s: turning on "
-                    "(capacity=%.1f Wh fits in gap %.1f Wh)",
-                    name,
-                    capacity,
-                    remaining_gap,
-                )
-                logger.info(
-                    "action=turn_on device=%s capacity=%.1f gap=%.1f priority=%d",
-                    name, capacity, remaining_gap, plug.priority,
-                    extra={"event": "action", "device": name, "action_type": "turn_on",
-                           "capacity_wh": capacity, "remaining_gap_wh": remaining_gap, "priority": plug.priority},
-                )
-                actions.append(
-                    PendingEffect(
-                        device_name=name,
-                        action="turn_on",
-                        timestamp=ctx.now,
-                        data_point_at=ctx.data_point_at or ctx.now,
-                        power_watts=plug.power_watts,
-                    )
-                )
-                remaining_gap -= capacity
-                if not ctx.dry_run:
-                    ctx.state.set_device_state(
-                        name,
-                        DeviceState(
-                            name=name, last_toggle=ctx.now, desired_state=True
-                        ),
-                    )
-
-            else:
-                logger.debug(
-                    "[_decide_turn_on] %s: too large "
-                    "(capacity=%.1f Wh > gap %.1f Wh)",
-                    name,
-                    capacity,
-                    remaining_gap,
-                )
-
-        if remaining_gap > 0 and ctx.tesla is not None and ctx.tesla.is_charging:
-            logger.debug(
-                "[_decide_turn_on] trying Tesla amps increase "
-                "for remaining %.1f Wh",
-                remaining_gap,
-            )
-            tesla_action = self._decide_tesla_amps(ctx, remaining_gap)
-            if tesla_action:
-                actions.append(tesla_action)
-
-        return actions
-
-    def _decide_turn_off(
-        self,
-        ctx: DecideContext,
-        gap_wh: float,
-    ) -> list[PendingEffect]:
-        """Turn off loads to reduce consumption.
-
-        Priority order:
-          1. Reduce Tesla charge amps (partial, no stop).
-          2. Disable plugs in priority order (lowest-priority first).
-          3. Stop Tesla charging if a deficit still remains.
-
-        Args:
-            ctx: Decision context.
-            gap_wh: Wh reduction needed.
-
-        Returns:
-            List of PendingEffect objects.
-        """
-        actions: list[PendingEffect] = []
-        remaining_reduction = gap_wh
-        dp = ctx.data_point_at or ctx.now
-
-        logger.debug(
-            "[_decide_turn_off] gap=%.1f Wh, seconds_remaining=%d",
-            gap_wh,
-            ctx.seconds_remaining,
-        )
-
-        # ── Step 1: reduce Tesla charge amps first (no stop) ──────────────────
-        if ctx.tesla and ctx.tesla.is_charging:
-            logger.debug(
-                "[_decide_turn_off] trying Tesla amps-only reduce "
-                "for %.1f Wh remaining",
-                remaining_reduction,
-            )
-            tesla_action = self._decide_tesla_reduce(
-                ctx,
-                remaining_reduction,
-                stop_allowed=False,
-            )
-            if tesla_action:
-                actions.append(tesla_action)
-                current_amps = ctx.tesla.current_amps or 0
-                target_amps = tesla_action.target_amps or 0
-                savings = StateTracker.delta_amps_to_wh(
-                    current_amps - target_amps, ctx.seconds_remaining
-                )
-                logger.debug(
-                    "[_decide_turn_off] Tesla amps %d → %d, "
-                    "savings=%.1f Wh, remaining %.1f → %.1f Wh",
-                    current_amps,
-                    target_amps,
-                    savings,
-                    remaining_reduction,
-                    remaining_reduction - savings,
-                )
-                remaining_reduction -= savings
-
-        # ── Step 2: disable plugs in priority order ────────────────────────────
-        candidates: list[tuple[int, str, Any]] = []
-
-        for name, plug in ctx.plugs.items():
-            if not ctx.state.can_toggle(name, ctx.now, turning_on=False):
-                logger.debug(
-                    "[_decide_turn_off] %s: skipped (debounce)",
-                    name,
-                )
-                continue
-
-            dev_state = ctx.state.devices.get(name)
-            if dev_state and dev_state.desired_state is True:
-                candidates.append((plug.priority, name, plug))
-                logger.debug(
-                    "[_decide_turn_off] %s: eligible (on)",
-                    name,
-                )
-            else:
-                logger.debug(
-                    "[_decide_turn_off] %s: skipped (not on)",
-                    name,
-                )
-
-        # Lower priority number = less important; sort ascending so least
-        # important eligible plugs are turned off first.
-        candidates.sort(key=lambda x: x[0])
-
-        for _, name, plug in candidates:
-            if remaining_reduction <= 0:
-                break
-            savings = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
-
-            # omit any "too large to turn off" logic:
-            # not relevant when shedding load.
-            logger.debug(
-                "[_decide_turn_off] %s: turning off "
-                "(savings=%.1f Wh fits in gap %.1f Wh)",
-                name,
-                savings,
-                remaining_reduction,
-            )
-            logger.info(
-                "action=turn_off device=%s savings=%.1f gap=%.1f priority=%d",
-                name, savings, remaining_reduction, plug.priority,
-                extra={"event": "action", "device": name, "action_type": "turn_off",
-                       "savings_wh": savings, "remaining_gap_wh": remaining_reduction, "priority": plug.priority},
-            )
-            actions.append(
-                PendingEffect(
-                    device_name=name,
-                    action="turn_off",
-                    timestamp=ctx.now,
-                    data_point_at=dp,
-                    # Signed: shedding load is negative (plan 3.4).
-                    power_watts=-plug.power_watts,
-                )
-            )
-            remaining_reduction -= savings
-            if not ctx.dry_run:
-                ctx.state.set_device_state(
-                    name,
-                    DeviceState(name=name, last_toggle=ctx.now, desired_state=False),
-                )
-            if remaining_reduction <= 0:
-                break
-
-        # ── Step 3: if deficit remains, stop Tesla charging ────────────
-        # Delegates to _decide_tesla_reduce with stop_allowed=True so
-        # the gap-aware deferral logic (safe_defer_secs) decides whether
-        # to stop now or keep the car on.  This path fires when Step 1
-        # returned no action (e.g. car at min amps with stop_allowed=False).
-        tesla_already_acted = any(a.device_name == "tesla" for a in actions)
-        if ctx.tesla and ctx.tesla.is_charging and remaining_reduction > 0 and not tesla_already_acted:
-            tesla_action = self._decide_tesla_reduce(ctx, remaining_reduction)
-            if tesla_action:
-                logger.info(
-                    "action=turn_off device=tesla reason=deficit remaining=%.1f",
-                    remaining_reduction,
-                    extra={"event": "action", "device": "tesla", "action_type": "turn_off",
-                           "reason": "deficit", "remaining_gap_wh": remaining_reduction},
-                )
-                actions.append(tesla_action)
-
-        return actions
-
-    def _tesla_supports_amps(
-        self, _plug: Any, tesla: TeslaState | None, requires_home_check: bool
+    def supports(
+        self, tesla: TeslaState | None, requires_home_check: bool
     ) -> bool:
         """Check if Tesla can handle partial amp adjustment.
 
         When ``requires_home_check`` is False (no home coords configured),
-        only ``plugged_in`` is checked.
-        When True, the vehicle must also be ``at_home``.
+        only ``plugged_in`` is checked. When True, the vehicle must also
+        be ``at_home``.
 
         Args:
-            _plug: Plug config that triggered the fallback (unused).
             tesla: Current Tesla state.
             requires_home_check: Whether to check the vehicle's home location.
 
@@ -1401,7 +1482,25 @@ class GapMinder:
             return False
         return True
 
-    def _decide_tesla_amps(
+    def safe_defer_secs(self, remaining_reduction: float) -> int:
+        """Calculate the safe defer window in seconds.
+
+        The defer window represents how long the Tesla can safely draw at 5A
+        before its energy consumption exceeds the gap. If the quarter-hour
+        has more time remaining than this window, we defer stopping (we have
+        buffer to stop later). If less time remains, we stop immediately.
+
+        Args:
+            remaining_reduction: The gap in Wh (always positive — deficit to reduce).
+
+        Returns:
+            Maximum defer window in seconds, capped at MAX_DEFER_SECS.
+        """
+        return int(
+            min(self.MAX_DEFER_SECS, remaining_reduction / (self.car_power_watts_5a / 3600))
+        )
+
+    def decide_increase(
         self,
         ctx: DecideContext,
         gap_wh: float,
@@ -1473,16 +1572,12 @@ class GapMinder:
             extra={"event": "action", "device": "tesla", "action_type": "set_amps",
                    "target_amps": target_amps, "previous_amps": current_amps, "gap_wh": gap_wh},
         )
-        return PendingEffect(
-            device_name="tesla",
-            action="set_amps",
-            timestamp=ctx.now,
-            data_point_at=ctx.data_point_at or ctx.now,
-            power_watts=StateTracker.amps_to_watts(additional_amps),
-            target_amps=target_amps,
+        return make_tesla_set_amps(
+            target_amps, additional_amps, ctx.now,
+            data_point_at=ctx.data_point_at,
         )
 
-    def _decide_tesla_reduce(
+    def decide_reduce(
         self,
         ctx: DecideContext,
         reduce_wh: float,
@@ -1496,6 +1591,9 @@ class GapMinder:
             stop_allowed: When False, return None instead of issuing a turn_off
                 command. Used when the caller wants amps-only reduction and will
                 handle stopping as a separate last-resort step.
+
+        Returns:
+            PendingEffect for set_amps or turn_off, or None if no action needed.
         """
         tesla = ctx.tesla
         if tesla is None:
@@ -1524,10 +1622,10 @@ class GapMinder:
                 )
                 return None
             # Defer stopping when at minimum amps: calculate a safe defer window
-            # based on the gap.  At 5A the car draws useful energy — stopping it
-            # removes all that draw.  Defer if the quarter-hour has more time
+            # based on the gap. At 5A the car draws useful energy — stopping it
+            # removes all that draw. Defer if the quarter-hour has more time
             # remaining than the safe window (i.e., we have buffer to stop later).
-            safe_defer_secs = self._safe_defer_secs(reduce_wh)
+            safe_defer_secs = self.safe_defer_secs(reduce_wh)
             if ctx.seconds_remaining > safe_defer_secs:
                 logger.debug(
                     "[_decide_tesla_reduce] deferring stop: current_amps=%d, "
@@ -1542,12 +1640,8 @@ class GapMinder:
                 extra={"event": "action", "device": "tesla", "action_type": "turn_off",
                        "reason": "amps_min_reached", "current_amps": current_amps},
             )
-            return PendingEffect(
-                device_name="tesla",
-                action="turn_off",
-                timestamp=ctx.now,
-                data_point_at=ctx.data_point_at or ctx.now,
-                power_watts=-StateTracker.amps_to_watts(current_amps),
+            return make_tesla_stop(
+                current_amps, ctx.now, data_point_at=ctx.data_point_at
             )
 
         # direct amp delta from energy over remaining window
@@ -1585,12 +1679,8 @@ class GapMinder:
                        "reason": "below_min_amps", "current_amps": current_amps,
                        "new_amps": new_amps, "min_amps": self.charge_amps_min},
             )
-            return PendingEffect(
-                device_name="tesla",
-                action="turn_off",
-                timestamp=ctx.now,
-                data_point_at=ctx.data_point_at or ctx.now,
-                power_watts=-StateTracker.amps_to_watts(current_amps),
+            return make_tesla_stop(
+                current_amps, ctx.now, data_point_at=ctx.data_point_at
             )
 
         if abs(new_amps - current_amps) < self.TESLA_AMP_CHANGE_THRESHOLD:
@@ -1606,11 +1696,422 @@ class GapMinder:
             extra={"event": "action", "device": "tesla", "action_type": "set_amps",
                    "target_amps": new_amps, "previous_amps": current_amps, "reason": "reduce"},
         )
-        return PendingEffect(
-            device_name="tesla",
-            action="set_amps",
-            timestamp=ctx.now,
-            data_point_at=ctx.data_point_at or ctx.now,
-            power_watts=StateTracker.amps_to_watts(new_amps - current_amps),
-            target_amps=new_amps,
+        return make_tesla_set_amps(
+            new_amps, new_amps - current_amps, ctx.now,
+            data_point_at=ctx.data_point_at,
+        )
+
+
+class GapMinder:
+    """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
+
+    TESLA_AMP_CHANGE_THRESHOLD = 1
+    MAX_DEFER_SECS = 120          # cap on the safe defer window
+    HARD_MAX_AMPS = TESLA_HARD_MAX_AMPS
+    """Absolute max — never exceed, regardless of config."""
+    # During the post-amp-increase settle window, suppress turn-off decisions
+    # only if the apparent deficit is below this threshold.  Deficits larger
+    # than this are treated as genuine even during the settle period (e.g. a
+    # new QH starting with Tesla at a high amp level that immediately overwhelms
+    # solar production).
+    TESLA_SETTLE_SUPPRESS_WH = 240
+
+    @property
+    def car_power_watts_5a(self) -> float:
+        """Car draw at Tesla's minimum charge rate, at nominal voltage.
+
+        Delegates to :attr:`tesla_decider` (single home for the math).
+        """
+        return self.tesla_decider.car_power_watts_5a
+
+    def __init__(
+        self,
+        hysteresis_wh: int | None = None,
+        charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT,
+        charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
+    ) -> None:
+        """Initialize the GapMinder.
+
+        Args:
+            hysteresis_wh: Hysteresis threshold in Wh. When None, defaults to
+                1000 for backward compatibility.
+            charge_amps_min: Minimum Tesla charge amps before turning off
+                instead of reducing further. Defaults to 5.
+            charge_amps_max: Maximum Tesla charge amps to command. Defaults
+                to 48.
+        """
+        # Backward-compat default hysteresis of 1000 Wh; the load manager
+        # passes a config-derived value (abs(target_wh) * 1/3) in production.
+        self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else 1000
+        self.charge_amps_min = charge_amps_min
+        self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
+        self.tesla_decider = TeslaDecider(
+            charge_amps_min=charge_amps_min,
+            charge_amps_max=charge_amps_max,
+        )
+        logger.info(
+            "GapMinder: charge_amps_min=%d charge_amps_max=%d (config provided %d)",
+            self.charge_amps_min, self.charge_amps_max, charge_amps_max,
+            extra={"event": "gapminder_init", "charge_amps_min": self.charge_amps_min,
+                   "charge_amps_max": self.charge_amps_max, "config_charge_amps_max": charge_amps_max},
+        )
+
+    def _safe_defer_secs(self, remaining_reduction: float) -> int:
+        """Calculate the safe defer window in seconds.
+
+        Delegates to :attr:`tesla_decider`; kept for existing callers.
+
+        Args:
+            remaining_reduction: The gap in Wh (always positive — deficit to reduce).
+
+        Returns:
+            Maximum defer window in seconds, capped at MAX_DEFER_SECS.
+        """
+        return self.tesla_decider.safe_defer_secs(remaining_reduction)
+
+    def _eligible_plugs(
+        self, ctx: DecideContext, want_on: bool
+    ) -> list[tuple[int, str, Any]]:
+        """Collect eligible plugs sorted for the requested direction.
+
+        Unifies the turn-on / turn-off candidate loops: turn-on collects
+        plugs that are currently off (highest priority first), turn-off
+        collects plugs that are currently on (lowest priority first).
+        Debounce and eligibility logging match the original loops.
+
+        Args:
+            ctx: Decision context.
+            want_on: True to collect turn-on candidates, False for turn-off.
+
+        Returns:
+            List of (priority, name, plug) tuples in decision order.
+        """
+        tag = "_decide_turn_on" if want_on else "_decide_turn_off"
+        candidates: list[tuple[int, str, Any]] = []
+        for name, plug in ctx.plugs.items():
+            if not ctx.state.can_toggle(name, ctx.now, turning_on=want_on):
+                logger.debug(
+                    "[%s] %s: skipped (debounce)",
+                    tag,
+                    name,
+                )
+                continue
+            dev_state = ctx.state.devices.get(name)
+            is_on = dev_state is not None and dev_state.desired_state is True
+            if want_on:
+                if is_on:
+                    continue  # already on
+            elif not is_on:
+                logger.debug(
+                    "[%s] %s: skipped (not on)",
+                    tag,
+                    name,
+                )
+                continue
+            else:
+                logger.debug(
+                    "[%s] %s: eligible (on)",
+                    tag,
+                    name,
+                )
+            candidates.append((plug.priority, name, plug))
+        # Higher priority number = more important: turn on the most
+        # important first, turn off the least important first.
+        candidates.sort(key=lambda x: x[0], reverse=want_on)
+        return candidates
+
+    def decide(
+        self,
+        ctx: DecideContext,
+        predicted_wh: float,
+        target_wh: float,
+    ) -> list[PendingEffect]:
+        """Decide what actions to take based on the predicted Wh and target Wh.
+
+        Args:
+            ctx: Decision context containing time, state, devices, and Tesla info.
+            predicted_wh: The predicted Wh for the current quarter-hour.
+            target_wh: The target Wh to achieve (negative = surplus).
+
+        Returns:
+            List of PendingEffect objects representing actions to take.
+        """
+        gap = target_wh - predicted_wh
+        abs_gap = abs(gap)
+
+        if abs_gap <= self.HYSTERESIS_WH:
+            logger.info(
+                "gapminder_hysteresis gap=%.1f hysteresis=%d no_action_needed",
+                gap, self.HYSTERESIS_WH,
+                extra={"event": "gapminder_hysteresis", "gap_wh": gap, "hysteresis_wh": self.HYSTERESIS_WH},
+            )
+            return []
+
+        if gap > 0:
+            edge_gap = gap - self.HYSTERESIS_WH  # aim for lower edge of deadband
+            logger.info(
+                "gapminder_decide direction=turn_on gap=%.1f edge_gap=%.1f hysteresis=%d",
+                gap, edge_gap, self.HYSTERESIS_WH,
+                extra={"event": "gapminder_decide", "direction": "turn_on", "gap_wh": gap, "edge_gap_wh": edge_gap, "hysteresis_wh": self.HYSTERESIS_WH},
+            )
+            return self._decide_turn_on(ctx, edge_gap)
+
+        edge_gap = abs_gap - self.HYSTERESIS_WH  # aim for upper edge of deadband
+        logger.info(
+            "gapminder_decide direction=turn_off gap=%.1f edge_gap=%.1f hysteresis=%d",
+            abs(gap), edge_gap, self.HYSTERESIS_WH,
+            extra={"event": "gapminder_decide", "direction": "turn_off", "gap_wh": abs(gap), "edge_gap_wh": edge_gap, "hysteresis_wh": self.HYSTERESIS_WH},
+        )
+        return self._decide_turn_off(
+            ctx, edge_gap,
+        )
+
+    def _decide_turn_on(self, ctx: DecideContext, gap: float) -> list[PendingEffect]:
+        """Turn on eligible loads to absorb excess solar.
+
+        Args:
+            ctx: Decision context.
+            gap: The Wh surplus to absorb.
+
+        Returns:
+            List of PendingEffect objects.
+        """
+        actions: list[PendingEffect] = []
+        if ctx.seconds_remaining < MIN_SECONDS_TO_ACT:
+            logger.debug(
+                "[_decide_turn_on] skipped (too little time: %d sec)",
+                ctx.seconds_remaining,
+            )
+            return actions
+
+        remaining_gap = gap
+
+        # Collect eligible loads that are currently off (highest priority first).
+        candidates = self._eligible_plugs(ctx, want_on=True)
+
+        for _, name, plug in candidates:
+            capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
+            if capacity <= remaining_gap:
+                logger.debug(
+                    "[_decide_turn_on] %s: turning on "
+                    "(capacity=%.1f Wh fits in gap %.1f Wh)",
+                    name,
+                    capacity,
+                    remaining_gap,
+                )
+                logger.info(
+                    "action=turn_on device=%s capacity=%.1f gap=%.1f priority=%d",
+                    name, capacity, remaining_gap, plug.priority,
+                    extra={"event": "action", "device": name, "action_type": "turn_on",
+                           "capacity_wh": capacity, "remaining_gap_wh": remaining_gap, "priority": plug.priority},
+                )
+                actions.append(
+                    make_plug_effect(
+                        name, "turn_on", plug.power_watts, ctx.now,
+                        data_point_at=ctx.data_point_at,
+                    )
+                )
+                remaining_gap -= capacity
+                if not ctx.dry_run:
+                    ctx.state.set_device_state(
+                        name,
+                        DeviceState(
+                            name=name, last_toggle=ctx.now, desired_state=True
+                        ),
+                    )
+
+            else:
+                logger.debug(
+                    "[_decide_turn_on] %s: too large "
+                    "(capacity=%.1f Wh > gap %.1f Wh)",
+                    name,
+                    capacity,
+                    remaining_gap,
+                )
+
+        if remaining_gap > 0 and ctx.tesla is not None and ctx.tesla.is_charging:
+            logger.debug(
+                "[_decide_turn_on] trying Tesla amps increase "
+                "for remaining %.1f Wh",
+                remaining_gap,
+            )
+            tesla_action = self._decide_tesla_amps(ctx, remaining_gap)
+            if tesla_action:
+                actions.append(tesla_action)
+
+        return actions
+
+    def _decide_turn_off(
+        self,
+        ctx: DecideContext,
+        gap_wh: float,
+    ) -> list[PendingEffect]:
+        """Turn off loads to reduce consumption.
+
+        Priority order:
+          1. Reduce Tesla charge amps (partial, no stop).
+          2. Disable plugs in priority order (lowest-priority first).
+          3. Stop Tesla charging if a deficit still remains.
+
+        Args:
+            ctx: Decision context.
+            gap_wh: Wh reduction needed.
+
+        Returns:
+            List of PendingEffect objects.
+        """
+        actions: list[PendingEffect] = []
+        remaining_reduction = gap_wh
+
+        logger.debug(
+            "[_decide_turn_off] gap=%.1f Wh, seconds_remaining=%d",
+            gap_wh,
+            ctx.seconds_remaining,
+        )
+
+        # ── Step 1: reduce Tesla charge amps first (no stop) ──────────────────
+        if ctx.tesla and ctx.tesla.is_charging:
+            logger.debug(
+                "[_decide_turn_off] trying Tesla amps-only reduce "
+                "for %.1f Wh remaining",
+                remaining_reduction,
+            )
+            tesla_action = self._decide_tesla_reduce(
+                ctx,
+                remaining_reduction,
+                stop_allowed=False,
+            )
+            if tesla_action:
+                actions.append(tesla_action)
+                current_amps = ctx.tesla.current_amps or 0
+                target_amps = tesla_action.target_amps or 0
+                savings = StateTracker.delta_amps_to_wh(
+                    current_amps - target_amps, ctx.seconds_remaining
+                )
+                logger.debug(
+                    "[_decide_turn_off] Tesla amps %d → %d, "
+                    "savings=%.1f Wh, remaining %.1f → %.1f Wh",
+                    current_amps,
+                    target_amps,
+                    savings,
+                    remaining_reduction,
+                    remaining_reduction - savings,
+                )
+                remaining_reduction -= savings
+
+        # ── Step 2: disable plugs in priority order ────────────────────────────
+        # Least important eligible plugs (currently on) first.
+        candidates = self._eligible_plugs(ctx, want_on=False)
+
+        for _, name, plug in candidates:
+            if remaining_reduction <= 0:
+                break
+            savings = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
+
+            # omit any "too large to turn off" logic:
+            # not relevant when shedding load.
+            logger.debug(
+                "[_decide_turn_off] %s: turning off "
+                "(savings=%.1f Wh fits in gap %.1f Wh)",
+                name,
+                savings,
+                remaining_reduction,
+            )
+            logger.info(
+                "action=turn_off device=%s savings=%.1f gap=%.1f priority=%d",
+                name, savings, remaining_reduction, plug.priority,
+                extra={"event": "action", "device": name, "action_type": "turn_off",
+                       "savings_wh": savings, "remaining_gap_wh": remaining_reduction, "priority": plug.priority},
+            )
+            actions.append(
+                make_plug_effect(
+                    name, "turn_off", plug.power_watts, ctx.now,
+                    data_point_at=ctx.data_point_at,
+                )
+            )
+            remaining_reduction -= savings
+            if not ctx.dry_run:
+                ctx.state.set_device_state(
+                    name,
+                    DeviceState(name=name, last_toggle=ctx.now, desired_state=False),
+                )
+            if remaining_reduction <= 0:
+                break
+
+        # ── Step 3: if deficit remains, stop Tesla charging ────────────
+        # Delegates to _decide_tesla_reduce with stop_allowed=True so
+        # the gap-aware deferral logic (safe_defer_secs) decides whether
+        # to stop now or keep the car on.  This path fires when Step 1
+        # returned no action (e.g. car at min amps with stop_allowed=False).
+        tesla_already_acted = any(a.device_name == "tesla" for a in actions)
+        if ctx.tesla and ctx.tesla.is_charging and remaining_reduction > 0 and not tesla_already_acted:
+            tesla_action = self._decide_tesla_reduce(ctx, remaining_reduction)
+            if tesla_action:
+                logger.info(
+                    "action=turn_off device=tesla reason=deficit remaining=%.1f",
+                    remaining_reduction,
+                    extra={"event": "action", "device": "tesla", "action_type": "turn_off",
+                           "reason": "deficit", "remaining_gap_wh": remaining_reduction},
+                )
+                actions.append(tesla_action)
+
+        return actions
+
+    def _tesla_supports_amps(
+        self, _plug: Any, tesla: TeslaState | None, requires_home_check: bool
+    ) -> bool:
+        """Check if Tesla can handle partial amp adjustment.
+
+        Delegates to :attr:`tesla_decider`; kept for existing callers.
+
+        Args:
+            _plug: Plug config that triggered the fallback (unused).
+            tesla: Current Tesla state.
+            requires_home_check: Whether to check the vehicle's home location.
+
+        Returns:
+            True if Tesla is eligible for amp-adjustment actions.
+        """
+        return self.tesla_decider.supports(tesla, requires_home_check)
+
+    def _decide_tesla_amps(
+        self,
+        ctx: DecideContext,
+        gap_wh: float,
+    ) -> PendingEffect | None:
+        """Adjust Tesla charge amps to fill residual gap.
+
+        Delegates to :attr:`tesla_decider`; kept for existing callers.
+
+        Args:
+            ctx: Decision context.
+            gap_wh: Wh surplus to absorb.
+
+        Returns:
+            PendingEffect for set_amps, or None if no action needed.
+        """
+        return self.tesla_decider.decide_increase(ctx, gap_wh)
+
+    def _decide_tesla_reduce(
+        self,
+        ctx: DecideContext,
+        reduce_wh: float,
+        stop_allowed: bool = True,
+    ) -> PendingEffect | None:
+        """Reduce Tesla charge amps, or stop charging if amps can't be reduced further.
+
+        Delegates to :attr:`tesla_decider`; kept for existing callers.
+
+        Args:
+            ctx: Decision context.
+            reduce_wh: Wh reduction needed.
+            stop_allowed: When False, return None instead of issuing a turn_off
+                command. Used when the caller wants amps-only reduction and will
+                handle stopping as a separate last-resort step.
+
+        Returns:
+            PendingEffect for set_amps or turn_off, or None if no action needed.
+        """
+        return self.tesla_decider.decide_reduce(
+            ctx, reduce_wh, stop_allowed=stop_allowed
         )

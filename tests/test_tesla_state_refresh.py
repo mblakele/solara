@@ -43,6 +43,59 @@ class TestFetchTeslaStateAsync:
         mgr.tesla_ctrl = TeslaController(config)
         return mgr
 
+    def test_configured_tesla_unavailable_stays_grey_in_devices(self):
+        """Configured Tesla with state None keeps a grey off entry in devices."""
+        from load_models import CycleContext
+
+        mgr = self._make_lm()
+        assert "tesla" not in mgr.state.devices
+        now = self.FIXED_NOW
+        ctx = CycleContext(
+            now=now,
+            force=False,
+            qh_name="QH1",
+            predicted_wh=-400.0,
+            seconds_remaining=900,
+            data_point_at=now,
+            now_postfetch=now,
+            adjusted_wh=-400.0,
+            gap_wh=400.0,
+            tesla_state=None,
+            succeeded_effects=[],
+            actions=[],
+            sentinel_on=False,
+        )
+        mgr._stage_commit(ctx)  # noqa: SLF001
+        assert "tesla" in mgr.state.devices
+        dev = mgr.state.devices["tesla"]
+        assert dev.actual_state is False
+        assert dev.current_amps is None
+
+    def test_unconfigured_tesla_stays_absent_from_devices(self):
+        """Without a Tesla controller, state None leaves no Tesla entry."""
+        from load_models import CycleContext
+
+        mgr = self._make_lm()
+        mgr.tesla_ctrl = None
+        now = self.FIXED_NOW
+        ctx = CycleContext(
+            now=now,
+            force=False,
+            qh_name="QH1",
+            predicted_wh=-400.0,
+            seconds_remaining=900,
+            data_point_at=now,
+            now_postfetch=now,
+            adjusted_wh=-400.0,
+            gap_wh=400.0,
+            tesla_state=None,
+            succeeded_effects=[],
+            actions=[],
+            sentinel_on=False,
+        )
+        mgr._stage_commit(ctx)  # noqa: SLF001
+        assert "tesla" not in mgr.state.devices
+
     def test_uses_telemetry_chargeamps_when_location_missing(self):
         """When telemetry has ChargeAmps but no Location, live amps are used."""
         mgr = self._make_lm()

@@ -55,8 +55,121 @@
       </div>
     </dl>
 
+    {% if diag is not none and qh1.predicted_wh is not none %}
+    {# Actionable surplus/deficit after the target is met: prefer the cycle
+       gap (target - adjusted, includes pending effects), else derive
+       target - predicted when a target is known. Positive gap = surplus
+       available to soak up; negative gap = deficit to shed. #}
+    {% set target_wh = load_management.target_wh if load_management and load_management.target_wh is defined and load_management.target_wh is not none else none %}
+    {% set gap_wh = diag.gap_wh if diag.gap_wh is defined and diag.gap_wh is not none else ((target_wh - qh1.predicted_wh) if target_wh is not none else none) %}
+    {% if gap_wh is not none %}
+    {# EV charging amps implied by the surplus over the remaining period
+       (matches the iOS client shape): amps = gapWh / hours / 240. #}
+    {% set hours = (qh1.remaining_seconds or 0) / 3600.0 %}
+    {% set car_amps = (gap_wh / hours / 240.0) if hours > 0 else none %}
+    {% set hyst = diag.hysteresis_wh if diag.hysteresis_wh is defined and diag.hysteresis_wh is not none else 0 %}
+    {% if gap_wh < -hyst %}
+    <div class="demand">
+      <span class="demand__label">reduce usage if possible</span>
+      <ul class="demand__list">
+        <li>🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
+      </ul>
+    </div>
+    {% elif gap_wh > hyst %}
+    {% set shower_min = (gap_wh / 81.0) | abs %}
+    {% set laundry_min = (gap_wh / 88.0) | abs %}
+    {% set show_shower = shower_min >= 1.0 %}
+    {% set show_laundry = laundry_min >= 1.0 %}
+    {% set show_car = car_amps is not none and (car_amps | abs) >= 1.0 %}
+    {% if show_shower or show_laundry or show_car %}
+    <div class="demand">
+      <span class="demand__label">Ideas</span>
+      <ul class="demand__list">
+        {% if show_shower %}<li>⚡🚿 {{ "%.1f" % shower_min }} min</li>{% endif %}
+        {% if show_laundry %}<li>⚡👕 {{ "%.1f" % laundry_min }} min</li>{% endif %}
+        {% if show_car %}<li>🚗 {{ "%+.1f" % car_amps }} Amps 240V</li>{% endif %}
+      </ul>
+    </div>
+    {% endif %}
+    {% endif %}
+    {% endif %}
+    {% endif %}
+
+    {% if load_management and load_management.state and load_management.state.devices %}
+    <div class="device-grid">
+      <span class="demand__label">Devices</span>
+      {% set sentinel_names = load_management.sentinel_names if load_management.sentinel_names is defined else (diag.sentinel_names if diag and diag.sentinel_names is defined else []) %}
+      <ul class="device-grid__list">
+        {% for name, dev in load_management.state.devices.items() %}
+        {% set is_sentinel = name in (sentinel_names or []) %}
+        {% set pending = namespace(action=none, amps=none) %}
+        {% if not is_sentinel %}
+        {% for effect in load_management.state.pending_effects or [] %}
+        {% if effect.device_name == name %}
+        {% set pending.action = effect.action %}
+        {% set pending.amps = effect.target_amps %}
+        {% endif %}
+        {% endfor %}
+        {% endif %}
+        {% set pending_action = pending.action %}
+        {% set pending_amps = pending.amps %}
+        {# Pill color: sentinel on -> red, sentinel off -> grey (pending
+           effects never apply to sentinels); pending turn_off -> blue,
+           pending turn_on / set_amps -> grey-green mix, otherwise on ->
+           faded green, off -> grey. Tesla counts as on (green) only when
+           charging; stopped or unavailable renders grey. #}
+        {% set pill_class = "device-pill--off" %}
+        {% if is_sentinel %}
+        {% if dev.actual_state %}
+        {% set pill_class = "device-pill--sentinel-on" %}
+        {% endif %}
+        {% elif pending_action == "turn_off" %}
+        {% set pill_class = "device-pill--pending-off" %}
+        {% elif pending_action == "turn_on" %}
+        {% set pill_class = "device-pill--pending-on" %}
+        {% elif pending_action == "set_amps" %}
+        {% if pending_amps is not none and pending_amps == 0 %}
+        {% set pill_class = "device-pill--pending-off" %}
+        {% else %}
+        {% set pill_class = "device-pill--pending-on" %}
+        {% endif %}
+        {% elif name == "tesla" %}
+        {% if dev.current_amps is not none %}
+        {% if dev.current_amps > 0 %}
+        {% set pill_class = "device-pill--on" %}
+        {% endif %}
+        {% elif dev.actual_state %}
+        {% set pill_class = "device-pill--on" %}
+        {% endif %}
+        {% elif dev.actual_state %}
+        {% set pill_class = "device-pill--on" %}
+        {% endif %}
+        {# Label: plain device name for plugs (state carried by color);
+           Tesla appends amps in parens when charging, or old>new while a
+           set_amps effect is pending. Sentinels always render plain. #}
+        {% set label = name %}
+        {% if name == "tesla" and not is_sentinel %}
+        {% set current = dev.current_amps %}
+        {% if pending_action == "set_amps" and pending_amps is not none and pending_amps != 0 and current is not none and current != 0 and pending_amps != current %}
+        {% set label = name ~ " (" ~ current ~ ">" ~ pending_amps ~ ")" %}
+        {% else %}
+        {% set amps = current %}
+        {% if amps is none or amps == 0 %}
+        {% set amps = pending_amps %}
+        {% endif %}
+        {% if amps is not none and amps != 0 %}
+        {% set label = name ~ " (" ~ amps ~ ")" %}
+        {% endif %}
+        {% endif %}
+        {% endif %}
+        <li class="device-pill {{ pill_class }}">{{ label }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
     <div class="history" aria-label="Earlier quarter-hours">
-      <div class="demand__label">Recent Periods</div>
+      <div class="demand__label">Recent</div>
       {% set hist_target = load_management.get("target_wh") if load_management else none %}
       {% set hist_hyst = diag.hysteresis_wh if diag else none %}
       {% for qh_key in ["QH2", "QH3", "QH4"] %}
@@ -74,83 +187,6 @@
       {% endif %}
       {% endfor %}
     </div>
-
-    {% set active = namespace(devices=[]) %}
-    {% if load_management and load_management.state and load_management.state.devices %}
-    {% for name, dev in load_management.state.devices.items() %}
-    {% if dev.actual_state %}
-    {% set label = name %}
-    {% if dev.current_amps is not none %}
-    {% set label = name ~ " (" ~ dev.current_amps ~ ")" %}
-    {% endif %}
-    {% set active.devices = active.devices + [label] %}
-    {% endif %}
-    {% endfor %}
-    {% endif %}
-
-    {% set pending = namespace(effects=[]) %}
-    {% if load_management and load_management.state and load_management.state.pending_effects %}
-    {% set devices = load_management.state.devices if load_management.state.devices else {} %}
-    {% for effect in load_management.state.pending_effects %}
-    {% set dev = devices.get(effect.device_name) %}
-    {% set label = effect.device_name %}
-    {# Annotate each effect with the state implied by the action taken.
-       Amps are shown when available (Tesla); otherwise derive (on)/(off)
-       from the action itself — this is reliable even when actual_state is
-       None (post-decision before the next sync). #}
-    {% if dev is not none and dev.current_amps is not none %}
-    {% set label = effect.device_name ~ " (" ~ dev.current_amps ~ ")" %}
-    {% elif effect.action == "turn_on" %}
-    {% set label = effect.device_name ~ " (on)" %}
-    {% elif effect.action == "turn_off" %}
-    {% set label = effect.device_name ~ " (off)" %}
-    {% endif %}
-    {% set pending.effects = pending.effects + [label] %}
-    {% endfor %}
-    {% endif %}
-
-    {% if active.devices or pending.effects %}
-    <div class="device-state">
-      {% if active.devices %}
-      <div class="device-state__line">
-        <span class="demand__label">Active devices</span>
-        <span>{{ active.devices | join(", ") }}</span>
-      </div>
-      {% endif %}
-      {% if pending.effects %}
-      <div class="device-state__line">
-        <span class="demand__label">Pending effects</span>
-        <span>{{ pending.effects | join(", ") }}</span>
-      </div>
-      {% endif %}
-    </div>
-    {% endif %}
-
-    {% if diag is not none and qh1.predicted_wh is not none %}
-    {# EV charging amps implied by the predicted energy over the remaining
-       period (matches the iOS client): amps = predictedWh / hours / -240. #}
-    {% set hours = (qh1.remaining_seconds or 0) / 3600.0 %}
-    {% set car_amps = (qh1.predicted_wh / hours / -240.0) if hours > 0 else none %}
-    {% if qh1.predicted_wh > 0 %}
-    <div class="demand">
-      <span class="demand__label">reduce usage if possible</span>
-      <ul class="demand__list">
-        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
-      </ul>
-    </div>
-    {% elif qh1.predicted_wh < diag.hysteresis_wh %}
-    {% set shower_min = (qh1.predicted_wh / 81.0) | abs %}
-    {% set laundry_min = (qh1.predicted_wh / 88.0) | abs %}
-    <div class="demand">
-      <span class="demand__label">Surplus ideas</span>
-      <ul class="demand__list">
-        <li>⚡🚿 {{ "%.1f" % shower_min }} min</li>
-        <li>⚡👕 {{ "%.1f" % laundry_min }} min</li>
-        <li>🔋🚗 {% if car_amps is not none %}{{ "%+.1f" % car_amps }} Amps 240V{% else %}—{% endif %}</li>
-      </ul>
-    </div>
-    {% endif %}
-    {% endif %}
   </article>
   {% endif %}
 {% endfor %}
