@@ -308,9 +308,10 @@ body {
 
 /* Devices section: single grid listing every configured device as a pill,
    two per line. State is carried by color, not parenthesised text:
-   on -> faded green, off -> grey, pending turn_off -> faded blue,
-   pending turn_on / set_amps -> static grey-green mix, sentinel on ->
-   red (sentinels never show pending colors). */
+   on -> solid gen green (matches the forecast number and sparkline),
+   off -> grey, pending turn_off -> faded blue,
+   pending turn_on / set_amps -> faded green (like the "recent" pills),
+   sentinel on -> red (sentinels never show pending colors). */
 .device-grid {
   display: flex;
   flex-direction: column;
@@ -336,7 +337,8 @@ body {
 }
 
 .device-pill--on {
-  background: color-mix(in srgb, var(--color-sunken) 78%, var(--color-gen));
+  background: var(--color-gen);
+  color: #fff;
 }
 
 .device-pill--off {
@@ -349,7 +351,7 @@ body {
 }
 
 .device-pill--pending-on {
-  background: color-mix(in srgb, var(--color-sunken) 50%, var(--color-gen));
+  background: color-mix(in srgb, var(--color-sunken) 78%, var(--color-gen));
 }
 
 .device-pill--sentinel-on {

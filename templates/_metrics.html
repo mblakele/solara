@@ -115,8 +115,8 @@
         {% set pending_amps = pending.amps %}
         {# Pill color: sentinel on -> red, sentinel off -> grey (pending
            effects never apply to sentinels); pending turn_off -> blue,
-           pending turn_on / set_amps -> grey-green mix, otherwise on ->
-           faded green, off -> grey. Tesla counts as on (green) only when
+           pending turn_on / set_amps -> faded green, otherwise on ->
+           solid green, off -> grey. Tesla counts as on (green) only when
            charging; stopped or unavailable renders grey. #}
         {% set pill_class = "device-pill--off" %}
         {% if is_sentinel %}
