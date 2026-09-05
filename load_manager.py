@@ -18,7 +18,7 @@ import time as _time_mod
 import uuid
 
 # Third-party imports.
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 
 import pytz
 
@@ -86,7 +86,14 @@ from load_models import (
     _tesla_state_to_dict,
 )
 
-from load_nbc import NBCPeriod, NBCReader, StateTracker, GapMinder, DecideContext
+from load_nbc import (
+    NBCPeriod,
+    NBCReader,
+    StateTracker,
+    GapMinder,
+    DecideContext,
+    make_plug_effect,
+)
 from quantization import usable_window
 
 from energy_cache import EnergyCache
@@ -1468,6 +1475,7 @@ class LoadManager:
                     name=name, actual_state=actual, desired_state=actual
                 )
             else:
+                prev_actual = dev_state.actual_state
                 dev_state.actual_state = actual
                 # Reconcile: if external actor changed the state, match it
                 if dev_state.desired_state != actual:
@@ -1478,7 +1486,45 @@ class LoadManager:
                         dev_state.desired_state,
                         actual,
                     )
+                    prev_desired = dev_state.desired_state
                     dev_state.desired_state = actual
+                    self._record_external_effect(
+                        name, actual, prev_desired, prev_actual
+                    )
+
+    def _record_external_effect(
+        self,
+        name: str,
+        actual: bool,
+        prev_desired: bool | None,
+        prev_actual: bool | None,
+    ) -> None:
+        """Record a pending effect for an externally flipped plug.
+
+        Mirrors a load-manager decision so NBC math (estimated_current_wh)
+        and the can_toggle debounce account for the change before the next
+        decision. Skipped on first observation (previous actual unknown),
+        when the previous desired state is unknown, the plug's rated power
+        is unknown, or dry-run mode is active.
+
+        Args:
+            name: Plug configuration name.
+            actual: Reconciled actual state (True = on).
+            prev_desired: Desired state before reconciliation.
+            prev_actual: Actual state before this sync (None on first sight).
+        """
+        if prev_actual is None or prev_desired is None or self.dry_run:
+            return
+        plug = self.plugs.get(name)
+        power = plug.power_watts if plug is not None else None
+        if power is None:
+            return
+        now = self._clock.now()
+        action: Literal["turn_on", "turn_off"] = "turn_on" if actual else "turn_off"
+        self.state.add_effect(make_plug_effect(name, action, power, now, now))
+        dev_state = self.state.devices.get(name)
+        if dev_state is not None:
+            dev_state.last_toggle = now
 
     async def _fire_telegram_notification(
         self,
