@@ -19,34 +19,7 @@ Write tests first, then diagnose and fix bugs.
 
 Always invoke tools using structured function-calling JSON (not inline XML or markdown text).
 
-When calling `todowrite`, emit todos as a raw JSON array (not a stringified array).
-
 Never try to work around permission errors. Stop and ask for help.
-
-### Editing
-
-#### ast-grep usage
-
-ast-grep is installed. Use it instead of grep/ripgrep when the search or edit cares about CODE STRUCTURE, not text. Concretely:
-
-- Finding all call sites of a function/method, regardless of formatting/whitespace
-- Renaming a parameter only where it's a parameter (not in strings/comments)
-- Finding a specific syntactic shape (e.g. all `try/except` blocks missing a `finally`)
-- Structural rewrites across many files with consistent shape
-
-Do NOT use ast-grep for: plain string/log/comment search, or one-off single-file edits where a normal Edit tool call is simpler.
-
-##### Syntax reminders
-- model is not reliable on these from memory — verify with `--help` or a dry run first.
-- Search: `ast-grep run -p '<pattern>' -l <language> <path>`
-- Pattern meta-variables: `$NAME` matches one node, `$$$NAME` matches zero-or-more (e.g. `$$$ARGS`)
-- Rewrite: `ast-grep run -p '<pattern>' -r '<rewrite>' -l <language> --update-all <path>`
-- ALWAYS run without `--update-all` first to preview matches before rewriting.
-- If unsure of exact flag names, run `ast-grep --help` or `ast-grep run --help` rather than guessing.
-
-#### batch_str_replace usage
-
-Prefer `batch_str_replace` over repeated `str_replace` calls for multiple independent edits. Emit all edits in one call.
 
 ### Communication Style
 
@@ -137,8 +110,6 @@ Key capabilities:
 - `LOAD_MANAGE_INTERVAL_SECS` — Seconds between load management cycles (default: 30)
 - Telegram device whitelist comes from the `telegram.devices` section of `devices.json`
   (there is no env-var override; the old `LOAD_TELEGRAM_DEVICES` env var is gone).
-  Notifications are **only sent** when this whitelist is configured AND at least one
-  action matches. If omitted or empty, no Telegram notifications are sent.
   Example: `{"pool_pump": ["turn_on", "turn_off"], "jackery": ["turn_on"]}`
 - Emporia VUE credentials are stored in `.vue-keys.json` rather than environment variables
 
@@ -196,14 +167,15 @@ project-root
                             # fleet_telemetry_config_create)
  ├── load_manager.py       # OAuth handling, pipeline stages (_stage_*), load-shedding management,
                              # _last_tesla_at_home preserves at_home across telemetry snapshots
- ├── load_models.py        # Shared data models (CycleContext, CycleResult, PendingEffect,
+ ├── load_models.py        # Shared data models (CycleContext, CycleResult, AsyncPhaseResult,
+                            # PendingEffect,
                             # TeslaChargeState, TeslaDriveState, TeslaLocation, TeslaCallbackPayload,
                             # TeslaEvent, TeslaEventKind, TeslaVehicleTelemetry,
                             # parse_tesla_event_payload, update_tesla_telemetry,
                             # get_active_tesla_telemetry, FleetTelemetryProvisionConfig) plus
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
-├── load_nbc.py            # NBCReader, StateTracker, GapMinder bin-packing, Tesla decisions
+├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider, PendingEffect factories
  ├── logfmt.py              # Structured log formatters: render extra= fields as
  │                          #   [key=value ...] suffixes (default) or JSON lines
  │                          #   (LOG_FORMAT=json); wired into app.py handlers
@@ -257,7 +229,18 @@ project-root
 - Tesla callback config dotfile: `.tesla-callback-config` (auto-created, auto-updated)
 - Pipeline orchestration in `load_manager.py` (`_stage_enabled_check`, `_stage_nbc_fetch`,
   `_stage_pending_check`, `_stage_compute_gap`, `_stage_async_phase`, `_stage_commit`,
-  `_stage_build_result`) — each independently testable
+  `_stage_build_result`) — each independently testable. All early exits go through
+  the `_early_exit()` builder (shared hysteresis/plugs/tesla/quantization defaults);
+  shared queries live in `_local_time()` (device-tz conversion), `_eligible_plugs()`
+  (engine-eligible vs out-of-range split), `is_sentinel_on()`, `_is_tesla_in_range()`,
+  and `_waiting_sleep_hint()` (prediction-window-capped re-check delay). The async
+  phase (`_cycle_async_phase` → `_cycle_async_phase_body`) returns an
+  `AsyncPhaseResult` dataclass (named fields, not a tuple) and is split into
+  `_async_sync_and_check_sentinel()`, `_record_tesla_auth_error()`,
+  `_correct_gap_with_inflight()`, `_suppressed_by_settle()`,
+  `_eligible_for_decision()`, `_decide_actions()`, `_run_actions()`; Tesla
+  execute paths share `_mark_vehicle_offline()` + `_handle_tesla_auth_error()`;
+  `run_cycle()` stage timings go through `_timed()`
 - `_stage_nbc_fetch` in `load_manager.py` — always fetches fresh NBC data
   (`get_current_qh(force=True, ...)` regardless of `ctx.force`). The NBC reader shares the
   app-level `EnergyCache` (wired in `app._get_load_manager()`), whose TTL outlives the
@@ -375,6 +358,14 @@ project-root
 
 ### Actions Generation Flow
 - GapMinder.decide() generates actions as a list of PendingEffect objects
+- All PendingEffect construction goes through the module factories in load_nbc.py:
+  `make_plug_effect()` (applies the signed-power invariant), `make_tesla_set_amps()`,
+  `make_tesla_stop()` — no other PendingEffect() call sites remain in load_nbc.py
+- Tesla amp logic lives in TeslaDecider (owned by GapMinder as `tesla_decider`):
+  `decide_increase()` / `decide_reduce()` / `supports()` / `safe_defer_secs()`.
+  GapMinder keeps thin `_decide_tesla_*` delegates so existing call sites and tests
+  keep working. Plug candidate collection is unified in
+  `GapMinder._eligible_plugs(ctx, want_on)` (priority order baked in).
 - In run_cycle(), raw NBC predictions are adjusted with pending effect deltas via
   `estimated_current_wh()` before being passed to decide() — this accounts for
   actions already taken this quarter-hour without waiting for fresh API data
@@ -425,23 +416,22 @@ project-root
   the `/?partial=load` fragment). Load management itself keeps running and the
   freshness strip still drives live SSE updates regardless — the section is a
   diagnostics view, not the live driver
-- The "Surplus ideas" block (`_metrics.html` `.demand__list`) renders the
-  label and the idea pills inline on one line (wrapping on narrow screens),
-  like "Recent Periods" / "Active devices"; each idea is its own shaded
-  pill (`.demand__list li`), matching the QH2/QH3/QH4 `.history__pill` look.
-  Neither `.demand` nor `.device-state` carries a dashed top divider —
-  this footer region is divider-free (spacing comes from `margin-top`).
-- Just above that, `.device-state` lists active devices and pending effects
-  as comma-separated text lines ("Active devices", "Pending effects").
-  Both lines annotate each device with its state in parentheses: Tesla
-  charging amps (`current_amps`, as reported) when present, otherwise
-  `(on)` / `(off)` from `actual_state` (purely from the serialized state in
-  `load_management.state.devices` — `StateTracker.to_dict()`). Pending
-  effects look up the same device state by name, so a `set_amps` effect
-  shows the reported amps rather than the commanded `target_amps`.
 
 ### Device State Tracking
- - StateTracker class (load_nbc.py lines 315–578) maintains:
+ - EffectStore class (load_nbc.py) owns the pending-effects list with its own
+   RLock: `add()`, `snapshot()`, `has_since()` / `count_since()` (window-buffered
+   freshness checks), `prune()` (dual wall-clock + data-point age), `latest_for()`,
+   `clear_tesla_set_amps()`. StateTracker keeps a `pending_effects` property for
+   backward compat plus thin delegating methods.
+ - TeslaSettleTracker class (load_nbc.py) owns the in-flight Tesla amp command
+   (`last_commanded_amps`, zero-sample confirmation): `record_command()`,
+   `inflight_wh()` (with `_inflight_zero()` / `_inflight_one_amp()` helpers),
+   `get_active()` / `is_settling()` sharing one `_find_active()` lookup
+   (dual wall-clock + data-point age, QH-boundary expiry). StateTracker keeps
+   a `last_commanded_amps` property plus delegating `tesla_inflight_wh()`,
+   `record_tesla_amp_command()`, `get_active_tesla_settle()`, `is_settling()`,
+   and syncs the adaptive window into both stores via `apply_prediction_window`.
+ - StateTracker class (load_nbc.py) maintains:
    - devices: dict[str, DeviceState] - desired/actual state, current_amps, last_toggle
    - pending_effects: list[PendingEffect] - actions taken since last NBC data point,
      pruned when fresh data arrives via `prune_old_effects()`
@@ -517,7 +507,6 @@ validated (`firstUsageInstant != chart_start` drift check).
 
 ### Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
-  The optional `force=True` parameter bypasses the stale-data check and always fetches fresh NBC data from API.
 - EnergyCache stores per-second samples in a sliding window; NBCReader reads QH predictions from it with `get_current_qh(force=False)`. After compaction, completed QH periods are stored as immutable `CompletedNBCPeriod` objects and per-second data only covers the current incomplete QH.
 - Controllers: PlugController (stub) / RealPlugController (aiohomekit), TeslaController (stub) / RealTeslaController (tesla-fleet-api)
 - Plugs configured via LOAD_PLUG_<NAME>=<accessory_id>:<power_watts>[:<priority>] env vars
@@ -553,11 +542,9 @@ separately. Document each subtask in the overall plan file in your agent's plan 
 
 When implementing a pre-existing plan (written by you or another agent), follow this order:
 1. **Read the plan** — understand what needs to change.
-2. **Write failing tests first** — even if the plan is detailed, a plan is not a substitute for tests.
+2. **Write failing tests first** — the Red phase comes first, no exemptions.
 3. **Make them pass** — implement production code to satisfy the tests.
 4. **Refactor** — clean up while keeping all tests green.
-
-Pre-existing plans, designs, or specifications do not exempt you from the test-first requirement. The Red phase must always come first — before any production code changes, even if the plan was written by a human or another agent.
 
 For changes larger than ~20 lines, summarize what will change (files affected,
 functions modified, any data migrations or schema changes) before writing any code.
@@ -628,23 +615,7 @@ Ensure that file is present and sourced before running.
 ### 3. Documentation & Typing
 
 - **Docstrings:** Required on all modules, classes, public methods, and functions.
-  Use Google-style format:
-
-  ```python
-  def fetch_usage(start: datetime, end: datetime) -> list[float]:
-      """Fetch energy usage between two timestamps.
-
-      Args:
-          start: Start of the query window, timezone-aware.
-          end: End of the query window, timezone-aware.
-
-      Returns:
-          List of kWh readings, one per hour.
-
-      Raises:
-          EmporiaAPIError: If the upstream API returns a non-200 status.
-      """
-  ```
+  Use Google-style format (`Args:` / `Returns:` / `Raises:` sections).
 
 - **Type hints:** Mandatory on all function arguments, return values, and instance
   attributes. Use `from __future__ import annotations` at the top of modules to
@@ -682,12 +653,6 @@ Ensure that file is present and sourced before running.
   storing to a database, in which case use UTC
 - Never compare naive and aware datetimes — this will raise a `TypeError` at runtime
 
-### HTTP Requests
-
-- Use the `requests` library
-- Parse JSON responses with `.json()` — never `json.loads(response.text)`
-- Set explicit timeouts on all outbound requests (e.g., `timeout=30`)
-
 ### Emporia API
 
 - Rate limits: respect any `Retry-After` headers
@@ -707,7 +672,7 @@ Ensure that file is present and sourced before running.
 ## 🧪 Testing Guidelines
 
 **Write tests for all new functionality.** A PR with new behavior but no new
-  tests is incomplete. This includes changes driven by pre-existing plans — a plan file is never a substitute for tests.
+  tests is incomplete (see the Test-First protocol above).
 - **Always guard against pollution from `devices.json` and `.env` files** The local `.env` (read lazily by the `config` module) may conflict with your test. Consider that and guard against it. Use deferred config in app code, and monkeypatch.setenv in pytest fixtures.
 ```
 # ❌ Evaluated at import — hard to mock
@@ -725,15 +690,7 @@ def clean_env(monkeypatch):
 ```
 - **Use `FakeClock` for time-based tests.** Never patch `datetime.now` directly
   — it is fragile and often patches the wrong module namespace. Always inject a
-  `FakeClock` into the object under test. Example:
-  ```python
-  from clock import FakeClock
-  fake_now = FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc))
-  mgr._clock = fake_now
-  ```
-  The `FakeClock` implements the same `Clock` protocol as `RealClock` so it works
-  anywhere a real clock is used (load management time-range checks, NBC quarter-hour
-  boundaries, stale-data detection, sleep-hint calculations, etc.).
+  `FakeClock` (same `Clock` protocol as `RealClock`) into the object under test.
 - **Never add special-case code solely to make tests pass.** For example, do not
   add `if os.getenv("TESTING"):` branches in production code paths.
 - **Updating test data is allowed and expected** when modernizing hardcoded dates

@@ -2604,11 +2604,16 @@ class TestNbcLogging:
     LOGGER_NAME = "test-nbc-logging"
 
     def _make_hp(self, energy_cache):
-        return HourlyProjection(
-            instant=self.INSTANT,
-            logger_next=logging.getLogger(self.LOGGER_NAME),
-            energy_cache=energy_cache,
-        )
+        # Pure-compute tests: bypass network init (vue login + device
+        # discovery), which costs ~4 s per construction against an
+        # unreachable API. Same pattern as other HourlyProjection tests.
+        with patch.object(MetricsBase, "vue_init"), \
+                patch.object(MetricsBase, "get_device_info"):
+            return HourlyProjection(
+                instant=self.INSTANT,
+                logger_next=logging.getLogger(self.LOGGER_NAME),
+                energy_cache=energy_cache,
+            )
 
     @staticmethod
     def _pop_result(n_samples):

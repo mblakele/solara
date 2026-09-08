@@ -2428,9 +2428,8 @@ class TestDataFreshness(unittest.TestCase):
 
 
 class TestSurplusIdeasLayout(unittest.TestCase):
-    """Surplus ideas on the dashboard: the label and the idea pills flow on a
-    single inline row (wrapping on narrow screens) — like 'Recent Periods' or
-    'Active devices' — with each idea as a shaded pill.
+    """Ideas on the dashboard: the label sits above a 2x2 pill grid —
+    like 'Recent' or 'Devices' — with each idea as a shaded pill.
     """
 
     def setUp(self):
@@ -2438,32 +2437,31 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         self.app.testing = True
 
     def test_static_css_surplus_ideas_single_line(self):
-        """The surplus ideas flow inline (label + pills) and wrap, with no
+        """The ideas section stacks label above a 2x2 pill grid, with no
         dashed top divider carrying into the section."""
         css = TestIndexMobileAndLive._static_text("style.css")
-        # The demand block puts the label and the pills on one line.
+        # The demand block stacks label above the grid.
         demand_block = css.split(".demand {", 1)[1].split("}", 1)[0]
         self.assertIn("display: flex;", demand_block)
-        self.assertIn("flex-wrap: wrap;", demand_block)
+        self.assertIn("flex-direction: column;", demand_block)
         self.assertNotIn("border-top", demand_block)
-        # The list itself is a wrapping row of pills, not a vertical stack.
+        # The list itself is a 2-column grid.
         list_block = css.split(".demand__list {", 1)[1].split("}", 1)[0]
-        self.assertIn("display: flex;", list_block)
-        self.assertIn("flex-wrap: wrap;", list_block)
-        self.assertNotIn("flex-direction: column;", list_block)
+        self.assertIn("display: grid;", list_block)
+        self.assertIn("repeat(2, 1fr)", list_block)
         # Shaded cell look, mirroring the QH2/QH3/QH4 history pills.
         li_block = css.split(".demand__list li {", 1)[1].split("}", 1)[0]
         self.assertIn("background: var(--color-sunken);", li_block)
         self.assertIn("border-radius: var(--radius-pill);", li_block)
 
     def test_static_css_no_divider_above_active_devices(self):
-        """The device-state section ('Active devices') carries no top divider."""
+        """The devices grid section carries no top divider."""
         css = TestIndexMobileAndLive._static_text("style.css")
-        block = css.split(".device-state {", 1)[1].split("}", 1)[0]
+        block = css.split(".device-grid {", 1)[1].split("}", 1)[0]
         self.assertNotIn("border-top", block)
 
     def test_surplus_ideas_render_as_own_list_items(self):
-        """Surplus ideas render as three separate <li> items."""
+        """Ideas render as three separate <li> items under an 'Ideas' label."""
         from flask import render_template
 
         import app as app_mod
@@ -2472,7 +2470,12 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         nbc = metrics["devices"][0]["nbc"]
         nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0))
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": 750.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2480,7 +2483,7 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 load_management=load_management,
                 freshness=None,
             )
-        self.assertIn("ideas", html)
+        self.assertIn(">Ideas<", html)
         self.assertIn("<li>", html)
 
     def test_positive_gap_reduce_usage_replaces_surplus_ideas(self):
@@ -2496,7 +2499,12 @@ class TestSurplusIdeasLayout(unittest.TestCase):
             nbc, QH1=dict(nbc["QH1"], predicted_wh=+800.0, remaining_seconds=900)
         )
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": -850.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2505,27 +2513,32 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 freshness=None,
             )
         self.assertIn("reduce usage if possible", html)
-        self.assertNotIn("Surplus ideas", html)
+        self.assertNotIn(">Ideas<", html)
         # Only the car-amps idea renders.
         self.assertIn("Amps 240V", html)
         self.assertNotIn(" min", html)
 
     def test_surplus_car_amps_uses_remaining_period_seconds(self):
-        """Car amps follow the iOS formula: predictedWh / hours / -240.0, where
-        hours = remaining seconds in the period / 3600."""
+        """Car amps follow gap Wh over remaining time: gapWh / hours / 240,
+        where hours = remaining seconds in the period / 3600."""
         from flask import render_template
 
         import app as app_mod
 
         metrics = realistic_metrics()
         nbc = metrics["devices"][0]["nbc"]
-        # -800 Wh over a full 900 s (0.25 h) at 240 V -> +13.3 A of charge
-        # headroom: -800 / 0.25 / -240 = 13.33.
+        # 750 Wh surplus over a full 900 s (0.25 h) at 240 V -> +12.5 A of
+        # charge headroom: 750 / 0.25 / 240 = 12.5.
         nbc = dict(
             nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0, remaining_seconds=900)
         )
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": 750.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2533,11 +2546,11 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 load_management=load_management,
                 freshness=None,
             )
-        self.assertIn("+13.3 Amps 240V</li>", html)
+        self.assertIn("+12.5 Amps 240V</li>", html)
 
     def test_positive_gap_car_amps_sign_and_value(self):
-        """A positive gap yields signed amps (deficit reads negative): +800 Wh
-        over 0.25 h -> 800 / 0.25 / -240 = -13.3 A."""
+        """A deficit gap yields signed amps: -850 Wh over 0.25 h ->
+        -850 / 0.25 / 240 = -14.2 A."""
         from flask import render_template
 
         import app as app_mod
@@ -2548,7 +2561,12 @@ class TestSurplusIdeasLayout(unittest.TestCase):
             nbc, QH1=dict(nbc["QH1"], predicted_wh=+800.0, remaining_seconds=900)
         )
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": -850.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2556,11 +2574,11 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 load_management=load_management,
                 freshness=None,
             )
-        self.assertIn("-13.3 Amps 240V</li>", html)
+        self.assertIn("-14.2 Amps 240V</li>", html)
 
     def test_car_amps_placeholder_when_no_time_remaining(self):
-        """No time left in the period (or missing remaining_seconds) renders
-        the em-dash placeholder instead of dividing by zero."""
+        """No time left hides the car idea (no divide by zero); other ideas
+        still render."""
         from flask import render_template
 
         import app as app_mod
@@ -2569,7 +2587,12 @@ class TestSurplusIdeasLayout(unittest.TestCase):
         nbc = metrics["devices"][0]["nbc"]
         nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0, remaining_seconds=0))
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
-        load_management = {"last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}}}
+        load_management = {
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": 750.0}
+            },
+        }
         with app_mod.app.test_request_context():
             html = render_template(
                 "_metrics.html",
@@ -2577,12 +2600,14 @@ class TestSurplusIdeasLayout(unittest.TestCase):
                 load_management=load_management,
                 freshness=None,
             )
-        self.assertIn("—</li>", html)
+        self.assertIn(">Ideas<", html)
+        self.assertNotIn("Amps 240V", html)
+        self.assertIn("9.3", html)
 
 
 class TestActiveDevicesPendingEffects(unittest.TestCase):
-    """The device-state section just above 'Surplus ideas' shows active
-    devices and pending effects, with Tesla charging amps in parentheses.
+    """The unified Devices grid shows every configured device as a pill, two
+    per line, with Tesla charging amps in parentheses.
     """
 
     def setUp(self):
@@ -2607,7 +2632,10 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         nbc = dict(nbc, QH1=dict(nbc["QH1"], predicted_wh=-800.0))
         metrics = {"devices": [dict(metrics["devices"][0], nbc=nbc)]}
         load_management = {
-            "last_cycle_result": {"diagnostics": {"hysteresis_wh": 50.0}},
+            "target_wh": -50.0,
+            "last_cycle_result": {
+                "diagnostics": {"hysteresis_wh": 50.0, "gap_wh": 750.0}
+            },
             "state": {"devices": devices, "pending_effects": effects},
         }
         with app_mod.app.test_request_context():
@@ -2619,7 +2647,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             )
 
     def test_lists_active_devices_with_tesla_amps(self):
-        """Active devices show their names, Tesla with current amps in parens."""
+        """Devices grid shows every device; on is green, off grey, Tesla with amps."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2629,14 +2657,22 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             },
             effects=[],
         )
-        self.assertIn("Active devices", html)
+        self.assertIn("Devices", html)
+        self.assertNotIn("Active devices", html)
+        self.assertNotIn("Pending effects", html)
         self.assertIn("water_heater", html)
         self.assertIn("pool_pump", html)
+        self.assertIn("hot_tub", html)
         self.assertIn("tesla (5)", html)
+        # State carried by color, not parenthesised on/off text.
+        self.assertNotIn("(on)", html)
+        self.assertNotIn("(off)", html)
+        self.assertIn("device-pill--on", html)
+        self.assertIn("device-pill--off", html)
+        self.assertIn("device-grid__list", html)
 
     def test_lists_pending_effects_with_device_state(self):
-        """Pending effects show the device's state after the action: (on),
-        (off), or the Tesla's charging amps in parentheses."""
+        """Pending turn_off renders blue, turn_on/set_amps the grey-green mix."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2653,14 +2689,16 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
                  "target_amps": 16},
             ],
         )
-        self.assertIn("Pending effects", html)
-        self.assertIn("water_heater (on)", html)
-        self.assertIn("hot_tub (off)", html)
-        self.assertIn("tesla (5)", html)
+        self.assertIn("Devices", html)
+        self.assertIn("device-pill--pending-on", html)
+        self.assertIn("device-pill--pending-off", html)
+        self.assertIn("tesla (5&gt;16)", html)
+        self.assertNotIn("(on)", html)
+        self.assertNotIn("(off)", html)
 
     def test_pending_effects_annotate_from_action_not_actual_state(self):
-        """Pending effects show (on)/(off) derived from the action taken,
-        not from actual_state which can be None right after a decision."""
+        """Pending colors derive from the action taken, not actual_state which
+        can be None right after a decision."""
         # actual_state=None on all devices (post-decision before next sync)
         html = self._render_with_effects(
             devices={
@@ -2677,12 +2715,44 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
                  "target_amps": 16},
             ],
         )
-        self.assertIn("Pending effects", html)
-        self.assertIn("water_heater (on)", html)
-        self.assertIn("hot_tub (off)", html)
+        self.assertIn("Devices", html)
+        self.assertIn("device-pill--pending-on", html)
+        self.assertIn("device-pill--pending-off", html)
+
+    def test_tesla_pending_set_amps_shows_old_to_new(self):
+        """Tesla with a pending set_amps shows old>new amps in parens."""
+        html = self._render_with_effects(
+            devices={
+                "tesla": {"actual_state": True, "current_amps": 10},
+            },
+            effects=[
+                {"device_name": "tesla", "action": "set_amps",
+                 "target_amps": 6},
+            ],
+        )
+        # Jinja autoescapes `>` to `&gt;`; the browser renders `tesla (10>6)`.
+        self.assertIn("tesla (10&gt;6)", html)
+
+    def test_tesla_stopped_or_unavailable_renders_grey_without_amps(self):
+        """Tesla stopped (0A) or unavailable renders grey with plain name."""
+        html = self._render_with_effects(
+            devices={
+                "tesla": {"actual_state": False, "current_amps": 0},
+            },
+            effects=[],
+        )
+        self.assertIn(">tesla</li>", html)
+        self.assertIn("device-pill--off", html)
+        html = self._render_with_effects(
+            devices={
+                "tesla": {"actual_state": None, "current_amps": None},
+            },
+            effects=[],
+        )
+        self.assertIn(">tesla</li>", html)
 
     def test_section_sits_above_surplus_ideas(self):
-        """The device-state section renders directly above 'Surplus ideas'."""
+        """Ideas render above Devices, which render above Recent."""
         html = self._render_with_effects(
             devices={
                 "water_heater": {"actual_state": True, "current_amps": None},
@@ -2692,15 +2762,23 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
             },
             effects=[],
         )
-        self.assertLess(html.index("Active devices"), html.index("Surplus ideas"))
+        self.assertLess(html.index(">Ideas<"), html.index("Devices"))
+        self.assertLess(html.index("Devices"), html.index("Recent"))
 
     def test_static_css_styles_device_state(self):
-        """style.css styles the device-state section and its lines."""
+        """style.css styles the devices grid, two-per-line pills, and states."""
         css = TestIndexMobileAndLive._static_text("style.css")
-        self.assertIn(".device-state", css)
-        self.assertIn(".device-state__line", css)
+        self.assertIn(".device-grid", css)
+        self.assertIn(".device-grid__list", css)
+        self.assertIn(".device-pill--on", css)
+        self.assertIn(".device-pill--off", css)
+        self.assertIn(".device-pill--pending-off", css)
+        self.assertIn(".device-pill--pending-on", css)
+        # Two devices per line.
+        grid_block = css.split(".device-grid__list {", 1)[1].split("}", 1)[0]
+        self.assertIn("repeat(2, 1fr)", grid_block)
 
-    def test_recent_periods_pills_tint_outside_envelope(self):
+    def test_recent_pills_tint_outside_envelope(self):
         """QH pills outside the target±hysteresis envelope get a load (blue)
         or gen (green) tint; pills inside stay grey."""
         from flask import render_template
@@ -2747,7 +2825,7 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         )
         self.assertIn('<span class="history__pill">-50</span>', html)
 
-    def test_recent_periods_pills_grey_when_no_envelope(self):
+    def test_recent_pills_grey_when_no_envelope(self):
         """Without target/hysteresis data, all pills stay the default grey."""
         from flask import render_template
         import app as app_mod

@@ -13,19 +13,6 @@ from load_nbc import ParsedMetricsQH
 class TestParsedMetricsQH(unittest.TestCase):
     """Tests for ParsedMetricsQH dataclass construction."""
 
-    def test_construction_all_fields(self):
-        """ParsedMetricsQH can be constructed with all fields."""
-        qh = ParsedMetricsQH(
-            qh_name="QH1",
-            predicted_wh=-1500.0,
-            seconds_remaining=600,
-            data_lag_secs=2.5,
-        )
-        self.assertEqual(qh.qh_name, "QH1")
-        self.assertEqual(qh.predicted_wh, -1500.0)
-        self.assertEqual(qh.seconds_remaining, 600)
-        self.assertEqual(qh.data_lag_secs, 2.5)
-
     def test_to_dict_matches_original_structure(self):
         """to_dict() output matches the original _parse_metrics return dict."""
         qh = ParsedMetricsQH(

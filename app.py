@@ -912,12 +912,25 @@ def _build_load_management_payload(lm: Any = None) -> dict:
     else:
         last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
 
+    sentinel_names = sorted(getattr(lm, "sentinel_names", frozenset()))
+    state_dict = lm.state.to_dict()
+    # Sentinels are special: never surface pending effects for them, even
+    # if one somehow exists in the tracker.
+    if sentinel_names:
+        sentinels = set(sentinel_names)
+        state_dict["pending_effects"] = [
+            eff
+            for eff in state_dict.get("pending_effects", [])
+            if eff.get("device_name") not in sentinels
+        ]
+
     payload: dict = {
         "enabled": lm.enabled,
         "dry_run": lm.dry_run,
         "target_wh": lm.target_wh,
         "nbc_device": lm.nbc_device,
-        "state": lm.state.to_dict(),
+        "state": state_dict,
+        "sentinel_names": sentinel_names,
         "last_cycle_result": last_result,
         "sleep_hint": last_result.get("sleep_hint", lm.config_interval_secs),
         "sleep_hint_at": last_result.get("sleep_hint_at"),

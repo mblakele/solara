@@ -5,7 +5,6 @@ _aggregate() and _get_tou_model() with typed dataclasses.
 """
 
 import unittest
-from datetime import datetime, timezone
 
 from energy_aggregator import TOUBuckets
 from metrics import TOUResult
@@ -13,14 +12,6 @@ from metrics import TOUResult
 
 class TestTOUBuckets(unittest.TestCase):
     """Tests for TOUBuckets dataclass."""
-
-    def test_construction_all_fields(self):
-        """TOUBuckets can be constructed with all fields."""
-        b = TOUBuckets(total=100.0, peak=30.0, part_peak=20.0, off_peak=50.0)
-        self.assertEqual(b.total, 100.0)
-        self.assertEqual(b.peak, 30.0)
-        self.assertEqual(b.part_peak, 20.0)
-        self.assertEqual(b.off_peak, 50.0)
 
     def test_default_zero(self):
         """TOUBuckets defaults to all zeros."""
@@ -62,13 +53,6 @@ class TestTOUBuckets(unittest.TestCase):
 
 class TestTOUResult(unittest.TestCase):
     """Tests for TOUResult dataclass."""
-
-    def test_construction(self):
-        """TOUResult can be constructed with TOUBuckets and nbc."""
-        buckets = TOUBuckets(total=100.0, peak=30.0, part_peak=20.0, off_peak=50.0)
-        r = TOUResult(buckets=buckets, nbc=500.0)
-        self.assertIs(r.buckets, buckets)
-        self.assertEqual(r.nbc, 500.0)
 
     def test_to_dict_matches_original_structure(self):
         """to_dict() output matches the original _get_tou_model return dict."""

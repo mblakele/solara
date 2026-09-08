@@ -1677,3 +1677,68 @@ def test_car_power_watts_5a_honors_voltage_override(monkeypatch):
     monkeypatch.setenv("TESLA_NOMINAL_VOLTAGE", "208")
     engine = GapMinder()
     assert engine.car_power_watts_5a == pytest.approx(5 * 208)
+
+
+# --- DecideContext propagation (relocated from test_decide_context.py) ---
+
+
+def test_dry_run_does_not_mutate_devices():
+    """Dry-run mode decides actions without mutating state.devices."""
+    engine = GapMinder()
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(
+            name="heater",
+            accessory_id="abc",
+            power_watts=4500.0,
+        )
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=300,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        dry_run=True,
+    )
+
+    actions = engine.decide(
+        ctx=ctx,
+        predicted_wh=-2000.0,
+        target_wh=-500.0,
+    )
+
+    assert len(actions) == 1
+    # State should not be mutated in dry-run
+    assert "heater" not in state.devices
+
+
+def test_data_point_at_propagated_to_effects():
+    """data_point_at from context is used for PendingEffect timestamps."""
+    engine = GapMinder()
+    state = StateTracker()
+    dp_at = fixed_now - timedelta(seconds=10)
+    plugs = {
+        "heater": PlugConfig(
+            name="heater",
+            accessory_id="abc",
+            power_watts=4500.0,
+        )
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=300,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        data_point_at=dp_at,
+    )
+
+    actions = engine.decide(
+        ctx=ctx,
+        predicted_wh=-2000.0,
+        target_wh=-500.0,
+    )
+
+    assert len(actions) == 1
+    assert actions[0].data_point_at == dp_at
