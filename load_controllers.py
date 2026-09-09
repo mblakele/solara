@@ -44,6 +44,7 @@ from load_models import (
     TeslaState,
     build_tesla_state,
     parse_charge_amps,
+    telemetry_indicates_charging,
 )
 from util import _haversine_distance, atomic_write_json
 
@@ -681,15 +682,16 @@ class RealTeslaController(AbstractTeslaController):
     ) -> TeslaState | None:
         """Fetch Tesla state from REST API as telemetry fallback.
 
-        When ``snapshot`` contains ``ChargeAmps``, uses it to derive
-        ``is_charging`` (amps > 0) and ``current_amps`` directly, skipping
-        the ``charge_state`` REST call entirely — only ``drive_state`` is
-        fetched (if home coords are configured).  This avoids an unnecessary
-        API round-trip when telemetry already tells us the vehicle is charging.
+        When ``snapshot`` corroborates charging (DetailedChargeState or
+        ChargeState), uses ``ChargeAmps`` from telemetry to derive
+        ``is_charging`` and ``current_amps`` directly, skipping the
+        ``charge_state`` REST call. ``ChargeAmps`` alone never skips the
+        call: it is the pilot setting and holds its last value when idle
+        (bugs/2026-09-09-tesla-ghost.log).
 
-        When ``snapshot`` is absent or empty, falls back to the original
-        two-call strategy: ``charge_state`` for charging status and amps,
-        then optionally ``drive_state`` for location.
+        When ``snapshot`` is absent, empty, or uncorroborated, falls back
+        to the full REST fetch: ``charge_state`` for charging status and
+        amps, then optionally ``drive_state`` for location.
 
         The Tesla Fleet API wraps endpoint data in a ``response`` key.
         Both wrapped (``{"response": {"charge_state": ...}}``) and
@@ -701,19 +703,19 @@ class RealTeslaController(AbstractTeslaController):
         """
         try:
             # ── Derive is_charging, current_amps, plugged_in ────────────────
-            if snapshot and snapshot.get("ChargeAmps") is not None:
-                # Telemetry snapshot has ChargeAmps — we already know the
-                # vehicle is charging.  Skip the charge_state REST call.
-                current_amps = parse_charge_amps(snapshot["ChargeAmps"])
+            if snapshot and telemetry_indicates_charging(snapshot):
+                # Corroborated charging state — telemetry amps are live.
+                # Skip the charge_state REST call.
+                current_amps = parse_charge_amps(snapshot.get("ChargeAmps"))
                 is_charging = current_amps is not None and current_amps > 0
                 plugged_in = is_charging
                 logger.debug(
                     "_init_from_rest: using ChargeAmps=%s from snapshot — "
-                    "skipping charge_state REST call",
+                    "skipping charge_state REST call (corroborated charging)",
                     current_amps,
                 )
             else:
-                # No ChargeAmps snapshot — fall back to full REST fetch.
+                # No corroborated charging state — fall back to full REST fetch.
                 charge_data = await self._fetch_vehicle_data(endpoints=["charge_state"])
                 cs = (
                     charge_data.get("response", {}).get("charge_state")

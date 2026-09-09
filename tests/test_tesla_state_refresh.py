@@ -97,12 +97,12 @@ class TestFetchTeslaStateAsync:
         assert "tesla" not in mgr.state.devices
 
     def test_uses_telemetry_chargeamps_when_location_missing(self):
-        """When telemetry has ChargeAmps but no Location, live amps are used."""
+        """Corroborated telemetry without Location uses live amps."""
         mgr = self._make_lm()
         # Set a stale last_commanded_amps / cached state baseline.
         mgr.state.last_commanded_amps = 11
 
-        telemetry_snapshot = {"ChargeAmps": 12}
+        telemetry_snapshot = {"ChargeAmps": 12, "ChargeState": "Charging"}
         has_telemetry_patcher = patch(
             "load_manager.has_telemetry", return_value=True
         )

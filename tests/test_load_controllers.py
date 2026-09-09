@@ -1322,7 +1322,7 @@ class TestRealTeslaControllerInitTeslaState:
     async def test_init_from_rest_with_snapshot_skips_charge_state(
         self, tesla_config,
     ):
-        """Snapshot with ChargeAmps skips charge_state REST call, fetches location_data."""
+        """Corroborated snapshot skips charge_state REST call, fetches location."""
         from load_controllers import RealTeslaController
         from load_models import TeslaState
 
@@ -1331,7 +1331,7 @@ class TestRealTeslaControllerInitTeslaState:
         ctrl.config.home_lon = -122.4194
         ctrl.config.home_radius_m = 100.0
 
-        snapshot = {"ChargeAmps": 12}
+        snapshot = {"ChargeAmps": 12, "ChargeState": "Charging"}
         mock_location = {
             "response": {
                 "drive_state": {
@@ -1359,7 +1359,7 @@ class TestRealTeslaControllerInitTeslaState:
     async def test_init_from_rest_with_snapshot_outside_home(
         self, tesla_config,
     ):
-        """Snapshot path correctly computes at_home=False when vehicle is far."""
+        """Corroborated snapshot correctly computes at_home=False when far."""
         from load_controllers import RealTeslaController
 
         ctrl = RealTeslaController(tesla_config)
@@ -1367,7 +1367,7 @@ class TestRealTeslaControllerInitTeslaState:
         ctrl.config.home_lon = -122.4194
         ctrl.config.home_radius_m = 100.0
 
-        snapshot = {"ChargeAmps": 16}
+        snapshot = {"ChargeAmps": 16, "ChargeState": "Charging"}
         mock_location = {
             "response": {
                 "drive_state": {
@@ -1391,14 +1391,14 @@ class TestRealTeslaControllerInitTeslaState:
     async def test_init_from_rest_with_snapshot_no_home_coords(
         self, tesla_config,
     ):
-        """Snapshot path: no home coords → skip location_data, at_home=False."""
+        """Corroborated snapshot: no home coords → skip location, at_home=False."""
         from load_controllers import RealTeslaController
 
         ctrl = RealTeslaController(tesla_config)
         ctrl.config.home_lat = None
         ctrl.config.home_lon = None
 
-        snapshot = {"ChargeAmps": 5}
+        snapshot = {"ChargeAmps": 5, "ChargeState": "Charging"}
 
         with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
             result = await ctrl._init_from_rest(snapshot=snapshot)
@@ -1415,7 +1415,7 @@ class TestRealTeslaControllerInitTeslaState:
     async def test_init_from_rest_with_snapshot_amps_zero(
         self, tesla_config,
     ):
-        """Snapshot with ChargeAmps=0 → not charging."""
+        """Uncorroborated amps=0 falls through to REST charge_state."""
         from load_controllers import RealTeslaController
 
         ctrl = RealTeslaController(tesla_config)
@@ -1423,30 +1423,34 @@ class TestRealTeslaControllerInitTeslaState:
         ctrl.config.home_lon = -122.4194
 
         snapshot = {"ChargeAmps": 0}
+        mock_charge = {
+            "response": {"charge_state": {"charging_state": "Disconnected"}}
+        }
 
         with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
+            mock_fetch.return_value = mock_charge
             result = await ctrl._init_from_rest(snapshot=snapshot)
 
         assert result is not None
         assert result.is_charging is False
-        assert result.current_amps == 0
+        assert result.current_amps is None
         assert result.plugged_in is False
         assert result.at_home is False
-        # Not charging → no location_data needed
-        assert mock_fetch.call_count == 0
+        # REST charge_state was consulted (amps alone is not trusted)
+        assert mock_fetch.call_count == 1
 
     @pytest.mark.asyncio
     async def test_init_from_rest_with_snapshot_location_data_fails(
         self, tesla_config,
     ):
-        """Snapshot path: location_data fetch fails → at_home=False default."""
+        """Corroborated snapshot: location fetch fails → at_home=False."""
         from load_controllers import RealTeslaController
 
         ctrl = RealTeslaController(tesla_config)
         ctrl.config.home_lat = 37.7749
         ctrl.config.home_lon = -122.4194
 
-        snapshot = {"ChargeAmps": 12}
+        snapshot = {"ChargeAmps": 12, "ChargeState": "Charging"}
 
         with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
             mock_fetch.side_effect = Exception("API error")

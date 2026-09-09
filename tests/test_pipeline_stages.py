@@ -185,7 +185,7 @@ class TestStagePendingCheck:
     def test_external_tesla_charge_waits_for_fresh_data(
         self, lm: LoadManager, ctx: CycleContext
     ):
-        """Externally-started charging after data_point → waiting_for_fresh_data."""
+        """Corroborated externally-started charging → waiting_for_fresh_data."""
         lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
         now = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
         data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -198,7 +198,7 @@ class TestStagePendingCheck:
             patch("load_manager.get_field_update_at", return_value=now),
             patch(
                 "load_manager.get_telemetry_snapshot",
-                return_value={"ChargeAmps": 12},
+                return_value={"ChargeAmps": 12, "ChargeState": "Charging"},
             ),
         ):
             result = lm._stage_pending_check(ctx)
@@ -210,7 +210,7 @@ class TestStagePendingCheck:
     def test_external_tesla_charge_no_effect_when_commanded(
         self, lm: LoadManager, ctx: CycleContext
     ):
-        """Telemetry shows charging but we commanded it → pass through."""
+        """Corroborated telemetry but we commanded it → pass through."""
         lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
         now = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
         data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -223,7 +223,7 @@ class TestStagePendingCheck:
             patch("load_manager.get_field_update_at", return_value=now),
             patch(
                 "load_manager.get_telemetry_snapshot",
-                return_value={"ChargeAmps": 12},
+                return_value={"ChargeAmps": 12, "ChargeState": "Charging"},
             ),
         ):
             result = lm._stage_pending_check(ctx)

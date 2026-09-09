@@ -84,6 +84,8 @@ from load_models import (
     TeslaAuthError,
     TeslaState,
     _tesla_state_to_dict,
+    parse_charge_amps,
+    telemetry_indicates_charging,
 )
 
 from load_nbc import (
@@ -907,15 +909,19 @@ class LoadManager:
         # When the Tesla is drawing significant amps and we didn't command it,
         # the charging may have started externally after the last NBC data
         # point.  In that case the prediction doesn't include this load, so
-        # wait for fresh data before making any decisions.
+        # wait for fresh data before making any decisions. ChargeAmps alone
+        # is not enough: it is the pilot setting and holds its last value
+        # when idle (bugs/2026-09-09-tesla-ghost.log) — require a
+        # corroborating charging state (DetailedChargeState or ChargeState).
         if tesla_configured:
             charge_last_update = get_field_update_at("ChargeAmps")
             if charge_last_update is not None and charge_last_update > data_point_at:
                 snapshot = get_telemetry_snapshot()
-                charge_amps = snapshot.get("ChargeAmps")
+                charge_amps = parse_charge_amps(snapshot.get("ChargeAmps"))
                 if (
                     charge_amps is not None
                     and charge_amps > 0
+                    and telemetry_indicates_charging(snapshot)
                     and self.state.last_commanded_amps is None
                 ):
                     candidate_details = self._build_candidate_details(
