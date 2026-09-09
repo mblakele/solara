@@ -35,13 +35,19 @@
 </main>
 
 {% if load_management and metrics.debug %}
+<details class="debug-details container">
+  <summary class="debug-details__summary">Load management (debug)</summary>
   {% include "_load_management.html" %}
+</details>
 {% endif %}
 
 {% if metrics.debug %}
-<div class="debug container">
-<pre>{{ metrics }}</pre>
-</div>
+<details class="debug-details container">
+  <summary class="debug-details__summary">Metrics (debug)</summary>
+  <div class="debug">
+  <pre>{{ metrics }}</pre>
+  </div>
+</details>
 {% endif %}
 
 <script src="static/app.js" defer></script>

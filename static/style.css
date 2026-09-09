@@ -529,6 +529,18 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* Collapsed-by-default debug sections (index.html, DEBUG=True only). */
+.debug-details {
+  margin-top: var(--space-lg);
+}
+
+.debug-details__summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
 /* ── Motion preferences ────────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   * {
