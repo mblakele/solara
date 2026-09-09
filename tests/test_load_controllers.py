@@ -1433,7 +1433,7 @@ class TestRealTeslaControllerInitTeslaState:
 
         assert result is not None
         assert result.is_charging is False
-        assert result.current_amps is None
+        assert result.current_amps == 0
         assert result.plugged_in is False
         assert result.at_home is False
         # REST charge_state was consulted (amps alone is not trusted)

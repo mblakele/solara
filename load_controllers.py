@@ -730,9 +730,15 @@ class RealTeslaController(AbstractTeslaController):
                 cs_str = cs.get("charging_state", "")
                 is_charging = cs_str == "Charging"
                 plugged_in = cs_str in ("Charging", "Complete", "PluggedIn")
-                current_amps = cs.get("charge_amps")
-                if current_amps is not None:
-                    current_amps = int(current_amps)
+                if is_charging:
+                    current_amps = cs.get("charge_amps")
+                    if current_amps is not None:
+                        current_amps = int(current_amps)
+                else:
+                    # Not charging: charge_amps is the stale pilot/request
+                    # setting, not measured draw (bugs/2026-09-09-tesla-ghost-b.log
+                    # showed charge_amps=5 with charging_state 'Complete').
+                    current_amps = 0
 
             # ── Location from location_data (only if charging + home coords) ──
             at_home = False  # Assume not home until proven otherwise

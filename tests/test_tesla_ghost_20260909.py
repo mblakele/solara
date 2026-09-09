@@ -168,3 +168,49 @@ def test_early_exit_refreshes_stale_tesla_display():
     assert dev is not None
     assert dev.actual_state is False
     assert dev.current_amps == 0
+
+
+def test_init_from_rest_complete_reports_zero_amps():
+    """REST charging_state=Complete with stale charge_amps=5 must report 0A.
+
+    Reproduces bugs/2026-09-09-tesla-ghost-b.log: the car is plugged in
+    past its charge limit (battery 65% > limit 50%), charging_state
+    'Complete', charge_rate 0.0 — but charge_amps still holds the old
+    5A pilot/request setting. Reporting it as current_amps=5 renders a
+    phantom "tesla (5)" in index html despite is_charging=False.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from load_controllers import RealTeslaController
+
+    config = TeslaConfig(
+        client_id="t",
+        client_secret="t",
+        redirect_uri="http://localhost/callback",
+        vehicle_id="v1",
+    )
+    ctrl = RealTeslaController(config)
+    mock_charge = {
+        "response": {
+            "charge_state": {"charging_state": "Complete", "charge_amps": 5}
+        }
+    }
+    with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
+        mock_fetch.return_value = mock_charge
+        result = asyncio.run(ctrl._init_from_rest(snapshot=None))
+    assert result is not None
+    assert result.is_charging is False
+    assert result.current_amps == 0
+    assert result.plugged_in is True
+
+
+def test_snapshot_complete_with_stale_amps_reports_zero_amps():
+    """DetailedChargeState=Complete with retained ChargeAmps=5 → 0A."""
+    ts = tesla_state_from_snapshot(
+        {"DetailedChargeState": "DetailedChargeStateComplete", "ChargeAmps": 5.0}
+    )
+    assert ts is not None
+    assert ts.is_charging is False
+    assert ts.current_amps == 0
+    assert ts.plugged_in is True

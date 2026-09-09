@@ -498,8 +498,13 @@ def tesla_state_from_snapshot(
         )
         return None
 
-    # ChargeAmps
-    current_amps = parse_charge_amps(snapshot.get("ChargeAmps"))
+    # ChargeAmps: the pilot/request setting, not measured draw — report 0
+    # when the charging state says the car isn't charging, so a retained
+    # pilot value can't render as a phantom "(5)" (ghost-b log).
+    if is_charging:
+        current_amps = parse_charge_amps(snapshot.get("ChargeAmps"))
+    else:
+        current_amps = 0
 
     at_home = _compute_at_home_from_location(snapshot)
     return build_tesla_state(
