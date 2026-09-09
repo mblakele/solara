@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from load_manager import LoadManager, LoadManagerConfig
-from load_models import TeslaConfig
+from load_models import TeslaConfig, TeslaState
 from mqtt_telemetry import tesla_state_from_snapshot
 
 
@@ -126,3 +126,45 @@ def test_init_from_rest_amps_alone_fetches_charge_state():
         for c in mock_fetch.call_args_list
     ]
     assert ["charge_state"] in endpoints
+
+
+def test_early_exit_refreshes_stale_tesla_display():
+    """Stale REST 5A entry must clear when live telemetry shows ghost amps.
+
+    Reproduces the 22:02 UTC fresh-log session: first cycle with no
+    telemetry trusts REST (charging 5A) into devices["tesla"]; later
+    cycles early-exit at pending_check while MQTT reports uncorroborated
+    ChargeAmps=4. The dashboard ("tesla (5)") stayed stale because only
+    the commit stage syncs the device entry.
+    """
+    from load_nbc import make_plug_effect
+
+    mgr = _make_lm()
+    mgr.state.sync_tesla_device_state(
+        TeslaState(is_charging=True, current_amps=5, plugged_in=True, at_home=True)
+    )
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    assert mgr.state.devices["tesla"].current_amps == 5
+
+    ctx = _ctx(mgr)
+    assert ctx.now_postfetch is not None
+    assert ctx.data_point_at is not None
+    mgr.state.add_effect(
+        make_plug_effect(
+            "ecoflow", "turn_off", 800.0, ctx.now_postfetch, ctx.data_point_at
+        )
+    )
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 4.000000059604645},
+        ),
+    ):
+        result = mgr._stage_pending_check(ctx)
+    assert result is not None
+    assert result.status == "waiting_for_fresh_data"
+    dev = mgr.state.devices.get("tesla")
+    assert dev is not None
+    assert dev.actual_state is False
+    assert dev.current_amps == 0

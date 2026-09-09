@@ -824,16 +824,64 @@ class LoadManager:
         ctx.adjusted_wh = res.adjusted_wh
         ctx.sentinel_on = res.sentinel_on
 
+    def _refresh_tesla_display_from_telemetry(self) -> None:
+        """Sync the dashboard Tesla entry from live telemetry only.
+
+        Only the commit stage syncs the ``devices["tesla"]`` entry (via
+        ``sync_tesla_device_state``), so cycles that early-exit at pending
+        check leave a stale entry behind — e.g. a first-cycle REST
+        ``charging 5A`` that later telemetry contradicts
+        (bugs/2026-09-09-tesla-ghost.log showed a stuck ``tesla (5)``).
+        Refresh the display entry from the telemetry snapshot so the
+        dashboard tracks live state even when no decision is made.
+
+        Telemetry-only: never touches REST or the network. Uncorroborated
+        amps (no charging state) display as idle via the same ghost-guard
+        rule as the async phase. When ``at_home`` is unseeded and
+        ``Location`` is absent, the display is left alone for the async
+        phase REST fallback to resolve.
+        """
+        if self.tesla_ctrl is None or not has_telemetry():
+            return
+        snapshot = get_telemetry_snapshot()
+        state = tesla_state_from_snapshot(snapshot)
+        if state is not None:
+            if "Location" in snapshot:
+                self._last_tesla_at_home = state.at_home
+            elif self._last_tesla_at_home is not None:
+                if not state.at_home:
+                    state = TeslaState(
+                        is_charging=state.is_charging,
+                        current_amps=state.current_amps,
+                        plugged_in=state.plugged_in,
+                        at_home=self._last_tesla_at_home,
+                    )
+            else:
+                return
+            self.state.sync_tesla_device_state(state)
+            return
+        if "Location" in snapshot:
+            at_home = _compute_at_home_from_location(snapshot)
+            self._last_tesla_at_home = at_home
+        elif self._last_tesla_at_home is not None:
+            at_home = self._last_tesla_at_home
+        else:
+            return
+        self.state.sync_tesla_device_state(_not_charging_state(at_home=at_home))
+
     def _stage_pending_check(
         self, ctx: CycleContext
     ) -> CycleResult | None:
         """Stage 3: Check whether NBC data is stale or pending effects
         are not yet reflected in the prediction.
 
-        When force=True, bypasses all checks and returns None immediately.
-        Otherwise returns a CycleResult for early-exit conditions or None
-        to continue the pipeline.
+        Refreshes the dashboard Tesla entry from live telemetry first so
+        early exits don't leave a stale charging display behind, then
+        runs the gates. When force=True, bypasses all checks and returns
+        None immediately. Otherwise returns a CycleResult for early-exit
+        conditions or None to continue the pipeline.
         """
+        self._refresh_tesla_display_from_telemetry()
         if ctx.force:
             return None
 
