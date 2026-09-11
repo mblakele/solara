@@ -144,5 +144,17 @@ TESLA_TOKEN_REFRESH_INTERVAL_SECS: int = 7 * 3600
 Deliberately shorter than the 8-hour access-token lifetime so the
 refresh always happens before the access token expires server-side."""
 
+TESLA_ARBITRATION_COOLDOWN_SECS: int = 300
+"""Minimum seconds between REST arbitration polls for ambiguous telemetry.
+
+When MQTT reports positive but uncorroborated ChargeAmps with no active
+command (bugs/2026-09-11-tesla-ghost-c.log), only a REST ``charge_state``
+read can tell the idle pilot ghost from a real external session. Each
+poll can wake an otherwise-sleeping car and costs API quota, so polls
+are spaced at least this far apart; between polls the last confirmed
+answer is sustained while amps stay positive, and amps dropping to zero
+clears it immediately. Five minutes bounds detection delay for a newly
+started external session against poll cost during long ghost periods."""
+
 TESLA_HOME_RADIUS_M_DEFAULT: float = 500.0
 """Default radius in metres around home used for at-home detection."""

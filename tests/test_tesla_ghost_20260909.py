@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from load_manager import LoadManager, LoadManagerConfig
-from load_models import TeslaConfig, TeslaState
+from load_models import TeslaConfig, TeslaState, PendingEffect
 from mqtt_telemetry import tesla_state_from_snapshot
 
 
@@ -280,3 +280,247 @@ def test_display_refresh_shows_commanded_charging():
     assert dev is not None
     assert dev.actual_state is True
     assert dev.current_amps == 10
+
+
+def _make_lm_with_real_ctrl_and_clock(clock):
+    """LoadManager wired to RealTeslaController + injectable clock."""
+    from load_controllers import RealTeslaController
+
+    config = TeslaConfig(
+        client_id="test",
+        client_secret="test",
+        redirect_uri="http://localhost/callback",
+        vehicle_id="v1",
+    )
+    ctrl = RealTeslaController(config)
+    mgr = LoadManager(
+        LoadManagerConfig(dry_run=True, config_interval_secs=30, clock=clock)
+    )
+    mgr.tesla_config = config
+    mgr.tesla_ctrl = ctrl
+    return mgr, ctrl
+
+
+def _charging_rest_response(amps=11):
+    return {
+        "response": {
+            "charge_state": {"charging_state": "Charging", "charge_amps": amps}
+        }
+    }
+
+
+def _complete_rest_response():
+    return {
+        "response": {
+            "charge_state": {"charging_state": "Complete", "charge_amps": 5}
+        }
+    }
+
+
+def test_arbitration_confirms_external_charging():
+    """Ambiguous amps + no command → one REST poll arbitrates (ghost-c).
+
+    The car started charging externally (never commanded by us); the
+    ChargeAmps-only feed cannot corroborate. A fresh REST poll saying
+    Charging must surface charging 11A instead of idle.
+    """
+    from clock import FakeClock
+    from unittest.mock import AsyncMock
+
+    mgr, ctrl = _make_lm_with_real_ctrl_and_clock(FakeClock())
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    assert mgr.state.last_commanded_amps is None
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 11.0},
+        ),
+        patch.object(
+            ctrl, "_fetch_vehicle_data", new=AsyncMock(
+                return_value=_charging_rest_response()
+            ),
+        ) as mock_fetch,
+    ):
+        state, error, _ = asyncio.run(mgr._fetch_tesla_state_async())
+    assert error is None
+    assert state is not None
+    assert state.is_charging is True
+    assert state.current_amps == 11
+    assert mock_fetch.call_count == 1
+
+
+def test_arbitration_cooldown_sustains_without_repolling():
+    """A confirmed session is sustained between polls, then re-polled."""
+    from clock import FakeClock
+    from unittest.mock import AsyncMock
+
+    clock = FakeClock()
+    mgr, ctrl = _make_lm_with_real_ctrl_and_clock(clock)
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    snapshot = {"ChargeAmps": 11.0}
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch("load_manager.get_telemetry_snapshot", return_value=snapshot),
+        patch.object(
+            ctrl, "_fetch_vehicle_data", new=AsyncMock(
+                return_value=_charging_rest_response()
+            ),
+        ) as mock_fetch,
+    ):
+        state1, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+        assert state1 is not None and state1.is_charging is True
+        assert mock_fetch.call_count == 1
+        # Within cooldown: sustained from latch, no new REST call.
+        clock.advance(60)
+        state2, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+        assert state2 is not None and state2.is_charging is True
+        assert state2.current_amps == 11
+        assert mock_fetch.call_count == 1
+
+
+def test_arbitration_repolls_after_cooldown_and_clears_latch():
+    """After cooldown a fresh poll runs; idle answer clears the latch."""
+    from clock import FakeClock
+    from unittest.mock import AsyncMock
+
+    clock = FakeClock()
+    mgr, ctrl = _make_lm_with_real_ctrl_and_clock(clock)
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    snapshot = {"ChargeAmps": 11.0}
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch("load_manager.get_telemetry_snapshot", return_value=snapshot),
+        patch.object(
+            ctrl, "_fetch_vehicle_data", new=AsyncMock(
+                side_effect=[
+                    _charging_rest_response(),
+                    _complete_rest_response(),
+                ]
+            ),
+        ) as mock_fetch,
+    ):
+        state1, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+        assert state1 is not None and state1.is_charging is True
+        clock.advance(301)
+        state2, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+        assert state2 is not None and state2.is_charging is False
+        assert state2.current_amps == 0
+        assert mock_fetch.call_count == 2
+
+
+def test_arbitration_negative_result_cools_down():
+    """REST saying Complete → idle, and no poll storm while ambiguous."""
+    from clock import FakeClock
+    from unittest.mock import AsyncMock
+
+    clock = FakeClock()
+    mgr, ctrl = _make_lm_with_real_ctrl_and_clock(clock)
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 5.0},
+        ),
+        patch.object(
+            ctrl, "_fetch_vehicle_data", new=AsyncMock(
+                return_value=_complete_rest_response()
+            ),
+        ) as mock_fetch,
+    ):
+        state1, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+        assert state1 is not None and state1.is_charging is False
+        assert state1.current_amps == 0
+        clock.advance(60)
+        state2, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+        assert state2 is not None and state2.is_charging is False
+        assert mock_fetch.call_count == 1
+
+
+def test_arbitration_latch_clears_when_amps_drop():
+    """Amps dropping to zero ends the session: latch clears, idle reported."""
+    from clock import FakeClock
+    from unittest.mock import AsyncMock
+
+    clock = FakeClock()
+    mgr, ctrl = _make_lm_with_real_ctrl_and_clock(clock)
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch.object(
+            ctrl, "_fetch_vehicle_data", new=AsyncMock(
+                return_value=_charging_rest_response()
+            ),
+        ) as mock_fetch,
+    ):
+        with patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 11.0},
+        ):
+            state1, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+            assert state1 is not None and state1.is_charging is True
+        # Car stops: amps read 0 → idle, latch cleared, no REST needed.
+        with patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 0},
+        ):
+            state2, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+            assert state2 is not None and state2.is_charging is False
+            assert mock_fetch.call_count == 1
+        # Amps return after cooldown → latch is gone, so re-poll.
+        clock.advance(301)
+        with patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 11.0},
+        ):
+            state3, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+            assert state3 is not None and state3.is_charging is True
+            assert mock_fetch.call_count == 2
+
+
+def test_arbitration_skipped_for_stub_controller():
+    """Stub controller (tests/odd configs) never attempts REST arbitration."""
+    mgr = _make_lm()
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 11.0},
+        ),
+    ):
+        state, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+    assert state is not None
+    assert state.is_charging is False
+    assert state.current_amps == 0
+
+
+def test_stop_clears_arbitration_latch():
+    """Our own stop command clears a latched arbitration (no restart loop)."""
+    from load_models import CycleContext
+
+    mgr = _make_lm()
+    mgr._last_rest_arbitration_charging = True  # noqa: SLF001
+    now = datetime(2026, 9, 11, 21, 2, 53, tzinfo=timezone.utc)
+    ctx = CycleContext(now=now, force=False)
+    ctx.sentinel_on = False
+    ctx.qh_name = "QH1"
+    ctx.predicted_wh = -50.0
+    ctx.adjusted_wh = -50.0
+    ctx.gap_wh = 40.0
+    ctx.now_postfetch = now
+    ctx.seconds_remaining = 700
+    ctx.data_point_at = now
+    ctx.actions = []
+    ctx.succeeded_effects = [
+        PendingEffect(
+            device_name="tesla",
+            action="turn_off",
+            timestamp=now,
+            data_point_at=now,
+            power_watts=-240.0,
+        )
+    ]
+    mgr._stage_commit(ctx)  # noqa: SLF001
+    assert mgr._last_rest_arbitration_charging is False  # noqa: SLF001

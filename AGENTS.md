@@ -266,16 +266,27 @@ project-root
   (`/api/v1/load/status`, index, SSE `load_cycle`). None-guarded for stub
   `nbc_reader`s that lack `energy_cache`
 - `_fetch_tesla_state_async()` in `load_manager.py` — fetches Tesla state from MQTT
-  telemetry with a fast path; returns telemetry state as long as `ChargeAmts` is present
-  (does NOT require `Location`). Preserves `at_home` from `_last_tesla_at_home` when
-  `Location` is absent in the snapshot. When live telemetry is present but parses to
-  `None` (no `DetailedChargeState` and no positive `ChargeAmps`), the vehicle is treated
-  as idle/disconnected — a not-charging `TeslaState` is returned (`current_amps=0`,
-  `plugged_in=False`, `at_home` from live `Location` or `_last_tesla_at_home`) and the
-  controller's stale cached `_init_state` is NOT used as an answer (ghost-guard;
-  bugs/2026-08-31-ghost-tesla-amps.log). Delegates to controller's `init_tesla_state()`
-  (which waits up to 60 s for telemetry, then REST) when telemetry is not yet available
-  or when `at_home` is unseeded and `Location` is absent (to seed location)
+  telemetry with a fast path; `tesla_state_from_snapshot()` requires charging-state
+  corroboration (`DetailedChargeState`/`ChargeState`, see `telemetry_indicates_charging()`
+  in `load_models.py`) because `ChargeAmps` alone is the pilot setting, not measured
+  draw (bugs/2026-09-09-tesla-ghost.log). Preserves `at_home` from `_last_tesla_at_home`
+  when `Location` is absent in the snapshot. Two fallbacks before the idle verdict:
+  `_commanded_charge_echo()` trusts positive amps under an active command (the car
+  answering us; bugs/2026-09-11-tesla-ghost-c.log), and `_arbitrate_tesla_state_from_rest()`
+  polls REST `charge_state` for ambiguous (positive, uncorroborated, uncommanded) amps —
+  load manager never starts charging itself, so every session begins this way. Polls are
+  spaced `TESLA_ARBITRATION_COOLDOWN_SECS` (300 s) apart; the verdict is sustained while
+  amps stay positive and cleared on amps-zero, corroborated idle, or our own stop command
+  (prevents a trim-restart loop). When live telemetry parses to `None` with no echo and
+  no arbitration answer, the vehicle is treated as idle/disconnected — a not-charging
+  `TeslaState` is returned (`current_amps=0`, `plugged_in=False`, `at_home` from live
+  `Location` or `_last_tesla_at_home`) and the controller's stale cached `_init_state`
+  is NOT used as an answer (ghost-guard; bugs/2026-08-31-ghost-tesla-amps.log). Delegates
+  to controller's `init_tesla_state()` (which waits up to 60 s for telemetry, then REST)
+  when telemetry is not yet available or when `at_home` is unseeded and `Location` is
+  absent (to seed location). `_init_from_rest()` reports `current_amps=0` (not the stale
+  pilot) whenever REST `charging_state != "Charging"` (bugs/2026-09-09-tesla-ghost-b.log);
+  same zeroing applies to the MQTT `DetailedChargeState`-present path
 - Data models in `load_models.py`
 - `nominal_voltage()` in `load_nbc.py` — deferred-config resolver for the
   `TESLA_NOMINAL_VOLTAGE` env (default 240; invalid/non-positive falls back

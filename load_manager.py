@@ -33,6 +33,7 @@ from constants import (
     DEFAULT_SLEEP_HINT_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
     STALE_DATA_THRESHOLD_SECS,
+    TESLA_ARBITRATION_COOLDOWN_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
 )
@@ -328,6 +329,13 @@ class LoadManager:
         # Preserved when Location is absent so the requires_home_check gate in
         # GapMinder doesn't incorrectly block Tesla decisions.
         self._last_tesla_at_home: bool | None = None
+        # REST arbitration verdict for ambiguous telemetry (positive but
+        # uncorroborated ChargeAmps, no active command). _last_at stamps the
+        # most recent poll; _charging holds its answer, sustained between
+        # polls while amps stay positive so decisions don't flap. Cleared
+        # when amps drop to zero and when we command a stop.
+        self._last_rest_arbitration_at: datetime | None = None
+        self._last_rest_arbitration_charging: bool = False
         # Anti-spam dedup: tracks the last auth error text sent to Telegram so we
         # only send one alert per unique error message (not one per 30 s cycle).
         self._last_auth_error_msg: str | None = None
@@ -671,6 +679,10 @@ class LoadManager:
             elif effect.device_name == "tesla" and effect.action in ("turn_off", "turn_on"):
                 self.state.record_tesla_amp_command(None)
                 self.state.clear_tesla_settle_effects()
+                # Our stop invalidates any confirmed-charging arbitration
+                # verdict — without this the sustained verdict could
+                # re-trigger a trim and restart the car we just stopped.
+                self._last_rest_arbitration_charging = False
             self.state.add_effect(effect)
 
         # Sync Tesla entry in devices from live vehicle state.
@@ -865,6 +877,12 @@ class LoadManager:
         if echo is not None:
             self.state.sync_tesla_device_state(echo)
             return
+        reported = parse_charge_amps(snapshot.get("ChargeAmps"))
+        if reported is not None and reported > 0:
+            sustained = self._arbitration_sustain(snapshot, reported)
+            if sustained is not None:
+                self.state.sync_tesla_device_state(sustained)
+                return
         if "Location" in snapshot:
             at_home = _compute_at_home_from_location(snapshot)
             self._last_tesla_at_home = at_home
@@ -920,6 +938,103 @@ class LoadManager:
             plugged_in=True,
             at_home=at_home,
         )
+
+    def _arbitration_sustain(
+        self, snapshot: dict[str, Any], reported_amps: int,
+    ) -> TeslaState | None:
+        """Report charging from a fresh REST arbitration verdict.
+
+        Returns a charging state at the live MQTT amps when the most
+        recent arbitration poll confirmed charging and its cooldown has
+        not elapsed. Amps dropping to zero clears the verdict immediately
+        (the session ended — no need to wait for a re-poll).
+
+        Args:
+            snapshot: Telemetry snapshot dict.
+            reported_amps: Parsed positive ChargeAmps value.
+
+        Returns:
+            Charging ``TeslaState`` at ``reported_amps``, or ``None``
+            when no fresh confirmed verdict exists.
+        """
+        if reported_amps <= 0:
+            self._last_rest_arbitration_charging = False
+            return None
+        if not self._last_rest_arbitration_charging:
+            return None
+        last_at = self._last_rest_arbitration_at
+        if last_at is None:
+            return None
+        age = (self._clock.now() - last_at).total_seconds()
+        if age >= TESLA_ARBITRATION_COOLDOWN_SECS:
+            return None
+        if "Location" in snapshot:
+            at_home = _compute_at_home_from_location(snapshot)
+            self._last_tesla_at_home = at_home
+        elif self._last_tesla_at_home is not None:
+            at_home = self._last_tesla_at_home
+        else:
+            return None
+        return TeslaState(
+            is_charging=True,
+            current_amps=reported_amps,
+            plugged_in=True,
+            at_home=at_home,
+        )
+
+    async def _arbitrate_tesla_state_from_rest(
+        self, snapshot: dict[str, Any],
+    ) -> TeslaState | None:
+        """Resolve ambiguous telemetry with an authoritative REST poll.
+
+        Positive but uncorroborated ChargeAmps with no active command is
+        ambiguous: idle pilot ghost vs. a real externally-started session
+        (load manager never starts charging itself, so every session
+        begins this way). Only a REST ``charge_state`` read — whose
+        ``charging_state`` enum is authoritative — can tell them apart.
+        Each poll can wake a sleeping car and costs quota, so polls are
+        spaced at least ``TESLA_ARBITRATION_COOLDOWN_SECS`` apart; between
+        polls the last confirmed answer is sustained (see
+        :meth:`_arbitration_sustain`). A negative answer is also latched
+        for the cooldown so ghost periods don't poll-storm.
+
+        Args:
+            snapshot: Telemetry snapshot dict.
+
+        Returns:
+            ``TeslaState`` when arbitration confirms charging (fresh poll
+            or sustained verdict), else ``None`` (idle ghost-guard applies).
+        """
+        reported = parse_charge_amps(snapshot.get("ChargeAmps"))
+        if reported is None or reported <= 0:
+            self._last_rest_arbitration_charging = False
+            return None
+        if not isinstance(self.tesla_ctrl, RealTeslaController):
+            return None
+        sustained = self._arbitration_sustain(snapshot, reported)
+        if sustained is not None:
+            return sustained
+        now = self._clock.now()
+        last_at = self._last_rest_arbitration_at
+        if (
+            last_at is not None
+            and (now - last_at).total_seconds()
+            < TESLA_ARBITRATION_COOLDOWN_SECS
+        ):
+            return None
+        self._last_rest_arbitration_at = now
+        logger.debug(
+            "tesla REST arbitration: polling charge_state for "
+            "uncorroborated amps=%d",
+            reported,
+        )
+        rest_state = await self.tesla_ctrl._init_from_rest(snapshot=None)  # noqa: SLF001
+        if rest_state is not None and rest_state.is_charging:
+            self._last_rest_arbitration_charging = True
+            self._last_tesla_at_home = rest_state.at_home
+            return rest_state
+        self._last_rest_arbitration_charging = False
+        return None
 
     def _stage_pending_check(
         self, ctx: CycleContext
@@ -1465,6 +1580,11 @@ class LoadManager:
             telemetry_snapshot = get_telemetry_snapshot()
             telemetry_state = tesla_state_from_snapshot(telemetry_snapshot)
             if telemetry_state is not None:
+                if not telemetry_state.is_charging:
+                    # Corroborated idle (e.g. DetailedChargeState Complete
+                    # while the pilot lingers): authoritative, so drop any
+                    # stale arbitration verdict.
+                    self._last_rest_arbitration_charging = False
                 # Track at_home from Location snapshots; preserve the last
                 # known at_home when Location is absent so the
                 # requires_home_check gate doesn't block Tesla decisions.
@@ -1494,6 +1614,14 @@ class LoadManager:
                 echo = self._commanded_charge_echo(telemetry_snapshot)
                 if echo is not None:
                     return echo, None, None
+                # No echo: arbitrate positive amps via REST (an external
+                # session we never commanded looks exactly like the pilot
+                # ghost on this feed).
+                arbitrated = await self._arbitrate_tesla_state_from_rest(
+                    telemetry_snapshot
+                )
+                if arbitrated is not None:
+                    return arbitrated, None, None
                 # No echo: no DetailedChargeState AND no positive ChargeAmps
                 # (or uncommanded ghost amps), so the vehicle is NOT charging
                 # / is disconnected. Do NOT fall all the way through to the
