@@ -837,8 +837,9 @@ class LoadManager:
 
         Telemetry-only: never touches REST or the network. Uncorroborated
         amps (no charging state) display as idle via the same ghost-guard
-        rule as the async phase. When ``at_home`` is unseeded and
-        ``Location`` is absent, the display is left alone for the async
+        rule as the async phase, except when the amps echo an active
+        command (see _commanded_charge_echo). When ``at_home`` is unseeded
+        and ``Location`` is absent, the display is left alone for the async
         phase REST fallback to resolve.
         """
         if self.tesla_ctrl is None or not has_telemetry():
@@ -860,6 +861,10 @@ class LoadManager:
                 return
             self.state.sync_tesla_device_state(state)
             return
+        echo = self._commanded_charge_echo(snapshot)
+        if echo is not None:
+            self.state.sync_tesla_device_state(echo)
+            return
         if "Location" in snapshot:
             at_home = _compute_at_home_from_location(snapshot)
             self._last_tesla_at_home = at_home
@@ -868,6 +873,53 @@ class LoadManager:
         else:
             return
         self.state.sync_tesla_device_state(_not_charging_state(at_home=at_home))
+
+    def _commanded_charge_echo(
+        self, snapshot: dict[str, Any],
+    ) -> TeslaState | None:
+        """Confirm charging from live amps echoing our active command.
+
+        Some fleet-telemetry feeds only ever deliver ``ChargeAmps`` — no
+        ``DetailedChargeState``/``ChargeState`` corroboration can arrive
+        (bugs/2026-09-11-tesla-ghost-c.log: every snapshot is
+        ``['ChargeAmps']``). Positive amps alone can't distinguish the
+        idle pilot ghost from real draw, but amps reported while we hold
+        an active, unconfirmed command are the car answering us — trust
+        them at face value, including mid-ramp values below the commanded
+        level (the settle math credits just the unconfirmed portion).
+
+        Requires ``last_commanded_amps is not None``: retained/stale amps
+        after a reboot meet a fresh ``None`` command and stay rejected,
+        as do never-commanded ghost amps. Any positive report counts —
+        exact equality with the command is not required.
+
+        Args:
+            snapshot: Telemetry snapshot dict.
+
+        Returns:
+            Charging ``TeslaState`` at the reported amps (``at_home``
+            preserved), or ``None`` when there is no active command, no
+            positive amps, or ``at_home`` can be neither read nor
+            preserved.
+        """
+        if self.state.last_commanded_amps is None:
+            return None
+        reported = parse_charge_amps(snapshot.get("ChargeAmps"))
+        if reported is None or reported <= 0:
+            return None
+        if "Location" in snapshot:
+            at_home = _compute_at_home_from_location(snapshot)
+            self._last_tesla_at_home = at_home
+        elif self._last_tesla_at_home is not None:
+            at_home = self._last_tesla_at_home
+        else:
+            return None
+        return TeslaState(
+            is_charging=True,
+            current_amps=reported,
+            plugged_in=True,
+            at_home=at_home,
+        )
 
     def _stage_pending_check(
         self, ctx: CycleContext
@@ -1435,12 +1487,19 @@ class LoadManager:
                 # telemetry fast path would otherwise return at_home=False
                 # without ever reaching the REST fallback below.
             else:
-                # Live telemetry is present but reports no parseable charging
-                # state (no DetailedChargeState AND no positive ChargeAmps), so
-                # the vehicle is NOT charging / is disconnected. Do NOT fall
-                # all the way through to the controller's cached `_init_state`
-                # as authoritative — it may hold a ghost "charging @ N A" from
-                # an earlier session (bugs/2026-08-31-ghost-tesla-amps.log).
+                # Live telemetry is present but reports no corroborated
+                # charging state. Before declaring idle, check the command
+                # echo: positive amps under an active command are the car
+                # answering us (bugs/2026-09-11-tesla-ghost-c.log).
+                echo = self._commanded_charge_echo(telemetry_snapshot)
+                if echo is not None:
+                    return echo, None, None
+                # No echo: no DetailedChargeState AND no positive ChargeAmps
+                # (or uncommanded ghost amps), so the vehicle is NOT charging
+                # / is disconnected. Do NOT fall all the way through to the
+                # controller's cached `_init_state` as authoritative — it may
+                # hold a ghost "charging @ N A" from an earlier session
+                # (bugs/2026-08-31-ghost-tesla-amps.log).
                 # Represent reality as idle/disconnected, preserving at_home.
                 if "Location" in telemetry_snapshot:
                     at_home = _compute_at_home_from_location(telemetry_snapshot)

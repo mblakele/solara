@@ -214,3 +214,69 @@ def test_snapshot_complete_with_stale_amps_reports_zero_amps():
     assert ts.is_charging is False
     assert ts.current_amps == 0
     assert ts.plugged_in is True
+
+
+def test_commanded_amps_echo_reports_charging():
+    """Live amps matching our active command confirm charging (ghost-c log).
+
+    Cycle c4: we commanded 10A, MQTT reports ChargeAmps=10.000000149011612,
+    and DetailedChargeState/ChargeState never arrive on this feed. The
+    command echo is confirmation — must report charging 10A, not idle 0A
+    (which fed a 487Wh phantom into tesla_inflight_correction and shed
+    ecoflow+jackery).
+    """
+    mgr = _make_lm()
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    mgr.state.last_commanded_amps = 10
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 10.000000149011612},
+        ),
+    ):
+        state, error, url = asyncio.run(mgr._fetch_tesla_state_async())
+    assert error is None
+    assert url is None
+    assert state is not None
+    assert state.is_charging is True
+    assert state.current_amps == 10
+    assert state.plugged_in is True
+    assert state.at_home is True
+
+
+def test_uncommanded_ghost_still_reports_idle():
+    """Amps with no active command and no corroboration still report idle."""
+    mgr = _make_lm()
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    assert mgr.state.last_commanded_amps is None
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 4.000000059604645},
+        ),
+    ):
+        state, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+    assert state is not None
+    assert state.is_charging is False
+    assert state.current_amps == 0
+
+
+def test_display_refresh_shows_commanded_charging():
+    """Pending-check display refresh surfaces the command echo."""
+    mgr = _make_lm()
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    mgr.state.last_commanded_amps = 10
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 10.000000149011612},
+        ),
+    ):
+        mgr._refresh_tesla_display_from_telemetry()  # noqa: SLF001
+    dev = mgr.state.devices.get("tesla")
+    assert dev is not None
+    assert dev.actual_state is True
+    assert dev.current_amps == 10
