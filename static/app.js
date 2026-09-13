@@ -121,6 +121,7 @@
     if (nextEl) {
       nextEl.textContent = (remain >= 0 ? Math.ceil(remain) : 0) + 's'
     }
+    syncConnection()
   }
 
   setInterval(tickFreshness, 1000)
@@ -186,6 +187,7 @@
     live = true
     cancelAutoRefresh()
     applyLiveBadge()
+    syncConnection()
     log('live updates active via /stream/status')
   }
 
@@ -196,6 +198,7 @@
     live = false
     log('sse driver lost, fallback reload rearmed', reason)
     scheduleReload()
+    syncConnection()
   }
 
   function noteEvent() {
@@ -208,6 +211,46 @@
       return true
     }
     return false
+  }
+
+  // Mirror fragment freshness onto the header connection dot. The
+  // in-fragment strip is a hidden state carrier; this paints the only
+  // visible indicator: dot-only when live+fresh, text when troubled
+  // (aging/stale data, reload mode, or a silent stream).
+  function syncConnection() {
+    var conn = document.getElementById('connection')
+    var strip = document.getElementById('data-freshness')
+    if (!conn || !strip) {
+      return
+    }
+    var status = strip.getAttribute('data-status') || 'fresh'
+    var driven = strip.getAttribute('data-live') === '1'
+    var silent = Date.now() - lastEventAt > silenceLimitMs
+    var state = silent ? 'reconnecting' : (!driven ? 'reload' : (status === 'fresh' ? 'live' : status))
+    if (conn.getAttribute('data-state') !== state) {
+      conn.setAttribute('data-state', state)
+    }
+    var ageEl = strip.querySelector('.freshness__age')
+    var nextEl = strip.querySelector('.freshness__next')
+    var age = ageEl ? ageEl.textContent : ''
+    var next = nextEl ? nextEl.textContent : ''
+    var label = state === 'live' ? 'Live'
+      : state === 'reconnecting' ? 'Reconnecting, data ' + age + ' old'
+      : !driven ? 'Data ' + age + ' old, next update in ' + next
+      : 'Data ' + age + ' old'
+    conn.setAttribute('aria-label', label)
+    var textEl = document.getElementById('connection-text')
+    if (textEl) {
+      var key = state + '|' + age + '|' + next + '|' + driven
+      if (textEl.getAttribute('data-rendered') !== key) {
+        var html = 'data <b class="connection__age">' + age + '</b> old'
+        if (!driven) {
+          html += ' · next ~<b class="connection__next">' + next + '</b>'
+        }
+        textEl.innerHTML = html
+        textEl.setAttribute('data-rendered', key)
+      }
+    }
   }
 
   function swapSection(id, url, selector) {
@@ -242,6 +285,7 @@
         if (live && node.querySelector('[data-live="0"]')) {
           unlive('fragment left live mode')
         }
+        syncConnection()
       })
       .catch(function (err) {
         // Keep the auto-refresh fallback in place.
@@ -280,6 +324,11 @@
       noteEvent()
       swapSection('load-management-section', '?partial=load', '.load-management')
     })
+    // Heartbeats carry no swap but prove the stream is alive; without
+    // this a healthy idle stream would trip the silence watchdog.
+    source.addEventListener('heartbeat', function () {
+      noteEvent()
+    })
     // EventSource reconnects automatically; transient errors need no
     // handling beyond a log line. A permanently dead stream trips the
     // silence watchdog above, which re-arms the reload fallback (live
@@ -289,5 +338,6 @@
     }
   }
 
+  syncConnection()
   scheduleReload()
 })()

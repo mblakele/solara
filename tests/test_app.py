@@ -2493,6 +2493,52 @@ class TestDataFreshness(unittest.TestCase):
         js = TestIndexMobileAndLive._static_text("app.js")
         self.assertIn('[data-live="1"]', js)
 
+    def test_index_header_carries_connection_dot(self):
+        """The app-bar header carries the connection indicator so the
+        freshness strip below it costs no vertical footprint.
+
+        Reload mode shows state plus text; live+fresh renders dot-only
+        state (text stays visually hidden until trouble)."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        header = html.split("</header>", 1)[0]
+        self.assertIn('id="connection"', header)
+        self.assertIn('data-state="reload"', header)
+        self.assertIn("connection__dot", header)
+
+    def test_index_header_dot_only_when_live_fresh(self):
+        """LM-enabled fresh pages mark the header dot live (quiet)."""
+        with mock_config():
+            TestIndexMobileAndLive._lm_wired_state()
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        header = html.split("</header>", 1)[0]
+        self.assertIn('id="connection"', header)
+        self.assertIn('data-state="live"', header)
+
+    def test_metrics_strip_hidden_state_carrier(self):
+        """The in-fragment freshness strip is hidden: it carries SSE state
+        for the header dot instead of occupying its own row."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        html = response.data.decode("utf-8")
+        self.assertTrue(
+            re.search(
+                r'<div class="freshness" id="data-freshness"[^>]*hidden', html
+            ),
+            "freshness strip must be hidden",
+        )
+
+    def test_static_app_js_mirrors_connection_dot(self):
+        """app.js mirrors fragment freshness state onto the header dot
+        after every swap and tick."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn("getElementById('connection')", js)
+        self.assertIn("syncConnection", js)
+
     def test_static_app_js_watches_sse_silence(self):
         """app.js re-arms the reload fallback when a live SSE stream goes
         quiet (device sleep, server restart, dead proxy).

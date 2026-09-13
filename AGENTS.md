@@ -195,7 +195,8 @@ project-root
 ├── tests/                 # All pytest tests
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # _metrics.html/_load_management.html are SSE-swappable fragments
-                           # (the metrics fragment carries the #data-freshness strip; the
+                           # (the metrics fragment carries the hidden #data-freshness state
+                           # strip mirrored onto the header #connection dot by syncConnection(); the
                            # sparkline filter receives quantization_seconds to feed
                            # chart.per_second_sparkline's bucket_secs downsampling)
 ├── static/                # Mobile-first design system (style.css) and the SSE dashboard

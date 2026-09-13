@@ -399,6 +399,54 @@ body {
   white-space: nowrap;
 }
 
+/* Hidden state carrier (mirrored onto #connection by syncConnection()):
+   .freshness sets display:flex, which would override the UA [hidden]
+   rule without this. */
+.freshness[hidden] {
+  display: none;
+}
+
+/* ── Connection indicator (app bar) ───────────────────────────────────────── */
+.connection {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.connection__dot {
+  flex: none;
+  width: 0.6em;
+  height: 0.6em;
+  border-radius: 50%;
+  background: var(--color-ok);
+}
+
+#connection[data-state="aging"] .connection__dot {
+  background: var(--color-warn);
+}
+
+#connection[data-state="stale"] .connection__dot,
+#connection[data-state="reconnecting"] .connection__dot {
+  background: var(--color-err);
+}
+
+#connection[data-state="reload"] .connection__dot {
+  background: var(--color-text-muted);
+}
+
+/* Dot-only when live+fresh; text returns the moment anything needs saying. */
+#connection[data-state="live"] .connection__text {
+  display: none;
+}
+
+.connection__text b {
+  font-weight: 650;
+  color: var(--color-text);
+}
+
 /* ── Load management ───────────────────────────────────────────────────── */
 .load-management {
   margin: var(--space-lg) auto;
