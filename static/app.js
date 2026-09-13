@@ -7,7 +7,8 @@
  *     what keeps the page fresh when SSE is unavailable (no JS, old proxy,
  *     load management disabled).
  *
- *  2. Live — EventSource('/stream/status'). Each metrics/load event triggers
+ *  2. Live — EventSource (stream/status resolved against the page path).
+ *     Each metrics/load event triggers
  *     a small fragment fetch (`?partial=metrics`, `?partial=load`) and swaps
  *     the section's innerHTML in place. All markup stays server-rendered
  *     (single source of truth in the Jinja templates). Only a fragment that
@@ -185,8 +186,21 @@
       })
   }
 
+  // Resolve the SSE endpoint against the page path so the dashboard works
+  // behind a subpath proxy (e.g. /solara/ -> /solara/stream/status) as well
+  // as at the site root (/ -> /stream/status). The index page always lives
+  // at the app root directory, so the directory containing the page is the
+  // app root.
+  function sseUrl() {
+    var base = window.location.pathname
+    if (base.slice(-1) !== '/') {
+      base += '/'
+    }
+    return base + 'stream/status'
+  }
+
   if (window.EventSource) {
-    var source = new EventSource('/stream/status')
+    var source = new EventSource(sseUrl())
     source.addEventListener('initial_metrics', function () {
       swapSection('metrics-section', '?partial=metrics', '.forecast')
     })

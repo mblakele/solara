@@ -2089,6 +2089,16 @@ class TestIndexMobileAndLive(unittest.TestCase):
         self.assertIn("partial=metrics", js)
         self.assertIn("partial=load", js)
 
+    def test_static_app_js_sse_url_is_prefix_aware(self):
+        """app.js builds the SSE URL from the page path so a subpath proxy
+        mount (e.g. /solara/) streams from /solara/stream/status instead of
+        the site root."""
+        js = self._static_text("app.js")
+        self.assertNotIn("EventSource('/stream/status')", js)
+        self.assertNotIn('EventSource("/stream/status")', js)
+        self.assertIn("window.location.pathname", js)
+        self.assertIn("stream/status", js)
+
 
 class TestLoadManagementSectionDebug(unittest.TestCase):
     """The legacy Load Management dashboard section is kept but only
