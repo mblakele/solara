@@ -1327,6 +1327,35 @@ class TestLagRecalculation(unittest.TestCase):
         lag = self._lag_to_seconds(data["devices"][0]["lag"])
         self.assertGreaterEqual(lag, 0)
 
+    def test_enrich_does_not_mutate_cached_dict(self):
+        """Repeated enrich passes over one cached dict must agree.
+
+        Regression: enrich rebound lag-bumped device copies back into the
+        shared cached dict, so every render inflated lag and two browsers
+        showed different ages for identical data.
+        """
+        import app as app_mod
+
+        fetched_at = datetime(2026, 9, 13, 1, 0, 0, tzinfo=timezone.utc)
+        now = fetched_at + timedelta(seconds=42)
+        cached: dict[str, Any] = {
+            "devices": [{"name": "m", "lag": timedelta(seconds=40)}],
+            "_fetched_at": fetched_at,
+            "api_response": {},
+        }
+        first = app_mod._enrich_metrics_for_sse(cached, now=now)
+        second = app_mod._enrich_metrics_for_sse(cached, now=now)
+        self.assertEqual(
+            first["devices"][0]["lag"].total_seconds(),
+            second["devices"][0]["lag"].total_seconds(),
+            "enrich must be idempotent for the same inputs",
+        )
+        self.assertEqual(
+            cached["devices"][0]["lag"].total_seconds(),
+            40.0,
+            "enrich must not mutate the caller's dict",
+        )
+
 
 class TestBuildLoadManagementPayloadLocked(unittest.TestCase):
     """Tests for _build_load_management_payload() when an lm is passed in.
