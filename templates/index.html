@@ -9,7 +9,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="format-detection" content="telephone=no">
 <title>solara</title>
-{% if refresh_secs is not none %}
+{# No meta refresh on SSE-driven (live) pages: the browser schedules it at
+   parse time and JS cannot cancel it, so it would bounce the page every N
+   seconds even while SSE works. The JS reload timer remains as the
+   cancellable fallback until markLive(). Reload-driven pages keep the meta
+   for no-JS / SSE-unavailable clients. #}
+{% if refresh_secs is not none and not (freshness and freshness.live) %}
 <meta http-equiv="refresh" content="{{ refresh_secs }}">
 {% endif %}
 {% if load_management and load_management.sleep_hint is defined %}

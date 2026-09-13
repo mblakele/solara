@@ -2372,6 +2372,40 @@ class TestDataFreshness(unittest.TestCase):
         # The meta refresh must stay: no LM means the page reloads on its own.
         self.assertIn(b'content="30"', response.data)
 
+    def test_index_no_meta_refresh_when_live(self):
+        """LM-on pages omit the meta refresh: SSE drives updates and the
+        meta tag cannot be cancelled by JS once the browser has seen it."""
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            TestIndexMobileAndLive._lm_wired_state()
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.get_or_fetch.return_value = (
+                    {
+                        "devices": [{"name": "meter", "lag": timedelta(seconds=6)}],
+                        "api_response": {},
+                        "instant": None,
+                    },
+                    True,
+                )
+                mock_cache.data = EnergyCacheData(
+                    samples=[0.0] * 900,
+                    data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                    last_sample_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    last_fetch_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    sample_count=900,
+                    quantization_seconds=30,
+                    quantization_offset=0,
+                    quantization_confidence=1.0,
+                )
+                response = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('data-live="1"', html)
+        self.assertNotIn('http-equiv="refresh"', html)
+
     def test_partial_metrics_includes_freshness_strip(self):
         """The SSE-swapped metrics fragment carries the same strip."""
         with mock_config():
