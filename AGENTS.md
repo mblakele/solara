@@ -200,6 +200,7 @@ project-root
                            # chart.per_second_sparkline's bucket_secs downsampling)
 ├── static/                # Mobile-first design system (style.css) and the SSE dashboard
                            # client (app.js) wiring EventSource → fragment swaps + freshness ticker
+                           # + silence watchdog (re-arms reload when a live stream goes quiet)
 ├── docs/                  # Supplementary documentation (e.g., LOADMANAGER.md, SSE_STREAMING.md, architecture.md)
 ├── devices.json           # Local device configuration — never commit
 ├── .env                   # Local secrets — never commit

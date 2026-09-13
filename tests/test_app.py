@@ -2493,6 +2493,23 @@ class TestDataFreshness(unittest.TestCase):
         js = TestIndexMobileAndLive._static_text("app.js")
         self.assertIn('[data-live="1"]', js)
 
+    def test_static_app_js_watches_sse_silence(self):
+        """app.js re-arms the reload fallback when a live SSE stream goes
+        quiet (device sleep, server restart, dead proxy).
+
+        Live pages carry no meta refresh, so a dead stream with no
+        watchdog would sit stale forever."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn("lastEventAt", js)
+        self.assertIn("silenceLimitMs", js)
+        self.assertIn("checkSilence", js)
+
+    def test_static_app_js_unlives_when_fragment_leaves_live(self):
+        """app.js leaves live mode when a swapped fragment is no longer
+        SSE-driven (e.g. load management disabled across a restart)."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn('[data-live="0"]', js)
+
     def test_static_css_styles_freshness_strip(self):
         """style.css styles the freshness strip and its status colors."""
         css = TestIndexMobileAndLive._static_text("style.css")
