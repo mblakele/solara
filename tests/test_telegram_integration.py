@@ -841,3 +841,46 @@ class TestTelegramDeviceWhitelist:
 
         assert result is False
         mock_sender.send_notification.assert_not_called()
+
+
+class TestTurnOffRuntimePlumbing:
+    """Queued turn_off events carry the inclusive today-runtime."""
+
+    def test_queued_off_event_includes_runtime(self):
+        """Decide-OFF then queue yields (06:12 today) on the alert line."""
+        from config import Config
+
+        Config().set("TIMEZONE", "America/Los_Angeles")
+        mock_sender = MagicMock(spec=TelegramSender)
+        mock_sender.is_configured = True
+
+        mgr = _make_manager_with_telegram_devices(
+            telegram_sender=mock_sender,
+            telegram_devices={"pool_pump": ["turn_off"]},
+        )
+        t_on = datetime(2026, 6, 15, 18, 0, 0, tzinfo=timezone.utc)
+        t_off = datetime(2026, 6, 15, 18, 6, 12, tzinfo=timezone.utc)
+        # Mirror the cycle order: decide flips desired (crediting the
+        # session), the queue step later reads the inclusive total.
+        mgr.state.note_desired_transition("pool_pump", True, t_on)
+        mgr.state.note_desired_transition("pool_pump", False, t_off)
+
+        mgr._queue_surplus_notification(
+            actions=[
+                PendingEffect(
+                    device_name="pool_pump",
+                    action="turn_off",
+                    timestamp=t_off,
+                    data_point_at=t_off,
+                    power_watts=-1500.0,
+                )
+            ],
+            predicted_wh=877.0,
+            target_wh=-50.0,
+            dry_run=False,
+            now=t_off,
+        )
+
+        assert len(mgr._pending_notifications) == 1
+        msg = mgr._pending_notifications[0].format_message()
+        assert "🔘 pool_pump (06:12 today)" in msg

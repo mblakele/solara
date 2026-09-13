@@ -106,6 +106,7 @@ from metrics import DriftAlert, drain_drift_alerts
 from telegram import (
     NotificationEvent,
     TelegramSender,
+    action_device_and_type,
     build_error_notification,
     build_notification,
 )
@@ -1712,8 +1713,14 @@ class LoadManager:
             dev_state = self.state.devices.get(name)
             if dev_state is None:
                 # First time seeing this plug's state
-                self.state.devices[name] = DeviceState(
-                    name=name, actual_state=actual, desired_state=actual
+                self.state.set_device_state(
+                    name,
+                    DeviceState(
+                        name=name, actual_state=actual, desired_state=None
+                    ),
+                )
+                self.state.note_desired_transition(
+                    name, actual, self._clock.now()
                 )
             else:
                 prev_actual = dev_state.actual_state
@@ -1728,7 +1735,9 @@ class LoadManager:
                         actual,
                     )
                     prev_desired = dev_state.desired_state
-                    dev_state.desired_state = actual
+                    self.state.note_desired_transition(
+                        name, actual, self._clock.now()
+                    )
                     self._record_external_effect(
                         name, actual, prev_desired, prev_actual
                     )
@@ -1766,6 +1775,33 @@ class LoadManager:
         dev_state = self.state.devices.get(name)
         if dev_state is not None:
             dev_state.last_toggle = now
+
+    def _runtime_for_actions(
+        self,
+        actions: list[PendingEffect],
+        now: datetime,
+    ) -> dict[str, float] | None:
+        """Build the per-device today-runtime map for turn_off plug actions.
+
+        Reads the inclusive total (closed sessions plus the open one) from
+        the state tracker at queue/send time — by then the decide step has
+        already credited the session being closed. Tesla and non-turn_off
+        actions are excluded. Returns None when no action qualifies so the
+        event renders the legacy lines.
+
+        Args:
+            actions: Decided actions for this cycle.
+            now: Current wall-clock time for the runtime read.
+
+        Returns:
+            Device-name → ON-time-seconds map, or None when empty.
+        """
+        runtime: dict[str, float] = {}
+        for action in actions:
+            device, action_type = action_device_and_type(action)
+            if action_type == "turn_off" and device.lower() != "tesla":
+                runtime[device] = self.state.runtime_today_for(device, now)
+        return runtime or None
 
     async def _fire_telegram_notification(
         self,
@@ -1830,6 +1866,7 @@ class LoadManager:
             predicted_wh=predicted_wh,
             target_wh=target_wh,
             now=now,
+            runtime_today_secs=self._runtime_for_actions(actions, now),
         )
         logger.debug("Telegram send event=%s", event)
 
@@ -1975,6 +2012,7 @@ class LoadManager:
             predicted_wh=predicted_wh,
             target_wh=target_wh,
             now=now,
+            runtime_today_secs=self._runtime_for_actions(actions, now),
         )
 
         # Whitelist gate: only queue when telegram.devices is configured

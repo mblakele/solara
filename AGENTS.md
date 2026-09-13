@@ -186,7 +186,11 @@ project-root
   ├── quantization.py        # Detect N-second constant-value windows (quantization) in per-second data
   ├── sse_event.py            # SSEBroadcaster thread-safe pub/sub + event_stream generator for Flask
                               # (close_all() wakes blocked streams on shutdown; sentinel never yielded)
-├── telegram.py            # TelegramSender, NotificationEvent, config loading helpers
+├── telegram.py            # TelegramSender, NotificationEvent (turn_off plug lines
+                           # carry "(MM:SS today)" via format_runtime_today +
+                           # runtime_today_secs, fed by LoadManager._runtime_for_actions),
+                           # action_device_and_type shared unwrapping helper,
+                           # config loading helpers
 ├── telegram_client.py     # Async Telegram Bot API client using aiohttp
 ├── util.py                # Shared utilities (JSON helpers, timezone handling)
 ├── pyproject.toml         # Project metadata, dependencies & script entrypoints
@@ -458,7 +462,11 @@ project-root
   - `apply_prediction_window()`: resolves the prediction/settle window from shared-cache
     quantization; commits a new window only after two consecutive cycles and ignores
     dead-band jitter (see `_resolve_prediction_window`)
-- DeviceState dataclass tracks per-device runtime state
+- DeviceState dataclass tracks per-device runtime state, including daily
+  ON-time fields (`on_since`, `runtime_today_secs`, `runtime_day`) credited by
+  `StateTracker.note_desired_transition()` (single funnel for GapMinder
+  decisions and `_sync_plug_states` reconciliation; meter-local midnight
+  resets/clips) and read via `runtime_today_for()` for alerts only
 - Stale detection uses **data-point age** (not fetch time): `data_point_at = fetched_at - timedelta(seconds=data_lag_secs)`.
   The threshold is `STALE_DATA_THRESHOLD_SECS` (80 seconds, constants.py) from the most
   recent per-second data point, accounting for Emporia API lag. Min toggle interval: 60 seconds.
@@ -473,6 +481,7 @@ project-root
 - `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`; "tesla" is accepted as a special device name for Tesla stop-charging alerts
 - Whitelist gate: Telegram notifications are only sent when a telegram.devices whitelist is explicitly configured AND at least one action matches it. Without a whitelist, notifications are blocked to prevent unintended messages to unconfigured devices.
 - Plug notifications use emoji format: `🟢 device → ON` / `🔘 device → OFF`
+- Plug `turn_off` lines append today's ON-time since meter-local midnight: `🔘 water heater (06:12 today)` (`MM:SS` under an hour, `H:MM:SS` above; plugs only, never Tesla/`turn_on`)
 - Tesla notifications use device-specific format: `🔌 Tesla charging stopped` / `⚡ Tesla charging started` / `🔋 Tesla charge amps → N A`
 
 ### EnergyCache & Incremental Fetch

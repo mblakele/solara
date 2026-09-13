@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -198,13 +198,22 @@ class TeslaConfig:
 
 @dataclass
 class DeviceState:
-    """Runtime state of a managed device."""
+    """Runtime state of a managed device.
+
+    The daily ON-time fields (``on_since``, ``runtime_today_secs``,
+    ``runtime_day``) back the "(MM:SS today)" suffix on Telegram turn_off
+    alerts. Days are meter-local midnights; see
+    :meth:`StateTracker.note_desired_transition`.
+    """
 
     name: str
     last_toggle: datetime | None = None
     desired_state: bool | None = None
     actual_state: bool | None = None
     current_amps: int | None = None
+    on_since: datetime | None = None
+    runtime_today_secs: float = 0.0
+    runtime_day: date | None = None
 
 
 @dataclass
