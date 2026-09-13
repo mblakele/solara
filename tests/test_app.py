@@ -2562,6 +2562,15 @@ class TestDataFreshness(unittest.TestCase):
         self.assertIn(".freshness", css)
         self.assertIn("data-status", css)
 
+    def test_static_css_app_bar_keeps_container_centering(self):
+        """The app-bar must not clobber .container's margin-inline:auto
+        with a margin shorthand, or the header stretches full-width while
+        content stays centered (dot stranded at the viewport edge)."""
+        css = TestIndexMobileAndLive._static_text("style.css")
+        block = css.split(".app-bar {", 1)[1].split("}", 1)[0]
+        self.assertIn("margin-block", block)
+        self.assertNotIn("margin:", block)
+
 
 class TestSurplusIdeasLayout(unittest.TestCase):
     """Ideas on the dashboard: the label sits above a 2x2 pill grid —

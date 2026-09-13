@@ -83,7 +83,10 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-sm);
-  margin: var(--space-xs) 0 var(--space-md);
+  /* margin-block only: the margin shorthand would clobber .container's
+     margin-inline:auto (equal specificity, later rule) and stretch the
+     header full-width while content stays centered. */
+  margin-block: var(--space-xs) var(--space-md);
 }
 
 .app-bar__title {
