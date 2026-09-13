@@ -336,6 +336,32 @@ def parse_charge_amps(raw: Any) -> int | None:
         return None
 
 
+def telemetry_indicates_charging(snapshot: dict[str, Any] | None) -> bool:
+    """Return True when telemetry charging state corroborates charging.
+
+    ChargeAmps alone is the pilot/limit setting, not measured draw — it
+    holds its last value when idle (bugs/2026-09-09-tesla-ghost.log showed
+    persistent 2-4A with no charging state). Require an explicit charging
+    state before trusting amps:
+
+    * DetailedChargeState == "DetailedChargeStateCharging", or
+    * ChargeState == "Charging"
+
+    Args:
+        snapshot: Telemetry snapshot dict (unwrapped or envelope values).
+
+    Returns:
+        True when either charging-state field reports charging.
+    """
+    if not snapshot:
+        return False
+    detailed = unwrap_telemetry_value(snapshot.get("DetailedChargeState"))
+    if isinstance(detailed, str) and detailed == "DetailedChargeStateCharging":
+        return True
+    charge = unwrap_telemetry_value(snapshot.get("ChargeState"))
+    return isinstance(charge, str) and charge == "Charging"
+
+
 @dataclass(frozen=True)
 class TeslaVehicleTelemetry:
     """State received via fleet-telemetry push callbacks.

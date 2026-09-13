@@ -223,8 +223,8 @@ class TestTeslaStateFromSnapshot:
     # ── Partial snapshot (ChargeAmps without DetailedChargeState) ──────────
 
     def test_returns_state_when_charge_amps_without_detailed(self):
-        """ChargeAmps > 0 without DetailedChargeState → inferred charging."""
-        ts = self._state(ChargeAmps=6.0)
+        """Corroborated amps (ChargeState=Charging) without Detailed → charging."""
+        ts = self._state(ChargeAmps=6.0, ChargeState="Charging")
         assert ts is not None
         assert ts.is_charging is True
         assert ts.plugged_in is True
@@ -241,22 +241,22 @@ class TestTeslaStateFromSnapshot:
         assert ts is None
 
     def test_partial_snapshot_still_computes_at_home(self):
-        """Partial snapshot with ChargeAmps and Location still computes at_home."""
+        """Partial corroborated snapshot with ChargeAmps and Location computes at_home."""
         loc = {"latitude": 37.7749, "longitude": -122.4194}
         with patch("config.Config") as mock_config_cls:
             mock_cfg = MagicMock()
             mock_cfg.tesla_home_lat = 37.7749
             mock_cfg.tesla_home_lon = -122.4194
             mock_config_cls.return_value = mock_cfg
-            ts = self._state(ChargeAmps=16.0, Location=loc)
+            ts = self._state(ChargeAmps=16.0, ChargeState="Charging", Location=loc)
         assert ts is not None
         assert ts.current_amps == 16
         assert ts.is_charging is True
         assert ts.at_home is True
 
     def test_partial_snapshot_with_envelope_charge_amps(self):
-        """ChargeAmps in fleet-telemetry envelope format works without DetailedChargeState."""
-        ts = self._state(ChargeAmps={"value": 6.0})
+        """ChargeAmps envelope + corroborating ChargeState works without Detailed."""
+        ts = self._state(ChargeAmps={"value": 6.0}, ChargeState="Charging")
         assert ts is not None
         assert ts.is_charging is True
         assert ts.current_amps == 6

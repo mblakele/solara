@@ -3,7 +3,11 @@
    in Jinja so the client only swaps HTML fragments (single source of truth).
 #}
 {% if freshness %}
-<div class="freshness" id="data-freshness"
+{# Hidden state carrier: the visible indicator lives in the app-bar header
+   (#connection, mirrored by syncConnection() in app.js). Kept in the
+   fragment so every SSE swap delivers fresh state; [hidden] needs an
+   explicit CSS rule since .freshness sets display:flex. #}
+<div class="freshness" id="data-freshness" hidden
      data-lag-at="{{ freshness.lag_at }}"
      data-lag="{{ freshness.age_secs }}"
      data-next="{{ freshness.next_update_secs }}"

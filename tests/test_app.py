@@ -1327,6 +1327,35 @@ class TestLagRecalculation(unittest.TestCase):
         lag = self._lag_to_seconds(data["devices"][0]["lag"])
         self.assertGreaterEqual(lag, 0)
 
+    def test_enrich_does_not_mutate_cached_dict(self):
+        """Repeated enrich passes over one cached dict must agree.
+
+        Regression: enrich rebound lag-bumped device copies back into the
+        shared cached dict, so every render inflated lag and two browsers
+        showed different ages for identical data.
+        """
+        import app as app_mod
+
+        fetched_at = datetime(2026, 9, 13, 1, 0, 0, tzinfo=timezone.utc)
+        now = fetched_at + timedelta(seconds=42)
+        cached: dict[str, Any] = {
+            "devices": [{"name": "m", "lag": timedelta(seconds=40)}],
+            "_fetched_at": fetched_at,
+            "api_response": {},
+        }
+        first = app_mod._enrich_metrics_for_sse(cached, now=now)
+        second = app_mod._enrich_metrics_for_sse(cached, now=now)
+        self.assertEqual(
+            first["devices"][0]["lag"].total_seconds(),
+            second["devices"][0]["lag"].total_seconds(),
+            "enrich must be idempotent for the same inputs",
+        )
+        self.assertEqual(
+            cached["devices"][0]["lag"].total_seconds(),
+            40.0,
+            "enrich must not mutate the caller's dict",
+        )
+
 
 class TestBuildLoadManagementPayloadLocked(unittest.TestCase):
     """Tests for _build_load_management_payload() when an lm is passed in.
@@ -2089,6 +2118,16 @@ class TestIndexMobileAndLive(unittest.TestCase):
         self.assertIn("partial=metrics", js)
         self.assertIn("partial=load", js)
 
+    def test_static_app_js_sse_url_is_prefix_aware(self):
+        """app.js builds the SSE URL from the page path so a subpath proxy
+        mount (e.g. /solara/) streams from /solara/stream/status instead of
+        the site root."""
+        js = self._static_text("app.js")
+        self.assertNotIn("EventSource('/stream/status')", js)
+        self.assertNotIn('EventSource("/stream/status")', js)
+        self.assertIn("window.location.pathname", js)
+        self.assertIn("stream/status", js)
+
 
 class TestLoadManagementSectionDebug(unittest.TestCase):
     """The legacy Load Management dashboard section is kept but only
@@ -2362,6 +2401,40 @@ class TestDataFreshness(unittest.TestCase):
         # The meta refresh must stay: no LM means the page reloads on its own.
         self.assertIn(b'content="30"', response.data)
 
+    def test_index_no_meta_refresh_when_live(self):
+        """LM-on pages omit the meta refresh: SSE drives updates and the
+        meta tag cannot be cancelled by JS once the browser has seen it."""
+        import app as app_mod
+        from energy_cache import EnergyCacheData
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            TestIndexMobileAndLive._lm_wired_state()
+            with patch.object(app_mod._state, "energy_cache") as mock_cache:
+                mock_cache.get_or_fetch.return_value = (
+                    {
+                        "devices": [{"name": "meter", "lag": timedelta(seconds=6)}],
+                        "api_response": {},
+                        "instant": None,
+                    },
+                    True,
+                )
+                mock_cache.data = EnergyCacheData(
+                    samples=[0.0] * 900,
+                    data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                    last_sample_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    last_fetch_at=datetime(2026, 1, 1, 12, 15, 0, tzinfo=timezone.utc),
+                    sample_count=900,
+                    quantization_seconds=30,
+                    quantization_offset=0,
+                    quantization_confidence=1.0,
+                )
+                response = self.app.get("/", headers={"Accept": "text/html"})
+
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn('data-live="1"', html)
+        self.assertNotIn('http-equiv="refresh"', html)
+
     def test_partial_metrics_includes_freshness_strip(self):
         """The SSE-swapped metrics fragment carries the same strip."""
         with mock_config():
@@ -2420,11 +2493,83 @@ class TestDataFreshness(unittest.TestCase):
         js = TestIndexMobileAndLive._static_text("app.js")
         self.assertIn('[data-live="1"]', js)
 
+    def test_index_header_carries_connection_dot(self):
+        """The app-bar header carries the connection indicator so the
+        freshness strip below it costs no vertical footprint.
+
+        Reload mode shows state plus text; live+fresh renders dot-only
+        state (text stays visually hidden until trouble)."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        header = html.split("</header>", 1)[0]
+        self.assertIn('id="connection"', header)
+        self.assertIn('data-state="reload"', header)
+        self.assertIn("connection__dot", header)
+
+    def test_index_header_dot_only_when_live_fresh(self):
+        """LM-enabled fresh pages mark the header dot live (quiet)."""
+        with mock_config():
+            TestIndexMobileAndLive._lm_wired_state()
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        header = html.split("</header>", 1)[0]
+        self.assertIn('id="connection"', header)
+        self.assertIn('data-state="live"', header)
+
+    def test_metrics_strip_hidden_state_carrier(self):
+        """The in-fragment freshness strip is hidden: it carries SSE state
+        for the header dot instead of occupying its own row."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        html = response.data.decode("utf-8")
+        self.assertTrue(
+            re.search(
+                r'<div class="freshness" id="data-freshness"[^>]*hidden', html
+            ),
+            "freshness strip must be hidden",
+        )
+
+    def test_static_app_js_mirrors_connection_dot(self):
+        """app.js mirrors fragment freshness state onto the header dot
+        after every swap and tick."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn("getElementById('connection')", js)
+        self.assertIn("syncConnection", js)
+
+    def test_static_app_js_watches_sse_silence(self):
+        """app.js re-arms the reload fallback when a live SSE stream goes
+        quiet (device sleep, server restart, dead proxy).
+
+        Live pages carry no meta refresh, so a dead stream with no
+        watchdog would sit stale forever."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn("lastEventAt", js)
+        self.assertIn("silenceLimitMs", js)
+        self.assertIn("checkSilence", js)
+
+    def test_static_app_js_unlives_when_fragment_leaves_live(self):
+        """app.js leaves live mode when a swapped fragment is no longer
+        SSE-driven (e.g. load management disabled across a restart)."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn('[data-live="0"]', js)
+
     def test_static_css_styles_freshness_strip(self):
         """style.css styles the freshness strip and its status colors."""
         css = TestIndexMobileAndLive._static_text("style.css")
         self.assertIn(".freshness", css)
         self.assertIn("data-status", css)
+
+    def test_static_css_app_bar_keeps_container_centering(self):
+        """The app-bar must not clobber .container's margin-inline:auto
+        with a margin shorthand, or the header stretches full-width while
+        content stays centered (dot stranded at the viewport edge)."""
+        css = TestIndexMobileAndLive._static_text("style.css")
+        block = css.split(".app-bar {", 1)[1].split("}", 1)[0]
+        self.assertIn("margin-block", block)
+        self.assertNotIn("margin:", block)
 
 
 class TestSurplusIdeasLayout(unittest.TestCase):

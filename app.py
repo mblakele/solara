@@ -185,6 +185,11 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
         metrics_data = {"devices": [], "api_response": {}, "instant": now}
     if now is None:
         now = datetime.now(timezone.utc)
+    # Copy the top-level dict: the source may be the cached
+    # full_metrics_dict by reference, and rebinding "devices" below must
+    # not persist lag-bumped copies back into the cache — every render
+    # would otherwise inflate lag further for all later readers.
+    metrics_data = dict(metrics_data)
     # Shallow-copy device entries before mutating them: the source dict may
     # be the cached full_metrics_dict, and in-place lag updates there would
     # accumulate elapsed time on every enrich pass.

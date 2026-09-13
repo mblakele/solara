@@ -1743,7 +1743,12 @@ def test_incomplete_telemetry_unseeded_location_falls_back_to_rest_not_charging(
                     ctrl, "init_tesla_state",
                     return_value=rest_state,
                 ) as mock_init:
-                    result = asyncio.run(mgr._fetch_tesla_state_async())
+                    # REST arbitration finds nothing authoritative.
+                    with patch.object(
+                        ctrl, "_init_from_rest",
+                        return_value=None,
+                    ):
+                        result = asyncio.run(mgr._fetch_tesla_state_async())
 
     assert mock_init.called, (
         "init_tesla_state should still be called when telemetry is "

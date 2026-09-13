@@ -9,7 +9,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="format-detection" content="telephone=no">
 <title>solara</title>
-{% if refresh_secs is not none %}
+{# No meta refresh on SSE-driven (live) pages: the browser schedules it at
+   parse time and JS cannot cancel it, so it would bounce the page every N
+   seconds even while SSE works. The JS reload timer remains as the
+   cancellable fallback until markLive(). Reload-driven pages keep the meta
+   for no-JS / SSE-unavailable clients. #}
+{% if refresh_secs is not none and not (freshness and freshness.live) %}
 <meta http-equiv="refresh" content="{{ refresh_secs }}">
 {% endif %}
 {% if load_management and load_management.sleep_hint is defined %}
@@ -28,6 +33,15 @@
 
 <header class="app-bar container">
   <h1 class="app-bar__title">Solara</h1>
+  {% if freshness %}
+  {# Connection indicator: dot-only when live+fresh, text when troubled.
+     State mirrors the hidden #data-freshness strip via syncConnection(). #}
+  {% if freshness.live %}{% set cstate = freshness.status if freshness.status != 'fresh' else 'live' %}{% else %}{% set cstate = 'reload' %}{% endif %}
+  <div class="connection" id="connection" data-state="{{ cstate }}" aria-label="{{ 'Live' if cstate == 'live' else 'Data ' ~ freshness.age_secs ~ ' seconds old' ~ ('' if freshness.live else ', next update in ' ~ freshness.next_update_secs ~ ' seconds') }}">
+    <span class="connection__dot" aria-hidden="true"></span>
+    <span class="connection__text" id="connection-text" aria-hidden="true">data <b class="connection__age">{{ freshness.age_secs }}s</b> old{% if not freshness.live %} · next ~<b class="connection__next">{{ freshness.next_update_secs }}s</b>{% endif %}</span>
+  </div>
+  {% endif %}
 </header>
 
 <main id="metrics-section" class="metrics-wrap container">
@@ -35,13 +49,19 @@
 </main>
 
 {% if load_management and metrics.debug %}
+<details class="debug-details container">
+  <summary class="debug-details__summary">Load management (debug)</summary>
   {% include "_load_management.html" %}
+</details>
 {% endif %}
 
 {% if metrics.debug %}
-<div class="debug container">
-<pre>{{ metrics }}</pre>
-</div>
+<details class="debug-details container">
+  <summary class="debug-details__summary">Metrics (debug)</summary>
+  <div class="debug">
+  <pre>{{ metrics }}</pre>
+  </div>
+</details>
 {% endif %}
 
 <script src="static/app.js" defer></script>

@@ -7,13 +7,23 @@
  *     what keeps the page fresh when SSE is unavailable (no JS, old proxy,
  *     load management disabled).
  *
- *  2. Live — EventSource('/stream/status'). Each metrics/load event triggers
+ *  2. Live — EventSource (stream/status resolved against the page path).
+ *     Each metrics/load event triggers
  *     a small fragment fetch (`?partial=metrics`, `?partial=load`) and swaps
  *     the section's innerHTML in place. All markup stays server-rendered
  *     (single source of truth in the Jinja templates). Only a fragment that
  *     marks itself SSE-driven (`data-live="1"` — load management enabled)
- *     removes the meta refresh and reload timer; without a driver the page
- *     keeps bouncing on its own cadence.
+ *     cancels the reload timer; without a driver the page keeps bouncing
+ *     on its own cadence. (Live pages carry no <meta http-equiv="refresh">:
+ *     the browser schedules it at parse time and later DOM removal cannot
+ *     cancel it, so the server omits it when live.)
+ *
+ *  Watchdog — a live page has no refresh to fall back on, so every SSE
+ *  event stamps lastEventAt and checkSilence() re-arms the reload timer
+ *  when the stream goes quiet past silenceLimitMs (device sleep, server
+ *  restart, dead proxy). A swapped fragment showing `data-live="0"`
+ *  (load management went away across a restart) also drops live mode.
+ *  Either way the page self-heals instead of sitting stale.
  *
  *  The metrics fragment also carries a data-freshness strip (`#data-freshness`):
  *  how old the per-second data is, when to expect the next update, and — once
@@ -42,6 +52,12 @@
 
   var reloadTimer = null
   var live = false
+  // Last wall-clock time an SSE event arrived (page load counts: the
+  // server just rendered). The watchdog compares against this; normal
+  // cadence (≤30 s cycles, 60 s idle heartbeats) stays far below the
+  // limit of twice the reload horizon with a 90 s floor.
+  var lastEventAt = Date.now()
+  var silenceLimitMs = Math.max(2 * millisMax, 90 * 1000)
 
   function timestamp() {
     return new Date(Date.now()).toLocaleTimeString()
@@ -105,9 +121,15 @@
     if (nextEl) {
       nextEl.textContent = (remain >= 0 ? Math.ceil(remain) : 0) + 's'
     }
+    syncConnection()
   }
 
   setInterval(tickFreshness, 1000)
+
+  // Silence watchdog: live pages have no meta refresh, so a quiet stream
+  // (device sleep, server restart, dead proxy) must re-arm the reload
+  // fallback instead of sitting stale.
+  setInterval(checkSilence, 10 * 1000)
 
   function cancelAutoRefresh() {
     var meta = document.querySelector('meta[http-equiv="refresh"]')
@@ -122,11 +144,25 @@
 
   document.addEventListener('visibilitychange', function () {
     log('visibilitychange', document.visibilityState)
+    if (document.visibilityState === 'visible') {
+      // Refresh the tick immediately (intervals are throttled while
+      // hidden) and reload at once if SSE died while we were away.
+      tickFreshness()
+      if (checkSilence()) {
+        log('reloading after silent sse')
+        window.location.reload()
+      }
+    }
   })
 
   window.addEventListener('focus', function () {
     var millis = Date.now() - window.__solaraTimePrev
     log('focus after', millis + 'ms')
+    if (checkSilence()) {
+      log('reloading after silent sse')
+      window.location.reload()
+      return
+    }
     if (!live && millis > millisMax) {
       log('reloading via focus')
       window.location.reload()
@@ -151,7 +187,70 @@
     live = true
     cancelAutoRefresh()
     applyLiveBadge()
+    syncConnection()
     log('live updates active via /stream/status')
+  }
+
+  function unlive(reason) {
+    if (!live) {
+      return
+    }
+    live = false
+    log('sse driver lost, fallback reload rearmed', reason)
+    scheduleReload()
+    syncConnection()
+  }
+
+  function noteEvent() {
+    lastEventAt = Date.now()
+  }
+
+  function checkSilence() {
+    if (live && Date.now() - lastEventAt > silenceLimitMs) {
+      unlive('silent sse')
+      return true
+    }
+    return false
+  }
+
+  // Mirror fragment freshness onto the header connection dot. The
+  // in-fragment strip is a hidden state carrier; this paints the only
+  // visible indicator: dot-only when live+fresh, text when troubled
+  // (aging/stale data, reload mode, or a silent stream).
+  function syncConnection() {
+    var conn = document.getElementById('connection')
+    var strip = document.getElementById('data-freshness')
+    if (!conn || !strip) {
+      return
+    }
+    var status = strip.getAttribute('data-status') || 'fresh'
+    var driven = strip.getAttribute('data-live') === '1'
+    var silent = Date.now() - lastEventAt > silenceLimitMs
+    var state = silent ? 'reconnecting' : (!driven ? 'reload' : (status === 'fresh' ? 'live' : status))
+    if (conn.getAttribute('data-state') !== state) {
+      conn.setAttribute('data-state', state)
+    }
+    var ageEl = strip.querySelector('.freshness__age')
+    var nextEl = strip.querySelector('.freshness__next')
+    var age = ageEl ? ageEl.textContent : ''
+    var next = nextEl ? nextEl.textContent : ''
+    var label = state === 'live' ? 'Live'
+      : state === 'reconnecting' ? 'Reconnecting, data ' + age + ' old'
+      : !driven ? 'Data ' + age + ' old, next update in ' + next
+      : 'Data ' + age + ' old'
+    conn.setAttribute('aria-label', label)
+    var textEl = document.getElementById('connection-text')
+    if (textEl) {
+      var key = state + '|' + age + '|' + next + '|' + driven
+      if (textEl.getAttribute('data-rendered') !== key) {
+        var html = 'data <b class="connection__age">' + age + '</b> old'
+        if (!driven) {
+          html += ' · next ~<b class="connection__next">' + next + '</b>'
+        }
+        textEl.innerHTML = html
+        textEl.setAttribute('data-rendered', key)
+      }
+    }
   }
 
   function swapSection(id, url, selector) {
@@ -178,6 +277,15 @@
         if (!live && node.querySelector('[data-live="1"]') && node.querySelector(selector)) {
           markLive()
         }
+        // Leaving live mode: the fragment is no longer SSE-driven
+        // ([data-live="0"] — load management went away, e.g. disabled
+        // across a server restart). Drop live and re-arm the reload timer;
+        // a later live fragment re-marks live and cancels it again, so
+        // flaps self-correct instead of sticking.
+        if (live && node.querySelector('[data-live="0"]')) {
+          unlive('fragment left live mode')
+        }
+        syncConnection()
       })
       .catch(function (err) {
         // Keep the auto-refresh fallback in place.
@@ -185,25 +293,51 @@
       })
   }
 
+  // Resolve the SSE endpoint against the page path so the dashboard works
+  // behind a subpath proxy (e.g. /solara/ -> /solara/stream/status) as well
+  // as at the site root (/ -> /stream/status). The index page always lives
+  // at the app root directory, so the directory containing the page is the
+  // app root.
+  function sseUrl() {
+    var base = window.location.pathname
+    if (base.slice(-1) !== '/') {
+      base += '/'
+    }
+    return base + 'stream/status'
+  }
+
   if (window.EventSource) {
-    var source = new EventSource('/stream/status')
+    var source = new EventSource(sseUrl())
     source.addEventListener('initial_metrics', function () {
+      noteEvent()
       swapSection('metrics-section', '?partial=metrics', '.forecast')
     })
     source.addEventListener('metrics_update', function () {
+      noteEvent()
       swapSection('metrics-section', '?partial=metrics', '.forecast')
     })
     source.addEventListener('initial_load_state', function () {
+      noteEvent()
       swapSection('load-management-section', '?partial=load', '.load-management')
     })
     source.addEventListener('load_cycle', function () {
+      noteEvent()
       swapSection('load-management-section', '?partial=load', '.load-management')
     })
-    // EventSource reconnects automatically; no explicit retry needed.
-    // If the connection dies permanently the fallback refresh still works
-    // unless we already switched to live (in which case a reconnect will
-    // resume updates).
+    // Heartbeats carry no swap but prove the stream is alive; without
+    // this a healthy idle stream would trip the silence watchdog.
+    source.addEventListener('heartbeat', function () {
+      noteEvent()
+    })
+    // EventSource reconnects automatically; transient errors need no
+    // handling beyond a log line. A permanently dead stream trips the
+    // silence watchdog above, which re-arms the reload fallback (live
+    // pages carry no meta refresh to fall back on).
+    source.onerror = function () {
+      log('sse connection error, retrying')
+    }
   }
 
+  syncConnection()
   scheduleReload()
 })()

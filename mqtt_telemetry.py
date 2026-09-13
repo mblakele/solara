@@ -32,7 +32,13 @@ import paho.mqtt.client as mqtt
 
 from constants import TESLA_HOME_RADIUS_M_DEFAULT
 
-from load_models import TeslaState, build_tesla_state, parse_charge_amps, unwrap_telemetry_value
+from load_models import (
+    TeslaState,
+    build_tesla_state,
+    parse_charge_amps,
+    telemetry_indicates_charging,
+    unwrap_telemetry_value,
+)
 from util import _haversine_distance
 
 # Deferred import to avoid circular import with config_loader → device_config
@@ -417,18 +423,18 @@ def tesla_state_from_snapshot(
 ) -> TeslaState | None:
     """Build a ``TeslaState`` from the current normalised MQTT snapshot.
 
-    Returns ``None`` when neither ``DetailedChargeState`` nor a positive
-    ``ChargeAmps`` value is present.
+    Returns ``None`` when no corroborated charging state is present.
 
     When ``DetailedChargeState`` is available, the standard mapping applies:
     - ``"DetailedChargeStateCharging"``     → ``is_charging=True``,  ``plugged_in=True``
     - ``"DetailedChargeStateComplete"``     → ``is_charging=False``, ``plugged_in=True``
     - ``"DetailedChargeStateDisconnected"`` → ``is_charging=False``, ``plugged_in=False``
 
-    When ``DetailedChargeState`` has not yet arrived via MQTT but
-    ``ChargeAmps > 0`` is present, the charging state is inferred from
-    the amps value (amps > 0 means charging is active).  This avoids
-    returning stale cached state from an earlier REST fallback.
+    When ``DetailedChargeState`` has not yet arrived, ``ChargeState ==
+    "Charging"`` corroborates charging alongside ``ChargeAmps > 0``.
+    ``ChargeAmps`` alone never infers charging: it is the pilot/limit
+    setting and holds its last value when idle
+    (bugs/2026-09-09-tesla-ghost.log).
 
     ``at_home`` is computed via haversine from the ``Location`` field.
     ``current_amps`` comes from ``ChargeAmps`` (rounded to int).
@@ -461,14 +467,21 @@ def tesla_state_from_snapshot(
             detailed_charge_state_str != "DetailedChargeStateDisconnected"
         )
     else:
-        # DetailedChargeState not yet received — try to infer from ChargeAmps.
+        # DetailedChargeState not yet received — require ChargeState
+        # corroboration; ChargeAmps alone is the pilot setting, not proof.
+        if not telemetry_indicates_charging(snapshot):
+            logger.warning(
+                "mqtt_telemetry: tesla_state_from_snapshot returning None — "
+                "no corroborated charging state (snapshot keys: %s)",
+                sorted(snapshot.keys()),
+            )
+            return None
         charge_val = parse_charge_amps(snapshot.get("ChargeAmps"))
         if charge_val is not None and charge_val > 0:
-            # Amps > 0 means charging is active — infer state from
-            # partial snapshot and skip remaining parsing.
+            # Corroborated charging (ChargeState == "Charging") with amps.
             logger.info(
                 "mqtt_telemetry: inferred charging from ChargeAmps=%s "
-                "(DetailedChargeState not yet received)",
+                "corroborated by ChargeState",
                 charge_val,
             )
             return build_tesla_state(
@@ -479,13 +492,19 @@ def tesla_state_from_snapshot(
             )
         logger.warning(
             "mqtt_telemetry: tesla_state_from_snapshot returning None — "
-            "DetailedChargeState not yet received (snapshot keys: %s)",
+            "corroborated charging state without positive ChargeAmps "
+            "(snapshot keys: %s)",
             sorted(snapshot.keys()),
         )
         return None
 
-    # ChargeAmps
-    current_amps = parse_charge_amps(snapshot.get("ChargeAmps"))
+    # ChargeAmps: the pilot/request setting, not measured draw — report 0
+    # when the charging state says the car isn't charging, so a retained
+    # pilot value can't render as a phantom "(5)" (ghost-b log).
+    if is_charging:
+        current_amps = parse_charge_amps(snapshot.get("ChargeAmps"))
+    else:
+        current_amps = 0
 
     at_home = _compute_at_home_from_location(snapshot)
     return build_tesla_state(
