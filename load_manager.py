@@ -984,7 +984,7 @@ class LoadManager:
         )
 
     async def _arbitrate_tesla_state_from_rest(
-        self, snapshot: dict[str, Any],
+        self, snapshot: dict[str, Any], now: datetime | None = None,
     ) -> TeslaState | None:
         """Resolve ambiguous telemetry with an authoritative REST poll.
 
@@ -999,13 +999,22 @@ class LoadManager:
         :meth:`_arbitration_sustain`). A negative answer is also latched
         for the cooldown so ghost periods don't poll-storm.
 
+        Skipped entirely outside the configured tesla.time_range window:
+        the state would be discarded by eligibility filtering anyway, so
+        no quota is spent.
+
         Args:
             snapshot: Telemetry snapshot dict.
+            now: Current wall-clock time for the time-range check and
+                cooldown math. Falls back to the injected clock when None.
 
         Returns:
             ``TeslaState`` when arbitration confirms charging (fresh poll
             or sustained verdict), else ``None`` (idle ghost-guard applies).
         """
+        effective_now = now if now is not None else self._clock.now()
+        if not self._is_tesla_in_range(effective_now):
+            return None
         reported = parse_charge_amps(snapshot.get("ChargeAmps"))
         if reported is None or reported <= 0:
             self._last_rest_arbitration_charging = False
@@ -1015,7 +1024,7 @@ class LoadManager:
         sustained = self._arbitration_sustain(snapshot, reported)
         if sustained is not None:
             return sustained
-        now = self._clock.now()
+        now = effective_now
         last_at = self._last_rest_arbitration_at
         if (
             last_at is not None
@@ -1558,7 +1567,7 @@ class LoadManager:
         return 0.0
 
     async def _fetch_tesla_state_async(
-        self,
+        self, now: datetime | None = None,
     ) -> tuple[TeslaState | None, str | None, str | None]:
         """Fetch Tesla charging state from MQTT telemetry, with REST fallback.
 
@@ -1568,11 +1577,23 @@ class LoadManager:
         the REST API fallback.
         The result is cached on the controller so subsequent calls are fast.
 
+        Outside the configured tesla.time_range window the REST fallback
+        and REST arbitration are skipped (telemetry is free MQTT and is
+        still used): the state would be discarded by eligibility filtering
+        anyway, so no vehicle-API quota is spent.
+
+        Args:
+            now: Current wall-clock time for the time-range check. Falls
+                back to the injected clock when None.
+
         Returns:
             Tuple of (tesla_state, tesla_error, tesla_login_url).
         """
         if self.tesla_ctrl is None:
             return None, None, None
+
+        effective_now = now if now is not None else self._clock.now()
+        tesla_in_range = self._is_tesla_in_range(effective_now)
 
         # Fast path: use live telemetry state whenever available.
         telemetry_state: TeslaState | None = None
@@ -1607,6 +1628,10 @@ class LoadManager:
                 # (15s interval) before Location (120s interval) so the
                 # telemetry fast path would otherwise return at_home=False
                 # without ever reaching the REST fallback below.
+                # Outside the tesla time range there is no REST seeding —
+                # return the telemetry state as-is (eligibility drops it).
+                if not tesla_in_range:
+                    return telemetry_state, None, None
             else:
                 # Live telemetry is present but reports no corroborated
                 # charging state. Before declaring idle, check the command
@@ -1617,9 +1642,10 @@ class LoadManager:
                     return echo, None, None
                 # No echo: arbitrate positive amps via REST (an external
                 # session we never commanded looks exactly like the pilot
-                # ghost on this feed).
+                # ghost on this feed). Skipped outside the tesla time
+                # range — _arbitrate_* also guards, this avoids the call.
                 arbitrated = await self._arbitrate_tesla_state_from_rest(
-                    telemetry_snapshot
+                    telemetry_snapshot, now=effective_now
                 )
                 if arbitrated is not None:
                     return arbitrated, None, None
@@ -1642,9 +1668,16 @@ class LoadManager:
                 # fallback below to seed _last_tesla_at_home. The REST merge
                 # (below) folds ``rest_state.at_home`` into the not-charging
                 # telemetry state, discarding the placeholder at_home=False.
+                # Outside the tesla time range there is no REST seeding.
                 telemetry_state = _not_charging_state(at_home=False)
+                if not tesla_in_range:
+                    return telemetry_state, None, None
 
         # REST fallback to seed _last_tesla_at_home and/or obtain location.
+        # Skipped outside the tesla time range: the state would be
+        # discarded by eligibility filtering, so no quota is spent.
+        if not tesla_in_range:
+            return telemetry_state, None, None
         if not isinstance(self.tesla_ctrl, RealTeslaController):
             return telemetry_state, None, None
 
@@ -2449,7 +2482,7 @@ class LoadManager:
         if (early := await self._async_sync_and_check_sentinel()):
             return early
         tesla_state, tesla_error, tesla_login_url = (
-            await self._fetch_tesla_state_async()
+            await self._fetch_tesla_state_async(now=now)
         )
         self._record_tesla_auth_error(tesla_error, tesla_login_url)
         corrected_adjusted_wh, corrected_gap_wh = self._correct_gap_with_inflight(
