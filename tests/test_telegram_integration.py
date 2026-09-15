@@ -347,7 +347,7 @@ class TestCycleCallsNotification:
         now = datetime.now(timezone.utc)
 
         with (
-            patch.object(mgr, "_sync_plug_states"),
+            patch.object(mgr, "_sync_plug_states", return_value=[]),
             patch.object(mgr, "_fetch_tesla_state_async", return_value=(None, None, None)),
             patch.object(mgr, "_execute_action", return_value=True),
             patch("load_manager.datetime") as mock_dt,
@@ -381,7 +381,7 @@ class TestCycleCallsNotification:
         now = datetime.now(timezone.utc)
 
         with (
-            patch.object(mgr, "_sync_plug_states"),
+            patch.object(mgr, "_sync_plug_states", return_value=[]),
             patch.object(mgr, "_fetch_tesla_state_async", return_value=(None, None, None)),
             patch.object(mgr, "_execute_action", return_value=True),
             patch("load_manager.datetime") as mock_dt,

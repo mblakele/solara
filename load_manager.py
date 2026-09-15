@@ -1723,14 +1723,22 @@ class LoadManager:
             return telemetry_state, None, None
         return None, None, None
 
-    async def _sync_plug_states(self) -> None:
+    async def _sync_plug_states(self) -> list[PendingEffect]:
         """Query actual plug states from controllers and reconcile with tracking.
 
         Detects external changes (e.g., user manually toggling a plug) by comparing
         the controller's reported state against our internal desired_state. When they
         diverge, updates both actual_state and desired_state to match reality so the
-        GapMinder makes decisions based on current conditions.
+        GapMinder makes decisions based on current conditions. Daily ON-time books
+        move via note_desired_transition, exactly as for managed decisions.
+
+        Returns:
+            Synthetic PendingEffects for reconciled external flips (empty
+            when nothing diverged). The async phase queues Telegram alerts
+            for these, reusing the whitelist and runtime rendering of
+            decided actions.
         """
+        external: list[PendingEffect] = []
         for name in self.plugs:
             try:
                 actual = await self.plug_ctrl.get_state(name)
@@ -1758,6 +1766,12 @@ class LoadManager:
             else:
                 prev_actual = dev_state.actual_state
                 dev_state.actual_state = actual
+                if prev_actual == actual:
+                    # No change in reported state — a desired/actual
+                    # mismatch is our own unconfirmed command, not an
+                    # external flip. Keep desired so the dashboard holds
+                    # pending instead of flapping to off/on.
+                    continue
                 # Reconcile: if external actor changed the state, match it
                 if dev_state.desired_state != actual:
                     logger.info(
@@ -1771,9 +1785,12 @@ class LoadManager:
                     self.state.note_desired_transition(
                         name, actual, self._clock.now()
                     )
-                    self._record_external_effect(
+                    effect = self._record_external_effect(
                         name, actual, prev_desired, prev_actual
                     )
+                    if effect is not None:
+                        external.append(effect)
+        return external
 
     def _record_external_effect(
         self,
@@ -1781,33 +1798,39 @@ class LoadManager:
         actual: bool,
         prev_desired: bool | None,
         prev_actual: bool | None,
-    ) -> None:
+    ) -> PendingEffect | None:
         """Record a pending effect for an externally flipped plug.
 
         Mirrors a load-manager decision so NBC math (estimated_current_wh)
         and the can_toggle debounce account for the change before the next
-        decision. Skipped on first observation (previous actual unknown),
-        when the previous desired state is unknown, the plug's rated power
-        is unknown, or dry-run mode is active.
+        decision. The returned effect lets the caller raise a Telegram
+        alert for the flip. Skipped on first observation (previous actual
+        unknown), when the previous desired state is unknown, the plug's
+        rated power is unknown, or dry-run mode is active.
 
         Args:
             name: Plug configuration name.
             actual: Reconciled actual state (True = on).
             prev_desired: Desired state before reconciliation.
             prev_actual: Actual state before this sync (None on first sight).
+
+        Returns:
+            The recorded PendingEffect, or None when skipped.
         """
         if prev_actual is None or prev_desired is None or self.dry_run:
-            return
+            return None
         plug = self.plugs.get(name)
         power = plug.power_watts if plug is not None else None
         if power is None:
-            return
+            return None
         now = self._clock.now()
         action: Literal["turn_on", "turn_off"] = "turn_on" if actual else "turn_off"
-        self.state.add_effect(make_plug_effect(name, action, power, now, now))
+        effect = make_plug_effect(name, action, power, now, now)
+        self.state.add_effect(effect)
         dev_state = self.state.devices.get(name)
         if dev_state is not None:
             dev_state.last_toggle = now
+        return effect
 
     def _runtime_for_actions(
         self,
@@ -2191,22 +2214,26 @@ class LoadManager:
                     event.event_type,
                 )
 
-    async def _async_sync_and_check_sentinel(self) -> AsyncPhaseResult | None:
+    async def _async_sync_and_check_sentinel(
+        self,
+    ) -> tuple[AsyncPhaseResult | None, list[PendingEffect]]:
         """Sync plug states and short-circuit when a sentinel is on.
 
         Returns:
-            AsyncPhaseResult to return immediately, or None to continue.
+            Tuple of (early result to return immediately, or None to
+            continue; synthetic effects for external flips found during
+            the sync, for Telegram alerting by the caller).
         """
         # Sync actual plug states before making decisions so the engine sees
         # external changes (user toggles, other automations, etc.)
-        await self._sync_plug_states()
+        external = await self._sync_plug_states()
         # Placed after _sync_plug_states so device state is populated.
         if not self.is_sentinel_on():
-            return None
+            return None, external
         logger.info(
             "[_cycle_async_phase] sentinel device is on, disabling load management"
         )
-        return AsyncPhaseResult(sentinel_on=True)
+        return AsyncPhaseResult(sentinel_on=True), external
 
     def _record_tesla_auth_error(
         self, tesla_error: str | None, tesla_login_url: str | None
@@ -2479,7 +2506,8 @@ class LoadManager:
     ) -> AsyncPhaseResult:
         """Body of _cycle_async_phase, extracted for try/finally cleanup."""
         self._vehicle_offline_this_cycle = False
-        if (early := await self._async_sync_and_check_sentinel()):
+        early, external_actions = await self._async_sync_and_check_sentinel()
+        if early is not None:
             return early
         tesla_state, tesla_error, tesla_login_url = (
             await self._fetch_tesla_state_async(now=now)
@@ -2488,6 +2516,17 @@ class LoadManager:
         corrected_adjusted_wh, corrected_gap_wh = self._correct_gap_with_inflight(
             adjusted_wh, tesla_state, seconds_remaining, now, data_point_at
         )
+        # Alert externally flipped plugs exactly like decided actions:
+        # the sync already closed their runtime sessions, so turn_off
+        # lines carry today's ON-time. Whitelist and dry-run guards apply.
+        if external_actions:
+            self._queue_surplus_notification(
+                actions=external_actions,
+                predicted_wh=corrected_adjusted_wh,
+                target_wh=self.target_wh,
+                dry_run=dry_run,
+                now=now,
+            )
         # Hysteresis guard uses corrected gap so in-flight Tesla draw is counted.
         if abs(corrected_gap_wh) <= self.engine.HYSTERESIS_WH:
             return AsyncPhaseResult(

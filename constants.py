@@ -53,6 +53,14 @@ DEFAULT_TARGET_WH: int = -50
 HYSTERESIS_PROPORTION: float = 1.0 / 3.0
 """Hysteresis Wh is abs(target_wh) * this proportion."""
 
+DEFAULT_HYSTERESIS_WH: int = 20
+"""Fallback hysteresis (Wh) when GapMinder gets no explicit value.
+
+Residential scale: blocks sub-20 Wh noise without swallowing the
+hundred-Wh gap errors real plug/Tesla decisions work with. Production
+still passes int(abs(target_wh) / 3) explicitly; this only covers
+direct GapMinder() construction (mostly tests)."""
+
 MIN_SECONDS_TO_ACT: int = 21
 """Minimum seconds remaining in a quarter-hour before the GapMinder will
 allow turn-on or Tesla amp changes.  Prevents actions too close to the

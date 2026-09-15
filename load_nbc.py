@@ -23,6 +23,7 @@ from config import Config
 from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
 
 from constants import (
+    DEFAULT_HYSTERESIS_WH,
     DEFAULT_PREDICTION_WINDOW_SECS,
     MIN_SECONDS_TO_ACT,
     SETTLE_WINDOW_DEADBAND_SECS,
@@ -1897,15 +1898,15 @@ class GapMinder:
 
         Args:
             hysteresis_wh: Hysteresis threshold in Wh. When None, defaults to
-                1000 for backward compatibility.
+                DEFAULT_HYSTERESIS_WH (20, residential scale).
             charge_amps_min: Minimum Tesla charge amps before turning off
                 instead of reducing further. Defaults to 5.
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
                 to 48.
         """
-        # Backward-compat default hysteresis of 1000 Wh; the load manager
-        # passes a config-derived value (abs(target_wh) * 1/3) in production.
-        self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else 1000
+        # Residential default (20 Wh); the load manager passes an explicit
+        # config-derived value (abs(target_wh) * 1/3) in production.
+        self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else DEFAULT_HYSTERESIS_WH
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.tesla_decider = TeslaDecider(

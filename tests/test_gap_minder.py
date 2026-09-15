@@ -34,7 +34,7 @@ def test_hysteresis_no_action():
 
 
 def test_hysteresis_no_action_at_boundary():
-    """No action exactly at +/-999 Wh (within margin)."""
+    """No action for a 19 Wh gap (within the 20 Wh margin)."""
     engine = GapMinder()
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
@@ -47,7 +47,7 @@ def test_hysteresis_no_action_at_boundary():
             plugs=plugs,
             tesla=None,
         ),
-        predicted_wh=-1500.0,
+        predicted_wh=-519.0,
         target_wh=-500.0,
     )
 
@@ -56,8 +56,8 @@ def test_hysteresis_no_action_at_boundary():
 
 def test_hysteresis_custom_value():
     """Custom hysteresis allows action within default margin."""
-    # With default hysteresis of 1000, gap=500 would be within margin.
-    # With hysteresis=100, gap=500 should trigger action.
+    # With default hysteresis of 20, gap=500 would be outside margin.
+    # With hysteresis=100, gap=500 should still trigger action.
     engine = GapMinder(hysteresis_wh=100)
     state = StateTracker()
     plugs = {
@@ -619,8 +619,8 @@ def test_hysteresis_blocks_small_gap_turn_off():
         ),
     }
 
-    # Tiny over-target gap: predicted -450 Wh vs target -500 Wh
-    # → gap = -500 - (-450) = -50 Wh (abs_gap = 50, within hysteresis)
+    # Tiny over-target gap: predicted -490 Wh vs target -500 Wh
+    # → gap = -500 - (-490) = -10 Wh (abs_gap = 10, within hysteresis)
     actions = engine.decide(
         ctx=DecideContext(
             now=fixed_now,
@@ -629,11 +629,11 @@ def test_hysteresis_blocks_small_gap_turn_off():
             plugs=plugs,
             tesla=None,
         ),
-        predicted_wh=-450.0,
+        predicted_wh=-490.0,
         target_wh=-500.0,
     )
 
-    # savings (250) > 2 * abs_gap (100), so undershoot would be worse than
+    # savings (250) > 2 * abs_gap (20), so undershoot would be worse than
     # overshoot — no action taken.
     assert len(actions) == 0
 
@@ -658,7 +658,7 @@ def test_hysteresis_blocks_small_gap_tesla_reduce():
         at_home=True,
     )
 
-    # Small over-target gap: predicted 350 Wh vs target -500 Wh → abs_gap = 150 Wh
+    # Small over-target gap: predicted -490 Wh vs target -500 Wh → abs_gap = 10 Wh
     actions = engine.decide(
         ctx=DecideContext(
             now=fixed_now,
@@ -667,21 +667,21 @@ def test_hysteresis_blocks_small_gap_tesla_reduce():
             plugs=plugs,
             tesla=tesla,
         ),
-        predicted_wh=350.0,
+        predicted_wh=-490.0,
         target_wh=-500.0,
     )
 
-    # Within hysteresis (150 < 1000) and no oversized device to bypass — no action
+    # Within hysteresis (10 < 20) and no oversized device to bypass — no action
     assert len(actions) == 0
 
 
 def test_hysteresis_blocks_small_gap_multiple():
     """A small over-target gap must not turn off any devices when
-    all of them fit in the gap but total savings is less than abs_gap.
+    the gap itself is inside hysteresis.
 
     Regression guard: if the top-level hysteresis gate is removed for
     over-target cases, this test will fail because the engine turns off
-    both plugs (total savings 62.5 Wh) for a 150 Wh gap.
+    both plugs (total savings 62.5 Wh) for a 10 Wh gap.
     """
     engine = GapMinder()
     state = StateTracker()
@@ -710,8 +710,8 @@ def test_hysteresis_blocks_small_gap_multiple():
         ),
     }
 
-    # Small over-target gap: predicted -350 Wh vs target -500 Wh
-    # → gap = -500 - (-350) = -150 Wh (abs_gap = 150, within hysteresis)
+    # Small over-target gap: predicted -490 Wh vs target -500 Wh
+    # → gap = -500 - (-490) = -10 Wh (abs_gap = 10, within hysteresis)
     actions = engine.decide(
         ctx=DecideContext(
             now=fixed_now,
@@ -720,13 +720,13 @@ def test_hysteresis_blocks_small_gap_multiple():
             plugs=plugs,
             tesla=None,
         ),
-        predicted_wh=-350.0,
+        predicted_wh=-490.0,
         target_wh=-500.0,
     )
 
     # fan savings ≈ 12.5 Wh (fits), dehumidifier savings ≈ 50 Wh (fits)
-    # Both fit in the gap but total savings (62.5) < abs_gap (150).
-    # Hysteresis blocks entirely since abs_gap (150) < HYSTERESIS_WH (1000)
+    # Both fit in the gap but total savings (62.5) > abs_gap (10).
+    # Hysteresis blocks entirely since abs_gap (10) < HYSTERESIS_WH (20)
     # and no oversized device would benefit from bypass.
     assert len(actions) == 0
 

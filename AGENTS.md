@@ -155,7 +155,8 @@ project-root
                            # env via the Config class + devices.json
 ├── conftest.py            # Pytest shared fixtures & configuration
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS,
-                           # Tesla charging constants TESLA_HARD_MAX_AMPS, etc.)
+                           # Tesla charging constants TESLA_HARD_MAX_AMPS, etc.,
+                           # DEFAULT_HYSTERESIS_WH=20 residential fallback)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
@@ -467,6 +468,13 @@ project-root
   `StateTracker.note_desired_transition()` (single funnel for GapMinder
   decisions and `_sync_plug_states` reconciliation; meter-local midnight
   resets/clips) and read via `runtime_today_for()` for alerts only
+- Dashboard pills (`templates/_metrics.html`) show `pending-on/off` (faded)
+  while a pending effect exists, else fall back to unconfirmed `desired_state`
+  mismatch (desired=True/actual=False → pending-on, desired=False/actual=True
+  → pending-off) so pruning before controller confirmation never flaps to
+  off/on; `_sync_plug_states` (`load_manager.py`) only reconciles `desired`
+  when the reported `actual` actually changed, preserving our own unconfirmed
+  command. Covered by `tests/test_desired_pending.py`.
 - Stale detection uses **data-point age** (not fetch time): `data_point_at = fetched_at - timedelta(seconds=data_lag_secs)`.
   The threshold is `STALE_DATA_THRESHOLD_SECS` (80 seconds, constants.py) from the most
   recent per-second data point, accounting for Emporia API lag. Min toggle interval: 60 seconds.
