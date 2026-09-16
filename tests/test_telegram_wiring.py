@@ -3,14 +3,14 @@
 Verifies that:
   - app._get_load_manager() passes a telegram_sender to LoadManagerConfig
   - load_manager.py logs when telegram sender is configured or not
-  - LoadManager._fire_telegram_notification respects the sender status
+  - LoadManager._queue_auth_error_notification respects the sender status
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -165,34 +165,31 @@ class TestLoadManagerTelegramLogging:
 
 
 # =============================================================================
-# 4. LoadManager._fire_auth_error_notification
+# 4. LoadManager._queue_auth_error_notification
 # =============================================================================
 
 
-class TestFireAuthErrorNotification:
+class TestQueueAuthErrorNotification:
 
-    @pytest.mark.asyncio
-    async def test_noop_when_sender_none(self):
-        """When telegram_sender is None, returns False."""
+    def test_noop_when_sender_none(self):
+        """When telegram_sender is None, nothing is queued."""
 
         mgr = LoadManager(LoadManagerConfig(telegram_sender=None))
-        result = await mgr._fire_auth_error_notification("auth error")
-        assert result is False
+        mgr._queue_auth_error_notification("auth error")
+        assert mgr._pending_notifications == []
 
-    @pytest.mark.asyncio
-    async def test_noop_when_not_configured(self):
-        """When sender exists but is_configured is False, returns False."""
+    def test_noop_when_not_configured(self):
+        """When sender exists but is_configured is False, nothing is queued."""
         mock_sender = MagicMock()
         mock_sender.is_configured = False
 
 
         mgr = LoadManager(LoadManagerConfig(telegram_sender=mock_sender))
-        result = await mgr._fire_auth_error_notification("auth error")
-        assert result is False
+        mgr._queue_auth_error_notification("auth error")
+        assert mgr._pending_notifications == []
 
-    @pytest.mark.asyncio
-    async def test_noop_when_alert_disabled(self):
-        """When alert_on_auth_error is False, returns False."""
+    def test_noop_when_alert_disabled(self):
+        """When alert_on_auth_error is False, nothing is queued."""
         mock_sender = MagicMock()
         mock_sender.is_configured = True
 
@@ -201,26 +198,27 @@ class TestFireAuthErrorNotification:
             LoadManagerConfig(telegram_sender=mock_sender),
         )
         mgr._telegram_alert_on_auth_error = False
-        result = await mgr._fire_auth_error_notification("auth error")
-        assert result is False
+        mgr._queue_auth_error_notification("auth error")
+        assert mgr._pending_notifications == []
 
-    @pytest.mark.asyncio
-    async def test_sends_when_alert_enabled(self):
-        """When alert_on_auth_error is True, sends notification."""
+    def test_queues_when_alert_enabled(self):
+        """When alert_on_auth_error is True, an error event is queued."""
+        from clock import FakeClock
+
         mock_sender = MagicMock()
         mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
 
 
         mgr = LoadManager(
-            LoadManagerConfig(telegram_sender=mock_sender),
+            LoadManagerConfig(
+                telegram_sender=mock_sender,
+                clock=FakeClock(datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)),
+            ),
         )
-        result = await mgr._fire_auth_error_notification("login_required")
-        assert result is True
-        mock_sender.send_notification.assert_awaited_once()
-        # Verify the notification contains the error text
-        call_args = mock_sender.send_notification.call_args[0][0]
-        assert "login_required" in call_args.description
+        mgr._queue_auth_error_notification("login_required")
+        assert len(mgr._pending_notifications) == 1
+        event = mgr._pending_notifications[0]
+        assert "login_required" in event.description
 
 
 # =============================================================================

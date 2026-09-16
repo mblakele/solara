@@ -2,7 +2,7 @@
 
 Covers:
   - LoadManager accepts telegram_sender parameter (via __init__)
-  - _fire_telegram_notification builds and sends the notification
+  - _queue_surplus_notification builds and queues the notification
   - Dry-run mode skips Telegram notifications
   - Missing sender gracefully skips notification
   - LoadManager.close() closes the telegram sender
@@ -152,153 +152,6 @@ class TestInitTelegramSender:
             )
         )
         assert mgr.telegram_sender is sender
-
-
-# =============================================================================
-# Tests: _fire_telegram_notification
-# =============================================================================
-
-
-class TestFireTelegramNotification:
-
-    @pytest.mark.asyncio
-    async def test_noop_when_sender_is_none(self):
-        """When telegram_sender is None, notification is skipped silently."""
-        mgr = _make_manager(telegram_sender=None)
-        now = datetime.now(timezone.utc)
-
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="pool_pump",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=2000.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
-        )
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_sends_notification_on_successful_actions(self):
-        """When sender is configured, whitelist matches, and actions exist, notification is sent."""
-        mock_sender = AsyncMock(spec=TelegramSender)
-        mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
-
-        mgr = _make_manager_with_telegram_devices(
-            telegram_sender=mock_sender,
-            telegram_devices={"pool_pump": ["turn_on"]},
-        )
-        now = datetime.now(timezone.utc)
-
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="pool_pump",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=2000.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
-        )
-
-        assert result is True
-        mock_sender.send_notification.assert_called_once()
-        event = mock_sender.send_notification.call_args[0][0]
-        assert isinstance(event, NotificationEvent)
-        assert event.event_type == "surplus"
-
-    @pytest.mark.asyncio
-    async def test_noop_when_sender_not_configured(self):
-        """When sender exists but is not configured, notification is skipped."""
-        mock_sender = AsyncMock(spec=TelegramSender)
-        mock_sender.is_configured = False
-
-        mgr = _make_manager(telegram_sender=mock_sender)
-        now = datetime.now(timezone.utc)
-
-        result = await mgr._fire_telegram_notification(
-            actions=[{"device": "pool_pump", "action": "turn_on"}],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
-        )
-
-        assert result is False
-        mock_sender.send_notification.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_noop_in_dry_run_mode(self):
-        """When dry_run is True, notification is skipped even if actions exist."""
-        mock_sender = AsyncMock(spec=TelegramSender)
-        mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
-
-        mgr = _make_manager(telegram_sender=mock_sender, dry_run=True)
-        now = datetime.now(timezone.utc)
-
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="pool_pump",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=2000.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=True,
-            now=now,
-        )
-
-        assert result is False
-        mock_sender.send_notification.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_returns_false_on_send_failure(self):
-        """Returns False when the underlying send fails."""
-        mock_sender = AsyncMock(spec=TelegramSender)
-        mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=False)
-
-        mgr = _make_manager(telegram_sender=mock_sender)
-        now = datetime.now(timezone.utc)
-
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="pool_pump",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=2000.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
-        )
-
-        assert result is False
 
 
 # =============================================================================
@@ -585,117 +438,116 @@ def _make_manager_with_telegram_devices(
 
 
 class TestTelegramDeviceWhitelist:
-    """Tests for telegram.devices whitelist gating in _fire_telegram_notification."""
+    """Tests for telegram.devices whitelist gating in _queue_surplus_notification."""
 
-    @pytest.mark.asyncio
-    async def test_no_notification_when_whitelist_not_configured(self):
-        """When telegram.devices is not configured, no notification is sent."""
-        mock_sender = AsyncMock(spec=TelegramSender)
+    @staticmethod
+    def _queue(
+        mgr: LoadManager,
+        actions: list,
+        dry_run: bool = False,
+    ) -> None:
+        """Queue a turn_on for the given actions via the live queue path."""
+        now = datetime.now(timezone.utc)
+        mgr._queue_surplus_notification(
+            actions=actions,
+            predicted_wh=-2000.0,
+            target_wh=-500.0,
+            dry_run=dry_run,
+            now=now,
+        )
+
+    @staticmethod
+    def _turn_on(device: str = "pool_pump", power: float = 1500.0) -> PendingEffect:
+        """Build a turn_on PendingEffect for whitelist tests."""
+        now = datetime.now(timezone.utc)
+        return PendingEffect(
+            device_name=device,
+            action="turn_on",
+            timestamp=now,
+            data_point_at=now,
+            power_watts=power,
+            target_amps=None,
+        )
+
+    def test_no_notification_when_whitelist_not_configured(self):
+        """When telegram.devices is not configured, nothing is queued."""
+        mock_sender = MagicMock(spec=TelegramSender)
         mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
 
         mgr = _make_manager_with_telegram_devices(
             telegram_sender=mock_sender, telegram_devices=None
         )
-        now = datetime.now(timezone.utc)
 
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="pool_pump",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=1500.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
-        )
+        self._queue(mgr, actions=[self._turn_on()])
 
-        # No whitelist configured → no notification sent
-        assert result is False
-        mock_sender.send_notification.assert_not_called()
+        assert mgr._pending_notifications == []
 
-    @pytest.mark.asyncio
-    async def test_sent_when_whitelist_matches(self):
-        """When whitelist is configured and action device+type matches, notification is sent."""
-        mock_sender = AsyncMock(spec=TelegramSender)
-        mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
+    def test_noop_when_sender_not_configured(self):
+        """When sender exists but is not configured, nothing is queued."""
+        mock_sender = MagicMock(spec=TelegramSender)
+        mock_sender.is_configured = False
 
         mgr = _make_manager_with_telegram_devices(
             telegram_sender=mock_sender,
             telegram_devices={"pool_pump": ["turn_on", "turn_off"]},
         )
-        now = datetime.now(timezone.utc)
 
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="pool_pump",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=1500.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
+        self._queue(mgr, actions=[self._turn_on()])
+
+        assert mgr._pending_notifications == []
+
+    def test_noop_in_dry_run_mode(self):
+        """When dry_run is True, nothing is queued even if actions exist."""
+        mock_sender = MagicMock(spec=TelegramSender)
+        mock_sender.is_configured = True
+
+        mgr = _make_manager_with_telegram_devices(
+            telegram_sender=mock_sender,
+            telegram_devices={"pool_pump": ["turn_on", "turn_off"]},
         )
 
-        assert result is True
-        mock_sender.send_notification.assert_called_once()
-        event = mock_sender.send_notification.call_args[0][0]
+        self._queue(mgr, actions=[self._turn_on()], dry_run=True)
+
+        assert mgr._pending_notifications == []
+
+    def test_sent_when_whitelist_matches(self):
+        """When whitelist matches, the event is queued."""
+        mock_sender = MagicMock(spec=TelegramSender)
+        mock_sender.is_configured = True
+
+        mgr = _make_manager_with_telegram_devices(
+            telegram_sender=mock_sender,
+            telegram_devices={"pool_pump": ["turn_on", "turn_off"]},
+        )
+
+        self._queue(mgr, actions=[self._turn_on()])
+
+        assert len(mgr._pending_notifications) == 1
+        event = mgr._pending_notifications[0]
         assert isinstance(event, NotificationEvent)
         assert event.event_type == "surplus"
 
-    @pytest.mark.asyncio
-    async def test_not_sent_when_whitelist_no_match(self):
-        """When whitelist is configured but device+type does not match, no notification."""
-        mock_sender = AsyncMock(spec=TelegramSender)
+    def test_not_sent_when_whitelist_no_match(self):
+        """When device does not match, nothing is queued."""
+        mock_sender = MagicMock(spec=TelegramSender)
         mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
 
         # Whitelist only allows "pool_pump" — "jackery" is not listed
         mgr = _make_manager_with_telegram_devices(
             telegram_sender=mock_sender,
             telegram_devices={"pool_pump": ["turn_on", "turn_off"]},
         )
-        now = datetime.now(timezone.utc)
 
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="jackery",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=500.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
+        self._queue(
+            mgr, actions=[self._turn_on(device="jackery", power=500.0)]
         )
 
-        assert result is False
-        mock_sender.send_notification.assert_not_called()
+        assert mgr._pending_notifications == []
 
-    @pytest.mark.asyncio
-    async def test_not_sent_when_action_type_not_allowed(self):
-        """When action type is not in the whitelist, no notification is sent."""
-        mock_sender = AsyncMock(spec=TelegramSender)
+    def test_not_sent_when_action_type_not_allowed(self):
+        """When action type is not in the whitelist, nothing is queued."""
+        mock_sender = MagicMock(spec=TelegramSender)
         mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
 
         # Whitelist only allows "turn_on" for pool_pump — turn_off is not allowed
         mgr = _make_manager_with_telegram_devices(
@@ -704,7 +556,7 @@ class TestTelegramDeviceWhitelist:
         )
         now = datetime.now(timezone.utc)
 
-        result = await mgr._fire_telegram_notification(
+        mgr._queue_surplus_notification(
             actions=[
                 PendingEffect(
                     device_name="pool_pump",
@@ -712,7 +564,6 @@ class TestTelegramDeviceWhitelist:
                     timestamp=now,
                     data_point_at=now,
                     power_watts=-1500.0,
-                    target_amps=None,
                 )
             ],
             predicted_wh=-2000.0,
@@ -721,126 +572,63 @@ class TestTelegramDeviceWhitelist:
             now=now,
         )
 
-        assert result is False
-        mock_sender.send_notification.assert_not_called()
+        assert mgr._pending_notifications == []
 
-    @pytest.mark.asyncio
-    async def test_notification_contains_all_actions_when_sent(self):
-        """When whitelist matches at least one action, notification includes all actions."""
-        mock_sender = AsyncMock(spec=TelegramSender)
+    def test_notification_contains_all_actions_when_sent(self):
+        """When whitelist matches at least one action, the queued event includes all actions."""
+        mock_sender = MagicMock(spec=TelegramSender)
         mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
 
         # Whitelist allows pool_pump but not jackery
         mgr = _make_manager_with_telegram_devices(
             telegram_sender=mock_sender,
             telegram_devices={"pool_pump": ["turn_on", "turn_off"]},
         )
-        now = datetime.now(timezone.utc)
 
         actions = [
-            PendingEffect(
-                device_name="pool_pump",
-                action="turn_on",
-                timestamp=now,
-                data_point_at=now,
-                power_watts=1500.0,
-                target_amps=None,
-            ),
-            PendingEffect(
-                device_name="jackery",
-                action="turn_on",
-                timestamp=now,
-                data_point_at=now,
-                power_watts=500.0,
-                target_amps=None,
-            ),
+            self._turn_on(device="pool_pump", power=1500.0),
+            self._turn_on(device="jackery", power=500.0),
         ]
 
-        result = await mgr._fire_telegram_notification(
-            actions=actions,
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
-        )
+        self._queue(mgr, actions=actions)
 
-        assert result is True
-        mock_sender.send_notification.assert_called_once()
-        event = mock_sender.send_notification.call_args[0][0]
-        # Notification must include ALL actions, not just the matching ones
+        assert len(mgr._pending_notifications) == 1
+        event = mgr._pending_notifications[0]
+        # Queued event must include ALL actions, not just the matching ones
         assert len(event.actions) == 2
         device_names = [a.device_name for a in event.actions]
         assert "pool_pump" in device_names
         assert "jackery" in device_names
 
-    @pytest.mark.asyncio
-    async def test_case_insensitive_device_matching(self):
+    def test_case_insensitive_device_matching(self):
         """Device name matching in whitelist is case-insensitive."""
-        mock_sender = AsyncMock(spec=TelegramSender)
+        mock_sender = MagicMock(spec=TelegramSender)
         mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
 
-        # Whitelist uses lowercase
+        # Whitelist uses uppercase
         mgr = _make_manager_with_telegram_devices(
             telegram_sender=mock_sender,
             telegram_devices={"POOL_PUMP": ["turn_on", "turn_off"]},
         )
-        now = datetime.now(timezone.utc)
 
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="pool_pump",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=1500.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
-        )
+        self._queue(mgr, actions=[self._turn_on()])
 
-        assert result is True
-        mock_sender.send_notification.assert_called_once()
+        assert len(mgr._pending_notifications) == 1
 
-    @pytest.mark.asyncio
-    async def test_no_notification_when_all_actions_filtered(self):
-        """When whitelist is configured but no action matches, no notification."""
-        mock_sender = AsyncMock(spec=TelegramSender)
+    def test_no_notification_when_all_actions_filtered(self):
+        """When whitelist is configured but no action matches, nothing is queued."""
+        mock_sender = MagicMock(spec=TelegramSender)
         mock_sender.is_configured = True
-        mock_sender.send_notification = AsyncMock(return_value=True)
 
         # Whitelist is empty dict → nothing matches
         mgr = _make_manager_with_telegram_devices(
             telegram_sender=mock_sender,
             telegram_devices={},
         )
-        now = datetime.now(timezone.utc)
 
-        result = await mgr._fire_telegram_notification(
-            actions=[
-                PendingEffect(
-                    device_name="pool_pump",
-                    action="turn_on",
-                    timestamp=now,
-                    data_point_at=now,
-                    power_watts=1500.0,
-                    target_amps=None,
-                )
-            ],
-            predicted_wh=-2000.0,
-            target_wh=-500.0,
-            dry_run=False,
-            now=now,
-        )
+        self._queue(mgr, actions=[self._turn_on()])
 
-        assert result is False
-        mock_sender.send_notification.assert_not_called()
+        assert mgr._pending_notifications == []
 
 
 class TestTurnOffRuntimePlumbing:

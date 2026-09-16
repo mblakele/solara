@@ -42,6 +42,13 @@ defines a cadence: no load management (no cycle-driven fetch) and no
 detected quantization window. Mirrors the 2-minute fallback reload timer
 in ``static/app.js``."""
 
+DATA_STALE_ALERT_THRESHOLD_SECS: int = 300
+"""Wall-clock age (seconds) of the most recent NBC data point before the
+load manager queues a Telegram data-health alert. Covers both stale
+``data_point_at`` and the boot-empty case (age measured from manager
+start when no data point has ever been seen). Throttled to one alert
+per QH per type (see ``LoadManager._check_stale_data_alert``)."""
+
 PRUNE_WINDOW_SECS: int = 3600
 """Samples older than this many seconds are pruned from EnergyCache."""
 

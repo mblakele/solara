@@ -155,19 +155,24 @@ project-root
                            # env via the Config class + devices.json
 ├── conftest.py            # Pytest shared fixtures & configuration
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS,
-                           # Tesla charging constants TESLA_HARD_MAX_AMPS, etc.,
+                           # DATA_STALE_ALERT_THRESHOLD_SECS=300 for Telegram data-health
+                           # alerts, Tesla charging constants TESLA_HARD_MAX_AMPS, etc.,
                            # DEFAULT_HYSTERESIS_WH=20 residential fallback)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
 ├── energy_cache.py        # EnergyCache with per-second sample storage, incremental
-                           # fetch merging, and pruning
+                           # fetch merging, pruning, and last_fetch_error surfacing
+                           # (stored fetch exception for LoadManager data-health alerts)
  ├── load_controllers.py   # Load manager controllers: PlugController/RealPlugController,
                             # TeslaController/RealTeslaController, VocolincController/RealVocolincController,
                             # and factory functions (load_controller_from_env,
                             # fleet_telemetry_config_create)
  ├── load_manager.py       # OAuth handling, pipeline stages (_stage_*), load-shedding management,
-                             # _last_tesla_at_home preserves at_home across telemetry snapshots
+                             # _last_tesla_at_home preserves at_home across telemetry snapshots,
+                             # data-health Telegram alerts (_check_data_health_alerts:
+                             # fatal fetch errors + 300 s stale/no-data, once per QH each,
+                             # bypassing the devices whitelist)
  ├── load_models.py        # Shared data models (CycleContext, CycleResult, AsyncPhaseResult,
                             # PendingEffect,
                             # TeslaChargeState, TeslaDriveState, TeslaLocation, TeslaCallbackPayload,
@@ -371,6 +376,8 @@ project-root
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 - Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
+- Data-health Telegram alerts (fatal fetch + 300 s stale/no-data, per-QH
+  throttle) in `tests/test_data_health_alerts.py`
 - File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
 - Compaction tests in `tests/test_compaction.py` (`CompletedNBCPeriod`, `compact()`, `inject_completed_qh()`, replace-not-merge behavior)
 
