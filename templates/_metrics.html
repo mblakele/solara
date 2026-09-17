@@ -17,7 +17,7 @@
      data-status="{{ freshness.status }}">
   <span id="live-indicator" class="live-indicator" data-state="off" hidden>live</span>
   <span class="freshness__dot" aria-hidden="true"></span>
-  <span class="freshness__text">data <b class="freshness__age">{{ freshness.age_secs }}s</b> old · next ~<b class="freshness__next">{{ freshness.next_update_secs }}s</b></span>
+  <span class="freshness__text">data age <b class="freshness__age">{{ freshness.age_secs }}s</b> · next ~<b class="freshness__next">{{ freshness.next_update_secs }}s</b></span>
 </div>
 {% endif %}
 {% for vd in metrics.devices %}

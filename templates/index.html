@@ -39,9 +39,9 @@
      data-show-text). State mirrors the hidden #data-freshness strip
      via syncConnection(). #}
   {% if freshness.live %}{% set cstate = freshness.status if freshness.status != 'fresh' else 'live' %}{% else %}{% set cstate = 'reload' %}{% endif %}
-  <button type="button" class="connection" id="connection" data-state="{{ cstate }}" aria-expanded="false" aria-label="{{ 'Live' if cstate == 'live' else 'Data ' ~ freshness.age_secs ~ ' seconds old' ~ ('' if freshness.live else ', next update in ' ~ freshness.next_update_secs ~ ' seconds') }}">
+  <button type="button" class="connection" id="connection" data-state="{{ cstate }}" aria-expanded="false" aria-label="{{ 'Live' if cstate == 'live' else 'Data age ' ~ freshness.age_secs ~ ' seconds' ~ ('' if freshness.live else ', next update in ' ~ freshness.next_update_secs ~ ' seconds') }}">
     <span class="connection__dot" aria-hidden="true"></span>
-    <span class="connection__text" id="connection-text" aria-hidden="true">data <b class="connection__age">{{ freshness.age_secs }}s</b> old{% if not freshness.live %} · next ~<b class="connection__next">{{ freshness.next_update_secs }}s</b>{% endif %}</span>
+    <span class="connection__text" id="connection-text" aria-hidden="true">data age <b class="connection__age">{{ freshness.age_secs }}s</b>{% if not freshness.live %} · next ~<b class="connection__next">{{ freshness.next_update_secs }}s</b>{% endif %}</span>
   </button>
   {% endif %}
   <div class="app-bar__spacer" aria-hidden="true"></div>

@@ -2332,8 +2332,7 @@ class TestDataFreshness(unittest.TestCase):
         # No-LM thresholds ride on the strip so the client ticks with them.
         self.assertIn('data-warn="300"', html)
         self.assertIn('data-stale="420"', html)
-        self.assertIn("data <b class=", html)
-        self.assertIn("old", html)
+        self.assertIn("data age <b class=", html)
 
     def test_index_html_freshness_live_when_lm_enabled(self):
         """LM-enabled pages mark the strip as SSE-driven with the sleep hint."""

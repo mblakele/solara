@@ -237,15 +237,15 @@
     var age = ageEl ? ageEl.textContent : ''
     var next = nextEl ? nextEl.textContent : ''
     var label = state === 'live' ? 'Live'
-      : state === 'reconnecting' ? 'Reconnecting, data ' + age + ' old'
-      : !driven ? 'Data ' + age + ' old, next update in ' + next
-      : 'Data ' + age + ' old'
+      : state === 'reconnecting' ? 'Reconnecting, data age ' + age
+      : !driven ? 'Data age ' + age + ', next update in ' + next
+      : 'Data age ' + age
     conn.setAttribute('aria-label', label)
     var textEl = document.getElementById('connection-text')
     if (textEl) {
       var key = state + '|' + age + '|' + next + '|' + driven
       if (textEl.getAttribute('data-rendered') !== key) {
-        var html = 'data <b class="connection__age">' + age + '</b> old'
+        var html = 'data age <b class="connection__age">' + age + '</b>'
         if (!driven) {
           html += ' · next ~<b class="connection__next">' + next + '</b>'
         }
