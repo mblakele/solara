@@ -234,7 +234,9 @@ project-root
                            # (relative hrefs for subpath-proxy compat);
                            # _metrics.html/_load_management.html are SSE-swappable fragments
                            # (the metrics fragment carries the hidden #data-freshness state
-                           # strip mirrored onto the header #connection dot by syncConnection(); the
+                           # strip mirrored onto the header #connection button by syncConnection()
+                           # (dot-only when live+fresh; tap toggles data-show-text to reveal/hide
+                           # the age text); the
                            # sparkline filter receives quantization_seconds to feed
                            # chart.per_second_sparkline's bucket_secs downsampling)
 ├── static/                # Mobile-first design system (style.css) and the SSE dashboard

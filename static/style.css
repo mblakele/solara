@@ -444,9 +444,20 @@ button.app-bar__link {
   display: flex;
   align-items: center;
   gap: 0.45em;
-  font-size: 0.8rem;
+  font: inherit;
   color: var(--color-text-muted);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 0.8rem;
   font-variant-numeric: tabular-nums;
+}
+
+#connection:focus-visible {
+  outline: 2px solid var(--color-load);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 .connection__dot {
@@ -470,8 +481,10 @@ button.app-bar__link {
   background: var(--color-text-muted);
 }
 
-/* Dot-only when live+fresh; text returns the moment anything needs saying. */
-#connection[data-state="live"] .connection__text {
+/* Dot-only when live+fresh unless the user tapped the dot to reveal the
+   age text (data-show-text); text always shows the moment anything needs
+   saying (aging/stale/reload/reconnecting). */
+#connection[data-state="live"]:not([data-show-text="true"]) .connection__text {
   display: none;
 }
 

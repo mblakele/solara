@@ -2539,6 +2539,36 @@ class TestDataFreshness(unittest.TestCase):
         self.assertIn("getElementById('connection')", js)
         self.assertIn("syncConnection", js)
 
+    def test_index_header_connection_is_tap_toggle(self):
+        """The connection indicator is a button so tapping the dot can
+        reveal/hide the age text (collapsed by default)."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        header = html.split("</header>", 1)[0]
+        self.assertIn('id="connection"', header)
+        self.assertIn("<button", header)
+        self.assertIn('aria-expanded="false"', header)
+
+    def test_static_app_js_toggles_connection_text(self):
+        """app.js flips data-show-text/aria-expanded when the dot is
+        tapped, without disturbing the mirrored freshness state."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn("data-show-text", js)
+        self.assertIn("aria-expanded", js)
+
+    def test_static_css_reveals_connection_text_on_tap(self):
+        """The live dot-only rule yields when the user tapped to reveal."""
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "static" / "style.css"
+        css = path.read_text(encoding="utf-8")
+        self.assertIn(
+            '#connection[data-state="live"]:not([data-show-text="true"])',
+            css,
+        )
+
     def test_static_app_js_watches_sse_silence(self):
         """app.js re-arms the reload fallback when a live SSE stream goes
         quiet (device sleep, server restart, dead proxy).

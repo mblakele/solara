@@ -216,7 +216,9 @@
   // Mirror fragment freshness onto the header connection dot. The
   // in-fragment strip is a hidden state carrier; this paints the only
   // visible indicator: dot-only when live+fresh, text when troubled
-  // (aging/stale data, reload mode, or a silent stream).
+  // (aging/stale data, reload mode, or a silent stream). Never touches
+  // data-show-text: the user's tap-to-reveal choice sticks across ticks
+  // and swaps.
   function syncConnection() {
     var conn = document.getElementById('connection')
     var strip = document.getElementById('data-freshness')
@@ -336,6 +338,18 @@
     source.onerror = function () {
       log('sse connection error, retrying')
     }
+  }
+
+  // Tapping the connection dot reveals/hides the age text when the
+  // indicator is otherwise dot-only (live+fresh). Pure display toggle on
+  // #connection (a <button>, so tap and keyboard come free).
+  var connToggle = document.getElementById('connection')
+  if (connToggle) {
+    connToggle.addEventListener('click', function () {
+      var shown = connToggle.getAttribute('data-show-text') === 'true'
+      connToggle.setAttribute('data-show-text', shown ? 'false' : 'true')
+      connToggle.setAttribute('aria-expanded', shown ? 'false' : 'true')
+    })
   }
 
   syncConnection()
