@@ -79,16 +79,86 @@ def test_tou_refresh_controls(details: str) -> None:
     dash_idx = header.index('Dashboard</a>')
     assert title_idx < refresh_idx < spacer_idx < dash_idx
     assert "onchange=\"this.form.requestSubmit()\"" in html
-    # Date pickers also trigger an update: the change handler syncs the
-    # details checkbox first, then submits via requestSubmit (script-wired,
-    # so the synced checkbox value is included in the submission).
+    # The range picker stages start+end as a pending selection: grid clicks
+    # only update the hidden fields, and Go hides the widget and submits
+    # once via requestSubmit (script-wired, so the synced checkbox value
+    # is included). There are no per-input change listeners firing a
+    # submit per date.
     script = html.split("<script>", 1)[1]
     assert "requestSubmit" in script
+    assert "s.addEventListener('change'" not in script
+    assert "e.addEventListener('change'" not in script
+    assert "grid.addEventListener('click'" in script
+    assert "getElementById('range-go')" in script
     # requestSubmit fires the submit listener, preserving explicit false
     # instead of letting the server restore the single-day default of true.
     assert "form.addEventListener('submit'" in html
     assert "h.value = 'false'" in html
     assert ('<table' in html) == (details == "true")
+
+
+def test_tou_range_picker_markup() -> None:
+    """The date-range picker carries hidden start/end fields and one grid."""
+    with mock_config(MOCK=True, TIMEZONE="America/Los_Angeles"):
+        response = app.test_client().get(
+            "/api/v1/tou?start_date=2026-09-16&end_date=2026-09-18",
+            headers={"Accept": "text/html"},
+        )
+    html = response.get_data(as_text=True)
+    assert 'id="range-picker"' in html
+    assert 'data-start="2026-09-16"' in html
+    assert 'data-end="2026-09-18"' in html
+    # Collapsed by default: the range shows as text; the calendar opens
+    # only when the user selects the date text.
+    assert 'id="range-toggle"' in html
+    assert 'aria-controls="range-calendar"' in html
+    assert '2026-09-16 → 2026-09-18' in html
+    assert 'id="range-calendar" hidden' in html
+    assert 'id="range-close"' in html
+    # Go is the single commit path: it hides the widget and applies the
+    # pending selection; Cancel reverts to the last committed range.
+    assert 'id="range-go"' in html
+    assert '>Go</button>' in html
+    assert 'id="range-grid"' in html
+    assert 'id="range-prev"' in html
+    assert 'id="range-next"' in html
+    assert 'id="range-label"' in html
+    assert 'type="hidden" id="start-date" name="start_date"' in html
+    assert 'type="hidden" id="end-date" name="end_date"' in html
+    # Earlier click is the start, later click is the end.
+    script = html.split("<script>", 1)[1]
+    assert "anchor < clicked ? anchor : clicked" in script
+    assert "range-toggle" in script
+    assert "aria-expanded" in script
+    assert "getElementById('range-go')" in script
+    assert "committedStart" in script
+    # The outside-click guard runs in the capture phase (before grid
+    # render() detaches the clicked day) and only hides the widget,
+    # keeping the pending selection for Go/Refresh.
+    assert "closest('#range-picker')" in script
+    assert "}, true)" in script
+    # Collapsing via the toggle is equivalent to Cancel: it reverts the
+    # staged selection to the committed range instead of keeping it.
+    toggle_handler = script.split("toggle.addEventListener('click'", 1)[1][:300]
+    assert "cancel()" in toggle_handler
+    # No-JS fallback keeps two plain date inputs inside <noscript>.
+    noscript = html.split("<noscript>", 1)[1].split("</noscript>", 1)[0]
+    assert noscript.count('type="date"') == 2
+    assert 'name="start_date"' in noscript
+    assert 'name="end_date"' in noscript
+
+
+def test_tou_range_picker_single_day_toggle() -> None:
+    """A single-day range shows one date as text on the toggle."""
+    with mock_config(MOCK=True, TIMEZONE="America/Los_Angeles"):
+        response = app.test_client().get(
+            "/api/v1/tou?start_date=2026-09-16&end_date=2026-09-16",
+            headers={"Accept": "text/html"},
+        )
+    html = response.get_data(as_text=True)
+    toggle = html.split('id="range-toggle"', 1)[1].split('</button>', 1)[0]
+    assert '2026-09-16' in toggle
+    assert '→' not in toggle
 
 
 class TestTOUPage(unittest.TestCase):
@@ -104,7 +174,10 @@ class TestTOUPage(unittest.TestCase):
             resp = self.app.get("/api/v1/tou", headers={"Accept": "text/html"})
         self.assertEqual(resp.status_code, 200)
         html = resp.data.decode("utf-8")
-        self.assertIn('type="date"', html)
+        self.assertIn('id="range-picker"', html)
+        self.assertIn('id="range-toggle"', html)
+        self.assertIn('id="range-calendar" hidden', html)
+        self.assertIn('id="range-grid"', html)
         self.assertIn('name="start_date"', html)
         self.assertIn('name="end_date"', html)
 
@@ -159,6 +232,9 @@ class TestTOUPage(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         html = resp.data.decode("utf-8")
         self.assertIn("15-min", html)
+        # Compact table drops the 34rem min-width so the two columns
+        # fit a 375px viewport without horizontal scrolling.
+        self.assertIn("data-table--compact", html)
 
     def test_tou_same_date_explicit_details(self) -> None:
         """Equal date-picker values return a day's data, not an empty report."""

@@ -23,13 +23,39 @@
   <section class="card tou">
     <h2 class="tou__heading">Time-of-Use Energy Report</h2>
     <form class="tou-form" id="tou-form" method="get" action="">
-      <div class="tou-form__row">
-        <label class="tou-form__field">Start date
-          <input type="date" id="start-date" name="start_date" value="{{ start_picker }}" required>
-        </label>
-        <label class="tou-form__field">End date
-          <input type="date" id="end-date" name="end_date" value="{{ end_picker }}" required>
-        </label>
+      <div class="range-picker" id="range-picker" data-start="{{ start_picker }}" data-end="{{ end_picker }}">
+        <button class="range-picker__toggle" type="button" id="range-toggle" aria-expanded="false" aria-controls="range-calendar" hidden>{% if start_picker == end_picker %}{{ start_picker }}{% else %}{{ start_picker }} → {{ end_picker }}{% endif %}</button>
+        <div class="range-picker__calendar" id="range-calendar" hidden>
+        <div class="range-picker__nav">
+          <button class="range-picker__navbtn" type="button" id="range-prev" aria-label="Previous month">‹</button>
+          <div class="range-picker__month" id="range-month" aria-live="polite"></div>
+          <button class="range-picker__navbtn" type="button" id="range-next" aria-label="Next month">›</button>
+        </div>
+        <div class="range-picker__weekdays" aria-hidden="true">
+          <span>Su</span><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span>
+        </div>
+        <div class="range-picker__grid" id="range-grid" role="group" aria-label="Choose a date range"></div>
+        <div class="range-picker__foot">
+          <p class="range-picker__selection" id="range-label" aria-live="polite"></p>
+          <div class="range-picker__actions">
+            <button class="range-picker__today" type="button" id="range-today">Today</button>
+            <button class="range-picker__close" type="button" id="range-close">Cancel</button>
+            <button class="range-picker__go" type="button" id="range-go">Go</button>
+          </div>
+        </div>
+        </div>
+        <input type="hidden" id="start-date" name="start_date" value="{{ start_picker }}">
+        <input type="hidden" id="end-date" name="end_date" value="{{ end_picker }}">
+        <noscript>
+          <div class="tou-form__row">
+            <label class="tou-form__field">Start date
+              <input type="date" name="start_date" value="{{ start_picker }}" required>
+            </label>
+            <label class="tou-form__field">End date
+              <input type="date" name="end_date" value="{{ end_picker }}" required>
+            </label>
+          </div>
+        </noscript>
       </div>
       <label class="tou-form__check">
         <input type="checkbox" id="details" name="details" value="true"{% if show_details %} checked{% endif %} onchange="this.form.requestSubmit()">
@@ -68,15 +94,14 @@
   <section class="card">
     <h3 class="section-heading">15-min details</h3>
     <div class="table-wrap">
-      <table class="data-table">
+      <table class="data-table data-table--compact">
         <thead>
-          <tr><th>Time</th><th>Bucket</th><th class="num">Wh</th></tr>
+          <tr><th>Time</th><th class="num">Wh</th></tr>
         </thead>
         <tbody>
           {% for p in periods %}
           <tr>
             <td>{{ (p.timestamp | astimezonestr(timezone)).strftime('%m-%d %H:%M') }}</td>
-            <td>{{ p.bucket }}</td>
             <td class="num">{{ "%.0f" % p.wh }}</td>
           </tr>
           {% endfor %}
@@ -94,24 +119,210 @@
 <script>
 (function () {
   'use strict'
+  var picker = document.getElementById('range-picker')
+  var form = document.getElementById('tou-form')
+  if (!picker || !form) { return }
   var s = document.getElementById('start-date')
   var e = document.getElementById('end-date')
   var d = document.getElementById('details')
-  var form = document.getElementById('tou-form')
+  var grid = document.getElementById('range-grid')
+  var monthEl = document.getElementById('range-month')
+  var label = document.getElementById('range-label')
+  var prev = document.getElementById('range-prev')
+  var next = document.getElementById('range-next')
+  var todayBtn = document.getElementById('range-today')
+  var closeBtn = document.getElementById('range-close')
+  var goBtn = document.getElementById('range-go')
+  var toggle = document.getElementById('range-toggle')
+  var calendar = document.getElementById('range-calendar')
   var touched = false
+  // Selection stays pending while the calendar is open: grid clicks and
+  // Today only update the hidden fields and highlight. Nothing is applied
+  // until the user presses Go (which hides the widget and submits), while
+  // Cancel / Escape / collapsing via the toggle discards the pending
+  // selection by reverting to the last committed range.
+  var anchor = null
+  var committedStart = picker.getAttribute('data-start') || (s && s.value) || ''
+  var committedEnd = picker.getAttribute('data-end') || (e && e.value) || ''
+  var view = parseDate(s && s.value ? s.value : picker.getAttribute('data-start'))
   if (d) {
     d.addEventListener('change', function () { touched = true })
+  }
+  function parseDate(str) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str || '')
+    if (m) { return { y: +m[1], m: +m[2] - 1 } }
+    var now = new Date()
+    return { y: now.getFullYear(), m: now.getMonth() }
+  }
+  function pad(n) { return (n < 10 ? '0' : '') + n }
+  function iso(y, m, day) { return y + '-' + pad(m + 1) + '-' + pad(day) }
+  function pretty(str) {
+    var p = parseDate(str)
+    var day = +str.slice(8, 10)
+    var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    return months[p.m] + ' ' + day + ', ' + p.y
   }
   function sync() {
     if (!s || !e || !d || touched) { return }
     d.checked = (s.value !== '' && s.value === e.value)
   }
-  function syncAndSubmit() {
-    sync()
-    if (form && form.requestSubmit) { form.requestSubmit() }
+  function submit() {
+    if (form.requestSubmit) { form.requestSubmit() }
+    else { form.submit() }
   }
-  if (s) { s.addEventListener('change', syncAndSubmit) }
-  if (e) { e.addEventListener('change', syncAndSubmit) }
+  function toggleText() {
+    if (!toggle || !s || !e) { return }
+    toggle.textContent = (s.value && e.value)
+      ? ((s.value === e.value) ? pretty(s.value) : pretty(s.value) + ' → ' + pretty(e.value))
+      : 'Choose dates'
+  }
+  function setOpen(open) {
+    if (!calendar || !toggle) { return }
+    calendar.hidden = !open
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false')
+    if (open) { render() }
+  }
+  function cancel() {
+    anchor = null
+    if (s) { s.value = committedStart }
+    if (e) { e.value = committedEnd }
+    render()
+    sync()
+    setOpen(false)
+  }
+  function render() {
+    if (!grid || !monthEl || !label || !s || !e) { return }
+    var names = ['January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December']
+    monthEl.textContent = names[view.m] + ' ' + view.y
+    var first = new Date(view.y, view.m, 1).getDay()
+    var days = new Date(view.y, view.m + 1, 0).getDate()
+    var html = ''
+    var i, cur
+    for (i = 0; i < first; i++) { html += '<span></span>' }
+    for (i = 1; i <= days; i++) {
+      cur = iso(view.y, view.m, i)
+      var cls = 'range-picker__day'
+      if (s.value && e.value && s.value <= e.value && cur >= s.value && cur <= e.value) {
+        cls += ' in-range'
+        if (cur === s.value && cur === e.value) { cls += ' is-single' }
+        else if (cur === s.value) { cls += ' is-start' }
+        else if (cur === e.value) { cls += ' is-end' }
+      } else if (anchor && cur === anchor) { cls += ' is-single' }
+      var selected = (cur === s.value || cur === e.value) ? ' aria-pressed="true"' : ' aria-pressed="false"'
+      html += '<button type="button" class="' + cls + '" data-date="' + cur + '"' + selected + '>' + i + '</button>'
+    }
+    grid.innerHTML = html
+    if (anchor) {
+      label.textContent = pretty(anchor) + ' → … (press Go)'
+    } else if (s.value && e.value) {
+      label.textContent = (s.value === e.value)
+        ? pretty(s.value)
+        : pretty(s.value) + ' → ' + pretty(e.value)
+    } else {
+      label.textContent = 'Pick a start date'
+    }
+    toggleText()
+  }
+  function shift(delta) {
+    view.m += delta
+    while (view.m < 0) { view.m += 12; view.y -= 1 }
+    while (view.m > 11) { view.m -= 12; view.y += 1 }
+    render()
+  }
+  if (grid) {
+    grid.addEventListener('click', function (ev) {
+      var btn = ev.target.closest ? ev.target.closest('button[data-date]') : null
+      if (!btn || !s || !e) { return }
+      var clicked = btn.getAttribute('data-date')
+      if (anchor === null) {
+        // First click arms the pending range as a single day.
+        anchor = clicked
+        s.value = clicked
+        e.value = clicked
+      } else {
+        var lo = anchor < clicked ? anchor : clicked
+        var hi = anchor < clicked ? clicked : anchor
+        anchor = null
+        // Earlier date is the start, later date is the end.
+        s.value = lo
+        e.value = hi
+        var v = parseDate(hi)
+        view = v
+      }
+      render()
+      sync()
+      // Stays open: Go applies the pending selection.
+    })
+  }
+  if (prev) { prev.addEventListener('click', function () { shift(-1) }) }
+  if (next) { next.addEventListener('click', function () { shift(1) }) }
+  if (toggle) {
+    toggle.addEventListener('click', function () {
+      if (calendar && !calendar.hidden) {
+        // Collapsing via the toggle discards the staged selection, just
+        // like Cancel: hide and restore the committed values and text.
+        // Focus stays on the toggle (it was the click target).
+        cancel()
+      } else {
+        setOpen(true)
+      }
+    })
+  }
+  if (closeBtn) {
+    closeBtn.addEventListener('click', function () {
+      cancel()
+      if (toggle) { toggle.focus() }
+    })
+  }
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape' && calendar && !calendar.hidden) {
+      cancel()
+      if (toggle) { toggle.focus() }
+    }
+  })
+  // Capture phase: runs before the grid handler's render() rebuilds
+  // grid.innerHTML (which detaches the clicked day, defeating any
+  // inside check at bubble time). A genuine outside click only hides
+  // the widget and keeps the pending selection, so Refresh or the
+  // details checkbox still apply it. Only Cancel/Escape discards
+  // pending state (see cancel()).
+  document.addEventListener('click', function (ev) {
+    if (!calendar || calendar.hidden || !picker) { return }
+    var t = ev.target
+    if (t && t.closest && t.closest('#range-picker')) { return }
+    setOpen(false)
+  }, true)
+  if (goBtn) {
+    goBtn.addEventListener('click', function () {
+      if (!s || !e || !s.value || !e.value) { return }
+      committedStart = s.value
+      committedEnd = e.value
+      anchor = null
+      setOpen(false)
+      submit()
+    })
+  }
+  if (todayBtn) {
+    todayBtn.addEventListener('click', function () {
+      var now = new Date()
+      var t = iso(now.getFullYear(), now.getMonth(), now.getDate())
+      anchor = null
+      if (s) { s.value = t }
+      if (e) { e.value = t }
+      view = { y: now.getFullYear(), m: now.getMonth() }
+      render()
+      sync()
+      // Stays open: Go applies the pending single-day selection.
+    })
+  }
+  render()
+  sync()
+  // The calendar stays collapsed until the user selects the date text:
+  // reveal the toggle showing the current range, keep the grid hidden.
+  setOpen(false)
+  if (toggle) { toggle.hidden = false }
   if (form) {
     form.addEventListener('submit', function () {
       if (d && !d.checked) {

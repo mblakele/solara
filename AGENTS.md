@@ -210,9 +210,21 @@ project-root
                            # test_app.py covers endpoint validation and range limits
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
-                           # card, kv, data-table) with start/end date pickers
-                           # (default: today from midnight) that sync the
-                           # details checkbox then auto-submit on change, a
+                           # card, kv, data-table) with a single-change
+                           # date-range picker calendar (collapsed by default:
+                           # the range shows as text on a toggle button and
+                           # the grid opens only when the date text is
+                           # selected; grid clicks/Today stage a pending
+                           # selection, Go hides the widget and submits once,
+                           # Cancel/Esc/toggle-collapse revert to the
+                           # committed range while outside-click only hides
+                           # (pending kept for Go/Refresh); outside-click
+                           # guard runs in the capture phase since render()
+                           # detaches the clicked day mid-dispatch;
+                           # hidden start_date/end_date fields,
+                           # <noscript> date-input fallback)
+                           # (default: today from midnight) that syncs the
+                           # details checkbox then auto-submits on commit, a
                            # details checkbox (auto on for single days, off for
                            # multi-day) that auto-submits on change via
                            # requestSubmit(); headers lay out title, status
