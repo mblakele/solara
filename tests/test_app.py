@@ -357,7 +357,7 @@ class TestApp(unittest.TestCase):
     def test_tou_date_range_366_days_accepted(self):
         """Test tou() accepts date ranges of exactly 366 days."""
         start = datetime(2025, 1, 1)
-        end = start + timedelta(days=366)
+        end = start + timedelta(days=365)  # Inclusive date-only end: 366 selected days.
         with mock_config(MOCK=True):
             response = self.app.get(
                 f"/api/v1/tou?start_date={start.strftime('%Y-%m-%d')}"

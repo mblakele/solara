@@ -127,7 +127,10 @@ This is a flat-layout Python project. All source files live at the project root 
 project-root
 ├── app.py                 # Flask app factory (create_app()), route definitions (/, /health,
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
-                           # _AppState runtime singletons, start_background_services()
+                           # _AppState runtime singletons, start_background_services();
+                           # TOU date-only end dates include the full local day (DST-aware),
+                           # while explicit timestamps retain their exact meaning;
+                           # picker/details defaults use the selected day, not the fetch boundary
 ├── wsgi.py                # Gunicorn entry point: app = create_app(); start_background_services()
 ├── gunicorn.conf.py       # Gunicorn hooks: post_worker_init chains cooperative-shutdown
                            # signal handlers; worker_int/worker_exit call app.request_shutdown();
@@ -202,8 +205,21 @@ project-root
 ├── pyproject.toml         # Project metadata, dependencies & script entrypoints
 ├── render.yaml            # Render.com deployment configuration
 ├── env.example            # Template for required environment variables
-├── tests/                 # All pytest tests
+├── tests/                 # All pytest tests; test_tou_page.py covers inclusive date
+                           # ranges, DST days, detail rows/defaults and picker dates;
+                           # test_app.py covers endpoint validation and range limits
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
+                           # tou.html shares the index design system (app-bar,
+                           # card, kv, data-table) with start/end date pickers
+                           # (default: today from midnight) that sync the
+                           # details checkbox then auto-submit on change, a
+                           # details checkbox (auto on for single days, off for
+                           # multi-day) that auto-submits on change via
+                           # requestSubmit(); headers lay out title, status
+                           # control (connection dot on index, Refresh ⟳
+                           # submit button with form=tou-form on TOU),
+                           # app-bar__spacer, then the cross link
+                           # (relative hrefs for subpath-proxy compat);
                            # _metrics.html/_load_management.html are SSE-swappable fragments
                            # (the metrics fragment carries the hidden #data-freshness state
                            # strip mirrored onto the header #connection dot by syncConnection(); the

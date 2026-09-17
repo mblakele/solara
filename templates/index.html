@@ -42,6 +42,10 @@
     <span class="connection__text" id="connection-text" aria-hidden="true">data <b class="connection__age">{{ freshness.age_secs }}s</b> old{% if not freshness.live %} · next ~<b class="connection__next">{{ freshness.next_update_secs }}s</b>{% endif %}</span>
   </div>
   {% endif %}
+  <div class="app-bar__spacer" aria-hidden="true"></div>
+  <nav class="app-bar__nav" aria-label="Reports">
+    <a class="app-bar__link" href="api/v1/tou">TOU</a>
+  </nav>
 </header>
 
 <main id="metrics-section" class="metrics-wrap container">

@@ -1,22 +1,129 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>TOU Energy Report</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f4f6fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)">
+<title>Time-of-Use — solara</title>
+<link rel="stylesheet" href="../../static/style.css">
 </head>
 <body>
-    <h1>Time-of-Use Energy Report</h1>
-    <p><strong>Start Date:</strong> {{ start_date }}</p>
-    <p><strong>End Date:</strong> {{ end_date }}</p>
-    <h2>Energy Buckets (Wh)</h2>
-    <ul>
-        <li><strong>Total:</strong> {{ buckets.total }}</li>
-        <li><strong>Peak:</strong> {{ buckets.peak }}</li>
-        <li><strong>Part-Peak:</strong> {{ buckets.part_peak }}</li>
-        <li><strong>Off-Peak:</strong> {{ buckets.off_peak }}</li>
-    </ul>
-    {% if nbc is not none %}
-    <h2>NBC Total (Wh)</h2>
-    <p><strong>{{ nbc }}</strong></p>
-    {% endif %}
+
+<header class="app-bar container">
+  <h1 class="app-bar__title">Solara</h1>
+  <button class="app-bar__link" type="submit" form="tou-form">Refresh ⟳</button>
+  <div class="app-bar__spacer" aria-hidden="true"></div>
+  <nav class="app-bar__nav" aria-label="Reports">
+    <a class="app-bar__link" href="../../">Dashboard</a>
+  </nav>
+</header>
+
+<main class="container tou-wrap">
+  <section class="card tou">
+    <h2 class="tou__heading">Time-of-Use Energy Report</h2>
+    <form class="tou-form" id="tou-form" method="get" action="">
+      <div class="tou-form__row">
+        <label class="tou-form__field">Start date
+          <input type="date" id="start-date" name="start_date" value="{{ start_picker }}" required>
+        </label>
+        <label class="tou-form__field">End date
+          <input type="date" id="end-date" name="end_date" value="{{ end_picker }}" required>
+        </label>
+      </div>
+      <label class="tou-form__check">
+        <input type="checkbox" id="details" name="details" value="true"{% if show_details %} checked{% endif %} onchange="this.form.requestSubmit()">
+        Show 15-min details
+      </label>
+    </form>
+
+    <dl class="kv">
+      <div class="kv__row">
+        <dt>Total</dt>
+        <dd>{{ "%.0f" % buckets.total }} Wh</dd>
+      </div>
+      <div class="kv__row">
+        <dt>Peak</dt>
+        <dd>{{ "%.0f" % buckets.peak }} Wh</dd>
+      </div>
+      <div class="kv__row">
+        <dt>Part-peak</dt>
+        <dd>{{ "%.0f" % buckets.part_peak }} Wh</dd>
+      </div>
+      <div class="kv__row">
+        <dt>Off-peak</dt>
+        <dd>{{ "%.0f" % buckets.off_peak }} Wh</dd>
+      </div>
+      {% if nbc is not none %}
+      <div class="kv__row">
+        <dt>NBC total</dt>
+        <dd>{{ "%.0f" % nbc }} Wh</dd>
+      </div>
+      {% endif %}
+    </dl>
+    <p class="instruction">{{ start_date }} → {{ end_date or "now" }}</p>
+  </section>
+
+  {% if show_details and periods %}
+  <section class="card">
+    <h3 class="section-heading">15-min details</h3>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr><th>Time</th><th>Bucket</th><th class="num">Wh</th></tr>
+        </thead>
+        <tbody>
+          {% for p in periods %}
+          <tr>
+            <td>{{ (p.timestamp | astimezonestr(timezone)).strftime('%m-%d %H:%M') }}</td>
+            <td>{{ p.bucket }}</td>
+            <td class="num">{{ "%.0f" % p.wh }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% elif not show_details %}
+  <p class="instruction container">15-min details hidden for multi-day ranges.
+    <a href="?start_date={{ start_picker }}&amp;end_date={{ end_picker }}&amp;details=true">Show details</a>
+  </p>
+  {% endif %}
+</main>
+
+<script>
+(function () {
+  'use strict'
+  var s = document.getElementById('start-date')
+  var e = document.getElementById('end-date')
+  var d = document.getElementById('details')
+  var form = document.getElementById('tou-form')
+  var touched = false
+  if (d) {
+    d.addEventListener('change', function () { touched = true })
+  }
+  function sync() {
+    if (!s || !e || !d || touched) { return }
+    d.checked = (s.value !== '' && s.value === e.value)
+  }
+  function syncAndSubmit() {
+    sync()
+    if (form && form.requestSubmit) { form.requestSubmit() }
+  }
+  if (s) { s.addEventListener('change', syncAndSubmit) }
+  if (e) { e.addEventListener('change', syncAndSubmit) }
+  if (form) {
+    form.addEventListener('submit', function () {
+      if (d && !d.checked) {
+        var h = document.createElement('input')
+        h.type = 'hidden'
+        h.name = 'details'
+        h.value = 'false'
+        form.appendChild(h)
+      }
+    })
+  }
+})()
+</script>
 </body>
 </html>
