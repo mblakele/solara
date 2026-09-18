@@ -43,6 +43,9 @@ class NotificationEvent:
         predicted_wh: The predicted Wh for the current quarter-hour.
         target_wh: The target Wh threshold.
         surplus_wh: Computed surplus/deficit (predicted - target).
+        runtime_today_secs: Optional per-device ON-time in seconds since
+            meter-local midnight, keyed by exact device name. Only
+            ``turn_off`` plug lines render it ("(MM:SS today)").
     """
 
     event_type: str
@@ -52,6 +55,7 @@ class NotificationEvent:
     predicted_wh: float = 0.0
     target_wh: float = 0.0
     surplus_wh: float = field(init=False)
+    runtime_today_secs: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         """Compute the surplus_wh from predicted and target."""
@@ -67,14 +71,8 @@ class NotificationEvent:
         if self.actions:
             action_lines = []
             for action in self.actions:
-                target_amps = None
-                if isinstance(action, dict):
-                    device = action.get("device", "unknown")
-                    action_type = action.get("type", "")
-                else:
-                    device = action.device_name
-                    action_type = action.action
-                    target_amps = getattr(action, "target_amps", None)
+                device, action_type = action_device_and_type(action)
+                target_amps = getattr(action, "target_amps", None)
 
                 if device.lower() == "tesla":
                     if action_type == "turn_off":
@@ -93,13 +91,55 @@ class NotificationEvent:
                         action_lines.append(f"  ⚡ Tesla {action_type}")
                 else:
                     bullet = "🔘" if action_type == "turn_off" else "🟢"
-                    action_lines.append(f"  {bullet} {device}")
+                    line = f"  {bullet} {device}"
+                    if action_type == "turn_off":
+                        runtime = (self.runtime_today_secs or {}).get(device)
+                        if runtime is not None:
+                            line += f" ({format_runtime_today(runtime)} today)"
+                    action_lines.append(line)
             action_list = "\n".join(action_lines)
 
         return (
             f"☀️ {self.description} {int(self.predicted_wh)}-Wh at {self.timestamp.strftime('%H:%M:%S')}\n"
             f"{action_list if self.actions else 'ℹ️ No actions'}"
         )
+
+
+def action_device_and_type(action: PendingEffect | dict) -> tuple[str, str]:
+    """Extract (device name, action type) from a PendingEffect or legacy dict.
+
+    Legacy dict actions use ``{"device": ..., "type": ...}`` keys;
+    PendingEffect objects expose ``device_name`` / ``action`` attributes.
+
+    Args:
+        action: A PendingEffect or a legacy dict action.
+
+    Returns:
+        Tuple of (device name, action type).
+    """
+    if isinstance(action, dict):
+        return action.get("device", "unknown"), action.get("type", "")
+    return action.device_name, action.action
+
+
+def format_runtime_today(total_secs: float) -> str:
+    """Format a today-runtime duration for turn_off alert lines.
+
+    Rounds down to whole seconds: ``MM:SS`` below one hour (``06:12``),
+    ``H:MM:SS`` at or above one hour (``1:04:09``).
+
+    Args:
+        total_secs: ON-time seconds since meter-local midnight.
+
+    Returns:
+        The formatted duration without any suffix.
+    """
+    total = max(0, int(total_secs))
+    minutes, seconds = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes:02d}:{seconds:02d}"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}"
 
 
 # Predefined event type constants for consistency across the system.
@@ -352,6 +392,7 @@ def build_notification(
     target_wh: float,
     now: datetime | None = None,
     config: Config | None = None,
+    runtime_today_secs: dict[str, float] | None = None,
 ) -> NotificationEvent:
     """Build a notification event for load management actions.
 
@@ -362,6 +403,9 @@ def build_notification(
         now: Current time, or the current time in UTC if None.
         config: Optional Config instance for timezone resolution. Falls
             back to module-level _config singleton when None.
+        runtime_today_secs: Optional per-device ON-time seconds since
+            meter-local midnight, keyed by device name. Rendered on
+            ``turn_off`` plug lines only.
 
     Returns:
         A formatted NotificationEvent with surplus context.
@@ -389,6 +433,7 @@ def build_notification(
         actions=actions,
         predicted_wh=predicted_wh,
         target_wh=target_wh,
+        runtime_today_secs=runtime_today_secs,
     )
 
 

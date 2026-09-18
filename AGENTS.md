@@ -127,7 +127,10 @@ This is a flat-layout Python project. All source files live at the project root 
 project-root
 ├── app.py                 # Flask app factory (create_app()), route definitions (/, /health,
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
-                           # _AppState runtime singletons, start_background_services()
+                           # _AppState runtime singletons, start_background_services();
+                           # TOU date-only end dates include the full local day (DST-aware),
+                           # while explicit timestamps retain their exact meaning;
+                           # picker/details defaults use the selected day, not the fetch boundary
 ├── wsgi.py                # Gunicorn entry point: app = create_app(); start_background_services()
 ├── gunicorn.conf.py       # Gunicorn hooks: post_worker_init chains cooperative-shutdown
                            # signal handlers; worker_int/worker_exit call app.request_shutdown();
@@ -155,18 +158,24 @@ project-root
                            # env via the Config class + devices.json
 ├── conftest.py            # Pytest shared fixtures & configuration
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS,
-                           # Tesla charging constants TESLA_HARD_MAX_AMPS, etc.)
+                           # DATA_STALE_ALERT_THRESHOLD_SECS=300 for Telegram data-health
+                           # alerts, Tesla charging constants TESLA_HARD_MAX_AMPS, etc.,
+                           # DEFAULT_HYSTERESIS_WH=20 residential fallback)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
 ├── energy_cache.py        # EnergyCache with per-second sample storage, incremental
-                           # fetch merging, and pruning
+                           # fetch merging, pruning, and last_fetch_error surfacing
+                           # (stored fetch exception for LoadManager data-health alerts)
  ├── load_controllers.py   # Load manager controllers: PlugController/RealPlugController,
                             # TeslaController/RealTeslaController, VocolincController/RealVocolincController,
                             # and factory functions (load_controller_from_env,
                             # fleet_telemetry_config_create)
  ├── load_manager.py       # OAuth handling, pipeline stages (_stage_*), load-shedding management,
-                             # _last_tesla_at_home preserves at_home across telemetry snapshots
+                             # _last_tesla_at_home preserves at_home across telemetry snapshots,
+                             # data-health Telegram alerts (_check_data_health_alerts:
+                             # fatal fetch errors + 300 s stale/no-data, once per QH each,
+                             # bypassing the devices whitelist)
  ├── load_models.py        # Shared data models (CycleContext, CycleResult, AsyncPhaseResult,
                             # PendingEffect,
                             # TeslaChargeState, TeslaDriveState, TeslaLocation, TeslaCallbackPayload,
@@ -186,17 +195,48 @@ project-root
   ├── quantization.py        # Detect N-second constant-value windows (quantization) in per-second data
   ├── sse_event.py            # SSEBroadcaster thread-safe pub/sub + event_stream generator for Flask
                               # (close_all() wakes blocked streams on shutdown; sentinel never yielded)
-├── telegram.py            # TelegramSender, NotificationEvent, config loading helpers
+├── telegram.py            # TelegramSender, NotificationEvent (turn_off plug lines
+                           # carry "(MM:SS today)" via format_runtime_today +
+                           # runtime_today_secs, fed by LoadManager._runtime_for_actions),
+                           # action_device_and_type shared unwrapping helper,
+                           # config loading helpers
 ├── telegram_client.py     # Async Telegram Bot API client using aiohttp
 ├── util.py                # Shared utilities (JSON helpers, timezone handling)
 ├── pyproject.toml         # Project metadata, dependencies & script entrypoints
 ├── render.yaml            # Render.com deployment configuration
 ├── env.example            # Template for required environment variables
-├── tests/                 # All pytest tests
+├── tests/                 # All pytest tests; test_tou_page.py covers inclusive date
+                           # ranges, DST days, detail rows/defaults and picker dates;
+                           # test_app.py covers endpoint validation and range limits
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
+                           # tou.html shares the index design system (app-bar,
+                           # card, kv, data-table) with a single-change
+                           # date-range picker calendar (collapsed by default:
+                           # the range shows as text on a toggle button and
+                           # the grid opens only when the date text is
+                           # selected; grid clicks/Today stage a pending
+                           # selection, Go hides the widget and submits once,
+                           # Cancel/Esc/toggle-collapse revert to the
+                           # committed range while outside-click only hides
+                           # (pending kept for Go/Refresh); outside-click
+                           # guard runs in the capture phase since render()
+                           # detaches the clicked day mid-dispatch;
+                           # hidden start_date/end_date fields,
+                           # <noscript> date-input fallback)
+                           # (default: today from midnight) that syncs the
+                           # details checkbox then auto-submits on commit, a
+                           # details checkbox (auto on for single days, off for
+                           # multi-day) that auto-submits on change via
+                           # requestSubmit(); headers lay out title, status
+                           # control (connection dot on index, Refresh ⟳
+                           # submit button with form=tou-form on TOU),
+                           # app-bar__spacer, then the cross link
+                           # (relative hrefs for subpath-proxy compat);
                            # _metrics.html/_load_management.html are SSE-swappable fragments
                            # (the metrics fragment carries the hidden #data-freshness state
-                           # strip mirrored onto the header #connection dot by syncConnection(); the
+                           # strip mirrored onto the header #connection button by syncConnection()
+                           # (dot-only when live+fresh; tap toggles data-show-text to reveal/hide
+                           # the age text); the
                            # sparkline filter receives quantization_seconds to feed
                            # chart.per_second_sparkline's bucket_secs downsampling)
 ├── static/                # Mobile-first design system (style.css) and the SSE dashboard
@@ -366,6 +406,8 @@ project-root
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 - Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
+- Data-health Telegram alerts (fatal fetch + 300 s stale/no-data, per-QH
+  throttle) in `tests/test_data_health_alerts.py`
 - File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
 - Compaction tests in `tests/test_compaction.py` (`CompletedNBCPeriod`, `compact()`, `inject_completed_qh()`, replace-not-merge behavior)
 
@@ -458,7 +500,18 @@ project-root
   - `apply_prediction_window()`: resolves the prediction/settle window from shared-cache
     quantization; commits a new window only after two consecutive cycles and ignores
     dead-band jitter (see `_resolve_prediction_window`)
-- DeviceState dataclass tracks per-device runtime state
+- DeviceState dataclass tracks per-device runtime state, including daily
+  ON-time fields (`on_since`, `runtime_today_secs`, `runtime_day`) credited by
+  `StateTracker.note_desired_transition()` (single funnel for GapMinder
+  decisions and `_sync_plug_states` reconciliation; meter-local midnight
+  resets/clips) and read via `runtime_today_for()` for alerts only
+- Dashboard pills (`templates/_metrics.html`) show `pending-on/off` (faded)
+  while a pending effect exists, else fall back to unconfirmed `desired_state`
+  mismatch (desired=True/actual=False → pending-on, desired=False/actual=True
+  → pending-off) so pruning before controller confirmation never flaps to
+  off/on; `_sync_plug_states` (`load_manager.py`) only reconciles `desired`
+  when the reported `actual` actually changed, preserving our own unconfirmed
+  command. Covered by `tests/test_desired_pending.py`.
 - Stale detection uses **data-point age** (not fetch time): `data_point_at = fetched_at - timedelta(seconds=data_lag_secs)`.
   The threshold is `STALE_DATA_THRESHOLD_SECS` (80 seconds, constants.py) from the most
   recent per-second data point, accounting for Emporia API lag. Min toggle interval: 60 seconds.
@@ -473,6 +526,7 @@ project-root
 - `validate_telegram_devices()` (device_config.py) — validates telegram.devices keys match plug names after every `_load()`; "tesla" is accepted as a special device name for Tesla stop-charging alerts
 - Whitelist gate: Telegram notifications are only sent when a telegram.devices whitelist is explicitly configured AND at least one action matches it. Without a whitelist, notifications are blocked to prevent unintended messages to unconfigured devices.
 - Plug notifications use emoji format: `🟢 device → ON` / `🔘 device → OFF`
+- Plug `turn_off` lines append today's ON-time since meter-local midnight: `🔘 water heater (06:12 today)` (`MM:SS` under an hour, `H:MM:SS` above; plugs only, never Tesla/`turn_on`)
 - Tesla notifications use device-specific format: `🔌 Tesla charging stopped` / `⚡ Tesla charging started` / `🔋 Tesla charge amps → N A`
 
 ### EnergyCache & Incremental Fetch

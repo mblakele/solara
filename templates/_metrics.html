@@ -17,7 +17,7 @@
      data-status="{{ freshness.status }}">
   <span id="live-indicator" class="live-indicator" data-state="off" hidden>live</span>
   <span class="freshness__dot" aria-hidden="true"></span>
-  <span class="freshness__text">data <b class="freshness__age">{{ freshness.age_secs }}s</b> old · next ~<b class="freshness__next">{{ freshness.next_update_secs }}s</b></span>
+  <span class="freshness__text">data age <b class="freshness__age">{{ freshness.age_secs }}s</b> · next ~<b class="freshness__next">{{ freshness.next_update_secs }}s</b></span>
 </div>
 {% endif %}
 {% for vd in metrics.devices %}
@@ -119,9 +119,12 @@
         {% set pending_amps = pending.amps %}
         {# Pill color: sentinel on -> red, sentinel off -> grey (pending
            effects never apply to sentinels); pending turn_off -> blue,
-           pending turn_on / set_amps -> faded green, otherwise on ->
-           solid green, off -> grey. Tesla counts as on (green) only when
-           charging; stopped or unavailable renders grey. #}
+           pending turn_on / set_amps -> faded green; unconfirmed
+           desired (no pending effect but desired != actual) -> faded
+           pending so the pill never flaps to off/on between "pending on"
+           and on; otherwise on -> solid green, off -> grey. Tesla counts
+           as on (green) only when charging; stopped or unavailable
+           renders grey. #}
         {% set pill_class = "device-pill--off" %}
         {% if is_sentinel %}
         {% if dev.actual_state %}
@@ -145,6 +148,10 @@
         {% elif dev.actual_state %}
         {% set pill_class = "device-pill--on" %}
         {% endif %}
+        {% elif dev.desired_state is sameas true and not dev.actual_state %}
+        {% set pill_class = "device-pill--pending-on" %}
+        {% elif dev.desired_state is sameas false and dev.actual_state %}
+        {% set pill_class = "device-pill--pending-off" %}
         {% elif dev.actual_state %}
         {% set pill_class = "device-pill--on" %}
         {% endif %}

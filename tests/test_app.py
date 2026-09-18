@@ -357,7 +357,7 @@ class TestApp(unittest.TestCase):
     def test_tou_date_range_366_days_accepted(self):
         """Test tou() accepts date ranges of exactly 366 days."""
         start = datetime(2025, 1, 1)
-        end = start + timedelta(days=366)
+        end = start + timedelta(days=365)  # Inclusive date-only end: 366 selected days.
         with mock_config(MOCK=True):
             response = self.app.get(
                 f"/api/v1/tou?start_date={start.strftime('%Y-%m-%d')}"
@@ -2332,8 +2332,7 @@ class TestDataFreshness(unittest.TestCase):
         # No-LM thresholds ride on the strip so the client ticks with them.
         self.assertIn('data-warn="300"', html)
         self.assertIn('data-stale="420"', html)
-        self.assertIn("data <b class=", html)
-        self.assertIn("old", html)
+        self.assertIn("data age <b class=", html)
 
     def test_index_html_freshness_live_when_lm_enabled(self):
         """LM-enabled pages mark the strip as SSE-driven with the sleep hint."""
@@ -2538,6 +2537,36 @@ class TestDataFreshness(unittest.TestCase):
         js = TestIndexMobileAndLive._static_text("app.js")
         self.assertIn("getElementById('connection')", js)
         self.assertIn("syncConnection", js)
+
+    def test_index_header_connection_is_tap_toggle(self):
+        """The connection indicator is a button so tapping the dot can
+        reveal/hide the age text (collapsed by default)."""
+        with mock_config():
+            response = self.app.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        header = html.split("</header>", 1)[0]
+        self.assertIn('id="connection"', header)
+        self.assertIn("<button", header)
+        self.assertIn('aria-expanded="false"', header)
+
+    def test_static_app_js_toggles_connection_text(self):
+        """app.js flips data-show-text/aria-expanded when the dot is
+        tapped, without disturbing the mirrored freshness state."""
+        js = TestIndexMobileAndLive._static_text("app.js")
+        self.assertIn("data-show-text", js)
+        self.assertIn("aria-expanded", js)
+
+    def test_static_css_reveals_connection_text_on_tap(self):
+        """The live dot-only rule yields when the user tapped to reveal."""
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "static" / "style.css"
+        css = path.read_text(encoding="utf-8")
+        self.assertIn(
+            '#connection[data-state="live"]:not([data-show-text="true"])',
+            css,
+        )
 
     def test_static_app_js_watches_sse_silence(self):
         """app.js re-arms the reload fallback when a live SSE stream goes

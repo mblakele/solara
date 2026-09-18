@@ -96,6 +96,36 @@ body {
   letter-spacing: 0.02em;
 }
 
+.app-bar__nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.app-bar__spacer {
+  flex: 1 1 auto;
+}
+
+button.app-bar__link {
+  font: inherit;
+  cursor: pointer;
+}
+
+.app-bar__link {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-load);
+  text-decoration: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  padding: 0.25rem 0.8rem;
+  background: var(--color-surface);
+}
+
+.app-bar__link:hover {
+  text-decoration: underline;
+}
+
 .live-indicator {
   display: inline-flex;
   align-items: center;
@@ -414,9 +444,20 @@ body {
   display: flex;
   align-items: center;
   gap: 0.45em;
-  font-size: 0.8rem;
+  font: inherit;
   color: var(--color-text-muted);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 0.8rem;
   font-variant-numeric: tabular-nums;
+}
+
+#connection:focus-visible {
+  outline: 2px solid var(--color-load);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 .connection__dot {
@@ -440,8 +481,10 @@ body {
   background: var(--color-text-muted);
 }
 
-/* Dot-only when live+fresh; text returns the moment anything needs saying. */
-#connection[data-state="live"] .connection__text {
+/* Dot-only when live+fresh unless the user tapped the dot to reveal the
+   age text (data-show-text); text always shows the moment anything needs
+   saying (aging/stale/reload/reconnecting). */
+#connection[data-state="live"]:not([data-show-text="true"]) .connection__text {
   display: none;
 }
 
@@ -524,6 +567,13 @@ body {
   font-size: 0.85rem;
 }
 
+/* Two-column tables (TOU 15-min details) fit narrow phones: no min-width
+   means no horizontal scrolling at 375px. Wider tables keep the 34rem
+   floor and scroll inside .table-wrap instead. */
+.data-table--compact {
+  min-width: 0;
+}
+
 .data-table th,
 .data-table td {
   text-align: left;
@@ -566,6 +616,226 @@ body {
 
 .actions__type {
   font-weight: 600;
+}
+
+/* ── TOU report ──────────────────────────────────────────────────────── */
+.tou-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding-bottom: var(--space-xl);
+}
+
+.tou {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.tou__heading {
+  margin: 0;
+  font-size: clamp(1.05rem, 3vw, 1.3rem);
+}
+
+.tou-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.tou-form__row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+  gap: var(--space-sm);
+}
+
+.tou-form__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.tou-form__field input {
+  font: inherit;
+  color: var(--color-text);
+  background: var(--color-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.6rem;
+}
+
+.tou-form__check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+}
+
+/* ── TOU date-range picker ────────────────────────────────────────── */
+.range-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+/* Collapsed by default: the form shows the range as text; the calendar
+   opens only when the user selects the date text. */
+.range-picker__toggle {
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  color: var(--color-text);
+  background: var(--color-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.6rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-picker__toggle::after {
+  content: "▾";
+  float: right;
+  color: var(--color-text-muted);
+}
+
+.range-picker__toggle[aria-expanded="true"]::after {
+  content: "▴";
+}
+
+.range-picker__toggle[hidden] {
+  display: none;
+}
+
+.range-picker__calendar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm);
+}
+
+.range-picker__calendar[hidden] {
+  display: none;
+}
+
+.range-picker__nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.range-picker__month {
+  font-weight: 650;
+  font-size: 0.95rem;
+}
+
+.range-picker__navbtn {
+  font: inherit;
+  cursor: pointer;
+  color: var(--color-text);
+  background: var(--color-sunken);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.8rem;
+  line-height: 1.2;
+}
+
+.range-picker__weekdays,
+.range-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 0.25rem;
+}
+
+.range-picker__weekdays {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.range-picker__day {
+  font: inherit;
+  cursor: pointer;
+  aspect-ratio: 1;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--color-sunken);
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+  padding: 0;
+}
+
+.range-picker__day:hover {
+  border-color: var(--color-load);
+}
+
+.range-picker__day:focus-visible {
+  outline: 2px solid var(--color-load);
+  outline-offset: 1px;
+}
+
+.range-picker__day.in-range {
+  background: color-mix(in srgb, var(--color-sunken) 55%, var(--color-load));
+}
+
+.range-picker__day.is-start,
+.range-picker__day.is-end,
+.range-picker__day.is-single {
+  background: var(--color-load);
+  color: #fff;
+  font-weight: 700;
+}
+
+.range-picker__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.range-picker__actions {
+  display: flex;
+  gap: var(--space-xs);
+}
+
+.range-picker__selection {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-picker__today,
+.range-picker__close {
+  font: inherit;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--color-load);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  padding: 0.25rem 0.8rem;
+}
+
+.range-picker__go {
+  font: inherit;
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: #fff;
+  background: var(--color-load);
+  border: 1px solid var(--color-load);
+  border-radius: var(--radius-pill);
+  padding: 0.25rem 0.9rem;
 }
 
 /* ── Debug output ──────────────────────────────────────────────────────── */

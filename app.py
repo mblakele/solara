@@ -54,6 +54,7 @@ from constants import (
 )
 
 from energy_cache import EnergyCache
+from energy_aggregator import EnergyDataAggregator
 from quantization import usable_window
 import logfmt
 from metrics import (
@@ -387,17 +388,91 @@ def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = 
     """Return TOU buckets and NBC total based on configuration.
 
     Raises requests.exceptions.HTTPError or IOError from TOUReporter.
-    Returns a TOUResult with buckets (TOU totals) and nbc (total Wh
-    across all 15-minute periods). In mock mode, returns realistic non-zero values.
+    Returns a TOUResult with buckets (TOU totals), nbc (total Wh
+    across all 15-minute periods), and periods (per-15-minute details).
+    In mock mode, returns realistic non-zero values.
     """
     is_mock = _config.is_mock_mode or force_mock
     if is_mock:
         mock = MetricsMock()
-        return TOUResult(buckets=mock.tou_result, nbc=mock.nbc_result)
+        periods = _mock_tou_periods(start_date, end_date)
+        return TOUResult(
+            buckets=mock.tou_result, nbc=mock.nbc_result, periods=tuple(periods)
+        )
     model = TOUReporter(start_date, end_date, logger, config=_config)
     assert model.tou_result is not None
     assert model.nbc_result is not None
-    return TOUResult(buckets=model.tou_result, nbc=model.nbc_result)
+    return TOUResult(
+        buckets=model.tou_result,
+        nbc=model.nbc_result,
+        periods=tuple(getattr(model, "periods", [])),
+    )
+
+
+def _mock_tou_periods(
+    start_date: datetime, end_date: datetime
+) -> list[dict[str, Any]]:
+    """Build deterministic per-15-minute mock periods for a date range.
+
+    Args:
+        start_date: Range start (UTC).
+        end_date: Range end (UTC).
+
+    Returns:
+        List of period dicts with timestamp, wh, and bucket keys,
+        one per 15-minute step.
+    """
+    periods: list[dict[str, Any]] = []
+    current = start_date
+    idx = 0
+    while current < end_date:
+        bucket = EnergyDataAggregator.classify_timestamp(current)
+        base = {"peak": 220.0, "part_peak": 150.0, "off_peak": 80.0}[bucket]
+        wh = base + float(idx % 4) * 5.0
+        periods.append({"timestamp": current, "wh": wh, "bucket": bucket})
+        current += timedelta(minutes=15)
+        idx += 1
+    return periods
+
+
+def _parse_details_param(value: str | None) -> bool | None:
+    """Parse the details query param to an explicit bool or None (auto).
+
+    Args:
+        value: Raw query string value, or None when absent.
+
+    Returns:
+        True/False for recognized truthy/falsy values, None when absent
+        (or unrecognized) so the caller falls back to the date-range default.
+    """
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("true", "1", "on", "yes"):
+        return True
+    if normalized in ("false", "0", "off", "no"):
+        return False
+    return None
+
+
+def _is_single_day(start_date: datetime, end_date: datetime) -> bool:
+    """Check whether a UTC range falls on one local calendar day.
+
+    Args:
+        start_date: Range start (UTC).
+        end_date: Range end (UTC).
+
+    Returns:
+        True when both instants share the same device-timezone date.
+    """
+    tz = pytz.timezone(get_timezone())
+    return start_date.astimezone(tz).date() == end_date.astimezone(tz).date()
+
+
+def _local_date_str(value: datetime) -> str:
+    """Format a datetime as a YYYY-MM-DD date in the device timezone."""
+    tz = pytz.timezone(get_timezone())
+    return value.astimezone(tz).strftime("%Y-%m-%d")
 
 
 def _validate_dates(
@@ -411,6 +486,12 @@ def _validate_dates(
     Defaults end_date to the injected clock's current time when not
     provided (RealClock in production — always a correctly localized,
     timezone-aware instant; FakeClock in tests).
+
+    A date-only ``end_date`` is inclusive: the local calendar day named
+    by ``end_date_str`` is included, so ``2026-09-16`` alone fetches one
+    full day. Explicit ``T`` timestamps keep their exact meaning.
+    The fetch boundary (exclusive end, midnight after the end day) stays
+    internal; the UI keeps echoing ``end_date_str`` verbatim.
 
     Args:
         start_date_str: Start date string, or None to abort with 400.
@@ -427,8 +508,14 @@ def _validate_dates(
 
     if end_date_str:
         try:
-            end_date = parse_date_to_utc(end_date_str)
-        except (ValueError, TypeError):
+            if "T" not in end_date_str:
+                # Advance the calendar date before localizing so DST days
+                # span 23/25 hours rather than an unconditional 24 hours.
+                next_day = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=1)
+                end_date = parse_date_to_utc(next_day.strftime("%Y-%m-%d"))
+            else:
+                end_date = parse_date_to_utc(end_date_str)
+        except (ValueError, TypeError, OverflowError):
             return abort(400, "Invalid end_date format")
     else:
         end_date = (clock or RealClock()).now()
@@ -827,6 +914,15 @@ def tou() -> ResponseReturnValue:
 
     start_date_str = request.args.get("start_date")
     end_date_str = request.args.get("end_date")
+    details_str = request.args.get("details")
+    wants_html = request.accept_mimetypes.accept_html
+
+    if not start_date_str and wants_html:
+        # HTML report defaults to the current local date from midnight:
+        # an empty picker load shows today's data without a 400.
+        # JSON clients keep the strict 400 below.
+        tz = pytz.timezone(get_timezone())
+        start_date_str = datetime.now(tz).strftime("%Y-%m-%d")
 
     result = _validate_dates(start_date_str, end_date_str)
     if isinstance(result, Response):
@@ -849,21 +945,40 @@ def tou() -> ResponseReturnValue:
     buckets = tou_data.buckets
     nbc = tou_data.nbc
 
-    if request.accept_mimetypes.accept_html:
+    # Keep the selected end day separate from its exclusive fetch boundary.
+    display_end = (
+        end_date - timedelta(microseconds=1)
+        if end_date_str and "T" not in end_date_str else end_date
+    )
+    # Details default: on for single local days, off for multi-day ranges.
+    # An explicit ?details=true/false/1/0/on/off always wins.
+    show_details = _parse_details_param(details_str)
+    if show_details is None:
+        show_details = _is_single_day(start_date, display_end)
+    periods = list(tou_data.periods) if show_details else []
+
+    if wants_html:
         return render_template(
             "tou.html",
             start_date=start_date_str,
-            end_date=end_date_str,
+            end_date=end_date_str or "",
+            start_picker=_local_date_str(start_date),
+            end_picker=_local_date_str(display_end),
             buckets=buckets,
             nbc=nbc,
+            periods=periods,
+            show_details=show_details,
+            timezone=get_timezone(),
         )
 
-    payload = {
+    payload: dict[str, Any] = {
         "start_date": start_date_str,
         "end_date": end_date_str,
         "buckets": buckets.to_dict(),
         "nbc": nbc,
     }
+    if show_details:
+        payload["periods"] = periods
     return _json_response(payload)
 
 

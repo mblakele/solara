@@ -35,13 +35,19 @@
   <h1 class="app-bar__title">Solara</h1>
   {% if freshness %}
   {# Connection indicator: dot-only when live+fresh, text when troubled.
-     State mirrors the hidden #data-freshness strip via syncConnection(). #}
+     Tapping the dot reveals/hides the age text (wired in app.js via
+     data-show-text). State mirrors the hidden #data-freshness strip
+     via syncConnection(). #}
   {% if freshness.live %}{% set cstate = freshness.status if freshness.status != 'fresh' else 'live' %}{% else %}{% set cstate = 'reload' %}{% endif %}
-  <div class="connection" id="connection" data-state="{{ cstate }}" aria-label="{{ 'Live' if cstate == 'live' else 'Data ' ~ freshness.age_secs ~ ' seconds old' ~ ('' if freshness.live else ', next update in ' ~ freshness.next_update_secs ~ ' seconds') }}">
+  <button type="button" class="connection" id="connection" data-state="{{ cstate }}" aria-expanded="false" aria-label="{{ 'Live' if cstate == 'live' else 'Data age ' ~ freshness.age_secs ~ ' seconds' ~ ('' if freshness.live else ', next update in ' ~ freshness.next_update_secs ~ ' seconds') }}">
     <span class="connection__dot" aria-hidden="true"></span>
-    <span class="connection__text" id="connection-text" aria-hidden="true">data <b class="connection__age">{{ freshness.age_secs }}s</b> old{% if not freshness.live %} · next ~<b class="connection__next">{{ freshness.next_update_secs }}s</b>{% endif %}</span>
-  </div>
+    <span class="connection__text" id="connection-text" aria-hidden="true">data age <b class="connection__age">{{ freshness.age_secs }}s</b>{% if not freshness.live %} · next ~<b class="connection__next">{{ freshness.next_update_secs }}s</b>{% endif %}</span>
+  </button>
   {% endif %}
+  <div class="app-bar__spacer" aria-hidden="true"></div>
+  <nav class="app-bar__nav" aria-label="Reports">
+    <a class="app-bar__link" href="api/v1/tou">TOU</a>
+  </nav>
 </header>
 
 <main id="metrics-section" class="metrics-wrap container">

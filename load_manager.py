@@ -29,6 +29,7 @@ import device_config
 from clock import Clock, RealClock
 from config import Config, ConfigWatcher, _config, check_restart_required
 from constants import (
+    DATA_STALE_ALERT_THRESHOLD_SECS,
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
@@ -49,7 +50,7 @@ from config_loader import (
     load_vocolinc_plugs_from_file,
 )
 
-from util import atomic_write_text
+from util import atomic_write_text, floor_to_qh, RetryableError
 
 from load_controllers import (
     CompositePlugController,
@@ -106,6 +107,7 @@ from metrics import DriftAlert, drain_drift_alerts
 from telegram import (
     NotificationEvent,
     TelegramSender,
+    action_device_and_type,
     build_error_notification,
     build_notification,
 )
@@ -342,6 +344,12 @@ class LoadManager:
         # Set to True when a Tesla command fails with VehicleOffline this cycle.
         # Used to select a shorter sleep hint so the next cycle retries quickly.
         self._vehicle_offline_this_cycle: bool = False
+        # Data-health alerting (bugs/2026-09-16-metrics.VueAuthenticationError):
+        # per-QH throttles for fatal-fetch and stale/no-data Telegram alerts.
+        # _boot_at anchors the empty-cache age when no data point exists yet.
+        self._boot_at: datetime = self._clock.now()
+        self._last_fetch_fatal_alert_qh: datetime | None = None
+        self._last_stale_alert_qh: datetime | None = None
 
         logger.debug("LoadManager %s", plug_ctrl)
         if plug_ctrl is not None:
@@ -983,7 +991,7 @@ class LoadManager:
         )
 
     async def _arbitrate_tesla_state_from_rest(
-        self, snapshot: dict[str, Any],
+        self, snapshot: dict[str, Any], now: datetime | None = None,
     ) -> TeslaState | None:
         """Resolve ambiguous telemetry with an authoritative REST poll.
 
@@ -998,13 +1006,22 @@ class LoadManager:
         :meth:`_arbitration_sustain`). A negative answer is also latched
         for the cooldown so ghost periods don't poll-storm.
 
+        Skipped entirely outside the configured tesla.time_range window:
+        the state would be discarded by eligibility filtering anyway, so
+        no quota is spent.
+
         Args:
             snapshot: Telemetry snapshot dict.
+            now: Current wall-clock time for the time-range check and
+                cooldown math. Falls back to the injected clock when None.
 
         Returns:
             ``TeslaState`` when arbitration confirms charging (fresh poll
             or sustained verdict), else ``None`` (idle ghost-guard applies).
         """
+        effective_now = now if now is not None else self._clock.now()
+        if not self._is_tesla_in_range(effective_now):
+            return None
         reported = parse_charge_amps(snapshot.get("ChargeAmps"))
         if reported is None or reported <= 0:
             self._last_rest_arbitration_charging = False
@@ -1014,7 +1031,7 @@ class LoadManager:
         sustained = self._arbitration_sustain(snapshot, reported)
         if sustained is not None:
             return sustained
-        now = self._clock.now()
+        now = effective_now
         last_at = self._last_rest_arbitration_at
         if (
             last_at is not None
@@ -1557,7 +1574,7 @@ class LoadManager:
         return 0.0
 
     async def _fetch_tesla_state_async(
-        self,
+        self, now: datetime | None = None,
     ) -> tuple[TeslaState | None, str | None, str | None]:
         """Fetch Tesla charging state from MQTT telemetry, with REST fallback.
 
@@ -1567,11 +1584,23 @@ class LoadManager:
         the REST API fallback.
         The result is cached on the controller so subsequent calls are fast.
 
+        Outside the configured tesla.time_range window the REST fallback
+        and REST arbitration are skipped (telemetry is free MQTT and is
+        still used): the state would be discarded by eligibility filtering
+        anyway, so no vehicle-API quota is spent.
+
+        Args:
+            now: Current wall-clock time for the time-range check. Falls
+                back to the injected clock when None.
+
         Returns:
             Tuple of (tesla_state, tesla_error, tesla_login_url).
         """
         if self.tesla_ctrl is None:
             return None, None, None
+
+        effective_now = now if now is not None else self._clock.now()
+        tesla_in_range = self._is_tesla_in_range(effective_now)
 
         # Fast path: use live telemetry state whenever available.
         telemetry_state: TeslaState | None = None
@@ -1606,6 +1635,10 @@ class LoadManager:
                 # (15s interval) before Location (120s interval) so the
                 # telemetry fast path would otherwise return at_home=False
                 # without ever reaching the REST fallback below.
+                # Outside the tesla time range there is no REST seeding —
+                # return the telemetry state as-is (eligibility drops it).
+                if not tesla_in_range:
+                    return telemetry_state, None, None
             else:
                 # Live telemetry is present but reports no corroborated
                 # charging state. Before declaring idle, check the command
@@ -1616,9 +1649,10 @@ class LoadManager:
                     return echo, None, None
                 # No echo: arbitrate positive amps via REST (an external
                 # session we never commanded looks exactly like the pilot
-                # ghost on this feed).
+                # ghost on this feed). Skipped outside the tesla time
+                # range — _arbitrate_* also guards, this avoids the call.
                 arbitrated = await self._arbitrate_tesla_state_from_rest(
-                    telemetry_snapshot
+                    telemetry_snapshot, now=effective_now
                 )
                 if arbitrated is not None:
                     return arbitrated, None, None
@@ -1641,9 +1675,16 @@ class LoadManager:
                 # fallback below to seed _last_tesla_at_home. The REST merge
                 # (below) folds ``rest_state.at_home`` into the not-charging
                 # telemetry state, discarding the placeholder at_home=False.
+                # Outside the tesla time range there is no REST seeding.
                 telemetry_state = _not_charging_state(at_home=False)
+                if not tesla_in_range:
+                    return telemetry_state, None, None
 
         # REST fallback to seed _last_tesla_at_home and/or obtain location.
+        # Skipped outside the tesla time range: the state would be
+        # discarded by eligibility filtering, so no quota is spent.
+        if not tesla_in_range:
+            return telemetry_state, None, None
         if not isinstance(self.tesla_ctrl, RealTeslaController):
             return telemetry_state, None, None
 
@@ -1689,14 +1730,22 @@ class LoadManager:
             return telemetry_state, None, None
         return None, None, None
 
-    async def _sync_plug_states(self) -> None:
+    async def _sync_plug_states(self) -> list[PendingEffect]:
         """Query actual plug states from controllers and reconcile with tracking.
 
         Detects external changes (e.g., user manually toggling a plug) by comparing
         the controller's reported state against our internal desired_state. When they
         diverge, updates both actual_state and desired_state to match reality so the
-        GapMinder makes decisions based on current conditions.
+        GapMinder makes decisions based on current conditions. Daily ON-time books
+        move via note_desired_transition, exactly as for managed decisions.
+
+        Returns:
+            Synthetic PendingEffects for reconciled external flips (empty
+            when nothing diverged). The async phase queues Telegram alerts
+            for these, reusing the whitelist and runtime rendering of
+            decided actions.
         """
+        external: list[PendingEffect] = []
         for name in self.plugs:
             try:
                 actual = await self.plug_ctrl.get_state(name)
@@ -1712,12 +1761,24 @@ class LoadManager:
             dev_state = self.state.devices.get(name)
             if dev_state is None:
                 # First time seeing this plug's state
-                self.state.devices[name] = DeviceState(
-                    name=name, actual_state=actual, desired_state=actual
+                self.state.set_device_state(
+                    name,
+                    DeviceState(
+                        name=name, actual_state=actual, desired_state=None
+                    ),
+                )
+                self.state.note_desired_transition(
+                    name, actual, self._clock.now()
                 )
             else:
                 prev_actual = dev_state.actual_state
                 dev_state.actual_state = actual
+                if prev_actual == actual:
+                    # No change in reported state — a desired/actual
+                    # mismatch is our own unconfirmed command, not an
+                    # external flip. Keep desired so the dashboard holds
+                    # pending instead of flapping to off/on.
+                    continue
                 # Reconcile: if external actor changed the state, match it
                 if dev_state.desired_state != actual:
                     logger.info(
@@ -1728,10 +1789,15 @@ class LoadManager:
                         actual,
                     )
                     prev_desired = dev_state.desired_state
-                    dev_state.desired_state = actual
-                    self._record_external_effect(
+                    self.state.note_desired_transition(
+                        name, actual, self._clock.now()
+                    )
+                    effect = self._record_external_effect(
                         name, actual, prev_desired, prev_actual
                     )
+                    if effect is not None:
+                        external.append(effect)
+        return external
 
     def _record_external_effect(
         self,
@@ -1739,193 +1805,66 @@ class LoadManager:
         actual: bool,
         prev_desired: bool | None,
         prev_actual: bool | None,
-    ) -> None:
+    ) -> PendingEffect | None:
         """Record a pending effect for an externally flipped plug.
 
         Mirrors a load-manager decision so NBC math (estimated_current_wh)
         and the can_toggle debounce account for the change before the next
-        decision. Skipped on first observation (previous actual unknown),
-        when the previous desired state is unknown, the plug's rated power
-        is unknown, or dry-run mode is active.
+        decision. The returned effect lets the caller raise a Telegram
+        alert for the flip. Skipped on first observation (previous actual
+        unknown), when the previous desired state is unknown, the plug's
+        rated power is unknown, or dry-run mode is active.
 
         Args:
             name: Plug configuration name.
             actual: Reconciled actual state (True = on).
             prev_desired: Desired state before reconciliation.
             prev_actual: Actual state before this sync (None on first sight).
+
+        Returns:
+            The recorded PendingEffect, or None when skipped.
         """
         if prev_actual is None or prev_desired is None or self.dry_run:
-            return
+            return None
         plug = self.plugs.get(name)
         power = plug.power_watts if plug is not None else None
         if power is None:
-            return
+            return None
         now = self._clock.now()
         action: Literal["turn_on", "turn_off"] = "turn_on" if actual else "turn_off"
-        self.state.add_effect(make_plug_effect(name, action, power, now, now))
+        effect = make_plug_effect(name, action, power, now, now)
+        self.state.add_effect(effect)
         dev_state = self.state.devices.get(name)
         if dev_state is not None:
             dev_state.last_toggle = now
+        return effect
 
-    async def _fire_telegram_notification(
+    def _runtime_for_actions(
         self,
         actions: list[PendingEffect],
-        predicted_wh: float,
-        target_wh: float,
-        dry_run: bool,
-        now: datetime | None = None,
-    ) -> bool:
-        """Send a Telegram notification for successful plug actions.
+        now: datetime,
+    ) -> dict[str, float] | None:
+        """Build the per-device today-runtime map for turn_off plug actions.
 
-        Builds a surplus notification from the actions and sends it via the
-        configured TelegramSender. Skipped when the sender is not configured,
-        dry-run mode is active, or there are no actions.
-
-        Args:
-            actions: List of PendingEffect actions describing what was done.
-            predicted_wh: The adjusted predicted Wh for the current quarter-hour.
-            target_wh: The target Wh for the current quarter-hour.
-            dry_run: Whether load management is in dry-run mode.
-            now: Current time, or the current time in UTC if None.
-
-        Returns:
-            True if a notification was sent successfully, False otherwise.
-        """
-        # Guard: no sender, not configured, dry-run, or no actions
-        if self.telegram_sender is None:
-            logger.info(
-                "Telegram notification skipped: sender not configured (LoadManager.telegram_sender is None)",
-            )
-            return False
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Telegram notification skipped: sender not configured (is_configured=False)",
-            )
-            return False
-        if dry_run:
-            logger.info(
-                "Telegram notification skipped: dry-run mode",
-            )
-            return False
-        if not actions:
-            # Operator-facing sign convention (deliberate, do NOT "fix"):
-            # NBC-signed — negative = excess solar, positive = grid draw —
-            # matching how predictions are displayed everywhere else.
-            # This is the OPPOSITE of the engine-internal control gap
-            # (target_wh - predicted_wh) in CycleDiagnostics/gapminder logs.
-            # See docs/LOADMANAGER.md and arch-review-pr-code-review.md #7.
-            gap_wh = predicted_wh - target_wh
-            logger.info(
-                "Telegram notification skipped: no actions "
-                "(gap=%+.1f Wh, positive=grid draw)",
-                gap_wh,
-            )
-            return False
-
-        if now is None:
-            now = self._clock.now()
-
-        event = build_notification(
-            actions=actions,
-            predicted_wh=predicted_wh,
-            target_wh=target_wh,
-            now=now,
-        )
-        logger.debug("Telegram send event=%s", event)
-
-        # Whitelist gate: notifications are only sent when a telegram.devices
-        # whitelist is explicitly configured AND at least one action matches it.
-        # When no whitelist is configured (_telegram_devices is None),
-        # notifications are blocked — users must list devices to enable them.
-        if self._telegram_devices is None:
-            logger.info(
-                "Telegram notification skipped: telegram.devices whitelist not configured",
-            )
-            return False
-        matches = any(
-            a.device_name.lower() in self._telegram_devices
-            and a.action in self._telegram_devices[a.device_name.lower()]
-            for a in actions
-        )
-        if not matches:
-            logger.info(
-                "Telegram notification skipped: no actions match telegram.devices whitelist",
-            )
-            return False
-
-        sent = False
-        try:
-            sent = await self.telegram_sender.send_notification(event)
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.warning("Telegram send failed: %s", e)
-
-        if sent:
-            device_names = ", ".join(a.device_name for a in actions)
-            logger.info(
-                "Telegram notification sent: devices=%s gap=%+.1f Wh",
-                device_names,
-                predicted_wh - target_wh,
-            )
-        else:
-            logger.info(
-                "Telegram notification not sent: devices=%s gap=%+.1f Wh",
-                ", ".join(a.device_name for a in actions),
-                predicted_wh - target_wh,
-            )
-
-        return sent
-
-    async def _fire_auth_error_notification(
-        self, error_msg: str, login_url: str | None = None,
-    ) -> bool:
-        """Send a Telegram alert for a vehicle auth error.
-
-        Unlike the surplus notification, this bypasses the devices whitelist
-        and dry-run guard — auth errors should always alert when enabled.
+        Reads the inclusive total (closed sessions plus the open one) from
+        the state tracker at queue/send time — by then the decide step has
+        already credited the session being closed. Tesla and non-turn_off
+        actions are excluded. Returns None when no action qualifies so the
+        event renders the legacy lines.
 
         Args:
-            error_msg: The auth error message text.
-            login_url: Optional Tesla OAuth login URL to include in the alert.
+            actions: Decided actions for this cycle.
+            now: Current wall-clock time for the runtime read.
 
         Returns:
-            True if a notification was sent, False otherwise.
+            Device-name → ON-time-seconds map, or None when empty.
         """
-        if self.telegram_sender is None:
-            logger.info(
-                "Auth error notification skipped: sender not configured",
-            )
-            return False
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Auth error notification skipped: sender not configured "
-                "(is_configured=False)",
-            )
-            return False
-        if not self._telegram_alert_on_auth_error:
-            logger.info(
-                "Auth error notification skipped: alert_on_auth_error is False",
-            )
-            return False
-
-        now = self._clock.now()
-        event = build_error_notification(error_msg, now=now, login_url=login_url)
-        sent = False
-        try:
-            sent = await self.telegram_sender.send_notification(event)
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.warning("Auth error notification send failed: %s", e)
-
-        if sent:
-            logger.info(
-                "Auth error notification sent: error=%s",
-                error_msg,
-            )
-        else:
-            logger.info(
-                "Auth error notification not sent: error=%s",
-                error_msg,
-            )
-        return sent
+        runtime: dict[str, float] = {}
+        for action in actions:
+            device, action_type = action_device_and_type(action)
+            if action_type == "turn_off" and device.lower() != "tesla":
+                runtime[device] = self.state.runtime_today_for(device, now)
+        return runtime or None
 
     def _queue_surplus_notification(
         self,
@@ -1937,8 +1876,10 @@ class LoadManager:
     ) -> None:
         """Queue a surplus notification for deferred synchronous send.
 
-        Guard logic mirrors _fire_telegram_notification but stores the
-        event in _pending_notifications instead of sending it.
+        Skipped when the sender is not configured, dry-run mode is active,
+        there are no actions, or no action matches the telegram.devices
+        whitelist. Matching events are stored in _pending_notifications
+        instead of being sent immediately.
         """
         if self.telegram_sender is None:
             logger.info(
@@ -1957,8 +1898,11 @@ class LoadManager:
             return
         if not actions:
             # Operator-facing sign convention (deliberate, do NOT "fix"):
-            # NBC-signed — negative = excess solar, positive = grid draw.
-            # See the twin comment in _fire_telegram_notification.
+            # NBC-signed — negative = excess solar, positive = grid draw —
+            # matching how predictions are displayed everywhere else.
+            # This is the OPPOSITE of the engine-internal control gap
+            # (target_wh - predicted_wh) in CycleDiagnostics/gapminder logs.
+            # See docs/LOADMANAGER.md.
             gap_wh = predicted_wh - target_wh
             logger.info(
                 "Telegram notification skipped: no actions "
@@ -1975,6 +1919,7 @@ class LoadManager:
             predicted_wh=predicted_wh,
             target_wh=target_wh,
             now=now,
+            runtime_today_secs=self._runtime_for_actions(actions, now),
         )
 
         # Whitelist gate: only queue when telegram.devices is configured
@@ -2011,8 +1956,9 @@ class LoadManager:
     ) -> None:
         """Queue an auth error notification for deferred synchronous send.
 
-        Guard logic mirrors _fire_auth_error_notification but stores the
-        event in _pending_notifications instead of sending it.
+        Unlike the surplus notification, this bypasses the devices whitelist
+        and dry-run guard — auth errors alert whenever a sender is
+        configured and alert_on_auth_error is enabled.
         """
         if self.telegram_sender is None:
             logger.info(
@@ -2094,6 +2040,174 @@ class LoadManager:
             )
             self._queue_drift_error_notification(alert)
 
+    @staticmethod
+    def _is_fatal_fetch_error(err: BaseException | None) -> bool:
+        """Return True when a fetch failure warrants an immediate alert.
+
+        Fatal means non-transient: auth/config errors such as
+        ``metrics.VueAuthenticationError``. Transient conditions —
+        ``RetryableError`` (e.g. ``RetryableMetricsException``), timeouts,
+        connection errors, OS errors, and ``requests`` network failures —
+        are excluded here; if they persist they surface via the
+        300 s stale-data alert instead of paging on every blip.
+
+        Args:
+            err: The stored fetch exception, or None.
+
+        Returns:
+            True for fatal (alertable) errors, False otherwise.
+        """
+        if err is None:
+            return False
+        if isinstance(err, RetryableError):
+            return False
+        if isinstance(err, (TimeoutError, ConnectionError, OSError)):
+            return False
+        try:
+            import requests as _requests
+
+            if isinstance(err, _requests.RequestException):
+                return False
+        except ImportError:
+            pass
+        return True
+
+    def _queue_fetch_fatal_notification(self, error_msg: str) -> None:
+        """Queue a Telegram alert for a fatal metrics-fetch failure.
+
+        Bypasses the telegram.devices whitelist and the dry-run guard
+        (like drift/auth-error alerts): data-health alerts must fire
+        whenever a sender is configured.
+
+        Args:
+            error_msg: Human-readable fetch failure text.
+        """
+        if self.telegram_sender is None:
+            logger.info(
+                "Fetch-fatal notification skipped: sender not configured",
+            )
+            return
+        if not self.telegram_sender.is_configured:
+            logger.info(
+                "Fetch-fatal notification skipped: sender not configured (is_configured=False)",
+            )
+            return
+        now = self._clock.now()
+        message = (
+            f"Emporia VUE fetch failure: {error_msg} "
+            "(no fresh data this cycle)"
+        )
+        event = build_error_notification(message, now=now)
+        self._pending_notifications.append(event)
+        logger.error("Fetch-fatal notification queued: %s", message)
+
+    def _queue_stale_data_notification(self, message: str) -> None:
+        """Queue a Telegram alert for stale or missing Emporia data.
+
+        Same bypass rules as :meth:`_queue_fetch_fatal_notification`:
+        whitelist and dry-run do not apply.
+
+        Args:
+            message: Human-readable staleness text (already includes age).
+        """
+        if self.telegram_sender is None:
+            logger.info(
+                "Stale-data notification skipped: sender not configured",
+            )
+            return
+        if not self.telegram_sender.is_configured:
+            logger.info(
+                "Stale-data notification skipped: sender not configured (is_configured=False)",
+            )
+            return
+        now = self._clock.now()
+        event = build_error_notification(message, now=now)
+        self._pending_notifications.append(event)
+        logger.error("Stale-data notification queued: %s", message)
+
+    def _check_fetch_fatal_alert(
+        self, err: BaseException | None, now: datetime,
+    ) -> None:
+        """Alert on a fatal fetch error, at most once per QH.
+
+        Args:
+            err: The stored fetch exception (or None).
+            now: Current wall-clock time for the QH throttle key.
+        """
+        if not self._is_fatal_fetch_error(err):
+            return
+        qh = floor_to_qh(now)
+        if self._last_fetch_fatal_alert_qh == qh:
+            return
+        self._last_fetch_fatal_alert_qh = qh
+        assert err is not None
+        self._queue_fetch_fatal_notification(f"{type(err).__name__}: {err}")
+
+    def _check_stale_data_alert(
+        self,
+        data_point_at: datetime | None,
+        now: datetime,
+        reason: str,
+    ) -> None:
+        """Alert when data age exceeds the threshold, at most once per QH.
+
+        Age is wall-clock ``now - data_point_at``; when no data point has
+        ever been seen (boot-empty cache) age is measured from manager
+        start instead.
+
+        Args:
+            data_point_at: Most recent NBC data point, or None when empty.
+            now: Current wall-clock time for age math and the QH key.
+            reason: Short tag included in the alert text (e.g.
+                ``stale_data`` or ``no_data``).
+        """
+        if data_point_at is not None:
+            age_secs = (now - data_point_at).total_seconds()
+        else:
+            age_secs = (now - self._boot_at).total_seconds()
+        if age_secs <= DATA_STALE_ALERT_THRESHOLD_SECS:
+            return
+        qh = floor_to_qh(now)
+        if self._last_stale_alert_qh == qh:
+            return
+        self._last_stale_alert_qh = qh
+        if data_point_at is None:
+            message = (
+                f"Solara data unavailable: no Emporia data for "
+                f"{age_secs:.0f}s (reason={reason})"
+            )
+        else:
+            message = (
+                f"Solara data stale: last data point {age_secs:.0f}s old "
+                f"(reason={reason})"
+            )
+        self._queue_stale_data_notification(message)
+
+    def _check_data_health_alerts(self, ctx: CycleContext) -> None:
+        """Run both data-health alert checks for the current cycle.
+
+        Called by ``run_cycle()`` right after the NBC fetch stage (on both
+        the success and early-exit paths) so a swallowed fetch exception
+        still pages: the fatal check reads the shared EnergyCache's stored
+        fetch error, and the stale check ages ``ctx.data_point_at``
+        (falling back to the last known data point for fetch misses).
+
+        Args:
+            ctx: Current pipeline context.
+        """
+        ec = getattr(self.nbc_reader, "energy_cache", None)
+        err = getattr(ec, "last_fetch_error", None) if ec is not None else None
+        self._check_fetch_fatal_alert(err, ctx.now)
+        data_point_at = ctx.data_point_at
+        reason = "stale_data"
+        if data_point_at is None:
+            data_point_at = self.state.last_data_point_at
+            reason = "no_incomplete_qh"
+            if data_point_at is None:
+                reason = "no_data"
+        now_ref = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
+        self._check_stale_data_alert(data_point_at, now_ref, reason)
+
     def _send_pending_notifications_sync(self) -> None:
         """Flush all queued Telegram notifications synchronously.
 
@@ -2120,22 +2234,26 @@ class LoadManager:
                     event.event_type,
                 )
 
-    async def _async_sync_and_check_sentinel(self) -> AsyncPhaseResult | None:
+    async def _async_sync_and_check_sentinel(
+        self,
+    ) -> tuple[AsyncPhaseResult | None, list[PendingEffect]]:
         """Sync plug states and short-circuit when a sentinel is on.
 
         Returns:
-            AsyncPhaseResult to return immediately, or None to continue.
+            Tuple of (early result to return immediately, or None to
+            continue; synthetic effects for external flips found during
+            the sync, for Telegram alerting by the caller).
         """
         # Sync actual plug states before making decisions so the engine sees
         # external changes (user toggles, other automations, etc.)
-        await self._sync_plug_states()
+        external = await self._sync_plug_states()
         # Placed after _sync_plug_states so device state is populated.
         if not self.is_sentinel_on():
-            return None
+            return None, external
         logger.info(
             "[_cycle_async_phase] sentinel device is on, disabling load management"
         )
-        return AsyncPhaseResult(sentinel_on=True)
+        return AsyncPhaseResult(sentinel_on=True), external
 
     def _record_tesla_auth_error(
         self, tesla_error: str | None, tesla_login_url: str | None
@@ -2408,15 +2526,27 @@ class LoadManager:
     ) -> AsyncPhaseResult:
         """Body of _cycle_async_phase, extracted for try/finally cleanup."""
         self._vehicle_offline_this_cycle = False
-        if (early := await self._async_sync_and_check_sentinel()):
+        early, external_actions = await self._async_sync_and_check_sentinel()
+        if early is not None:
             return early
         tesla_state, tesla_error, tesla_login_url = (
-            await self._fetch_tesla_state_async()
+            await self._fetch_tesla_state_async(now=now)
         )
         self._record_tesla_auth_error(tesla_error, tesla_login_url)
         corrected_adjusted_wh, corrected_gap_wh = self._correct_gap_with_inflight(
             adjusted_wh, tesla_state, seconds_remaining, now, data_point_at
         )
+        # Alert externally flipped plugs exactly like decided actions:
+        # the sync already closed their runtime sessions, so turn_off
+        # lines carry today's ON-time. Whitelist and dry-run guards apply.
+        if external_actions:
+            self._queue_surplus_notification(
+                actions=external_actions,
+                predicted_wh=corrected_adjusted_wh,
+                target_wh=self.target_wh,
+                dry_run=dry_run,
+                now=now,
+            )
         # Hysteresis guard uses corrected gap so in-flight Tesla draw is counted.
         if abs(corrected_gap_wh) <= self.engine.HYSTERESIS_WH:
             return AsyncPhaseResult(
@@ -2703,8 +2833,11 @@ class LoadManager:
             )
             # Escalate any persistent Emporia drift detected during the fetch
             # to ERROR + one-time Telegram alert, on both the success and
-            # early-exit paths.
+            # early-exit paths. Data-health alerts (fatal fetch errors +
+            # 300 s stale/no-data) run on the same paths so a swallowed
+            # fetch exception still pages (bugs/2026-09-16).
             self._drain_drift_alerts()
+            self._check_data_health_alerts(ctx)
             if stage2_result:
                 logger.info("cycle_early_exit stage=nbc_fetch status=%s reason=%s",
                             stage2_result.status, stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",

@@ -185,6 +185,11 @@ class EnergyCacheData:
 
 
 class EnergyCache:
+    # Too many public methods (22/20): the cache is the single home for
+    # samples, quantization, fetch-error surfacing (last_fetch_error for
+    # data-health alerts), and QH extraction — the property-per-field
+    # wrapper interface is inherent to its role, not hidden cohesion.
+    # pylint: disable=too-many-public-methods
     """Unified cache for per-second energy samples with sliding-window semantics.
 
     Stores raw Wh-per-second data points in a time-ordered list keyed by
@@ -222,6 +227,14 @@ class EnergyCache:
         # so readers never block behind network I/O (plan 2.2).
         self._fetch_lock: threading.Lock = threading.Lock()
         self._fetch_timeout_secs: int = fetch_timeout_secs
+        # Last fetch failure surfaced for data-health alerting: the
+        # exception from the most recent fetch_func run (or timeout),
+        # plus when it happened. Cleared on the next successful fetch.
+        # Lets LoadManager distinguish fatal auth/config errors (alert
+        # immediately, once per QH) from transient blips without
+        # changing the stale-serve contract of get_or_fetch().
+        self._last_fetch_error: BaseException | None = None
+        self._last_fetch_error_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Public properties (mimic the old direct-attribute interface)
@@ -393,6 +406,16 @@ class EnergyCache:
     def data_lag_secs(self, value: float) -> None:
         """Set the API data lag in seconds."""
         self._set_data_field(data_lag_secs=value)
+
+    @property
+    def last_fetch_error(self) -> BaseException | None:
+        """Exception from the most recent fetch, or ``None`` on success."""
+        return self._last_fetch_error
+
+    @property
+    def last_fetch_error_at(self) -> datetime | None:
+        """When the last fetch failure happened, or ``None``."""
+        return self._last_fetch_error_at
 
     # ------------------------------------------------------------------
     # Validation
@@ -754,12 +777,14 @@ class EnergyCache:
         future = pool.submit(_wrapped)
         try:
             result = future.result(timeout=self._fetch_timeout_secs)
-        except concurrent.futures.TimeoutError:
+        except concurrent.futures.TimeoutError as exc:
             timed_out.set()
             logger.warning(
                 "EnergyCache fetch timed out after %ds",
                 self._fetch_timeout_secs,
             )
+            self._last_fetch_error = exc
+            self._last_fetch_error_at = self._clock.now()
             pool.shutdown(wait=False, cancel_futures=True)
             return None
         except Exception as exc:  # noqa: BLE001
@@ -776,9 +801,13 @@ class EnergyCache:
                 )
             else:
                 logger.exception("EnergyCache fetch_func raised")
+            self._last_fetch_error = exc
+            self._last_fetch_error_at = self._clock.now()
             pool.shutdown(wait=False, cancel_futures=True)
             return None
         pool.shutdown(wait=False)
+        self._last_fetch_error = None
+        self._last_fetch_error_at = None
         return result
 
     def get_or_fetch(
@@ -1060,6 +1089,8 @@ class EnergyCache:
         """Clear the cache."""
         with self._lock:
             self._data = None
+            self._last_fetch_error = None
+            self._last_fetch_error_at = None
 
     def sleep_interval_adjust(
         self, interval_seconds: float, now: datetime

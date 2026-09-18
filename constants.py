@@ -42,6 +42,13 @@ defines a cadence: no load management (no cycle-driven fetch) and no
 detected quantization window. Mirrors the 2-minute fallback reload timer
 in ``static/app.js``."""
 
+DATA_STALE_ALERT_THRESHOLD_SECS: int = 300
+"""Wall-clock age (seconds) of the most recent NBC data point before the
+load manager queues a Telegram data-health alert. Covers both stale
+``data_point_at`` and the boot-empty case (age measured from manager
+start when no data point has ever been seen). Throttled to one alert
+per QH per type (see ``LoadManager._check_stale_data_alert``)."""
+
 PRUNE_WINDOW_SECS: int = 3600
 """Samples older than this many seconds are pruned from EnergyCache."""
 
@@ -52,6 +59,14 @@ DEFAULT_TARGET_WH: int = -50
 
 HYSTERESIS_PROPORTION: float = 1.0 / 3.0
 """Hysteresis Wh is abs(target_wh) * this proportion."""
+
+DEFAULT_HYSTERESIS_WH: int = 20
+"""Fallback hysteresis (Wh) when GapMinder gets no explicit value.
+
+Residential scale: blocks sub-20 Wh noise without swallowing the
+hundred-Wh gap errors real plug/Tesla decisions work with. Production
+still passes int(abs(target_wh) / 3) explicitly; this only covers
+direct GapMinder() construction (mostly tests)."""
 
 MIN_SECONDS_TO_ACT: int = 21
 """Minimum seconds remaining in a quarter-hour before the GapMinder will

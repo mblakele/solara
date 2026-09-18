@@ -216,7 +216,9 @@
   // Mirror fragment freshness onto the header connection dot. The
   // in-fragment strip is a hidden state carrier; this paints the only
   // visible indicator: dot-only when live+fresh, text when troubled
-  // (aging/stale data, reload mode, or a silent stream).
+  // (aging/stale data, reload mode, or a silent stream). Never touches
+  // data-show-text: the user's tap-to-reveal choice sticks across ticks
+  // and swaps.
   function syncConnection() {
     var conn = document.getElementById('connection')
     var strip = document.getElementById('data-freshness')
@@ -235,15 +237,15 @@
     var age = ageEl ? ageEl.textContent : ''
     var next = nextEl ? nextEl.textContent : ''
     var label = state === 'live' ? 'Live'
-      : state === 'reconnecting' ? 'Reconnecting, data ' + age + ' old'
-      : !driven ? 'Data ' + age + ' old, next update in ' + next
-      : 'Data ' + age + ' old'
+      : state === 'reconnecting' ? 'Reconnecting, data age ' + age
+      : !driven ? 'Data age ' + age + ', next update in ' + next
+      : 'Data age ' + age
     conn.setAttribute('aria-label', label)
     var textEl = document.getElementById('connection-text')
     if (textEl) {
       var key = state + '|' + age + '|' + next + '|' + driven
       if (textEl.getAttribute('data-rendered') !== key) {
-        var html = 'data <b class="connection__age">' + age + '</b> old'
+        var html = 'data age <b class="connection__age">' + age + '</b>'
         if (!driven) {
           html += ' · next ~<b class="connection__next">' + next + '</b>'
         }
@@ -336,6 +338,18 @@
     source.onerror = function () {
       log('sse connection error, retrying')
     }
+  }
+
+  // Tapping the connection dot reveals/hides the age text when the
+  // indicator is otherwise dot-only (live+fresh). Pure display toggle on
+  // #connection (a <button>, so tap and keyboard come free).
+  var connToggle = document.getElementById('connection')
+  if (connToggle) {
+    connToggle.addEventListener('click', function () {
+      var shown = connToggle.getAttribute('data-show-text') === 'true'
+      connToggle.setAttribute('data-show-text', shown ? 'false' : 'true')
+      connToggle.setAttribute('aria-expanded', shown ? 'false' : 'true')
+    })
   }
 
   syncConnection()

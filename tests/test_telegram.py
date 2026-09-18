@@ -321,6 +321,129 @@ class TestNotificationEvent:
         assert "pool_pump" in msg
 
 
+class TestTurnOffRuntime:
+    """turn_off plug lines carry today's ON-time; nothing else does."""
+
+    def _off_event(self, **kwargs):
+        from load_models import PendingEffect
+
+        now = datetime(2026, 6, 15, 18, 6, 12, tzinfo=timezone.utc)
+        return NotificationEvent(
+            event_type=EVENT_TYPE_SURPLUS,
+            timestamp=now,
+            description="Solara",
+            actions=[
+                PendingEffect(
+                    device_name="water_heater",
+                    action="turn_off",
+                    timestamp=now,
+                    data_point_at=now,
+                    power_watts=-4500,
+                ),
+            ],
+            predicted_wh=877.0,
+            target_wh=-50.0,
+            **kwargs,
+        )
+
+    def test_turn_off_includes_today_runtime(self):
+        """turn_off with a runtime entry shows (MM:SS today)."""
+        msg = self._off_event(runtime_today_secs={"water_heater": 372.0}).format_message()
+        assert "🔘 water_heater (06:12 today)" in msg
+
+    def test_turn_off_without_runtime_has_no_suffix(self):
+        """Missing runtime entry renders the legacy line."""
+        msg = self._off_event().format_message()
+        assert "🔘 water_heater" in msg
+        assert "today" not in msg
+
+    def test_turn_on_never_has_suffix(self):
+        """turn_on lines never carry a runtime suffix."""
+        from load_models import PendingEffect
+
+        now = datetime(2026, 6, 15, 18, 6, 12, tzinfo=timezone.utc)
+        event = NotificationEvent(
+            event_type=EVENT_TYPE_SURPLUS,
+            timestamp=now,
+            description="Solara",
+            actions=[
+                PendingEffect(
+                    device_name="water_heater",
+                    action="turn_on",
+                    timestamp=now,
+                    data_point_at=now,
+                    power_watts=4500,
+                ),
+            ],
+            predicted_wh=877.0,
+            target_wh=-50.0,
+            runtime_today_secs={"water_heater": 372.0},
+        )
+        msg = event.format_message()
+        assert "🟢 water_heater" in msg
+        assert "today" not in msg
+
+    def test_tesla_turn_off_never_has_suffix(self):
+        """Tesla stop lines never carry a runtime suffix."""
+        from load_models import PendingEffect
+
+        now = datetime(2026, 6, 15, 18, 6, 12, tzinfo=timezone.utc)
+        event = NotificationEvent(
+            event_type=EVENT_TYPE_SURPLUS,
+            timestamp=now,
+            description="Solara",
+            actions=[
+                PendingEffect(
+                    device_name="tesla",
+                    action="turn_off",
+                    timestamp=now,
+                    data_point_at=now,
+                    power_watts=0,
+                ),
+            ],
+            predicted_wh=877.0,
+            target_wh=-50.0,
+            runtime_today_secs={"tesla": 372.0},
+        )
+        msg = event.format_message()
+        assert "Tesla charging stopped" in msg
+        assert "today" not in msg
+
+    def test_runtime_over_an_hour_uses_h_mm_ss(self):
+        """3720+ s renders as H:MM:SS."""
+        msg = self._off_event(
+            runtime_today_secs={"water_heater": 3849.0}
+        ).format_message()
+        assert "🔘 water_heater (1:04:09 today)" in msg
+
+
+class TestFormatRuntimeToday:
+
+    def test_zero(self):
+        """Zero seconds renders as 00:00."""
+        from telegram import format_runtime_today
+
+        assert format_runtime_today(0.0) == "00:00"
+
+    def test_floors_partial_seconds(self):
+        """Partial seconds round down."""
+        from telegram import format_runtime_today
+
+        assert format_runtime_today(59.9) == "00:59"
+
+    def test_minutes_seconds(self):
+        """372 s renders as 06:12."""
+        from telegram import format_runtime_today
+
+        assert format_runtime_today(372.0) == "06:12"
+
+    def test_hour_boundary(self):
+        """3600 s renders as 1:00:00."""
+        from telegram import format_runtime_today
+
+        assert format_runtime_today(3600.0) == "1:00:00"
+
+
 # =============================================================================
 # 3. TelegramSender
 # =============================================================================

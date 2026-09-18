@@ -30,7 +30,6 @@ from util import (
     RetryableError,
     ceil_to_qh,
     compute_nbc_quarters,
-    custom_json_default,
     floor_to_qh,
     inject_completed_qh,
     is_debug,
@@ -366,12 +365,14 @@ class DeviceMetrics:
 class TOUResult:
     """Result of a TOU (Time-of-Use) query.
 
-    Wraps TOUBuckets and NBC total for the requested date range.
+    Wraps TOUBuckets and NBC total for the requested date range, plus
+    optional per-15-minute period details for the report table.
     Replaces the dict return from _get_tou_model().
     """
 
     buckets: TOUBuckets
     nbc: float
+    periods: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for backward compat."""
@@ -995,15 +996,9 @@ class TOUReporter(MetricsBase):
         self.end_date = end_date
         self.tou_result: Optional[TOUBuckets] = None
         self.nbc_result: Optional[float] = None
+        self.periods: list[dict[str, Any]] = []
 
         self.fetch_usage_data()
-        if is_debug(config):
-            filename = (
-                _CLOCK.now().isoformat()
-                + f"_{start_date}_{end_date if end_date else 'None'}_"
-            )
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(self.usage_data_list, f, default=custom_json_default)
         self.aggregate_tou()
 
     def fetch_usage_data(self) -> None:
@@ -1063,7 +1058,8 @@ class TOUReporter(MetricsBase):
 
         Delegates to EnergyDataAggregator for TOU bucket classification.
         NBC is the sum of all 15-minute period values in Wh across the
-        entire reporting period.
+        entire reporting period. Also builds the per-15-minute period
+        details used by the TOU report table.
         """
         total = 0.0
         peak = 0.0
@@ -1071,6 +1067,7 @@ class TOUReporter(MetricsBase):
         off_peak = 0.0
 
         nbc_total_wh = 0.0
+        periods: list[dict[str, Any]] = []
 
         for data_chunk in self.usage_data_list:
             chunk_buckets: TOUBuckets = EnergyDataAggregator.aggregate_from_15min(
@@ -1083,14 +1080,24 @@ class TOUReporter(MetricsBase):
             off_peak += chunk_buckets.off_peak
 
             # Sum positive 15-min periods only (imports); negatives are exports, ignored
-            for usage_kwh in data_chunk["data"]:
-                if usage_kwh is not None and usage_kwh > 0:
-                    nbc_total_wh += usage_kwh * 1000.0
+            chunk_start = data_chunk["start"]
+            for idx, usage_kwh in enumerate(data_chunk["data"]):
+                if usage_kwh is None:
+                    continue
+                timestamp = chunk_start + timedelta(minutes=15 * idx)
+                wh = usage_kwh * 1000.0
+                bucket = EnergyDataAggregator.classify_timestamp(timestamp)
+                periods.append(
+                    {"timestamp": timestamp, "wh": wh, "bucket": bucket}
+                )
+                if usage_kwh > 0:
+                    nbc_total_wh += wh
 
         self.tou_result = TOUBuckets(
             total=total, peak=peak, part_peak=part_peak, off_peak=off_peak,
         )
         self.nbc_result = nbc_total_wh
+        self.periods = periods
 
 
 # Maintain backward compatibility by aliasing Metrics to HourlyProjection

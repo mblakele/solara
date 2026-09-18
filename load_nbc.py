@@ -13,14 +13,17 @@ import math
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
+
+import pytz
 
 from energy_cache import EnergyCache
 from config import Config
 from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
 
 from constants import (
+    DEFAULT_HYSTERESIS_WH,
     DEFAULT_PREDICTION_WINDOW_SECS,
     MIN_SECONDS_TO_ACT,
     SETTLE_WINDOW_DEADBAND_SECS,
@@ -38,6 +41,71 @@ logger = logging.getLogger(__name__)
 # at import (cheap) but only READ when conversions run, so tests can control
 # it via env vars per-test.
 _VOLTAGE_CONFIG = Config()
+
+# Deferred config accessor for the meter timezone — read per call so tests
+# can pin TIMEZONE without reimporting.
+_TZ_CONFIG = Config()
+
+
+def _meter_tz() -> Any:
+    """Return the meter-local tzinfo for day-boundary math.
+
+    Reads ``TIMEZONE`` through the deferred config lookup chain
+    (env var → .env → default), the same clock Telegram display times
+    and load time-ranges already use. Falls back to UTC on unknown names.
+
+    Returns:
+        A tzinfo object (pytz timezone or ``timezone.utc``).
+    """
+    try:
+        return pytz.timezone(_TZ_CONFIG.timezone)
+    except pytz.exceptions.UnknownTimeZoneError:
+        logger.warning(
+            "Unknown TIMEZONE=%r — using UTC for runtime day boundaries",
+            _TZ_CONFIG.timezone,
+        )
+        return timezone.utc
+
+
+def _local_day(now: datetime) -> date:
+    """Return the meter-local calendar day containing ``now``.
+
+    Args:
+        now: Wall-clock time (naive values are treated as UTC).
+
+    Returns:
+        The local date in the meter timezone.
+    """
+    aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return aware.astimezone(_meter_tz()).date()
+
+
+def _local_midnight_utc(now: datetime) -> datetime:
+    """Return the start of ``now``'s meter-local day as an aware UTC datetime.
+
+    Sessions spanning midnight are clipped to this instant so only the
+    post-midnight portion counts toward the new day.
+
+    Args:
+        now: Wall-clock time (naive values are treated as UTC).
+
+    Returns:
+        Local midnight converted to UTC.
+    """
+    aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    tz = _meter_tz()
+    local_day = aware.astimezone(tz).date()
+    try:
+        midnight_local = tz.localize(
+            datetime(local_day.year, local_day.month, local_day.day)
+        )
+    except AttributeError:
+        # Non-pytz fallback tzinfo (e.g. timezone.utc) has no localize().
+        midnight_local = datetime(
+            local_day.year, local_day.month, local_day.day,
+            tzinfo=tz,
+        )
+    return midnight_local.astimezone(timezone.utc)
 
 
 def nominal_voltage() -> float:
@@ -960,6 +1028,102 @@ class StateTracker:
         """
         self._effects.add(effect)
 
+    def note_desired_transition(
+        self, name: str, new_desired: bool, now: datetime
+    ) -> bool:
+        """Record a desired-state flip and credit daily ON-time.
+
+        Central transition point for plug ON/OFF tracking: GapMinder
+        decisions and ``_sync_plug_states`` reconciliation both funnel
+        through here so no path can change ``desired_state`` without
+        updating the runtime books. Only ``desired_state`` and the
+        runtime fields are touched — ``last_toggle``/``actual_state``
+        stay with their existing call sites (the sync tests pin
+        ``last_toggle`` moving only when a pending effect is recorded).
+
+        Day handling (meter-local midnight): on a new local day the
+        accumulation resets and an in-progress session is clipped to
+        midnight, so only today's portion counts. Unknown prior ON-time
+        is never invented — a first sighting starts from zero.
+
+        Args:
+            name: Device name key.
+            new_desired: The reconciled desired state (True = on).
+            now: Current wall-clock time.
+
+        Returns:
+            True when the desired value actually changed.
+        """
+        aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        today = _local_day(aware)
+        midnight = _local_midnight_utc(aware)
+        with self._state_lock:
+            dev = self.devices.get(name)
+            if dev is None:
+                dev = DeviceState(name=name)
+                self.devices[name] = dev
+            if dev.runtime_day is None:
+                dev.runtime_day = today
+            elif dev.runtime_day != today:
+                dev.runtime_today_secs = 0.0
+                dev.runtime_day = today
+                if dev.on_since is not None and dev.on_since < midnight:
+                    dev.on_since = midnight
+            if dev.desired_state == new_desired:
+                return False
+            if new_desired:
+                dev.on_since = aware
+            else:
+                if dev.desired_state is True:
+                    start = dev.on_since or dev.last_toggle
+                    if start is not None:
+                        if start.tzinfo is None:
+                            start = start.replace(tzinfo=timezone.utc)
+                        start = max(start, midnight)
+                        secs = (aware - start).total_seconds()
+                        if secs > 0:
+                            dev.runtime_today_secs += secs
+                dev.on_since = None
+            dev.desired_state = new_desired
+            return True
+
+    def runtime_today_for(self, name: str, now: datetime) -> float:
+        """Return total ON-time seconds for the meter-local day.
+
+        Adds the still-open session (when the device is currently
+        desired-ON) to the closed-session accumulation, clipping the
+        session to local midnight. Pure read — never mutates state.
+
+        Args:
+            name: Device name key.
+            now: Current wall-clock time.
+
+        Returns:
+            ON-time seconds since local midnight (0.0 for unknown devices).
+        """
+        aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        today = _local_day(aware)
+        midnight = _local_midnight_utc(aware)
+        with self._state_lock:
+            dev = self.devices.get(name)
+            if dev is None:
+                return 0.0
+            base = (
+                dev.runtime_today_secs if dev.runtime_day == today else 0.0
+            )
+            if dev.desired_state is not True:
+                return base
+            start = dev.on_since or dev.last_toggle
+            if start is None:
+                return base
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            start = max(start, midnight)
+            secs = (aware - start).total_seconds()
+            if secs > 0:
+                base += secs
+            return base
+
     def apply_prediction_window(self, prediction_window_seconds: int) -> None:
         """Resolve the prediction/settle window from quantization data.
 
@@ -1734,15 +1898,15 @@ class GapMinder:
 
         Args:
             hysteresis_wh: Hysteresis threshold in Wh. When None, defaults to
-                1000 for backward compatibility.
+                DEFAULT_HYSTERESIS_WH (20, residential scale).
             charge_amps_min: Minimum Tesla charge amps before turning off
                 instead of reducing further. Defaults to 5.
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
                 to 48.
         """
-        # Backward-compat default hysteresis of 1000 Wh; the load manager
-        # passes a config-derived value (abs(target_wh) * 1/3) in production.
-        self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else 1000
+        # Residential default (20 Wh); the load manager passes an explicit
+        # config-derived value (abs(target_wh) * 1/3) in production.
+        self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else DEFAULT_HYSTERESIS_WH
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.tesla_decider = TeslaDecider(
@@ -1913,12 +2077,8 @@ class GapMinder:
                 )
                 remaining_gap -= capacity
                 if not ctx.dry_run:
-                    ctx.state.set_device_state(
-                        name,
-                        DeviceState(
-                            name=name, last_toggle=ctx.now, desired_state=True
-                        ),
-                    )
+                    if ctx.state.note_desired_transition(name, True, ctx.now):
+                        ctx.state.devices[name].last_toggle = ctx.now
 
             else:
                 logger.debug(
@@ -2031,10 +2191,8 @@ class GapMinder:
             )
             remaining_reduction -= savings
             if not ctx.dry_run:
-                ctx.state.set_device_state(
-                    name,
-                    DeviceState(name=name, last_toggle=ctx.now, desired_state=False),
-                )
+                if ctx.state.note_desired_transition(name, False, ctx.now):
+                    ctx.state.devices[name].last_toggle = ctx.now
             if remaining_reduction <= 0:
                 break
 

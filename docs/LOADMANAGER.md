@@ -118,6 +118,18 @@ of excess solar unabsorbed rather than driving net usage to exactly zero.
 Set it closer to 0 to absorb more solar, or more negative (e.g., -100)
 to be conservative and leave more surplus on the grid.
 
+## Hysteresis
+
+Production `hysteresis_wh = int(abs(target_wh) / 3)` (`load_manager.py:309`,
+proportion in `constants.py:HYSTERESIS_PROPORTION`). With the current
+`target_wh = -9` (`devices.json`) that is **3 Wh** — essentially no deadband
+against hundred-Wh gap errors (e.g. a 2000 W plug with ~800 s left is
+~440 Wh). The old **1000 Wh** figure was the previous `GapMinder` unit-test
+default; the fallback is now **20 Wh** (`constants.py:DEFAULT_HYSTERESIS_WH`),
+used only when no explicit value is passed. Production always passes
+`int(abs(target_wh) / 3)` explicitly — do not rely on the fallback when
+reasoning about production over-commit risk.
+
 **Two sign conventions, deliberately:**
 
 - **Engine-internal "gap"** (CycleDiagnostics, `gapminder_decide` logs):

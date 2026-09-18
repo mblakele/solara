@@ -78,6 +78,21 @@ class EnergyDataAggregator:
         return timestamp.astimezone(local_tz).hour
 
     @staticmethod
+    def classify_timestamp(timestamp: datetime) -> str:
+        """Classify a timestamp into a TOU bucket in device-local time.
+
+        Args:
+            timestamp: Point in time (naive assumed device-local,
+                aware converted to device-local).
+
+        Returns:
+            Bucket name: 'peak', 'part_peak', or 'off_peak'.
+        """
+        return EnergyDataAggregator.classify_hour(
+            EnergyDataAggregator._get_local_hour(timestamp)
+        )
+
+    @staticmethod
     def _aggregate(
         start_time: datetime,
         data: list[float],
