@@ -1,11 +1,10 @@
 """Turn-on aims at target (not deadband edge).
 
-Red-phase for the 2026-09-26 decide-margin experiment: with
-predicted=-32.821 / target=-9 / hysteresis=3 and a 260 W plug with
-297 s remaining (capacity ~21.4 Wh), the old edge budget (20.8 Wh)
-rejected the plug while the full-gap budget (23.8 Wh) accepts it.
+With predicted=-32.821 / target=-9 / hysteresis=3 and a 260 W plug with
+297 s remaining (capacity ~21.4 Wh), the edge budget with margin=3
+(20.8 Wh) rejects the plug while the full-gap budget (23.8 Wh) accepts it.
 
-Turn-off edge coverage moved to tests/test_turn_off_aim.py.
+Turn-off edge coverage lives in tests/test_turn_off_aim.py.
 """
 
 from datetime import datetime, timezone
@@ -28,7 +27,7 @@ def _ctx(state: StateTracker, plugs: dict[str, PlugConfig], seconds: int) -> Dec
 
 
 def test_turn_on_aims_at_target() -> None:
-    """A plug fitting in the full gap but not the edge gap turns on."""
+    """A plug fitting in the full gap but not the margin budget turns on."""
     engine = GapMinder(hysteresis_wh=3)
     state = StateTracker()
     plugs = {

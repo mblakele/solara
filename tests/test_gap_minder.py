@@ -13,7 +13,7 @@ fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 
 
 def test_hysteresis_no_action():
-    """No action when within hysteresis margin."""
+    """No action when within hysteresis band."""
     engine = GapMinder()
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
@@ -34,7 +34,7 @@ def test_hysteresis_no_action():
 
 
 def test_hysteresis_no_action_at_boundary():
-    """No action for a 19 Wh gap (within the 20 Wh margin)."""
+    """No action for a 19 Wh gap (within the 20 Wh hysteresis band)."""
     engine = GapMinder()
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
@@ -55,9 +55,9 @@ def test_hysteresis_no_action_at_boundary():
 
 
 def test_hysteresis_custom_value():
-    """Custom hysteresis allows action within default margin."""
-    # With default hysteresis of 20, gap=500 would be outside margin.
-    # With hysteresis=100, gap=500 should still trigger action.
+    """Custom hysteresis still triggers action for a 500 Wh gap."""
+    # With default hysteresis of 20, gap=500 is outside the band.
+    # With hysteresis=100, gap=500 is also outside, so action triggers.
     engine = GapMinder(hysteresis_wh=100)
     state = StateTracker()
     plugs = {
@@ -731,7 +731,7 @@ def test_hysteresis_blocks_small_gap_multiple():
     assert len(actions) == 0
 
 
-# --- Deadband edge-gap tests ---
+# --- Margin-budget tests (explicit turn_*_margin_wh restores edge behavior) ---
 
 
 def test_edge_gap_reduces_surplus_turn_on():
@@ -741,7 +741,7 @@ def test_edge_gap_reduces_surplus_turn_on():
     turn_on_margin_wh=1000 → budget = 1500 - 1000 = 500.
     big_plug (1000W, 900s → 250 Wh) fits in budget.
     huge_plug (2000W, 900s → 500 Wh) does NOT fit after big occupies 250.
-    Old default turned on both; explicit margin only turns on big.
+    Full-gap budget turns on both; explicit margin only turns on big.
     """
     engine = GapMinder(hysteresis_wh=1000, turn_on_margin_wh=1000)
     state = StateTracker()
@@ -771,45 +771,9 @@ def test_edge_gap_reduces_surplus_turn_on():
         target_wh=-500.0,
     )
 
-    # huge (priority 5, 500 Wh) exactly fits edge_gap, big (priority 0) skipped
+    # huge (priority 5, 500 Wh) exactly fits the margin budget, big (priority 0) skipped
     assert len(actions) == 1
     assert actions[0].device_name == "huge"
-
-
-def test_edge_gap_reduces_tesla_amps_reduction():
-    """With an explicit turn-off margin, Tesla reduction uses the deadband edge.
-
-    gap = target - predicted = 500 - 2000 = -1500 (deficit).
-    turn_off_margin_wh=1000 → budget = 1500 - 1000 = 500.
-    Full-gap reduces by ceil(1500*3600/(240*900))=25 amps → target=23.
-    Edge reduces by ceil(500*3600/(240*900))=9 amps  → target=39.
-    """
-    engine = GapMinder(hysteresis_wh=1000, turn_off_margin_wh=1000)
-    state = StateTracker()
-    plugs: dict[str, PlugConfig] = {}
-    tesla = TeslaState(
-        is_charging=True,
-        current_amps=48,
-        plugged_in=True,
-        at_home=True,
-    )
-
-    actions = engine.decide(
-        ctx=DecideContext(
-            now=fixed_now,
-            seconds_remaining=900,
-            state=state,
-            plugs=plugs,
-            tesla=tesla,
-        ),
-        predicted_wh=2000.0,
-        target_wh=500.0,
-    )
-
-    assert len(actions) == 1
-    assert actions[0].action == "set_amps"
-    # Old: 23 amps  New: 39 amps (edge_gap-based reduction)
-    assert actions[0].target_amps == 39
 
 
 # --- QH boundary guards (near-end-of-quarter-hour skip) ---

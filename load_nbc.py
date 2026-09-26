@@ -1818,8 +1818,8 @@ class TeslaDecider:
 
         if new_amps < self.charge_amps_min:
             # guard against premature turn-off
-            turn_off_hysteresis = int(3 * self.charge_amps_min / 5)
-            if new_amps < (self.charge_amps_min - turn_off_hysteresis):
+            stop_tolerance_amps = int(3 * self.charge_amps_min / 5)
+            if new_amps < (self.charge_amps_min - stop_tolerance_amps):
                 logger.debug(
                     "[_decide_tesla_reduce] skipped stop: new_amps=%d ~= min=%d",
                     new_amps,
