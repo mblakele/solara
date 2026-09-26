@@ -350,6 +350,9 @@ class LoadManager:
         self._boot_at: datetime = self._clock.now()
         self._last_fetch_fatal_alert_qh: datetime | None = None
         self._last_stale_alert_qh: datetime | None = None
+        # Out-of-range ON alerts: per-device QH throttle so a forgotten
+        # manual ON pages once per quarter-hour, not every 30 s cycle.
+        self._last_out_of_range_alert_qh: dict[str, datetime] = {}
 
         logger.debug("LoadManager %s", plug_ctrl)
         if plug_ctrl is not None:
@@ -1463,7 +1466,10 @@ class LoadManager:
                 "can_toggle": can_toggle,
             }
             if not self._is_device_in_time_range(now, plug.time_range):
-                fields["reason"] = "outside_time_range"
+                if getattr(plug, "shed_outside_range", False):
+                    fields["reason"] = "outside_time_range_shed_only"
+                else:
+                    fields["reason"] = "outside_time_range"
             if dev_state:
                 fields["desired_state"] = dev_state.desired_state
                 fields["actual_state"] = dev_state.actual_state
@@ -1527,7 +1533,13 @@ class LoadManager:
             if not self.state.can_toggle(name, now):
                 continue
             if not self._is_device_in_time_range(now, plug.time_range):
-                continue
+                # Shed-enabled plugs count as eligible on deficit (they can
+                # still be turned off outside their window), never on surplus.
+                if not (
+                    not gap_positive
+                    and getattr(plug, "shed_outside_range", False)
+                ):
+                    continue
             dev_state = self.state.devices.get(name)
             # All plugs are eligible: turn-on when off/unknown, turn-off when on
             if gap_positive:
@@ -2125,6 +2137,67 @@ class LoadManager:
         self._pending_notifications.append(event)
         logger.error("Stale-data notification queued: %s", message)
 
+    def _queue_out_of_range_notification(
+        self, device_name: str, time_range: tuple[time, time], now: datetime,
+    ) -> None:
+        """Queue a Telegram alert for a plug ON outside its time range.
+
+        Bypasses the telegram.devices whitelist and the dry-run guard
+        (like data-health alerts): a forgotten manual ON must page
+        whenever a sender is configured.
+
+        Args:
+            device_name: Plug configuration name.
+            time_range: The plug's configured (start, end) window.
+            now: Current wall-clock time for the event timestamp.
+        """
+        if self.telegram_sender is None:
+            logger.info(
+                "Out-of-range notification skipped: sender not configured",
+            )
+            return
+        if not self.telegram_sender.is_configured:
+            logger.info(
+                "Out-of-range notification skipped: sender not configured (is_configured=False)",
+            )
+            return
+        start_str = time_range[0].strftime("%H:%M")
+        end_str = time_range[1].strftime("%H:%M")
+        message = (
+            f"{device_name} is ON outside its time range "
+            f"{start_str}-{end_str}"
+        )
+        event = build_error_notification(message, now=now)
+        self._pending_notifications.append(event)
+        logger.warning("Out-of-range notification queued: %s", message)
+
+    def _check_out_of_range_alert(self, now: datetime) -> None:
+        """Alert for managed plugs left ON outside their time range.
+
+        Throttled to one alert per device per quarter-hour so a forgotten
+        heater pages promptly without spamming every 30 s cycle.
+
+        Args:
+            now: Current wall-clock time for range checks and throttling.
+        """
+        qh = floor_to_qh(now)
+        for name, plug in self.plugs.items():
+            if name in self.sentinel_names:
+                continue
+            if plug.time_range is None:
+                continue
+            if self._is_device_in_time_range(now, plug.time_range):
+                continue
+            dev_state = self.state.devices.get(name)
+            if dev_state is None:
+                continue
+            if dev_state.desired_state is not True and dev_state.actual_state is not True:
+                continue
+            if self._last_out_of_range_alert_qh.get(name) == qh:
+                continue
+            self._last_out_of_range_alert_qh[name] = qh
+            self._queue_out_of_range_notification(name, plug.time_range, now)
+
     def _check_fetch_fatal_alert(
         self, err: BaseException | None, now: datetime,
     ) -> None:
@@ -2384,19 +2457,35 @@ class LoadManager:
         return False
 
     def _eligible_for_decision(
-        self, now: datetime, tesla_state: TeslaState | None
+        self, now: datetime, tesla_state: TeslaState | None,
+        gap_wh: float | None = None,
     ) -> tuple[dict[str, PlugConfig], TeslaState | None]:
         """Filter engine candidates by time range.
+
+        Plugs with ``shed_outside_range`` rejoin the eligible set on
+        deficit (negative gap): they can be turned off outside their
+        window but never turned on there.
 
         Args:
             now: Current wall-clock time.
             tesla_state: Current Tesla state, or None.
+            gap_wh: Corrected gap (target - adjusted); when negative,
+                shed-enabled out-of-range plugs are included.
 
         Returns:
             Tuple of (eligible plugs by name, eligible Tesla state or None).
         """
         # Filter plugs by per-device time range: only eligible plugs reach the engine.
         eligible_plugs, outside_range = self._eligible_plugs(now)
+        if gap_wh is not None and gap_wh < 0:
+            for name in outside_range:
+                plug = self.plugs.get(name)
+                if plug is not None and getattr(plug, "shed_outside_range", False):
+                    eligible_plugs[name] = plug
+            outside_range = [
+                n for n in outside_range
+                if not getattr(self.plugs[n], "shed_outside_range", False)
+            ]
         # Log which devices were filtered out by time range (once per cycle).
         if outside_range:
             logger.debug("Outside time range: %s", ", ".join(outside_range))
@@ -2547,6 +2636,9 @@ class LoadManager:
                 dry_run=dry_run,
                 now=now,
             )
+        # Out-of-range ON alert: states are fresh from the sync above, so
+        # a forgotten manual ON pages even when the gap needs no action.
+        self._check_out_of_range_alert(now)
         # Hysteresis guard uses corrected gap so in-flight Tesla draw is counted.
         if abs(corrected_gap_wh) <= self.engine.HYSTERESIS_WH:
             return AsyncPhaseResult(
@@ -2567,7 +2659,7 @@ class LoadManager:
                 adjusted_wh=corrected_adjusted_wh,
             )
         eligible_plugs, eligible_tesla = self._eligible_for_decision(
-            now, tesla_state
+            now, tesla_state, gap_wh=corrected_gap_wh
         )
         actions = self._decide_actions(
             eligible_plugs, eligible_tesla, corrected_adjusted_wh,

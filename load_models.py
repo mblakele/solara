@@ -152,6 +152,8 @@ class PlugConfig:
         sentinel: When True, the plug is a privileged "sentinel" device —
             tracked for diagnostics but never acted upon. If on, load
             management disables entirely.
+        shed_outside_range: When True with a time_range, the plug can still
+            be turned off outside its window (shed) but never turned on.
     """
 
     name: str
@@ -161,6 +163,7 @@ class PlugConfig:
     controller_type: Literal["homekit", "vocolinc"] = "homekit"
     time_range: tuple[time, time] | None = None
     sentinel: bool = False
+    shed_outside_range: bool = False
 
 
 @dataclass

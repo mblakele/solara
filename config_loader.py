@@ -132,6 +132,7 @@ def load_plugs_from_file() -> dict[str, Any]:
             priority=int(entry.get("priority", 0)),
             time_range=_parse_device_time_range(entry.get("time_range")),
             sentinel=bool(entry.get("sentinel", False)),
+            shed_outside_range=bool(entry.get("shed_outside_range", False)),
         )
     return plugs
 
@@ -173,6 +174,7 @@ def load_vocolinc_plugs_from_file() -> dict[str, Any]:
             controller_type="vocolinc",
             time_range=_parse_device_time_range(entry.get("time_range")),
             sentinel=bool(entry.get("sentinel", False)),
+            shed_outside_range=bool(entry.get("shed_outside_range", False)),
         )
     return plugs
 
