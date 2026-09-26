@@ -72,6 +72,20 @@ def test_devices_tie_break_by_name() -> None:
     assert list(result["state"]["devices"].keys()) == ["alpha", "bravo", "tesla"]
 
 
+def test_devices_tie_break_by_device_name() -> None:
+    """Same priority and case-folded name fall back to the hardware id."""
+    from app import _build_load_management_payload
+
+    plugs = {
+        "b": PlugConfig(name="b", accessory_id="a1", power_watts=100.0),
+        "B": PlugConfig(name="B", accessory_id="z9", power_watts=100.0),
+    }
+    lm = _make_lm(["B", "b"], plugs, set())
+    result = _build_load_management_payload(lm)
+    # Raw string order would put "B" first; the hardware id breaks the tie.
+    assert list(result["state"]["devices"].keys()) == ["b", "B"]
+
+
 def test_devices_empty_unchanged() -> None:
     """Empty device dicts pass through without error."""
     from app import _build_load_management_payload

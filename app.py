@@ -1013,13 +1013,16 @@ def sort_devices_for_display(
     """Order device states for the dashboard Devices grid.
 
     Sentinel plugs first, then regular plugs in priority order (higher
-    number first, matching the turn-on decision order, with name as
-    tie-break), then anything else (vehicles such as tesla) last.
+    number first, matching the turn-on decision order). Ties break by
+    name (case-insensitive), then hardware id (``accessory_id``, which
+    holds the vocolinc ``device_name``), then raw name so the order
+    is total. Anything else (vehicles such as tesla) sorts last.
 
     Args:
         devices: Device-name → state dicts in tracker insertion order.
-        plugs: Plug-name → config (must expose ``priority``); entries
-            absent here sort with the trailing group.
+        plugs: Plug-name → config (must expose ``priority`` and
+            ``accessory_id``); entries absent here sort with the
+            trailing group.
         sentinel_names: Names treated as sentinels (first group).
 
     Returns:
@@ -1029,19 +1032,21 @@ def sort_devices_for_display(
     if not isinstance(plugs, dict):
         plugs = {}
 
-    def sort_key(name: str) -> tuple[int, int, str]:
+    def sort_key(name: str) -> tuple[int, int, str, str, str]:
         if name in sentinels:
             group = 0
         elif name in plugs:
             group = 1
         else:
             group = 2
-        priority = getattr(plugs.get(name), "priority", 0)
+        plug = plugs.get(name)
+        priority = getattr(plug, "priority", 0)
         try:
             priority_num = int(priority)
         except (TypeError, ValueError):
             priority_num = 0
-        return (group, -priority_num, name)
+        device_id = str(getattr(plug, "accessory_id", "") or "")
+        return (group, -priority_num, name.lower(), device_id, name)
 
     return dict(sorted(devices.items(), key=lambda item: sort_key(item[0])))
 
