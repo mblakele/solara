@@ -777,14 +777,14 @@ def test_edge_gap_reduces_surplus_turn_on():
 
 
 def test_edge_gap_reduces_tesla_amps_reduction():
-    """With edge_gap, Tesla amp reduction is computed against deadband edge.
+    """With an explicit turn-off margin, Tesla reduction uses the deadband edge.
 
     gap = target - predicted = 500 - 2000 = -1500 (deficit).
-    h=1000 → edge_gap = 1500 - 1000 = 500.
-    Old code reduces by ceil(1500*3600/(240*900))=25 amps → target=23.
-    New code reduces by ceil(500*3600/(240*900))=9 amps  → target=39.
+    turn_off_margin_wh=1000 → budget = 1500 - 1000 = 500.
+    Full-gap reduces by ceil(1500*3600/(240*900))=25 amps → target=23.
+    Edge reduces by ceil(500*3600/(240*900))=9 amps  → target=39.
     """
-    engine = GapMinder(hysteresis_wh=1000)
+    engine = GapMinder(hysteresis_wh=1000, turn_off_margin_wh=1000)
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
     tesla = TeslaState(
@@ -1374,11 +1374,11 @@ def test_decide_tesla_reduce_at_5a_stops_with_zero_gap():
 def test_decide_tesla_reduce_at_5a_defers_with_small_edge_gap():
     """Tesla at 5A, seconds_remaining=10, turn_off path, gap=-4 Wh.
 
-    After hysteresis subtraction, edge_gap=1. Safe window = min(120, 1*3) = 3.
+    With an explicit turn-off margin, budget=1. Safe window = min(120, 1*3) = 3.
     secs_remaining=10 > 3 → defers. The small edge gap means the defer
     window is very short.
     """
-    engine = GapMinder(hysteresis_wh=3)
+    engine = GapMinder(hysteresis_wh=3, turn_off_margin_wh=3)
     state = StateTracker()
     plugs: dict[str, PlugConfig] = {}
     tesla = TeslaState(

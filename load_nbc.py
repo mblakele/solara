@@ -1894,6 +1894,7 @@ class GapMinder:
         charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT,
         charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
         turn_on_margin_wh: int | None = None,
+        turn_off_margin_wh: int | None = None,
     ) -> None:
         """Initialize the GapMinder.
 
@@ -1906,18 +1907,22 @@ class GapMinder:
                 to 48.
             turn_on_margin_wh: Wh withheld from the turn-on budget only.
                 ``decide()`` passes ``gap - turn_on_margin_wh`` to
-                ``_decide_turn_on`` while ``_decide_turn_off`` keeps using
-                the full hysteresis. Defaults to 0 (aim at target); pass
+                ``_decide_turn_on``. Defaults to 0 (aim at target); pass
+                the hysteresis value to restore the old deadband-edge
+                behavior. ``None`` is treated as 0.
+            turn_off_margin_wh: Wh withheld from the turn-off budget only.
+                ``decide()`` passes ``abs_gap - turn_off_margin_wh`` to
+                ``_decide_turn_off``. Defaults to 0 (aim at target); pass
                 the hysteresis value to restore the old deadband-edge
                 behavior. ``None`` is treated as 0.
         """
         # Residential default (20 Wh); the load manager passes an explicit
         # config-derived value (abs(target_wh) * 1/3) in production.
         self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else DEFAULT_HYSTERESIS_WH
-        # Experiment toggle (bugs/2026-09-26-decide-margin): turn-on aims at
-        # the target (margin 0) while turn-off stays on the deadband edge.
-        # To revert, construct with turn_on_margin_wh=hysteresis_wh.
+        # Both directions aim at the target (margin 0).
+        # To revert either, construct with turn_*_margin_wh=hysteresis_wh.
         self.TURN_ON_MARGIN_WH = turn_on_margin_wh if turn_on_margin_wh is not None else 0
+        self.TURN_OFF_MARGIN_WH = turn_off_margin_wh if turn_off_margin_wh is not None else 0
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.tesla_decider = TeslaDecider(
@@ -2015,9 +2020,9 @@ class GapMinder:
 
         Returns:
             Budget passed to ``_decide_turn_off``: ``abs_gap`` minus the
-            full hysteresis (deadband edge, unchanged).
+            configured turn-off margin (0 aims at target).
         """
-        return abs_gap - self.HYSTERESIS_WH
+        return abs_gap - self.TURN_OFF_MARGIN_WH
 
     def decide(
         self,
