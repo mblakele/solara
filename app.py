@@ -1502,6 +1502,28 @@ def start_background_services() -> None:
     _state.background_services_started_at = datetime.now(timezone.utc)
 
 
+_STATUS_LABELS = {
+    "ok": "forecast this period",
+    "dry-run": "dry run",
+    "disabled": "disabled",
+    "no_incomplete_qh": "waiting for data",
+    "stale_data": "stale data",
+    "waiting_for_fresh_data": "waiting for data",
+}
+
+
+def _status_label(status: str) -> str:
+    """Return the forecast-period label for a cycle status.
+
+    Args:
+        status: CycleStatus string from the last CycleResult.
+
+    Returns:
+        Human-readable label for the forecast__period span.
+    """
+    return _STATUS_LABELS.get(status, "forecast this period")
+
+
 def create_app() -> Flask:
     """Create and configure the Flask application.
 
@@ -1528,6 +1550,7 @@ def create_app() -> Flask:
     application.register_blueprint(bp)
     application.jinja_env.filters["astimezonestr"] = astimezone_filter
     application.jinja_env.filters["per_second_sparkline"] = per_second_sparkline
+    application.jinja_env.globals["_status_label"] = _status_label
     application.json = CustomJSONProvider(application)
     application.register_error_handler(RetryableMetricsException, error_retryable)
     application.add_url_rule("/", "index", index)
