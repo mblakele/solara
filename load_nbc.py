@@ -1893,6 +1893,7 @@ class GapMinder:
         hysteresis_wh: int | None = None,
         charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT,
         charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
+        turn_on_margin_wh: int | None = None,
     ) -> None:
         """Initialize the GapMinder.
 
@@ -1903,10 +1904,20 @@ class GapMinder:
                 instead of reducing further. Defaults to 5.
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
                 to 48.
+            turn_on_margin_wh: Wh withheld from the turn-on budget only.
+                ``decide()`` passes ``gap - turn_on_margin_wh`` to
+                ``_decide_turn_on`` while ``_decide_turn_off`` keeps using
+                the full hysteresis. Defaults to 0 (aim at target); pass
+                the hysteresis value to restore the old deadband-edge
+                behavior. ``None`` is treated as 0.
         """
         # Residential default (20 Wh); the load manager passes an explicit
         # config-derived value (abs(target_wh) * 1/3) in production.
         self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else DEFAULT_HYSTERESIS_WH
+        # Experiment toggle (bugs/2026-09-26-decide-margin): turn-on aims at
+        # the target (margin 0) while turn-off stays on the deadband edge.
+        # To revert, construct with turn_on_margin_wh=hysteresis_wh.
+        self.TURN_ON_MARGIN_WH = turn_on_margin_wh if turn_on_margin_wh is not None else 0
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.tesla_decider = TeslaDecider(
@@ -1984,6 +1995,30 @@ class GapMinder:
         candidates.sort(key=lambda x: x[0], reverse=want_on)
         return candidates
 
+    def _turn_on_budget(self, gap: float) -> float:
+        """Compute the turn-on budget from the full surplus gap.
+
+        Args:
+            gap: Full surplus gap in Wh (target - predicted, always positive).
+
+        Returns:
+            Budget passed to ``_decide_turn_on``: ``gap`` minus the
+            configured turn-on margin (0 aims at target).
+        """
+        return gap - self.TURN_ON_MARGIN_WH
+
+    def _turn_off_budget(self, abs_gap: float) -> float:
+        """Compute the turn-off budget from the absolute deficit gap.
+
+        Args:
+            abs_gap: Absolute deficit gap in Wh (always positive).
+
+        Returns:
+            Budget passed to ``_decide_turn_off``: ``abs_gap`` minus the
+            full hysteresis (deadband edge, unchanged).
+        """
+        return abs_gap - self.HYSTERESIS_WH
+
     def decide(
         self,
         ctx: DecideContext,
@@ -2012,22 +2047,22 @@ class GapMinder:
             return []
 
         if gap > 0:
-            edge_gap = gap - self.HYSTERESIS_WH  # aim for lower edge of deadband
+            budget = self._turn_on_budget(gap)
             logger.info(
                 "gapminder_decide direction=turn_on gap=%.1f edge_gap=%.1f hysteresis=%d",
-                gap, edge_gap, self.HYSTERESIS_WH,
-                extra={"event": "gapminder_decide", "direction": "turn_on", "gap_wh": gap, "edge_gap_wh": edge_gap, "hysteresis_wh": self.HYSTERESIS_WH},
+                gap, budget, self.HYSTERESIS_WH,
+                extra={"event": "gapminder_decide", "direction": "turn_on", "gap_wh": gap, "edge_gap_wh": budget, "hysteresis_wh": self.HYSTERESIS_WH},
             )
-            return self._decide_turn_on(ctx, edge_gap)
+            return self._decide_turn_on(ctx, budget)
 
-        edge_gap = abs_gap - self.HYSTERESIS_WH  # aim for upper edge of deadband
+        budget = self._turn_off_budget(abs_gap)
         logger.info(
             "gapminder_decide direction=turn_off gap=%.1f edge_gap=%.1f hysteresis=%d",
-            abs(gap), edge_gap, self.HYSTERESIS_WH,
-            extra={"event": "gapminder_decide", "direction": "turn_off", "gap_wh": abs(gap), "edge_gap_wh": edge_gap, "hysteresis_wh": self.HYSTERESIS_WH},
+            abs(gap), budget, self.HYSTERESIS_WH,
+            extra={"event": "gapminder_decide", "direction": "turn_off", "gap_wh": abs(gap), "edge_gap_wh": budget, "hysteresis_wh": self.HYSTERESIS_WH},
         )
         return self._decide_turn_off(
-            ctx, edge_gap,
+            ctx, budget,
         )
 
     def _decide_turn_on(self, ctx: DecideContext, gap: float) -> list[PendingEffect]:

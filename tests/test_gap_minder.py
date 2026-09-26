@@ -735,15 +735,15 @@ def test_hysteresis_blocks_small_gap_multiple():
 
 
 def test_edge_gap_reduces_surplus_turn_on():
-    """With edge_gap, only plugs that fit within the deadband edge are turned on.
+    """With an explicit turn-on margin, only plugs fitting the edge turn on.
 
     gap = target - predicted = -500 - (-2000) = 1500 (surplus).
-    h=1000 → edge_gap = 1500 - 1000 = 500.
-    big_plug (1000W, 900s → 250 Wh) fits in edge_gap.
+    turn_on_margin_wh=1000 → budget = 1500 - 1000 = 500.
+    big_plug (1000W, 900s → 250 Wh) fits in budget.
     huge_plug (2000W, 900s → 500 Wh) does NOT fit after big occupies 250.
-    Old code turned on both; new code only turns on big.
+    Old default turned on both; explicit margin only turns on big.
     """
-    engine = GapMinder(hysteresis_wh=1000)
+    engine = GapMinder(hysteresis_wh=1000, turn_on_margin_wh=1000)
     state = StateTracker()
     plugs = {
         "big": PlugConfig(
