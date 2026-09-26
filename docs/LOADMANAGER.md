@@ -193,7 +193,8 @@ Set `LOAD_PLUG_CONTROLLER=real` and add entries to `devices.json`:
 - **name**: Label for your reference
 - **accessory_id**: Must match the IP/mDNS name used during pairing
 - **power_watts**: Approximate power draw when on (used for bin-packing decisions)
-- **priority**: Lower number = higher priority for activation (optional, default 0)
+- **priority**: Higher number = higher priority (optional, default 0).
+  Plugs turn on most-important-first and shed least-important-first.
 - **time_range**: Only activate during this window (optional, format `HH:MM-HH:MM`)
 - **shed_outside_range**: When `true` with a `time_range`, the plug can still
   be turned off outside its window but never turned on there (off-but-not-on).

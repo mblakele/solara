@@ -1005,6 +1005,47 @@ def _cycle_result_to_dict(result: CycleResult | dict | None) -> dict:
     return result.to_dict()
 
 
+def sort_devices_for_display(
+    devices: dict[str, Any],
+    plugs: dict[str, Any] | None = None,
+    sentinel_names: set[str] | frozenset[str] | list[str] | None = None,
+) -> dict[str, Any]:
+    """Order device states for the dashboard Devices grid.
+
+    Sentinel plugs first, then regular plugs in priority order (higher
+    number first, matching the turn-on decision order, with name as
+    tie-break), then anything else (vehicles such as tesla) last.
+
+    Args:
+        devices: Device-name → state dicts in tracker insertion order.
+        plugs: Plug-name → config (must expose ``priority``); entries
+            absent here sort with the trailing group.
+        sentinel_names: Names treated as sentinels (first group).
+
+    Returns:
+        New dict with the same entries in display order.
+    """
+    sentinels = set(sentinel_names or [])
+    if not isinstance(plugs, dict):
+        plugs = {}
+
+    def sort_key(name: str) -> tuple[int, int, str]:
+        if name in sentinels:
+            group = 0
+        elif name in plugs:
+            group = 1
+        else:
+            group = 2
+        priority = getattr(plugs.get(name), "priority", 0)
+        try:
+            priority_num = int(priority)
+        except (TypeError, ValueError):
+            priority_num = 0
+        return (group, -priority_num, name)
+
+    return dict(sorted(devices.items(), key=lambda item: sort_key(item[0])))
+
+
 def _build_load_management_payload(lm: Any = None) -> dict:
     """Build a load management state payload for the index endpoint.
 
@@ -1034,6 +1075,14 @@ def _build_load_management_payload(lm: Any = None) -> dict:
 
     sentinel_names = sorted(getattr(lm, "sentinel_names", frozenset()))
     state_dict = lm.state.to_dict()
+    # Predictable Devices-grid order: sentinels, plugs by priority, vehicles.
+    devices = state_dict.get("devices")
+    if isinstance(devices, dict):
+        state_dict["devices"] = sort_devices_for_display(
+            devices,
+            getattr(lm, "plugs", None),
+            sentinel_names,
+        )
     # Sentinels are special: never surface pending effects for them, even
     # if one somehow exists in the tracker.
     if sentinel_names:
