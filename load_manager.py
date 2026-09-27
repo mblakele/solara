@@ -102,6 +102,8 @@ from quantization import usable_window
 
 from energy_cache import EnergyCache
 
+from gap_trend import GapTrendTracker
+
 from metrics import DriftAlert, drain_drift_alerts
 
 from telegram import (
@@ -327,6 +329,11 @@ class LoadManager:
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
         )
+        # Ramp awareness: EWMA slope of the adjusted gap across cycles,
+        # fed in _stage_compute_gap and exposed in diagnostics. The last
+        # trusted rate (or None) is kept for early-exit result payloads.
+        self.gap_trend = GapTrendTracker()
+        self._last_gap_trend_wh_per_s: float | None = None
         # Tracks the last known at_home value from Location telemetry snapshots.
         # Preserved when Location is absent so the requires_home_check gate in
         # GapMinder doesn't incorrectly block Tesla decisions.
@@ -527,6 +534,20 @@ class LoadManager:
             "settle_window_secs": self.state.effective_settle_secs,
         }
 
+    def _gap_trend_diagnostics(self) -> dict[str, Any]:
+        """Most recent trusted gap-trend rate for cycle diagnostics.
+
+        Returns:
+            Dict with ``gap_trend_wh_per_s``; None when no sustained
+            trend is confirmed (including before the first compute_gap).
+            Early-exit paths report the last compute_gap value.
+        """
+        return {
+            "gap_trend_wh_per_s": getattr(
+                self, "_last_gap_trend_wh_per_s", None
+            ),
+        }
+
     def is_enabled_at(self, now: datetime) -> bool:
         """Check if load management is enabled at the given moment.
 
@@ -629,6 +650,21 @@ class LoadManager:
         gap_wh = self.target_wh - adjusted_wh
         ctx.adjusted_wh = adjusted_wh
         ctx.gap_wh = gap_wh
+        # Feed the trend tracker on the pending-effect-corrected gap so the
+        # slope never chases our own actions. Keyed on data_point_at: stale
+        # or repeated fetches are ignored inside the tracker, and QH
+        # rollover resets history via qh_name.
+        noise_floor = (
+            self.engine.HYSTERESIS_WH / seconds_remaining
+            if seconds_remaining > 0
+            else 0.0
+        )
+        rate, trusted = self.gap_trend.update(
+            data_point_at, gap_wh,
+            qh_name=ctx.qh_name, noise_floor=noise_floor,
+        )
+        ctx.gap_trend_wh_per_s = rate if trusted else None
+        self._last_gap_trend_wh_per_s = ctx.gap_trend_wh_per_s
 
     def _stage_commit(self, ctx: CycleContext) -> CycleResult | None:
         """Stage 6: Sentinel check, commit effects, Tesla tracking, hysteresis.
@@ -796,6 +832,7 @@ class LoadManager:
                 active_tesla_telemetry=active_telemetry,
                 tesla_command_offline=self._vehicle_offline_this_cycle,
                 **self._quantization_diagnostics(),
+                **self._gap_trend_diagnostics(),
             ),
             sleep_hint=(
                 DEFAULT_SLEEP_HINT_SECS
@@ -1382,6 +1419,7 @@ class LoadManager:
                 sentinel_names=sentinel_names,
                 sentinel_on=sentinel_on,
                 **self._quantization_diagnostics(),
+                **self._gap_trend_diagnostics(),
             ),
             sleep_hint=sleep_hint,
             sleep_hint_at=sleep_hint_at,
@@ -2533,6 +2571,10 @@ class LoadManager:
                     and self.tesla_config.home_lat is not None
                     and self.tesla_config.home_lon is not None
                 ),
+                gap_trend_wh_per_s=getattr(
+                    self, "_last_gap_trend_wh_per_s", None
+                ),
+                cycle_secs=self.config_interval_secs,
             ),
             predicted_wh=corrected_adjusted_wh,
             target_wh=self.target_wh,
