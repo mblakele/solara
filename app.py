@@ -1598,7 +1598,7 @@ else:
         handler.setFormatter(logfmt.create_formatter(True))
     else:
         handler.setFormatter(logfmt.StructuredFormatter(
-            "[%(asctime)s] [%(process)d] [%(levelname)s] %(message)s",
+            "[%(asctime)s] [%(process)d] [%(levelname)s] %(name)s %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S %z",
         ))
     logging.basicConfig(handlers=[handler],
