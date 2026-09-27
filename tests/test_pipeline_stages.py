@@ -1277,3 +1277,115 @@ class TestAuthErrorFromInitTeslaState:
         ))
 
         lm_with_successful_tesla._queue_auth_error_notification.assert_not_called()  # type: ignore[attr-defined]
+
+class TestStageComputeGapTrend:
+    """_stage_compute_gap() feeds the gap-trend tracker (ramp awareness).
+
+    Trend is computed on the adjusted gap (pending-effect corrected) keyed
+    on data_point_at, so waiting/stale cycles never fabricate a slope and
+    our own plug toggles never chase themselves.
+    """
+
+    def _run_gap_cycle(
+        self,
+        lm: LoadManager,
+        ctx: CycleContext,
+        data_point: datetime,
+        predicted_wh: float,
+        seconds_remaining: int = 450,
+        qh_name: str = "QH1",
+    ) -> None:
+        ctx.qh_name = qh_name
+        ctx.data_point_at = data_point
+        ctx.now_postfetch = data_point + timedelta(seconds=30)
+        ctx.predicted_wh = predicted_wh
+        ctx.seconds_remaining = seconds_remaining
+        lm._stage_compute_gap(ctx)
+
+    def test_trend_none_until_three_cycles(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """ctx.gap_trend_wh_per_s is None until two slopes confirm."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        assert ctx.gap_trend_wh_per_s is None
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -37.5)
+        assert ctx.gap_trend_wh_per_s is None
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=60), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        assert abs(ctx.gap_trend_wh_per_s - 0.25) < 1e-9
+
+    def test_repeated_data_point_ignored(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A repeated data_point_at (stale fetch) never crashes or trends."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base, -37.5)
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_qh_change_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """QH rollover discards the previous QH's ramp."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=60), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=90), -52.5, qh_name="QH2"
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+
+class TestBuildResultGapTrend:
+    """CycleDiagnostics carry the gap trend into logs/JSON/SSE."""
+
+    def test_build_result_includes_gap_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """After trending cycles, build_result diagnostics expose the rate."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        for i, predicted in enumerate([-30.0, -37.5, -45.0]):
+            ctx.qh_name = "QH1"
+            ctx.data_point_at = base + timedelta(seconds=30 * i)
+            ctx.now_postfetch = base + timedelta(seconds=30 * i + 30)
+            ctx.predicted_wh = predicted
+            ctx.seconds_remaining = 450 - 30 * i
+            lm._stage_compute_gap(ctx)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.gap_trend_wh_per_s is not None
+        assert abs(result.diagnostics.gap_trend_wh_per_s - 0.25) < 1e-9
+        payload = result.diagnostics.to_dict()
+        assert abs(payload["gap_trend_wh_per_s"] - 0.25) < 1e-9
+
+    def test_build_result_trend_none_when_flat(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Without a confirmed trend the field is None (not zero)."""
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = -100.0
+        ctx.seconds_remaining = 450
+        ctx.now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.gap_trend_wh_per_s is None
+        assert result.diagnostics.to_dict()["gap_trend_wh_per_s"] is None

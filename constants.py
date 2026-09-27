@@ -122,6 +122,23 @@ reliable NBC prediction.  Below this threshold the pipeline returns
 ``no_incomplete_qh`` with a short sleep hint instead of acting on a
 wildly extrapolated single-sample prediction."""
 
+# ── Gap trend (ramp-aware Tesla stop) ────────────────────────────────
+
+GAP_TREND_WINDOW: int = 3
+"""Number of recent (data_point_at, gap) samples retained for slope
+estimation.  Three samples yield two consecutive slopes, the minimum
+needed to confirm a sustained ramp before acting on it."""
+
+GAP_TREND_EWMA_ALPHA: float = 0.3
+"""Weight of the most recent slope in the exponentially weighted moving
+average over the window.  Dampens single-cycle spikes while tracking
+sustained ramps such as sunset."""
+
+GAP_TREND_MIN_SLOPES: int = 2
+"""Consecutive same-sign slopes required before a trend is trusted.
+A single slope (two samples) is never enough — clouds and meter jitter
+flip the sign within one cycle."""
+
 # ── Fetch drift observability ────────────────────────────────────────
 
 DRIFT_REJECTION_ALERT_AFTER: int = 5

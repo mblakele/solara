@@ -120,7 +120,7 @@ to be conservative and leave more surplus on the grid.
 
 ## Hysteresis
 
-Production `hysteresis_wh = int(abs(target_wh) / 3)` (`load_manager.py:309`,
+Production `hysteresis_wh = int(abs(target_wh) / 3)` (`load_manager.py`,
 proportion in `constants.py:HYSTERESIS_PROPORTION`). With the current
 `target_wh = -9` (`devices.json`) that is **3 Wh** — essentially no deadband
 against hundred-Wh gap errors (e.g. a 2000 W plug with ~800 s left is
@@ -129,6 +129,28 @@ default; the fallback is now **20 Wh** (`constants.py:DEFAULT_HYSTERESIS_WH`),
 used only when no explicit value is passed. Production always passes
 `int(abs(target_wh) / 3)` explicitly — do not rely on the fallback when
 reasoning about production over-commit risk.
+
+## Tesla stop deferral and ramp awareness
+
+At Tesla's 5 A minimum there is nothing to trim: the only shed action is
+an all-or-nothing stop (~1200 W × remaining seconds). The static rule
+(`TeslaDecider.decide_reduce`, `load_nbc.py`) defers the stop while
+`seconds_remaining > gap / (1200/3600)` (capped at `MAX_DEFER_SECS=120`),
+so an exact-hit stop lands precisely on target — assuming the prediction
+is frozen. On a sustained ramp (sunset, `bugs/2026-09-26-tesla-stop-
+charging.log`) the frozen assumption defers one cycle too long.
+
+`GapTrendTracker` (`gap_trend.py`, constants `GAP_TREND_*`) estimates the
+adjusted-gap slope across cycles (EWMA over a 3-sample window, keyed on
+`data_point_at`, QH-reset; flat repeats are neutral, opposing slopes
+reject). Fed in `_stage_compute_gap` on the pending-effect-corrected gap
+with noise floor `hysteresis / seconds_remaining`, exposed as
+`gap_trend_wh_per_s` in `CycleDiagnostics`/JSON/SSE. When trusted and
+positive, the exact-hit stop time `t* = (P·R − G₀)/(P + r)` (trend clamped
+to half the 5 A rate) stops now if `t*` falls within one cycle
+(`DecideContext.cycle_secs`); otherwise the static rule stands unchanged.
+Flat, shrinking, or unconfirmed trends never alter behavior. Plug
+decisions are intentionally out of scope (Phase I: Tesla stop only).
 
 **Two sign conventions, deliberately:**
 

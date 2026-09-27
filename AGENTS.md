@@ -185,6 +185,9 @@ project-root
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
 ├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider, PendingEffect factories
+├── gap_trend.py           # GapTrendTracker: EWMA slope of the adjusted gap across cycles
+│                          # (data_point_at keying, QH reset, plateau-neutral); feeds the
+│                          # ramp-aware Tesla stop in TeslaDecider.decide_reduce
  ├── logfmt.py              # Structured log formatters: render extra= fields as
  │                          #   [key=value ...] suffixes (default) or JSON lines
  │                          #   (LOG_FORMAT=json); wired into app.py handlers
@@ -207,7 +210,10 @@ project-root
 ├── env.example            # Template for required environment variables
 ├── tests/                 # All pytest tests; test_tou_page.py covers inclusive date
                            # ranges, DST days, detail rows/defaults and picker dates;
-                           # test_app.py covers endpoint validation and range limits
+                           # test_app.py covers endpoint validation and range limits;
+                           # test_gap_trend.py covers the gap-slope tracker, test_tesla_decider.py
+                           # the ramp-aware stop rule, test_tesla_ramp_replay.py the
+                           # 2026-09-26 incident sequence
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change

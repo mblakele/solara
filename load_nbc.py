@@ -1481,6 +1481,11 @@ class DecideContext:
             home_lat/home_lon, the engine checks ``tesla.at_home`` before
             issuing charging actions. When False (missing config), Tesla
             charging is allowed regardless of location.
+        gap_trend_wh_per_s: Sustained slope of the adjusted gap in Wh/s
+            (positive = deficit growing), or None when unconfirmed.
+            Only hastens Tesla stops; never delays them.
+        cycle_secs: Decision cadence in seconds. The ramp rule stops now
+            when the exact-hit stop time falls within one cycle.
     """
 
     now: datetime
@@ -1491,6 +1496,8 @@ class DecideContext:
     dry_run: bool = False
     data_point_at: datetime | None = None
     requires_home_check: bool = True
+    gap_trend_wh_per_s: float | None = None
+    cycle_secs: int = 30
 
 
 def make_plug_effect(
@@ -1594,6 +1601,12 @@ class TeslaDecider:
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
     MAX_DEFER_SECS = 120          # cap on the safe defer window
+    RAMP_TREND_CLAMP_FRACTION = 0.5
+    """Cap on a trusted gap trend as a fraction of Tesla 5A draw.
+
+    A single-cycle spike must not slam the stop decision: the trend used
+    in the ramp rule is clamped to half the car's minimum draw rate.
+    """
     HARD_MAX_AMPS = TESLA_HARD_MAX_AMPS
     """Absolute max — never exceed, regardless of config."""
 
@@ -1663,6 +1676,34 @@ class TeslaDecider:
         return int(
             min(self.MAX_DEFER_SECS, remaining_reduction / (self.car_power_watts_5a / 3600))
         )
+
+    def _ramp_stop_now(self, ctx: DecideContext, reduce_wh: float) -> bool:
+        """Return True when a rising deficit pulls the stop into this cycle.
+
+        The static defer rule assumes a frozen prediction. With a sustained
+        deficit growth rate ``r`` the exact-hit stop time is
+        ``t* = (P·R − G₀)/(P + r)`` (P = 5A draw in Wh/s, R = remaining,
+        G₀ = gap). When ``t*`` falls within one decision cycle, waiting a
+        full cycle overshoots the optimum, so stop now. Only hastens stops
+        (positive trusted trends); flat, shrinking, or unconfirmed trends
+        keep the static rule byte-for-byte.
+
+        Args:
+            ctx: Decision context (carries the trusted trend and cadence).
+            reduce_wh: Wh reduction needed (always positive).
+
+        Returns:
+            True to stop now despite static defer headroom.
+        """
+        trend = ctx.gap_trend_wh_per_s
+        if trend is None or trend <= 0:
+            return False
+        power_wh_per_s = self.car_power_watts_5a / 3600
+        clamped = min(trend, power_wh_per_s * self.RAMP_TREND_CLAMP_FRACTION)
+        t_star = (power_wh_per_s * ctx.seconds_remaining - reduce_wh) / (
+            power_wh_per_s + clamped
+        )
+        return t_star <= ctx.cycle_secs
 
     def decide_increase(
         self,
@@ -1791,13 +1832,23 @@ class TeslaDecider:
             # remaining than the safe window (i.e., we have buffer to stop later).
             safe_defer_secs = self.safe_defer_secs(reduce_wh)
             if ctx.seconds_remaining > safe_defer_secs:
-                logger.debug(
-                    "[_decide_tesla_reduce] deferring stop: current_amps=%d, "
-                    "seconds_remaining=%d, safe_defer=%ds, gap=%.1f Wh",
-                    current_amps, ctx.seconds_remaining, safe_defer_secs,
-                    reduce_wh,
-                )
-                return None
+                if self._ramp_stop_now(ctx, reduce_wh):
+                    logger.debug(
+                        "[_decide_tesla_reduce] ramp stop: t* within one "
+                        "cycle (seconds_remaining=%d, safe_defer=%ds, "
+                        "gap=%.1f Wh, trend=%.3f Wh/s)",
+                        ctx.seconds_remaining, safe_defer_secs,
+                        reduce_wh,
+                        ctx.gap_trend_wh_per_s,
+                    )
+                else:
+                    logger.debug(
+                        "[_decide_tesla_reduce] deferring stop: current_amps=%d, "
+                        "seconds_remaining=%d, safe_defer=%ds, gap=%.1f Wh",
+                        current_amps, ctx.seconds_remaining, safe_defer_secs,
+                        reduce_wh,
+                    )
+                    return None
             logger.info(
                 "action=turn_off device=tesla reason=amps_min_reached current_amps=%d",
                 current_amps,

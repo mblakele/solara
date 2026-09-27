@@ -129,3 +129,64 @@ def test_eligible_plugs_turn_off_order():
     ctx = _ctx(state=state, plugs=plugs, tesla=None)
     names = [name for _, name, _ in engine._eligible_plugs(ctx, want_on=False)]
     assert names == ["low", "high"]
+
+
+def _min_amps_ctx(seconds_remaining, reduce_trend=None, cycle_secs=30):
+    """DecideContext with Tesla at minimum amps (stop-or-defer branch)."""
+    return _ctx(
+        seconds_remaining=seconds_remaining,
+        tesla=TeslaState(
+            is_charging=True, current_amps=5, plugged_in=True, at_home=True
+        ),
+        gap_trend_wh_per_s=reduce_trend,
+        cycle_secs=cycle_secs,
+    )
+
+
+class TestRampAwareStop:
+    """Ramp-adjusted Tesla stop (bugs/2026-09-26-tesla-stop-charging.log).
+
+    Static safe_defer assumes a frozen prediction; on a sustained rising
+    deficit the exact-hit stop time falls before the next cycle, so the
+    decider stops one cycle early. Flat/unknown trends keep static
+    behavior byte-for-byte.
+    """
+
+    def test_ramp_stops_one_cycle_early(self):
+        """c54: R=149, gap=45.1, trend=+0.25 → stop (static defers)."""
+        decider = TeslaDecider()
+        action = decider.decide_reduce(_min_amps_ctx(149, 0.25), 45.1)
+        assert action is not None
+        assert action.device_name == "tesla"
+        assert action.action == "turn_off"
+
+    def test_flat_none_trend_defers_parity(self):
+        """Same c54 numbers with no trend → defer (static parity)."""
+        decider = TeslaDecider()
+        assert decider.decide_reduce(_min_amps_ctx(149), 45.1) is None
+
+    def test_zero_trend_defers(self):
+        """Explicit zero trend falls back to the static rule."""
+        decider = TeslaDecider()
+        assert decider.decide_reduce(_min_amps_ctx(149, 0.0), 45.1) is None
+
+    def test_negative_trend_defers(self):
+        """Shrinking deficit never hastens a stop."""
+        decider = TeslaDecider()
+        assert decider.decide_reduce(_min_amps_ctx(149, -0.25), 45.1) is None
+
+    def test_trend_beyond_next_cycle_defers(self):
+        """c52: R=184, gap=38.3, trend=+0.25 → t*≈39s > 30s cadence."""
+        decider = TeslaDecider()
+        assert decider.decide_reduce(_min_amps_ctx(184, 0.25), 38.3) is None
+
+    def test_huge_trend_clamped(self):
+        """trend=+1.0 is clamped to P/2: t*≈33s still defers."""
+        decider = TeslaDecider()
+        assert decider.decide_reduce(_min_amps_ctx(200, 1.0), 50.0) is None
+
+    def test_ramp_stop_inside_static_window(self):
+        """Ramp never delays: R=119, gap=56.3 stops with or without trend."""
+        decider = TeslaDecider()
+        assert decider.decide_reduce(_min_amps_ctx(119, 0.25), 56.3) is not None
+        assert decider.decide_reduce(_min_amps_ctx(119), 56.3) is not None
