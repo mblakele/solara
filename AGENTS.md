@@ -427,6 +427,15 @@ project-root
 - Actions are determined by comparing adjusted predicted_wh against target_wh (default -50 Wh)
 - Three action types: "turn_on", "turn_off", "set_amps"
 - Algorithm uses bin-packing to fit eligible loads into the surplus gap
+- Both directions aim at the target: `decide()` passes `gap - TURN_ON_MARGIN_WH`
+  (default 0) to `_decide_turn_on` via `_turn_on_budget()` and
+  `abs_gap - TURN_OFF_MARGIN_WH` (default 0) to `_decide_turn_off` via
+  `_turn_off_budget()`; pass `turn_on_margin_wh=hysteresis_wh` or
+  `turn_off_margin_wh=hysteresis_wh` to restore the old deadband-edge
+  behavior. Covered by tests/test_turn_on_aim.py and tests/test_turn_off_aim.py;
+  the edge-mode plug case lives in tests/test_gap_minder.py as
+  `test_edge_gap_reduces_surplus_turn_on` and the edge-mode Tesla case as
+  `test_edge_gap_reduces_tesla_amps_reduction`.
 - Turn-off shedding is deliberately unguarded (design decision, not an
   oversight): no MIN_SECONDS_TO_ACT floor and no overshoot cap —
   `_decide_turn_off` turns plugs off until `remaining_reduction <= 0`, even

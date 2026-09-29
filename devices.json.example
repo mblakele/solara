@@ -11,7 +11,8 @@
         "accessory_id": "192.168.1.50",
         "power_watts": 4500,
         "priority": 10,
-        "time_range": "06:00-22:00"
+        "time_range": "06:00-22:00",
+        "shed_outside_range": true
       },
       {
         "name": "home_presence",

@@ -1722,7 +1722,8 @@ class TestRealTeslaControllerAuthError:
         from unittest.mock import MagicMock, patch
 
         ctrl = RealTeslaController(tesla_config)
-        ctrl._last_saved_tokens_at = 999999.0  # far in the "future" (monotonic)
+        import time as _time
+        ctrl._last_saved_tokens_at = _time.monotonic() + 3600.0  # 1h in the future
         ctrl._ensure_api = AsyncMock()  # type: ignore[assignment]
         mock_api = MagicMock()
         ctrl._api = mock_api

@@ -33,7 +33,7 @@
 
     <div class="forecast__value {{ 'forecast__value--gen' if qh1.predicted_wh is not none and qh1.predicted_wh < 0 else 'forecast__value--load' }}">
       {% if qh1.predicted_wh is not none %}
-      {{ "%+.0f" % (qh1.predicted_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period">forecast this period</span>
+      {{ "%+.0f" % (qh1.predicted_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period">{{ _status_label(load_management.last_cycle_result.status if load_management and load_management.last_cycle_result else "ok") }}</span>
       {% else %}
       <span class="forecast__placeholder">—</span>
       {% endif %}

@@ -1005,6 +1005,52 @@ def _cycle_result_to_dict(result: CycleResult | dict | None) -> dict:
     return result.to_dict()
 
 
+def sort_devices_for_display(
+    devices: dict[str, Any],
+    plugs: dict[str, Any] | None = None,
+    sentinel_names: set[str] | frozenset[str] | list[str] | None = None,
+) -> dict[str, Any]:
+    """Order device states for the dashboard Devices grid.
+
+    Sentinel plugs first, then regular plugs in priority order (higher
+    number first, matching the turn-on decision order). Ties break by
+    name (case-insensitive), then hardware id (``accessory_id``, which
+    holds the vocolinc ``device_name``), then raw name so the order
+    is total. Anything else (vehicles such as tesla) sorts last.
+
+    Args:
+        devices: Device-name → state dicts in tracker insertion order.
+        plugs: Plug-name → config (must expose ``priority`` and
+            ``accessory_id``); entries absent here sort with the
+            trailing group.
+        sentinel_names: Names treated as sentinels (first group).
+
+    Returns:
+        New dict with the same entries in display order.
+    """
+    sentinels = set(sentinel_names or [])
+    if not isinstance(plugs, dict):
+        plugs = {}
+
+    def sort_key(name: str) -> tuple[int, int, str, str, str]:
+        if name in sentinels:
+            group = 0
+        elif name in plugs:
+            group = 1
+        else:
+            group = 2
+        plug = plugs.get(name)
+        priority = getattr(plug, "priority", 0)
+        try:
+            priority_num = int(priority)
+        except (TypeError, ValueError):
+            priority_num = 0
+        device_id = str(getattr(plug, "accessory_id", "") or "")
+        return (group, -priority_num, name.lower(), device_id, name)
+
+    return dict(sorted(devices.items(), key=lambda item: sort_key(item[0])))
+
+
 def _build_load_management_payload(lm: Any = None) -> dict:
     """Build a load management state payload for the index endpoint.
 
@@ -1034,6 +1080,14 @@ def _build_load_management_payload(lm: Any = None) -> dict:
 
     sentinel_names = sorted(getattr(lm, "sentinel_names", frozenset()))
     state_dict = lm.state.to_dict()
+    # Predictable Devices-grid order: sentinels, plugs by priority, vehicles.
+    devices = state_dict.get("devices")
+    if isinstance(devices, dict):
+        state_dict["devices"] = sort_devices_for_display(
+            devices,
+            getattr(lm, "plugs", None),
+            sentinel_names,
+        )
     # Sentinels are special: never surface pending effects for them, even
     # if one somehow exists in the tracker.
     if sentinel_names:
@@ -1448,6 +1502,28 @@ def start_background_services() -> None:
     _state.background_services_started_at = datetime.now(timezone.utc)
 
 
+_STATUS_LABELS = {
+    "ok": "forecast this period",
+    "dry-run": "dry run",
+    "disabled": "disabled",
+    "no_incomplete_qh": "waiting for data",
+    "stale_data": "stale data",
+    "waiting_for_fresh_data": "waiting for data",
+}
+
+
+def _status_label(status: str) -> str:
+    """Return the forecast-period label for a cycle status.
+
+    Args:
+        status: CycleStatus string from the last CycleResult.
+
+    Returns:
+        Human-readable label for the forecast__period span.
+    """
+    return _STATUS_LABELS.get(status, "forecast this period")
+
+
 def create_app() -> Flask:
     """Create and configure the Flask application.
 
@@ -1474,6 +1550,7 @@ def create_app() -> Flask:
     application.register_blueprint(bp)
     application.jinja_env.filters["astimezonestr"] = astimezone_filter
     application.jinja_env.filters["per_second_sparkline"] = per_second_sparkline
+    application.jinja_env.globals["_status_label"] = _status_label
     application.json = CustomJSONProvider(application)
     application.register_error_handler(RetryableMetricsException, error_retryable)
     application.add_url_rule("/", "index", index)

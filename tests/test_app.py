@@ -193,6 +193,44 @@ class TestApp(unittest.TestCase):
         self.assertIn("forecast this period", data)
         self.assertIn('class="forecast"', data)
 
+    def test_index_html_status_labels(self):
+        """Forecast period label reflects last_cycle_result.status."""
+        import app as app_mod
+        from load_models import CycleResult
+
+        cases = [
+            ("ok", "forecast this period"),
+            ("dry-run", "dry run"),
+            ("disabled", "disabled"),
+            ("no_incomplete_qh", "waiting for data"),
+            ("stale_data", "stale data"),
+            ("waiting_for_fresh_data", "waiting for data"),
+        ]
+
+        for status, expected_label in cases:
+            with self.subTest(status=status):
+                mock_lm = unittest.mock.MagicMock()
+                mock_lm.enabled = True
+                mock_lm.target_wh = -500
+                mock_lm.nbc_device = "test_nbc"
+                mock_lm.state = unittest.mock.MagicMock()
+                mock_lm.state.devices = {}
+                mock_lm.state.pending_effects = []
+                mock_lm.run_cycle.return_value = CycleResult(status=status)
+                mock_lm.sentinel_names = []
+
+                with mock_config(overrides={"MOCK": "True", "DEBUG": "True"}):
+                    from config import Config
+                    Config().set("LOAD_MANAGE_ENABLED", "True")
+
+                    app_mod._state.load_manager = mock_lm
+                    app_mod._state.last_cycle_result = mock_lm.run_cycle.return_value
+
+                    response = self.app.get("/", headers={"Accept": "text/html"})
+                self.assertEqual(response.status_code, 200)
+                data = response.data.decode("utf-8")
+                self.assertIn(expected_label, data)
+
     def test_index_real_mode_lm_disabled(self):
         """Index returns 200 in real mode when load management is disabled.
 
