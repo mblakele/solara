@@ -15,6 +15,24 @@ failing test, **stop and ask** rather than continuing to iterate blindly.
 
 Write tests first, then diagnose and fix bugs.
 
+### Analyzing a log in `bugs/`
+
+**When a task mentions a path under `bugs/` (e.g. "analyze
+`bugs/2026-10-10-tesla-overshoot.log`"), your FIRST tool call is the scorer, and
+your FIRST output block is its raw output:**
+
+```bash
+uv run python tools/forecast_log_scoring.py bugs/<file>.log
+```
+
+It extracts every forecast anchor plus the completed-quarter actual in one pass
+and prints scored-anchor counts, signed/absolute error, `sigma_rate`, per-`R`
+buckets, and the quarter's realized total. Lead the reply with that output, then
+explain it with a hand reconstruction of the `nbc_set` lines. Do not derive
+anchor tables, errors, or the quarter's actual Wh by hand when the tool already
+computes them — hand numbers are for *explaining* the tool's numbers, not for
+*replacing* them.
+
 ### Tool Use
 
 Always invoke tools using structured function-calling JSON (not inline XML or markdown text).
@@ -130,7 +148,10 @@ project-root
 │                          # Linted and type-checked (`uv run pylint *.py tools/*.py`,
 │                          # mypy `files` includes `tools/*.py`), but not shipped in
 │                          # the gunicorn/Flask runtime path.
-│   └── forecast_log_scoring.py  # Scores NBC forecast quality against production logs:
+│   └── forecast_log_scoring.py  # FIRST STEP for any task that names a `bugs/*.log`
+│                          # file — run it and lead with its output (see
+│                          # "Analyzing a log in `bugs/`" under General Advice).
+│                          # Scores NBC forecast quality against production logs:
 │                          # parses forecast anchors + completed-quarter actuals and
 │                          # reports forecast uncertainty. Despite the name it does NOT
 │                          # replay decisions (contrast tests/test_tesla_ramp_replay.py,
