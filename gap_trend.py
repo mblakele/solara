@@ -14,9 +14,11 @@ from datetime import datetime
 
 from constants import (
     GAP_TREND_EWMA_ALPHA,
+    GAP_TREND_MAX_SPAN_SECS,
     GAP_TREND_MIN_SLOPES,
     GAP_TREND_WINDOW,
 )
+from util import floor_to_qh
 
 
 class GapTrendTracker:
@@ -25,44 +27,57 @@ class GapTrendTracker:
     Samples are keyed on ``data_point_at`` (not wall clock) so stale or
     repeated fetches never fabricate a slope.  History resets on
     quarter-hour rollover so one QH's ramp cannot leak into the next.
+
+    The quarter-hour identity is derived from ``data_point_at`` itself
+    rather than taken from the caller.  ``ParsedMetricsQH.qh_name`` is the
+    hardcoded literal ``"QH1"`` for every incomplete quarter, so keying on
+    it can never detect a rollover — which let a 20:45 sample be
+    slope-fitted against 20:43/20:44 samples from the previous hour
+    (bugs/2026-10-10-tesla-overshoot.log, c587).
     """
 
     def __init__(
         self,
         window: int = GAP_TREND_WINDOW,
         alpha: float = GAP_TREND_EWMA_ALPHA,
+        max_span_secs: int = GAP_TREND_MAX_SPAN_SECS,
     ) -> None:
         """Initialize an empty tracker.
 
         Args:
             window: Recent samples retained (need window-1 slopes).
             alpha: Weight of the newest slope in the EWMA.
+            max_span_secs: Largest ``data_point_at`` delta to slope across;
+                a larger gap clears history.
         """
         self._window = window
         self._alpha = alpha
+        self._max_span_secs = max_span_secs
         self._samples: deque[tuple[datetime, float]] = deque(maxlen=window)
-        self._qh_name: str | None = None
+        self._qh_start: datetime | None = None
 
     def reset(self) -> None:
-        """Discard all history (e.g. on QH rollover detected by caller)."""
+        """Discard all history (samples and quarter-hour identity)."""
         self._samples.clear()
-        self._qh_name = None
+        self._qh_start = None
 
     def update(
         self,
         data_point_at: datetime,
         gap_wh: float,
-        qh_name: str | None = None,
         noise_floor: float = 0.0,
     ) -> tuple[float, bool]:
         """Record one cycle's adjusted gap and return the trend.
+
+        History is cleared when the new sample falls in a different
+        quarter-hour, or when it is more than ``max_span_secs`` past the
+        previous sample.
 
         Args:
             data_point_at: Timestamp of the NBC data point this cycle.
             gap_wh: Adjusted gap (target − adjusted prediction), always
                 computed from pending-effect-corrected predictions so the
                 trend never chases our own actions.
-            qh_name: Current quarter-hour id.  A change discards history.
             noise_floor: Minimum |slope| (Wh/s) to trust.  Callers pass
                 ``hysteresis / seconds_remaining``.
 
@@ -72,17 +87,20 @@ class GapTrendTracker:
             strictly opposing signs and |ewma| above the noise floor; flat
             (zero) slopes are neutral and neither confirm nor break a ramp.
         """
-        if (
-            qh_name is not None
-            and self._qh_name is not None
-            and qh_name != self._qh_name
-        ):
+        qh_start = floor_to_qh(data_point_at)
+        if self._qh_start is not None and qh_start != self._qh_start:
             self._samples.clear()
-        if qh_name is not None:
-            self._qh_name = qh_name
+        self._qh_start = qh_start
 
-        if self._samples and data_point_at <= self._samples[-1][0]:
-            return 0.0, False
+        if self._samples:
+            prev_ts = self._samples[-1][0]
+            if data_point_at <= prev_ts:
+                return 0.0, False
+            span = (data_point_at - prev_ts).total_seconds()
+            if span > self._max_span_secs:
+                # Too far from the last sample to describe the current
+                # regime; keep the new sample as a fresh seed only.
+                self._samples.clear()
         self._samples.append((data_point_at, gap_wh))
 
         if len(self._samples) < GAP_TREND_MIN_SLOPES + 1:
@@ -91,14 +109,13 @@ class GapTrendTracker:
         # Slopes over the last GAP_TREND_MIN_SLOPES intervals.
         slopes: list[float] = []
         recent = list(self._samples)[-(GAP_TREND_MIN_SLOPES + 1):]
+        # Samples are strictly increasing in data_point_at: update() rejects
+        # any timestamp at or before the newest sample, so every adjacent
+        # pair here has dt > 0.
         for (prev_ts, prev_gap), (cur_ts, cur_gap) in zip(recent, recent[1:]):
             dt = (cur_ts - prev_ts).total_seconds()
-            if dt <= 0:
-                return 0.0, False
             slopes.append((cur_gap - prev_gap) / dt)
 
-        if len(slopes) < GAP_TREND_MIN_SLOPES:
-            return 0.0, False
         # Zero slopes are neutral (repeated fetch of the same data carries
         # no new information); only strictly opposing nonzero slopes break
         # confirmation. This tolerates meter/NBC plateaus inside a ramp
