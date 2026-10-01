@@ -141,15 +141,29 @@ is frozen. On a sustained ramp (sunset, `bugs/2026-09-26-tesla-stop-
 charging.log`) the frozen assumption defers one cycle too long.
 
 `GapTrendTracker` (`gap_trend.py`, constants `GAP_TREND_*`) estimates the
-adjusted-gap slope across cycles (EWMA over a 3-sample window, keyed on
-`data_point_at`, QH-reset; flat repeats are neutral, opposing slopes
-reject). Fed in `_stage_compute_gap` on the pending-effect-corrected gap
-with noise floor `hysteresis / seconds_remaining`, exposed as
-`gap_trend_wh_per_s` in `CycleDiagnostics`/JSON/SSE. When trusted and
-positive, the exact-hit stop time `t* = (P·R − G₀)/(P + r)` (trend clamped
-to half the 5 A rate) stops now if `t*` falls within one cycle
-(`DecideContext.cycle_secs`); otherwise the static rule stands unchanged.
-Flat, shrinking, or unconfirmed trends never alter behavior. Plug
+adjusted-gap slope across cycles: an EWMA over a 3-sample window keyed on
+`data_point_at`, with flat repeats neutral and opposing slopes rejecting.
+History clears on two boundaries — a quarter-hour rollover, and a
+`data_point_at` delta above `GAP_TREND_MAX_SPAN_SECS` (120 s, matching the
+furthest horizon a defer decision examines). The quarter-hour identity is
+**derived** via `floor_to_qh(data_point_at)`, not taken from the caller:
+`ParsedMetricsQH.qh_name` is the hardcoded literal `"QH1"` for every
+incomplete quarter, so keying on it could never detect a rollover. That
+bug let a 20:45 sample be slope-fitted against 20:43/20:44 samples from
+the previous hour, publishing a bogus −6.1 Wh/s trend
+(`bugs/2026-10-10-tesla-overshoot.log`, c587). Harmless for the Tesla stop
+— `_ramp_stop_now` only fires when the deficit already exceeds ~⅓ of the
+energy the car would draw over the remaining time, a regime where stopping
+is right regardless of trend — but it must not survive into plug Phase II,
+where a spurious trend could drop a 4857 W load.
+
+Fed in `_stage_compute_gap` on the pending-effect-corrected gap with noise
+floor `hysteresis / seconds_remaining`, exposed as `gap_trend_wh_per_s` in
+`CycleDiagnostics`/JSON/SSE. When trusted and positive, the exact-hit stop
+time `t* = (P·R − G₀)/(P + r)` (trend clamped to half the 5 A rate) stops
+now if `t*` falls within one cycle (`DecideContext.cycle_secs`); otherwise
+the static rule stands unchanged. Flat, shrinking, or unconfirmed trends
+never alter behavior. Plug
 decisions are intentionally out of scope (Phase I: Tesla stop only).
 
 **Two sign conventions, deliberately:**

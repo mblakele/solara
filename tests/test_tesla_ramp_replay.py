@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from gap_trend import GapTrendTracker
 from load_models import TeslaState
 from load_nbc import DecideContext, StateTracker, TeslaDecider
-from gap_trend import GapTrendTracker
+from util import floor_to_qh
 
 # (seconds_remaining, turn_off deficit Wh) from the log, c36 → c54.
 INCIDENT_POINTS: list[tuple[int, float]] = [
@@ -36,12 +37,40 @@ INCIDENT_POINTS: list[tuple[int, float]] = [
     (149, 45.1),
 ]
 
+# c36's data point; R=419 puts the quarter-hour end at 00:00:03.
 BASE = datetime(2026, 9, 26, 23, 53, 4, tzinfo=timezone.utc)
 TARGET_WH = -9
 # Predicted Wh at c54 and c55 from the log (for landed estimates).
 PREDICTED_C54 = 36.1
 PREDICTED_C55 = 47.3
 TESLA_5A_WH_PER_S = 5 * 240 / 3600
+
+
+def _timestamps() -> list[datetime]:
+    """Derive each step's data point from the log's own seconds_remaining.
+
+    The real cycles were not on a fixed 30 s cadence — R falls 419→149
+    (270 s) across 15 steps, with deltas of 8-30 s. Deriving timestamps
+    from the R column keeps the fixture self-consistent *and* keeps every
+    sample inside one quarter-hour; a synthetic 30 s spacing would run
+    past midnight and silently split the sequence across two QHs.
+    """
+    first_remaining = INCIDENT_POINTS[0][0]
+    return [
+        BASE + timedelta(seconds=first_remaining - remaining)
+        for remaining, _ in INCIDENT_POINTS
+    ]
+
+
+def test_replay_sequence_stays_within_one_quarter_hour() -> None:
+    """Fixture guard: the whole incident belongs to a single QH.
+
+    GapTrendTracker resets on a quarter-hour boundary, so a fixture that
+    straddles one would silently lose its history (and with it the
+    regression this file exists to protect).
+    """
+    stamps = _timestamps()
+    assert len({floor_to_qh(ts) for ts in stamps}) == 1
 
 
 def _tesla_5a() -> TeslaState:
@@ -55,27 +84,17 @@ def _replay(use_trend: bool) -> list:
     decider = TeslaDecider()
     tracker = GapTrendTracker()
     results = []
-    for i, (remaining, gap) in enumerate(INCIDENT_POINTS):
-        data_point_at = BASE + timedelta(seconds=30 * i)
-        trend: float | None = None
-        if use_trend:
-            rate, trusted = tracker.update(
-                data_point_at, gap, qh_name="QH1",
-                noise_floor=3 / remaining,
-            )
-            trend = rate if trusted else None
-        else:
-            tracker.update(
-                data_point_at, gap, qh_name="QH1",
-                noise_floor=3 / remaining,
-            )
+    for data_point_at, (remaining, gap) in zip(_timestamps(), INCIDENT_POINTS):
+        rate, trusted = tracker.update(
+            data_point_at, gap, noise_floor=3 / remaining,
+        )
         ctx = DecideContext(
             now=data_point_at + timedelta(seconds=30),
             seconds_remaining=remaining,
             state=StateTracker(),
             plugs={},
             tesla=_tesla_5a(),
-            gap_trend_wh_per_s=trend,
+            gap_trend_wh_per_s=rate if (use_trend and trusted) else None,
             cycle_secs=30,
         )
         results.append(decider.decide_reduce(ctx, gap))

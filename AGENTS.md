@@ -186,7 +186,10 @@ project-root
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
 ├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider, PendingEffect factories
 ├── gap_trend.py           # GapTrendTracker: EWMA slope of the adjusted gap across cycles
-│                          # (data_point_at keying, QH reset, plateau-neutral); feeds the
+│                          # (keyed on data_point_at; quarter-hour identity derived via
+│                          # floor_to_qh because ParsedMetricsQH.qh_name is the constant
+│                          # "QH1"; history clears on QH rollover or a data gap over
+│                          # GAP_TREND_MAX_SPAN_SECS; plateau-neutral). Feeds the
 │                          # ramp-aware Tesla stop in TeslaDecider.decide_reduce
  ├── logfmt.py              # Structured log formatters: render extra= fields as
  │                          #   [key=value ...] suffixes (default) or JSON lines

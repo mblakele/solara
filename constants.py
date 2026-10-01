@@ -135,9 +135,19 @@ average over the window.  Dampens single-cycle spikes while tracking
 sustained ramps such as sunset."""
 
 GAP_TREND_MIN_SLOPES: int = 2
-"""Consecutive same-sign slopes required before a trend is trusted.
-A single slope (two samples) is never enough — clouds and meter jitter
-flip the sign within one cycle."""
+"""Slopes required before a gap trend is trusted. A single slope (two
+samples) is never enough — clouds and meter jitter flip the sign within
+one cycle. Zero slopes are neutral and neither confirm nor break."""
+
+GAP_TREND_MAX_SPAN_SECS: int = 120
+"""Largest ``data_point_at`` delta the gap tracker will slope across.
+
+Matches ``TeslaDecider.MAX_DEFER_SECS``, the furthest horizon a stop
+decision ever examines. A slope averaged over more seconds than that
+describes a regime the decision cannot act on (e.g. a long stall, or a
+window spanning a quarter-hour boundary), so the tracker clears history
+instead of trusting it. Real production deltas are 30-60 s, because half
+the cycles exit early on ``waiting_for_fresh_data``."""
 
 # ── Fetch drift observability ────────────────────────────────────────
 

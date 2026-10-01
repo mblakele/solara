@@ -1329,15 +1329,58 @@ class TestStageComputeGapTrend:
     def test_qh_change_resets_trend(
         self, lm: LoadManager, ctx: CycleContext
     ):
-        """QH rollover discards the previous QH's ramp."""
+        """A real quarter-hour boundary discards the previous QH's ramp.
+
+        The crossing step is kept within the span guard's limit so this
+        exercises the quarter-hour reset specifically, not the span guard.
+        """
         lm.target_wh = -9
-        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        base = datetime(2025, 6, 1, 12, 14, 30, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=10), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=20), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=31), -52.5, qh_name="QH2"
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_hour_boundary_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Crossing the hour (a new QH1) also resets — the production bug.
+
+        ctx.qh_name is the literal "QH1" either side of the hour boundary,
+        so only a timestamp-derived identity can catch this.
+        """
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 14, 40, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=5), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=10), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=21), -52.5, qh_name="QH1"
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_long_data_gap_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A data-point gap past the span limit clears history."""
+        from constants import GAP_TREND_MAX_SPAN_SECS
+
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
         self._run_gap_cycle(lm, ctx, base, -30.0)
         self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -37.5)
         self._run_gap_cycle(lm, ctx, base + timedelta(seconds=60), -45.0)
         assert ctx.gap_trend_wh_per_s is not None
         self._run_gap_cycle(
-            lm, ctx, base + timedelta(seconds=90), -52.5, qh_name="QH2"
+            lm,
+            ctx,
+            base + timedelta(seconds=60 + GAP_TREND_MAX_SPAN_SECS + 1),
+            -52.5,
         )
         assert ctx.gap_trend_wh_per_s is None
 

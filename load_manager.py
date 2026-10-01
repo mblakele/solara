@@ -652,16 +652,15 @@ class LoadManager:
         ctx.gap_wh = gap_wh
         # Feed the trend tracker on the pending-effect-corrected gap so the
         # slope never chases our own actions. Keyed on data_point_at: stale
-        # or repeated fetches are ignored inside the tracker, and QH
-        # rollover resets history via qh_name.
+        # or repeated fetches are ignored inside the tracker, which also
+        # resets itself on quarter-hour rollover and over-long data gaps.
         noise_floor = (
             self.engine.HYSTERESIS_WH / seconds_remaining
             if seconds_remaining > 0
             else 0.0
         )
         rate, trusted = self.gap_trend.update(
-            data_point_at, gap_wh,
-            qh_name=ctx.qh_name, noise_floor=noise_floor,
+            data_point_at, gap_wh, noise_floor=noise_floor,
         )
         ctx.gap_trend_wh_per_s = rate if trusted else None
         self._last_gap_trend_wh_per_s = ctx.gap_trend_wh_per_s
