@@ -41,7 +41,7 @@ front. For those changes you may **skip the Red-Green ceremony**:
 
 - No failing test is required before touching `templates/`, `static/style.css`,
   or presentation-only changes to markup.
-- Still run the full verification gate (`uv run pylint *.py`, `uv run mypy`,
+- Still run the full verification gate (`uv run pylint *.py tools/*.py`, `uv run mypy`,
   `uv run pytest`) after the change, and update any existing tests that assert
   on the changed markup so the suite stays green.
 - The exemption covers **presentation only**. Any change that alters behavior,
@@ -125,6 +125,21 @@ This is a flat-layout Python project. All source files live at the project root 
 
 ```
 project-root
+├── tools/                 # Offline-only analysis tools. No production module
+│                          # imports anything in here; they read log text and report.
+│                          # Linted and type-checked (`uv run pylint *.py tools/*.py`,
+│                          # mypy `files` includes `tools/*.py`), but not shipped in
+│                          # the gunicorn/Flask runtime path.
+│   └── forecast_log_scoring.py  # Scores NBC forecast quality against production logs:
+│                          # parses forecast anchors + completed-quarter actuals and
+│                          # reports forecast uncertainty. Despite the name it does NOT
+│                          # replay decisions (contrast tests/test_tesla_ramp_replay.py,
+│                          # which re-runs production classes); it measures the forecast.
+│                          # Identity: a realized error is *identically*
+│                          # -remaining_secs * rate_error (ForecastAnchor.error vs
+│                          # rate_shortfall), so U(R) = k * sigma_rate * R is complete,
+│                          # not an approximation. Run from the repo root:
+│                          #   uv run python tools/forecast_log_scoring.py bugs/*.log
 ├── app.py                 # Flask app factory (create_app()), route definitions (/, /health,
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
                            # _AppState runtime singletons, start_background_services();
@@ -211,7 +226,12 @@ project-root
 ├── pyproject.toml         # Project metadata, dependencies & script entrypoints
 ├── render.yaml            # Render.com deployment configuration
 ├── env.example            # Template for required environment variables
-├── tests/                 # All pytest tests; test_tou_page.py covers inclusive date
+├── tests/                 # All pytest tests; test_forecast_log_scoring.py covers the
+                           # offline tool (parser quarter identity, actual resolution,
+                           # the error==-R*shortfall identity, sigma_rate/coverage, and
+                           # that the tool runs standalone; real-log assertions skip
+                           # because bugs/ is gitignored);
+                           # test_tou_page.py covers inclusive date
                            # ranges, DST days, detail rows/defaults and picker dates;
                            # test_app.py covers endpoint validation and range limits;
                            # test_gap_trend.py covers the gap-slope tracker, test_tesla_decider.py
@@ -648,7 +668,7 @@ After **any** code change, always run these commands in order. Do not proceed
 to the next step if a prior step fails.
 
 ```bash
-uv run pylint *.py                     # 1. Style and bug checks
+uv run pylint *.py tools/*.py          # 1. Style and bug checks
 uv run mypy                            # 2. Type correctness
 uv run pytest                          # 3. Full test suite (fast, no coverage)
 uv run pytest --cov=.                  # 4. Coverage check (opt-in)
@@ -664,7 +684,7 @@ is required (e.g. CI, or after changing test-relevant code).
 |---|---|
 | Run full test suite | `uv run pytest` |
 | Run a single test | `uv run pytest tests/test_app.py::test_function_name` |
-| Lint | `uv run pylint *.py` |
+| Lint | `uv run pylint *.py tools/*.py` |
 | Type check | `uv run mypy` |
 | Dev server | `uv run python app.py` |
 | Production-like server | `gunicorn --reload -c gunicorn.conf.py --worker-class=gthread --threads=4 --bind 127.0.0.1:8000 wsgi:app` |
