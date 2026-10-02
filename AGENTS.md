@@ -18,7 +18,7 @@ Write tests first, then diagnose and fix bugs.
 ### Analyzing a log in `bugs/`
 
 **When a task mentions a path under `bugs/` (e.g. "analyze
-`bugs/2026-10-10-tesla-overshoot.log`"), your FIRST tool call is the scorer, and
+`bugs/2026-10-01-tesla-overshoot.log`"), your FIRST tool call is the scorer, and
 your FIRST output block is its raw output:**
 
 ```bash
