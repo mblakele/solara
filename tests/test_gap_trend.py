@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from constants import GAP_TREND_MAX_SPAN_SECS
 from gap_trend import GapTrendTracker
 
@@ -228,3 +230,128 @@ def test_span_just_under_limit_accumulates() -> None:
     rate, trusted = tracker.update(_ts(base, 30 + GAP_TREND_MAX_SPAN_SECS), 25.0)
     assert trusted is True
     assert rate > 0
+
+
+# ── Jitter (churn) accumulator ───────────────────────────────────────
+#
+# churn = EWMA of |slope_n - slope_(n-1)| (Wh/s): the cycle-to-cycle swing
+# of the adjusted-gap estimate itself. It is the uncertainty measure for
+# turn-on decisions (bugs/2026-10-10-tesla-overshoot.log: both Tesla
+# increases ran with no trusted trend while the series oscillated).
+
+_INCIDENT_SEQ = [
+    ((20, 40, 31), 12.731666250000025),
+    ((20, 41, 1), 28.281547499999995),
+    ((20, 42, 1), 3.4183974999999975),
+    ((20, 43, 1), 7.68822333333334),
+    ((20, 44, 1), -1.223295833333328),
+]
+
+
+def test_churn_unmeasurable_before_two_slopes() -> None:
+    """No churn until two slopes exist (third sample onward)."""
+    tracker = GapTrendTracker()
+    base = datetime(2026, 10, 1, 20, 40, 31, tzinfo=timezone.utc)
+    tracker.update(base, 12.7)
+    assert tracker.churn_wh_per_s == 0.0
+    tracker.update(_ts(base, 30), 28.3)
+    assert tracker.churn_wh_per_s == 0.0
+
+
+def test_churn_values_on_production_incident_series() -> None:
+    """Exact churn on the log's gap series (slopes 30 s/60 s spaced).
+
+    Slopes: +0.5183, -0.4144, +0.0712, -0.1485 Wh/s (data points 30 s,
+    then 60 s apart). First churn appears at the third sample; later
+    values are the EWMA (alpha 0.3) over the per-update |delta slope|
+    pairs.
+    """
+    tracker = GapTrendTracker()
+    base = datetime(2026, 10, 1, 20, 40, 31, tzinfo=timezone.utc)
+    churns: list[float] = []
+    for (h, m, s), gap in _INCIDENT_SEQ:
+        tracker.update(
+            datetime(2026, 10, 1, h, m, s, tzinfo=timezone.utc), gap,
+            noise_floor=3.0 / 60,
+        )
+        churns.append(tracker.churn_wh_per_s)
+    assert churns == pytest.approx(
+        [0.0, 0.0, 0.9327152083333323, 0.7985655249999993, 0.6249025924999996]
+    )
+
+
+def test_churn_reported_while_trend_untrusted() -> None:
+    """Churn is measurable exactly when the trend is not.
+
+    The oscillating incident series never confirms a trend, yet its
+    churn keeps growing — the jitter signal exists precisely in the dark
+    zone where gap_trend_wh_per_s is None.
+    """
+    tracker = GapTrendTracker()
+    base = datetime(2026, 10, 1, 20, 40, 31, tzinfo=timezone.utc)
+    trusted_any = False
+    churn_at_end = 0.0
+    for (h, m, s), gap in _INCIDENT_SEQ:
+        _, trusted = tracker.update(
+            datetime(2026, 10, 1, h, m, s, tzinfo=timezone.utc), gap,
+            noise_floor=3.0 / 60,
+        )
+        trusted_any = trusted_any or trusted
+        churn_at_end = tracker.churn_wh_per_s
+    assert trusted_any is False
+    assert churn_at_end > 0.5
+
+
+def test_churn_resets_with_explicit_reset() -> None:
+    """reset() clears the churn accumulator along with samples."""
+    tracker = GapTrendTracker()
+    base = datetime(2026, 10, 1, 20, 40, 31, tzinfo=timezone.utc)
+    tracker.update(base, 12.7)
+    tracker.update(_ts(base, 30), 28.3)
+    tracker.update(_ts(base, 90), 3.4)
+    assert tracker.churn_wh_per_s > 0.0
+    tracker.reset()
+    assert tracker.churn_wh_per_s == 0.0
+
+
+def test_churn_resets_on_qh_boundary() -> None:
+    """A new quarter-hour starts with clean jitter history."""
+    tracker = GapTrendTracker()
+    tracker.update(datetime(2026, 10, 1, 20, 40, 31, tzinfo=timezone.utc), 12.7)
+    tracker.update(datetime(2026, 10, 1, 20, 41, 1, tzinfo=timezone.utc), 28.3)
+    tracker.update(datetime(2026, 10, 1, 20, 42, 1, tzinfo=timezone.utc), 3.4)
+    assert tracker.churn_wh_per_s > 0.0
+    tracker.update(datetime(2026, 10, 1, 20, 45, 31, tzinfo=timezone.utc), -553.5)
+    assert tracker.churn_wh_per_s == 0.0
+
+
+def test_churn_resets_on_oversized_span() -> None:
+    """A span beyond the horizon clears churn with the sample history."""
+    tracker = GapTrendTracker()
+    base = datetime(2026, 10, 1, 20, 40, 31, tzinfo=timezone.utc)
+    tracker.update(base, 12.7)
+    tracker.update(_ts(base, 30), 28.3)
+    tracker.update(_ts(base, 90), 3.4)
+    assert tracker.churn_wh_per_s > 0.0
+    tracker.update(_ts(base, 90 + GAP_TREND_MAX_SPAN_SECS + 1), 5.0)
+    assert tracker.churn_wh_per_s == 0.0
+
+
+# ── Sub-noise-floor slopes are flat ──────────────────────────────────
+
+
+def test_subfloor_opposing_slope_is_neutral() -> None:
+    """An opposing slope below the noise floor reads as flat, not a flip.
+
+    The docstring promises flat (zero) slopes neither confirm nor break a
+    ramp, but the sign check treated every nonzero slope as strictly
+    opposing — so a -0.01 Wh/s wiggle (indistinguishable from meter
+    noise at a 0.02 floor) broke a sustained +0.25 Wh/s ramp.
+    """
+    tracker = GapTrendTracker()
+    base = datetime(2026, 9, 26, 23, 51, 4, tzinfo=timezone.utc)
+    tracker.update(base, 40.0)
+    tracker.update(_ts(base, 30), 47.5)  # +0.25/s
+    rate, trusted = tracker.update(_ts(base, 60), 47.2, noise_floor=0.02)  # -0.01/s
+    assert trusted is True
+    assert rate == pytest.approx(0.3 * -0.01 + 0.7 * 0.25)

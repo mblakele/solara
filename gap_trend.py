@@ -46,7 +46,8 @@ class GapTrendTracker:
 
         Args:
             window: Recent samples retained (need window-1 slopes).
-            alpha: Weight of the newest slope in the EWMA.
+            alpha: Weight of the newest slope (and the newest churn sample)
+                in their EWMA.
             max_span_secs: Largest ``data_point_at`` delta to slope across;
                 a larger gap clears history.
         """
@@ -55,11 +56,31 @@ class GapTrendTracker:
         self._max_span_secs = max_span_secs
         self._samples: deque[tuple[datetime, float]] = deque(maxlen=window)
         self._qh_start: datetime | None = None
+        self._churn: float | None = None
+
+    @property
+    def churn_wh_per_s(self) -> float:
+        """Cycle-to-cycle swing of the slope estimate (Wh/s).
+
+        EWMA of ``|slope_n - slope_(n-1)|`` over successive updates: how
+        far the end-of-quarter gap projection moves between cycles. This
+        is the jitter/uncertainty signal for turn-on decisions — reported
+        even while the trend itself is untrusted, because the oscillating
+        incident series (bugs/2026-10-10-tesla-overshoot.log) is exactly
+        the case where ``update()`` confirms no trend but the swing is
+        large.
+
+        Returns:
+            0.0 until two slopes exist (third sample onward). Resets with
+            the sample history (explicit reset, QH rollover, span guard).
+        """
+        return 0.0 if self._churn is None else self._churn
 
     def reset(self) -> None:
-        """Discard all history (samples and quarter-hour identity)."""
+        """Discard all history (samples, churn, and quarter-hour identity)."""
         self._samples.clear()
         self._qh_start = None
+        self._churn = None
 
     def update(
         self,
@@ -84,12 +105,15 @@ class GapTrendTracker:
         Returns:
             Tuple of (ewma_slope_wh_per_s, trusted).  Rate is 0.0 whenever
             untrusted.  Trusted requires GAP_TREND_MIN_SLOPES slopes with no
-            strictly opposing signs and |ewma| above the noise floor; flat
-            (zero) slopes are neutral and neither confirm nor break a ramp.
+            opposing signs above the noise floor and |ewma| above the noise
+            floor; flat (zero) slopes — and slopes at or below
+            ``noise_floor``, which are indistinguishable from meter noise —
+            are neutral and neither confirm nor break a ramp.
         """
         qh_start = floor_to_qh(data_point_at)
         if self._qh_start is not None and qh_start != self._qh_start:
             self._samples.clear()
+            self._churn = None
         self._qh_start = qh_start
 
         if self._samples:
@@ -101,6 +125,7 @@ class GapTrendTracker:
                 # Too far from the last sample to describe the current
                 # regime; keep the new sample as a fresh seed only.
                 self._samples.clear()
+                self._churn = None
         self._samples.append((data_point_at, gap_wh))
 
         if len(self._samples) < GAP_TREND_MIN_SLOPES + 1:
@@ -116,11 +141,24 @@ class GapTrendTracker:
             dt = (cur_ts - prev_ts).total_seconds()
             slopes.append((cur_gap - prev_gap) / dt)
 
+        # Jitter: |delta| between the two newest slopes, EWMA-smoothed so
+        # one calm fetch cannot mask an oscillating quarter. Folded before
+        # the trust checks below: churn must be reported while the trend
+        # stays untrusted — that dark zone is where consumers need it.
+        pair_churn = abs(slopes[-1] - slopes[-2])
+        if self._churn is None:
+            self._churn = pair_churn
+        else:
+            self._churn = self._alpha * pair_churn + (1.0 - self._alpha) * self._churn
+
         # Zero slopes are neutral (repeated fetch of the same data carries
-        # no new information); only strictly opposing nonzero slopes break
-        # confirmation. This tolerates meter/NBC plateaus inside a ramp
+        # no new information), and so are slopes at or below the noise
+        # floor (indistinguishable from meter noise): only opposing
+        # slopes *above* the floor break confirmation. This tolerates
+        # meter/NBC plateaus inside a ramp
         # (bugs/2026-09-26-tesla-stop-charging.log: 38.3 → 38.3 → 45.1).
-        if any(s > 0 for s in slopes) and any(s < 0 for s in slopes):
+        meaningful = [s for s in slopes if abs(s) > noise_floor]
+        if any(s > 0 for s in meaningful) and any(s < 0 for s in meaningful):
             return 0.0, False
 
         ewma = slopes[0]

@@ -149,6 +149,16 @@ window spanning a quarter-hour boundary), so the tracker clears history
 instead of trusting it. Real production deltas are 30-60 s, because half
 the cycles exit early on ``waiting_for_fresh_data``."""
 
+JITTER_GUARD_FRACTION: float = 1.0
+"""Turn-on jitter guard: decline when ``churn * seconds_remaining`` reaches
+this multiple of the surplus gap it is claiming.
+
+Sized by the overshoot replay (``tests/test_tesla_overshoot_replay.py``),
+not by intuition: with 1.0 the guard blocks the oscillation-driven c579
++1 A increase from ``bugs/2026-10-10-tesla-overshoot.log`` and lands the
+quarter within ~3 Wh of the -9 Wh target instead of +1.74 Wh. Turn-on
+only — turn-off and the ramp-aware stop are protective and unaffected."""
+
 # ── Fetch drift observability ────────────────────────────────────────
 
 DRIFT_REJECTION_ALERT_AFTER: int = 5

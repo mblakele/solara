@@ -1706,3 +1706,205 @@ def test_data_point_at_propagated_to_effects():
 
     assert len(actions) == 1
     assert actions[0].data_point_at == dp_at
+
+
+# --- Jitter guard (turn-on only) ------------------------------------
+#
+# When the gap estimate's own cycle-to-cycle swing (churn x seconds
+# remaining) meets or exceeds the gap it is claiming, the turn-on path
+# declines to act. The shared query GapMinder.turn_on_jitter_guard_fires()
+# is both the guard decide() applies and the source of the manager's
+# reason="excessive_jitter" report, so they can never disagree.
+# Turn-off and hysteresis are untouched.
+
+
+def test_jitter_guard_blocks_turn_on_when_swing_exceeds_gap():
+    """swing >= JITTER_GUARD_FRACTION * gap declines the plug turn-on."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=0.25,  # swing = 0.25 * 100 = 25 Wh >= gap 20 Wh
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert actions == []
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is True
+    )
+
+
+def test_jitter_guard_fires_at_exact_boundary():
+    """swing == JITTER_GUARD_FRACTION * gap still fires (>=, not >)."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=0.2,  # swing = 20.0 Wh == gap 20 Wh
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert actions == []
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is True
+    )
+
+
+def test_jitter_guard_blocks_tesla_increase():
+    """The incident path: a Tesla amp increase is declined under jitter."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    tesla = TeslaState(
+        is_charging=True, current_amps=10, plugged_in=True, at_home=True,
+    )
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs={},
+        tesla=tesla,
+        gap_jitter_wh_per_s=0.25,  # swing 25 Wh >= gap 20 Wh
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert actions == []
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is True
+    )
+
+
+def test_jitter_guard_inactive_when_jitter_none():
+    """No jitter value (never measured) → normal turn-on, no guard."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=None,
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert [a.action for a in actions] == ["turn_on"]
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )
+
+
+def test_jitter_guard_inactive_when_swing_below_fraction():
+    """A swing under the gap does not block: jitter is not a veto by size."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=0.19,  # swing 19 Wh < gap 20 Wh
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert [a.action for a in actions] == ["turn_on"]
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )
+
+
+def test_jitter_guard_ignores_turn_off():
+    """Turn-off/shed runs regardless of jitter (protective, plan contract)."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    state.devices["heater"] = DeviceState(
+        name="heater", desired_state=True, actual_state=True,
+    )
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=50.0,  # absurd jitter: 5000 Wh swing
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=100.0, target_wh=-9.0)
+
+    assert [a.action for a in actions] == ["turn_off"]
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            -109.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )
+
+
+def test_jitter_guard_ignores_hysteresis_band():
+    """Within hysteresis nothing was due anyway: no guard either."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=50.0,
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-11.0, target_wh=-9.0)
+
+    assert actions == []
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            2.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )

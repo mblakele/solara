@@ -231,6 +231,47 @@ class TestApp(unittest.TestCase):
                 data = response.data.decode("utf-8")
                 self.assertIn(expected_label, data)
 
+    def test_index_html_jitter_notice(self):
+        """Forecast card shows the jitter notice exactly when the guard fired.
+
+        reason == "excessive_jitter" (with status staying "ok") renders the
+        short ``⚠ jitter detected`` notice; ok / hysteresis / stale_data
+        never do.
+        """
+        import app as app_mod
+
+        for reason in ("excessive_jitter", "ok", "hysteresis", "stale_data"):
+            with self.subTest(reason=reason):
+                mock_lm = unittest.mock.MagicMock()
+                mock_lm.enabled = True
+                mock_lm.target_wh = -500
+                mock_lm.nbc_device = "test_nbc"
+                mock_lm.state = unittest.mock.MagicMock()
+                mock_lm.state.devices = {}
+                mock_lm.state.pending_effects = []
+                result = _cycle_result()
+                result["diagnostics"] = {
+                    **result["diagnostics"],
+                    "reason": reason,
+                }
+                mock_lm.run_cycle.return_value = result
+                mock_lm.sentinel_names = []
+
+                with mock_config(MOCK=True):
+                    from config import Config
+                    Config().set("LOAD_MANAGE_ENABLED", "True")
+
+                    app_mod._state.load_manager = mock_lm
+                    app_mod._state.last_cycle_result = result
+
+                    response = self.app.get("/", headers={"Accept": "text/html"})
+                self.assertEqual(response.status_code, 200)
+                data = response.data.decode("utf-8")
+                if reason == "excessive_jitter":
+                    self.assertIn("⚠ jitter detected", data)
+                else:
+                    self.assertNotIn("⚠ jitter detected", data)
+
     def test_index_real_mode_lm_disabled(self):
         """Index returns 200 in real mode when load management is disabled.
 
@@ -589,6 +630,49 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         self.assertEqual(diag["quantizationOffset"], 5)
         self.assertEqual(diag["quantizationConfidence"], 0.9)
         self.assertEqual(diag["settleWindowSecs"], 60)
+
+    def test_load_status_includes_gap_jitter(self):
+        """GET /load/status diagnostics carry the gap jitter (churn) value."""
+        from load_models import CycleDiagnostics, CycleResult
+
+        mock_lm = unittest.mock.MagicMock()
+        mock_lm.enabled = True
+        mock_lm.target_wh = -500
+        mock_lm.nbc_device = "test_nbc"
+        mock_state = unittest.mock.MagicMock()
+        mock_state.devices = {}
+        mock_state.pending_effects = []
+        mock_lm.state = mock_state
+
+        import app as app_mod
+
+        app_mod._state.last_cycle_result = CycleResult(
+            status="ok",
+            qh="QH1",
+            predicted_wh=-800.0,
+            adjusted_wh=-750.0,
+            target_wh=-500,
+            actions=[],
+            diagnostics=CycleDiagnostics(
+                gap_wh=-300.0,
+                hysteresis_wh=50,
+                seconds_remaining=45,
+                data_point_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+                reason="ok",
+                pending_effects_count=0,
+                tesla_configured=False,
+                gap_jitter_wh_per_s=0.42,
+            ),
+            sleep_hint=30.0,
+            sleep_hint_at="2026-01-01T12:00:00+00:00",
+        )
+
+        with patch("app._get_load_manager", return_value=mock_lm):
+            response = self.app.get("/api/v1/load/status")
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data)
+        diag = data["lastCycleResult"]["diagnostics"]
+        self.assertEqual(diag["gapJitterWhPerS"], 0.42)
 
     def test_index_html_includes_sleep_hint_meta(self):
         """Index HTML includes a meta tag with the sleep_hint value for JS."""
@@ -2177,12 +2261,17 @@ class TestLoadManagementSectionDebug(unittest.TestCase):
         self.app.testing = True
 
     @contextlib.contextmanager
-    def _lm_wired_real_mode(self, debug):
-        """Real-mode config with LM enabled and a controllable debug flag."""
+    def _lm_wired_real_mode(self, debug, result=None):
+        """Real-mode config with LM enabled and a controllable debug flag.
+
+        Args:
+            debug: Value served as metrics.debug by the mocked cache.
+            result: Cycle result to publish; defaults to ``_cycle_result()``.
+        """
         import app as app_mod
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
-            lm = _make_lm(_cycle_result())
+            lm = _make_lm(result if result is not None else _cycle_result())
             Config().set("LOAD_MANAGE_ENABLED", "True")
             app_mod._state.load_manager = lm
             app_mod._state.load_manager_init_failed = False
@@ -2237,6 +2326,23 @@ class TestLoadManagementSectionDebug(unittest.TestCase):
         self.assertIn(
             'id="load-management-section"', response.data.decode("utf-8")
         )
+
+    def test_debug_section_shows_gap_jitter_row(self):
+        """Diagnostics rows include the numeric gap jitter (churn) value."""
+        result = _cycle_result()
+        result["diagnostics"] = {
+            **result["diagnostics"],
+            "reason": "excessive_jitter",
+            "gap_jitter_wh_per_s": 0.42,
+        }
+        with self._lm_wired_real_mode(debug=True, result=result):
+            response = self.app.get(
+                "/?partial=load", headers={"Accept": "text/html"}
+            )
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode("utf-8")
+        self.assertIn("Gap Jitter Wh/s", html)
+        self.assertIn("0.420", html)
 
 
 class TestDataFreshness(unittest.TestCase):

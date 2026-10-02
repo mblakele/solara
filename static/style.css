@@ -306,6 +306,19 @@ button.app-bar__link {
   background: color-mix(in srgb, var(--color-sunken) 78%, var(--color-gen));
 }
 
+/* Turn-on jitter guard notice (diag.reason == "excessive_jitter"): short,
+   warn-palette banner on the forecast card explaining a declined cycle. */
+.jitter-notice {
+  margin-top: var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
+  background: var(--color-warn-bg);
+  color: var(--color-warn);
+  border: 1px solid var(--color-warn);
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
 .demand {
   display: flex;
   flex-direction: column;
