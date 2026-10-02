@@ -81,6 +81,45 @@ def _build_bar_path(
     )
 
 
+def _indexed_bars(
+    samples: Sequence[float],
+    bucket_secs: int | None,
+) -> tuple[list[tuple[int, int, float]], int]:
+    """Aggregate windowed samples into nonzero bar slots.
+
+    Each entry is ``(slot_index, seconds_present, value)``. Zero-valued
+    buckets are kept out of the bar list but still occupy their slot, so
+    bars land on their true time positions within the fixed-width
+    window.
+
+    Args:
+        samples: Per-second energy values, already window-trimmed.
+        bucket_secs: Aggregation window in seconds (> 1), or None/1 to
+            keep one bar per second.
+
+    Returns:
+        ``(indexed, step)``: the nonzero slots, and the slot width in
+        seconds (1 when not bucketing).
+    """
+    indexed: list[tuple[int, int, float]] = []
+    if bucket_secs is not None and bucket_secs > 1:
+        step = max(1, int(bucket_secs))
+        for start in range(0, len(samples), step):
+            chunk = samples[start : start + step]
+            if not chunk:
+                continue
+            # Signed mean: preserves the waveform's sign (green vs blue) and
+            # smooths per-second noise within each quantized window.
+            mean = sum(chunk) / len(chunk)
+            if mean != 0:
+                indexed.append((start // step, len(chunk), mean))
+        return indexed, step
+    for i, value in enumerate(samples):
+        if value != 0:
+            indexed.append((i, 1, value))
+    return indexed, 1
+
+
 def per_second_sparkline(
     samples: Sequence[float],
     width: int = DEFAULT_WIDTH,
@@ -107,27 +146,7 @@ def per_second_sparkline(
     # Only the last 5 minutes are shown, matching the upstream 300-sample trim.
     samples = samples[-WINDOW_SECS:]
 
-    # Each entry is (bucket_index, seconds_present, value). Zero-valued buckets
-    # are kept out of the bar list but still occupy their slot, so bars land on
-    # their true time positions within the fixed-width window.
-    indexed: list[tuple[int, int, float]] = []
-    if bucket_secs is not None and bucket_secs > 1:
-        step = max(1, int(bucket_secs))
-        for start in range(0, len(samples), step):
-            chunk = samples[start : start + step]
-            if not chunk:
-                continue
-            # Signed mean: preserves the waveform's sign (green vs blue) and
-            # smooths per-second noise within each quantized window.
-            mean = sum(chunk) / len(chunk)
-            if mean != 0:
-                indexed.append((start // step, len(chunk), mean))
-    else:
-        step = 1
-        for i, value in enumerate(samples):
-            if value != 0:
-                indexed.append((i, 1, value))
-
+    indexed, step = _indexed_bars(samples, bucket_secs)
     max_abs = max((abs(value) for _, _, value in indexed), default=0.0)
 
     bars: list[str] = []

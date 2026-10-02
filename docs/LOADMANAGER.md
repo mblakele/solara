@@ -177,6 +177,39 @@ decisions are intentionally out of scope (Phase I: Tesla stop only).
   displayed everywhere else. Users are used to reading -N as solar;
   these lines say so explicitly (`positive=grid draw`).
 
+## Turn-on jitter guard
+
+Sometimes the adjusted-gap estimate oscillates so hard that its own
+cycle-to-cycle swing exceeds the gap it is claiming
+(`bugs/2026-10-10-tesla-overshoot.log`: `12.7 → 28.3 → 3.4 → 7.7 → −1.2`
+Wh across five data points, producing two Tesla increases that overshot
+the −9 Wh target to +1.74 Wh — miss +10.7). `GapTrendTracker.churn_wh_per_s`
+(`gap_trend.py`) measures this as an EWMA of `|Δslope|` — the jitter —
+and reports it as `gap_jitter_wh_per_s` in
+`CycleDiagnostics`/JSON/SSE even while the trend itself stays untrusted
+(a trend that never confirms is exactly where jitter matters).
+
+`GapMinder.turn_on_jitter_guard_fires()` (`load_nbc.py`) declines a
+turn-on cycle when `churn × seconds_remaining ≥ JITTER_GUARD_FRACTION ×
+gap` (constant `1.0` in `constants.py`, sized by the replay in
+`tests/test_tesla_overshoot_replay.py`, not by intuition): the estimate
+is swinging harder than its verdict, so the verdict is not actionable
+information. The guard returns no actions, logs `gapminder_jitter_guard`,
+and `_decide_actions` recomputes the *same predicate* to set
+`reason="excessive_jitter"` — the outcome travels through the shared
+query rather than a `DecideContext` field because that dataclass is
+frozen, so decision and report can never disagree. The index forecast
+card then shows `⚠ jitter detected` (the cycle `status` itself stays
+`ok`).
+
+Scope: **turn-on only**. Turn-off shedding and the ramp-aware Tesla stop
+are protective and never guarded; within hysteresis the guard never
+fires (nothing was due anyway); a churn value that is not yet measurable
+(0.0) never fires, which is why the incident's *first* increase — taken
+before the oscillation was measurable — is deliberately allowed. In the
+replay the guarded variant lands the incident quarter within ~3 Wh of
+the −9 Wh target instead of +1.74 Wh (acceptance: `|miss| < 10.7`).
+
 ## Dry-Run Mode
 
 Set `LOAD_MANAGE_DRY_RUN=True` to test load management without executing actions.

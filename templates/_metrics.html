@@ -39,6 +39,13 @@
       {% endif %}
     </div>
 
+    {% if diag is not none and diag.reason == "excessive_jitter" %}
+    {# Reason-only signal: cycle status stays "ok", the turn-on jitter
+       guard declined the cycle. Server-rendered, arrives with the usual
+       SSE fragment swap (no client-side ticking). #}
+    <p class="jitter-notice" role="status">⚠ jitter detected</p>
+    {% endif %}
+
     <div class="sparkline">{{ vd.per_second_data | default([]) | per_second_sparkline(bucket_secs=quantization_seconds | default(1)) | safe }}</div>
 
     {% set w = 60 * qh1.prediction_w if qh1.prediction_w is not none else none %}

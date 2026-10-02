@@ -159,7 +159,19 @@ project-root
 │                          # Identity: a realized error is *identically*
 │                          # -remaining_secs * rate_error (ForecastAnchor.error vs
 │                          # rate_shortfall), so U(R) = k * sigma_rate * R is complete,
-│                          # not an approximation. Run from the repo root:
+│                          # not an approximation. It also reports a churn band
+│                          # (k * churn * R, production's GapTrendTracker fed from the
+│                          # anchor series — raw predicted_wh stands in for the gap;
+│                          # constant offsets/signs cancel in |Δslope|) beside the
+│                          # sigma band, and reads — never re-executes — what
+│                          # production logged about its own decisions: CycleResult
+│                          # reprs (per-quarter target/miss, reason, production churn,
+│                          # scoped to the diagnostics=CycleDiagnostics(...) segment)
+│                          # and gapminder_jitter_guard INFO events (wall-time quarter,
+│                          # exact because previous_qh exits before decide()). Report
+│                          # output: churn-band coverage line, jitter-guard summary
+│                          # line, target/miss/guard columns in the quarter table.
+│                          # Run from the repo root:
 │                          #   uv run python tools/forecast_log_scoring.py bugs/*.log
 ├── app.py                 # Flask app factory (create_app()), route definitions (/, /health,
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
@@ -186,7 +198,10 @@ project-root
                            # so every edge snaps onto whole device pixels (no AA
                            # hairlines even above shorter neighbors); always laid
                            # out for a full 300-second window (partial windows render
-                           # left-aligned at real time positions, blank right)
+                           # left-aligned at real time positions, blank right);
+                           # slot aggregation lives in _indexed_bars() (extracted
+                           # from per_second_sparkline to stay under pylint's local
+                           # budget; behavior unchanged, covered by the chart tests)
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
                            # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
 ├── config_loader.py       # Config loading helpers (load_tesla_config,
@@ -196,7 +211,8 @@ project-root
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS,
                            # DATA_STALE_ALERT_THRESHOLD_SECS=300 for Telegram data-health
                            # alerts, Tesla charging constants TESLA_HARD_MAX_AMPS, etc.,
-                           # DEFAULT_HYSTERESIS_WH=20 residential fallback)
+                           # DEFAULT_HYSTERESIS_WH=20 residential fallback,
+                           # JITTER_GUARD_FRACTION=1.0 turn-on jitter guard)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
@@ -212,20 +228,23 @@ project-root
                              # data-health Telegram alerts (_check_data_health_alerts:
                              # fatal fetch errors + 300 s stale/no-data, once per QH each,
                              # bypassing the devices whitelist)
- ├── load_models.py        # Shared data models (CycleContext, CycleResult, AsyncPhaseResult,
-                            # PendingEffect,
+ ├── load_models.py        # Shared data models (CycleContext (stage-4 gap_jitter_wh_per_s),
+                            # CycleResult, CycleDiagnostics (gap_jitter_wh_per_s + to_dict),
+                            # AsyncPhaseResult, PendingEffect,
                             # TeslaChargeState, TeslaDriveState, TeslaLocation, TeslaCallbackPayload,
                             # TeslaEvent, TeslaEventKind, TeslaVehicleTelemetry,
                             # parse_tesla_event_payload, update_tesla_telemetry,
                             # get_active_tesla_telemetry, FleetTelemetryProvisionConfig) plus
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
-├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider, PendingEffect factories
+├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider (incl. turn_on_jitter_guard_fires), PendingEffect factories
 ├── gap_trend.py           # GapTrendTracker: EWMA slope of the adjusted gap across cycles
 │                          # (keyed on data_point_at; quarter-hour identity derived via
 │                          # floor_to_qh because ParsedMetricsQH.qh_name is the constant
 │                          # "QH1"; history clears on QH rollover or a data gap over
-│                          # GAP_TREND_MAX_SPAN_SECS; plateau-neutral). Feeds the
+│                          # GAP_TREND_MAX_SPAN_SECS; plateau-neutral; churn_wh_per_s
+│                          # reports the |Δslope| jitter EWMA (0.0 until measurable)
+│                          # behind the turn-on jitter guard). Feeds the
 │                          # ramp-aware Tesla stop in TeslaDecider.decide_reduce
  ├── logfmt.py              # Structured log formatters: render extra= fields as
  │                          #   [key=value ...] suffixes (default) or JSON lines
@@ -249,15 +268,23 @@ project-root
 ├── env.example            # Template for required environment variables
 ├── tests/                 # All pytest tests; test_forecast_log_scoring.py covers the
                            # offline tool (parser quarter identity, actual resolution,
-                           # the error==-R*shortfall identity, sigma_rate/coverage, and
-                           # that the tool runs standalone; real-log assertions skip
-                           # because bugs/ is gitignored);
+                           # the error==-R*shortfall identity, sigma_rate/coverage,
+                           # the churn band — GapTrendTracker fed from anchors,
+                           # offset/sign invariance, reset across quarters,
+                           # churn_coverage — guard/cycle-result parsing incl. the
+                           # segment-scoping traps (action data_point_at before,
+                           # candidate reason after diagnostics), target/miss/guard
+                           # joins, and that the tool runs standalone; real-log
+                           # assertions skip because bugs/ is gitignored);
                            # test_tou_page.py covers inclusive date
                            # ranges, DST days, detail rows/defaults and picker dates;
                            # test_app.py covers endpoint validation and range limits;
-                           # test_gap_trend.py covers the gap-slope tracker, test_tesla_decider.py
-                           # the ramp-aware stop rule, test_tesla_ramp_replay.py the
-                           # 2026-09-26 incident sequence
+                           # test_gap_trend.py covers the gap-slope tracker (+ the churn /
+                           # jitter EWMA), test_tesla_decider.py the ramp-aware stop rule,
+                           # test_tesla_ramp_replay.py the 2026-09-26 incident sequence,
+                           # test_tesla_overshoot_replay.py the 2026-10-01 overshoot
+                           # (status quo characterized; jitter-guard gate: |miss| < 10.7
+                           # toward target −9)
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change
@@ -286,7 +313,8 @@ project-root
                            # (the metrics fragment carries the hidden #data-freshness state
                            # strip mirrored onto the header #connection button by syncConnection()
                            # (dot-only when live+fresh; tap toggles data-show-text to reveal/hide
-                           # the age text); the
+                           # the age text) plus the "⚠ jitter detected" notice when
+                           # diag.reason == "excessive_jitter"; the
                            # sparkline filter receives quantization_seconds to feed
                            # chart.per_second_sparkline's bucket_secs downsampling)
 ├── static/                # Mobile-first design system (style.css) and the SSE dashboard

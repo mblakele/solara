@@ -25,6 +25,7 @@ from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTele
 from constants import (
     DEFAULT_HYSTERESIS_WH,
     DEFAULT_PREDICTION_WINDOW_SECS,
+    JITTER_GUARD_FRACTION,
     MIN_SECONDS_TO_ACT,
     SETTLE_WINDOW_DEADBAND_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
@@ -1484,6 +1485,11 @@ class DecideContext:
         gap_trend_wh_per_s: Sustained slope of the adjusted gap in Wh/s
             (positive = deficit growing), or None when unconfirmed.
             Only hastens Tesla stops; never delays them.
+        gap_jitter_wh_per_s: Cycle-to-cycle churn of the gap estimate in
+            Wh/s (EWMA of |delta slope|), or None before the first
+            compute_gap and 0.0 when not yet measurable. Turn-on consumers
+            multiply by ``seconds_remaining`` to bound the projection's
+            own cycle-to-cycle swing.
         cycle_secs: Decision cadence in seconds. The ramp rule stops now
             when the exact-hit stop time falls within one cycle.
     """
@@ -1497,6 +1503,7 @@ class DecideContext:
     data_point_at: datetime | None = None
     requires_home_check: bool = True
     gap_trend_wh_per_s: float | None = None
+    gap_jitter_wh_per_s: float | None = None
     cycle_secs: int = 30
 
 
@@ -2103,6 +2110,24 @@ class GapMinder:
             return []
 
         if gap > 0:
+            # Jitter guard (turn-on only): when the estimate's own
+            # cycle-to-cycle swing meets the gap it is claiming, the claim
+            # is not actionable information — decline and say so. Turn-off
+            # and the ramp-aware stop stay untouched (protective paths).
+            jitter = ctx.gap_jitter_wh_per_s
+            if jitter is not None and self.turn_on_jitter_guard_fires(
+                gap, jitter, ctx.seconds_remaining
+            ):
+                swing = jitter * ctx.seconds_remaining
+                logger.info(
+                    "gapminder_jitter_guard gap=%.1f jitter=%.4f swing=%.1f R=%d",
+                    gap, jitter, swing, ctx.seconds_remaining,
+                    extra={"event": "gapminder_jitter_guard",
+                           "gap_wh": gap, "jitter_wh_per_s": jitter,
+                           "swing_wh": swing,
+                           "seconds_remaining": ctx.seconds_remaining},
+                )
+                return []
             budget = self._turn_on_budget(gap)
             logger.info(
                 "gapminder_decide direction=turn_on gap=%.1f edge_gap=%.1f hysteresis=%d",
@@ -2120,6 +2145,42 @@ class GapMinder:
         return self._decide_turn_off(
             ctx, budget,
         )
+
+    def turn_on_jitter_guard_fires(
+        self,
+        gap_wh: float,
+        jitter_wh_per_s: float | None,
+        seconds_remaining: int,
+    ) -> bool:
+        """Whether the turn-on jitter guard must decline this cycle.
+
+        The guard fires when the adjusted gap estimate's own cycle-to-
+        cycle swing (churn x seconds remaining) meets the surplus gap it
+        is claiming: the estimate is oscillating harder than its verdict,
+        so it is not actionable information. One query serves both
+        ``decide()`` (which declines) and ``LoadManager._decide_actions``
+        (which reports ``reason="excessive_jitter"``), so the decision and
+        its report can never disagree. It is a method rather than a
+        ``DecideContext`` output because that dataclass is frozen by
+        contract (``tests/test_decide_context.py``).
+
+        Args:
+            gap_wh: The gap decide() computes (``target_wh -
+                predicted_wh``); positive = surplus (turn-on direction).
+            jitter_wh_per_s: Gap churn in Wh/s, or None when never
+                measured. None never fires.
+            seconds_remaining: Seconds left in the current quarter-hour.
+
+        Returns:
+            True when the guard must decline. False inside the hysteresis
+            band, on deficits (turn-off is protective and unguarded), and
+            when ``jitter * seconds_remaining < JITTER_GUARD_FRACTION *
+            gap``.
+        """
+        if jitter_wh_per_s is None or gap_wh <= self.HYSTERESIS_WH:
+            return False
+        swing = jitter_wh_per_s * seconds_remaining
+        return swing >= JITTER_GUARD_FRACTION * gap_wh
 
     def _decide_turn_on(self, ctx: DecideContext, gap: float) -> list[PendingEffect]:
         """Turn on eligible loads to absorb excess solar.
