@@ -231,8 +231,8 @@ and `_decide_actions` recomputes the *same predicate* to set
 `reason="excessive_jitter"` — the outcome travels through the shared
 query rather than a `DecideContext` field because that dataclass is
 frozen, so decision and report can never disagree. The index forecast
-card then shows `⚠ jitter detected` (the cycle `status` itself stays
-`ok`).
+card's period label then becomes `⚠ low confidence` (the cycle
+`status` itself stays `ok`).
 
 Regression coverage for both clusters of the marine-layer log — all 35
 logged triples, replayed through the real tracker — lives in

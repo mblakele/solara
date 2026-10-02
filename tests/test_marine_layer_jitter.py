@@ -2,7 +2,7 @@
 
 ``bugs/2026-10-02-sunrise-marine-layer-jitter.log`` — 08:08-08:23 PDT, 53-76
 minutes after sunrise, thick marine layer, even grey light. Load management
-reported ``reason="excessive_jitter"`` (index: ``⚠ jitter detected``) 35 times
+reported ``reason="excessive_jitter"`` (index: ``⚠ low confidence``) 35 times
 while zero turn-on actions existed to protect, and the churn it measured was
 below the quarter's own realized forecast error. Two mechanisms:
 

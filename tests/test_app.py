@@ -232,11 +232,11 @@ class TestApp(unittest.TestCase):
                 self.assertIn(expected_label, data)
 
     def test_index_html_jitter_notice(self):
-        """Forecast card shows the jitter notice exactly when the guard fired.
+        """Forecast-period label is replaced by low confidence when the guard fired.
 
-        reason == "excessive_jitter" (with status staying "ok") renders the
-        short ``⚠ jitter detected`` notice; ok / hysteresis / stale_data
-        never do.
+        reason == "excessive_jitter" (with status staying "ok") replaces the
+        ``forecast this period`` label with ``⚠ low confidence``; ok /
+        hysteresis / stale_data never do.
         """
         import app as app_mod
 
@@ -268,9 +268,10 @@ class TestApp(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 data = response.data.decode("utf-8")
                 if reason == "excessive_jitter":
-                    self.assertIn("⚠ jitter detected", data)
+                    self.assertIn("⚠ low confidence", data)
+                    self.assertNotIn("forecast this period", data)
                 else:
-                    self.assertNotIn("⚠ jitter detected", data)
+                    self.assertNotIn("⚠ low confidence", data)
 
     def test_index_real_mode_lm_disabled(self):
         """Index returns 200 in real mode when load management is disabled.
