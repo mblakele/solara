@@ -1,4 +1,4 @@
-"""Incident replay: bugs/2026-10-10-tesla-overshoot.log, quarter 20:30-20:45.
+"""Incident replay: bugs/2026-10-01-tesla-overshoot.log, quarter 20:30-20:45.
 
 Characterizes the shipped turn-on behavior for the 2026-10-01 overshoot
 (actual ``+1.739 Wh`` vs ``target_wh=-9``, miss ``+10.7``) by stepping the

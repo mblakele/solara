@@ -33,7 +33,7 @@ class GapTrendTracker:
     hardcoded literal ``"QH1"`` for every incomplete quarter, so keying on
     it can never detect a rollover — which let a 20:45 sample be
     slope-fitted against 20:43/20:44 samples from the previous hour
-    (bugs/2026-10-10-tesla-overshoot.log, c587).
+    (bugs/2026-10-01-tesla-overshoot.log, c587).
     """
 
     def __init__(
@@ -66,7 +66,7 @@ class GapTrendTracker:
         far the end-of-quarter gap projection moves between cycles. This
         is the jitter/uncertainty signal for turn-on decisions — reported
         even while the trend itself is untrusted, because the oscillating
-        incident series (bugs/2026-10-10-tesla-overshoot.log) is exactly
+        incident series (bugs/2026-10-01-tesla-overshoot.log) is exactly
         the case where ``update()`` confirms no trend but the swing is
         large.
 

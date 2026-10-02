@@ -151,7 +151,7 @@ furthest horizon a defer decision examines). The quarter-hour identity is
 incomplete quarter, so keying on it could never detect a rollover. That
 bug let a 20:45 sample be slope-fitted against 20:43/20:44 samples from
 the previous hour, publishing a bogus −6.1 Wh/s trend
-(`bugs/2026-10-10-tesla-overshoot.log`, c587). Harmless for the Tesla stop
+(`bugs/2026-10-01-tesla-overshoot.log`, c587). Harmless for the Tesla stop
 — `_ramp_stop_now` only fires when the deficit already exceeds ~⅓ of the
 energy the car would draw over the remaining time, a regime where stopping
 is right regardless of trend — but it must not survive into plug Phase II,
@@ -181,7 +181,7 @@ decisions are intentionally out of scope (Phase I: Tesla stop only).
 
 Sometimes the adjusted-gap estimate oscillates so hard that its own
 cycle-to-cycle swing exceeds the gap it is claiming
-(`bugs/2026-10-10-tesla-overshoot.log`: `12.7 → 28.3 → 3.4 → 7.7 → −1.2`
+(`bugs/2026-10-01-tesla-overshoot.log`: `12.7 → 28.3 → 3.4 → 7.7 → −1.2`
 Wh across five data points, producing two Tesla increases that overshot
 the −9 Wh target to +1.74 Wh — miss +10.7). `GapTrendTracker.churn_wh_per_s`
 (`gap_trend.py`) measures this as an EWMA of `|Δslope|` — the jitter —

@@ -146,7 +146,7 @@ def test_qh_boundary_resets_history() -> None:
 def test_hour_boundary_resets_history() -> None:
     """The hour rollover (a new QH1) also resets — the production bug.
 
-    bugs/2026-10-10-tesla-overshoot.log c587 slope-fitted a 20:45-21:00
+    bugs/2026-10-01-tesla-overshoot.log c587 slope-fitted a 20:45-21:00
     sample against 20:43/20:44 samples from the previous hour's QH because
     the reset keyed on ``qh_name``, which load_nbc.py hardcodes to "QH1".
     """
@@ -236,7 +236,7 @@ def test_span_just_under_limit_accumulates() -> None:
 #
 # churn = EWMA of |slope_n - slope_(n-1)| (Wh/s): the cycle-to-cycle swing
 # of the adjusted-gap estimate itself. It is the uncertainty measure for
-# turn-on decisions (bugs/2026-10-10-tesla-overshoot.log: both Tesla
+# turn-on decisions (bugs/2026-10-01-tesla-overshoot.log: both Tesla
 # increases ran with no trusted trend while the series oscillated).
 
 _INCIDENT_SEQ = [

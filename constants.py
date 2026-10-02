@@ -155,7 +155,7 @@ this multiple of the surplus gap it is claiming.
 
 Sized by the overshoot replay (``tests/test_tesla_overshoot_replay.py``),
 not by intuition: with 1.0 the guard blocks the oscillation-driven c579
-+1 A increase from ``bugs/2026-10-10-tesla-overshoot.log`` and lands the
++1 A increase from ``bugs/2026-10-01-tesla-overshoot.log`` and lands the
 quarter within ~3 Wh of the -9 Wh target instead of +1.74 Wh. Turn-on
 only — turn-off and the ramp-aware stop are protective and unaffected."""
 

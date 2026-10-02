@@ -29,7 +29,7 @@ from tools.forecast_log_scoring import (
 )
 
 _BUGS = Path(__file__).resolve().parents[1] / "bugs"
-_OVERSHOOT = _BUGS / "2026-10-10-tesla-overshoot.log"
+_OVERSHOOT = _BUGS / "2026-10-01-tesla-overshoot.log"
 _NEEDS_REAL_LOG = pytest.mark.skipif(
     not _OVERSHOOT.exists(), reason="bugs/ is gitignored; log not present"
 )
