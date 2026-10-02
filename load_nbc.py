@@ -25,7 +25,9 @@ from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTele
 from constants import (
     DEFAULT_HYSTERESIS_WH,
     DEFAULT_PREDICTION_WINDOW_SECS,
+    JITTER_FLOOR_WH_PER_S,
     JITTER_GUARD_FRACTION,
+    JITTER_HORIZON_SECS,
     MIN_SECONDS_TO_ACT,
     SETTLE_WINDOW_DEADBAND_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
@@ -1924,6 +1926,29 @@ class TeslaDecider:
         )
 
 
+def jitter_swing_wh(jitter_wh_per_s: float, seconds_remaining: int) -> float:
+    """Projected swing (Wh) a churn estimate claims over the rest of a quarter.
+
+    Churn is measured from 30-60 s cycle spacing with a 3-sample window, so
+    projecting it across the entire remaining quarter overstates the horizon
+    over which it means anything. The projection is therefore capped at
+    ``JITTER_HORIZON_SECS``.
+
+    This single helper is used by the guard predicate, by ``GapMinder.decide``'s
+    ``gapminder_jitter_guard`` INFO line, and by the manager's
+    ``gap_jitter ... swing_wh=`` DEBUG line, so log, reason, and decision can
+    never disagree about what swing was judged.
+
+    Args:
+        jitter_wh_per_s: Gap-slope churn in Wh/s (never ``None`` here).
+        seconds_remaining: Seconds left in the current quarter.
+
+    Returns:
+        The horizon-capped swing in Wh.
+    """
+    return jitter_wh_per_s * min(seconds_remaining, JITTER_HORIZON_SECS)
+
+
 class GapMinder:
     """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
@@ -2118,7 +2143,7 @@ class GapMinder:
             if jitter is not None and self.turn_on_jitter_guard_fires(
                 gap, jitter, ctx.seconds_remaining
             ):
-                swing = jitter * ctx.seconds_remaining
+                swing = jitter_swing_wh(jitter, ctx.seconds_remaining)
                 logger.info(
                     "gapminder_jitter_guard gap=%.1f jitter=%.4f swing=%.1f R=%d",
                     gap, jitter, swing, ctx.seconds_remaining,
@@ -2164,6 +2189,19 @@ class GapMinder:
         ``DecideContext`` output because that dataclass is frozen by
         contract (``tests/test_decide_context.py``).
 
+        Two gates keep the comparison honest, both sized from evidence
+        rather than intuition:
+
+        * ``JITTER_FLOOR_WH_PER_S`` — churn below the floor is the
+          forecast window's own quantization, not oscillation. Without
+          it ``churn >= gap / R`` collapses to ~0.01 Wh/s on a calm
+          quarter (``bugs/2026-10-02-sunrise-marine-layer-jitter.log``:
+          35 "excessive jitter" reports at churn 0.015-0.047).
+        * ``JITTER_HORIZON_SECS`` — the swing is projected only over the
+          horizon the churn measurement can speak to, so a 30-60 s slope
+          change is not scaled by however much quarter is left
+          (``jitter_swing_wh``).
+
         Args:
             gap_wh: The gap decide() computes (``target_wh -
                 predicted_wh``); positive = surplus (turn-on direction).
@@ -2173,13 +2211,16 @@ class GapMinder:
 
         Returns:
             True when the guard must decline. False inside the hysteresis
-            band, on deficits (turn-off is protective and unguarded), and
-            when ``jitter * seconds_remaining < JITTER_GUARD_FRACTION *
-            gap``.
+            band, on deficits (turn-off is protective and unguarded), when
+            ``jitter < JITTER_FLOOR_WH_PER_S``, and when
+            ``jitter_swing_wh(jitter, seconds_remaining) <
+            JITTER_GUARD_FRACTION * gap``.
         """
         if jitter_wh_per_s is None or gap_wh <= self.HYSTERESIS_WH:
             return False
-        swing = jitter_wh_per_s * seconds_remaining
+        if jitter_wh_per_s < JITTER_FLOOR_WH_PER_S:
+            return False
+        swing = jitter_swing_wh(jitter_wh_per_s, seconds_remaining)
         return swing >= JITTER_GUARD_FRACTION * gap_wh
 
     def _decide_turn_on(self, ctx: DecideContext, gap: float) -> list[PendingEffect]:

@@ -32,6 +32,7 @@ from constants import (
     DATA_STALE_ALERT_THRESHOLD_SECS,
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
+    JITTER_MAX_REMAINING_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
     STALE_DATA_THRESHOLD_SECS,
     TESLA_ARBITRATION_COOLDOWN_SECS,
@@ -96,6 +97,7 @@ from load_nbc import (
     StateTracker,
     GapMinder,
     DecideContext,
+    jitter_swing_wh,
     make_plug_effect,
 )
 from quantization import usable_window
@@ -669,8 +671,15 @@ class LoadManager:
             if seconds_remaining > 0
             else 0.0
         )
+        # Churn is withheld while the projection is still extrapolation-
+        # dominated: past JITTER_MAX_REMAINING_SECS of a quarter at least
+        # two thirds of predicted_wh is prediction_w * seconds_remaining, so
+        # a forecast-window step (or our own just-realized action entering
+        # that window) moves the gap with no new information. The sample is
+        # still recorded — the trend and its trust rule are unaffected.
         rate, trusted = self.gap_trend.update(
             data_point_at, gap_wh, noise_floor=noise_floor,
+            churn_ready=seconds_remaining <= JITTER_MAX_REMAINING_SECS,
         )
         ctx.gap_trend_wh_per_s = rate if trusted else None
         self._last_gap_trend_wh_per_s = ctx.gap_trend_wh_per_s
@@ -684,7 +693,8 @@ class LoadManager:
             logger.debug(
                 "gap_jitter churn=%.4f swing_wh=%.1f seconds_remaining=%d "
                 "trend_trusted=%s",
-                churn, churn * seconds_remaining, seconds_remaining, trusted,
+                churn, jitter_swing_wh(churn, seconds_remaining),
+                seconds_remaining, trusted,
                 extra={"event": "gap_jitter"},
             )
 

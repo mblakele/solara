@@ -355,3 +355,97 @@ def test_subfloor_opposing_slope_is_neutral() -> None:
     rate, trusted = tracker.update(_ts(base, 60), 47.2, noise_floor=0.02)  # -0.01/s
     assert trusted is True
     assert rate == pytest.approx(0.3 * -0.01 + 0.7 * 0.25)
+
+
+# ── Churn readiness gate (quarter-opening extrapolation) ─────────────
+#
+# bugs/2026-10-02-sunrise-marine-layer-jitter.log, cluster B: the
+# quarter-opening prediction is raw + prediction_w * R with R ≈ 900, so
+# it is ~96 % extrapolation. One sign flip of prediction_w (our own
+# jackery turn_off seen through that window) moved the gap 69.42 Wh in a
+# single cycle, seeding churn at 1.10 Wh/s, which then decayed x0.7 for
+# five minutes of "excessive jitter" reports while trend_trusted=True.
+#
+# churn_ready=False keeps the sample in the trend window (slope, trust
+# rule and gap_trend_wh_per_s are byte-for-byte unchanged) but withholds
+# it from the churn accumulator, so a slope pair that straddles the
+# opening extrapolation can never seed the EWMA.
+
+_OPENING = datetime(2026, 10, 2, 15, 16, 1, tzinfo=timezone.utc)
+# (delta secs, gap Wh, churn_ready) — the log's QH 15:15 opening.
+_CLUSTER_B: list[tuple[int, float, bool]] = [
+    (0, -60.73, False),   # raw 1.779 + 0.057483 * 869  -> +51.73 Wh
+    (63, 8.69, False),    # prediction_w flips sign; the transient
+    (90, 8.69, False),
+    (120, 8.69, True),    # first churn-ready sample
+    (150, 8.69, True),
+    (180, 8.69, True),
+    (210, 8.60, True),
+]
+
+
+def test_churn_ignores_quarter_opening_samples() -> None:
+    """Samples the caller withholds (``churn_ready=False``) never seed churn.
+
+    ``_stage_compute_gap`` withholds them while more than
+    ``JITTER_MAX_REMAINING_SECS`` remain — see
+    ``test_compute_gap_gates_churn_on_remaining``. The opening flip is
+    worth 1.102 Wh/s of pair churn with no new information; gated out,
+    churn stays 0.0 until three ready samples exist and then measures only
+    the post-transient series (0.0009 here), comfortably under
+    ``JITTER_FLOOR_WH_PER_S``.
+    """
+    from constants import JITTER_FLOOR_WH_PER_S
+
+    tracker = GapTrendTracker()
+    for delta, gap, ready in _CLUSTER_B:
+        tracker.update(_ts(_OPENING, delta), gap, churn_ready=ready)
+        if delta <= 90:
+            assert tracker.churn_wh_per_s == 0.0, delta
+    # ready triple at 150/180/210: slopes 0.0 and -0.003, EWMA seeded flat
+    assert tracker.churn_wh_per_s == pytest.approx(0.0009)
+    assert tracker.churn_wh_per_s < JITTER_FLOOR_WH_PER_S
+
+
+def test_churn_ready_defaults_to_every_sample() -> None:
+    """The default still reproduces today's churn exactly (no gate)."""
+    tracker = GapTrendTracker()
+    tracker.update(_ts(_OPENING, 0), -60.73)
+    tracker.update(_ts(_OPENING, 63), 8.69)
+    tracker.update(_ts(_OPENING, 90), 8.69)
+    # slopes 69.42/63 = 1.1020 and 0.0 -> pair churn 1.1020
+    assert tracker.churn_wh_per_s == pytest.approx(69.42 / 63)
+
+
+def test_trend_unaffected_by_churn_ready() -> None:
+    """Gating churn must not change the trend, its trust, or its resets."""
+    gated = GapTrendTracker()
+    plain = GapTrendTracker()
+    for delta, gap, ready in _CLUSTER_B:
+        gated.update(_ts(_OPENING, delta), gap, churn_ready=ready)
+        plain.update(_ts(_OPENING, delta), gap)
+    assert gated.churn_wh_per_s != plain.churn_wh_per_s
+    gated_rate, gated_trusted = gated.update(_ts(_OPENING, 240), 8.55)
+    plain_rate, plain_trusted = plain.update(_ts(_OPENING, 240), 8.55)
+    assert gated_trusted == plain_trusted
+    assert gated_rate == pytest.approx(plain_rate)
+
+
+def test_qh_rollover_clears_the_churn_window() -> None:
+    """A stale ready window must not survive into the next quarter.
+
+    The next QH can open with not-ready samples, so `_samples` refills to
+    the churn threshold while every one of them is gated; if the ready
+    window had survived the rollover it would recompute churn from the
+    previous quarter's gaps.
+    """
+    tracker = GapTrendTracker()
+    tracker.update(datetime(2026, 10, 2, 15, 10, 1, tzinfo=timezone.utc), 40.0)
+    tracker.update(datetime(2026, 10, 2, 15, 10, 31, tzinfo=timezone.utc), 47.5)
+    tracker.update(datetime(2026, 10, 2, 15, 11, 1, tzinfo=timezone.utc), 47.2)
+    assert tracker.churn_wh_per_s > 0.0
+
+    next_qh = datetime(2026, 10, 2, 15, 15, 1, tzinfo=timezone.utc)
+    for delta in (0, 30, 60):
+        tracker.update(_ts(next_qh, delta), -60.0 + delta, churn_ready=False)
+    assert tracker.churn_wh_per_s == 0.0

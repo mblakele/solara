@@ -1404,6 +1404,29 @@ class TestStageComputeGapTrend:
         assert ctx.gap_jitter_wh_per_s == lm.gap_trend.churn_wh_per_s
         assert ctx.gap_jitter_wh_per_s > 0.0
 
+    def test_compute_gap_gates_churn_on_remaining(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Churn is withheld while more than JITTER_MAX_REMAINING_SECS remain.
+
+        Past 600 s of a quarter at least two thirds of the projection is
+        `prediction_w * seconds_remaining` extrapolation, so seeding the
+        churn EWMA there reported "excessive jitter" for five minutes
+        (bugs/2026-10-02-sunrise-marine-layer-jitter.log, cluster B).
+        The default 450 s window still measures churn as before.
+        """
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0, seconds_remaining=750)
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=30), -45.0, seconds_remaining=720
+        )
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=60), -69.0, seconds_remaining=690
+        )
+        assert ctx.gap_trend_wh_per_s is not None  # trend is unaffected
+        assert ctx.gap_jitter_wh_per_s == 0.0
+
     def test_jitter_debug_log_when_measurable(
         self, lm: LoadManager, ctx: CycleContext, caplog
     ):
