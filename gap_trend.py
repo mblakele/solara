@@ -55,6 +55,7 @@ class GapTrendTracker:
         self._alpha = alpha
         self._max_span_secs = max_span_secs
         self._samples: deque[tuple[datetime, float]] = deque(maxlen=window)
+        self._churn_samples: deque[tuple[datetime, float]] = deque(maxlen=window)
         self._qh_start: datetime | None = None
         self._churn: float | None = None
 
@@ -70,23 +71,76 @@ class GapTrendTracker:
         the case where ``update()`` confirms no trend but the swing is
         large.
 
+        Accumulated over the churn-ready window only (see
+        ``update(churn_ready=...)``), so a slope pair straddling a
+        quarter's extrapolation-dominated opening cannot seed it.
+
         Returns:
-            0.0 until two slopes exist (third sample onward). Resets with
-            the sample history (explicit reset, QH rollover, span guard).
+            0.0 until two slopes exist among churn-ready samples (third
+            ready sample onward). Resets with the sample history
+            (explicit reset, QH rollover, span guard).
         """
         return 0.0 if self._churn is None else self._churn
 
     def reset(self) -> None:
         """Discard all history (samples, churn, and quarter-hour identity)."""
-        self._samples.clear()
+        self._clear_history()
         self._qh_start = None
+
+    def _clear_history(self) -> None:
+        """Drop both sample windows and the churn accumulator."""
+        self._samples.clear()
+        self._churn_samples.clear()
         self._churn = None
+
+    @staticmethod
+    def _slopes(samples: list[tuple[datetime, float]]) -> list[float]:
+        """Slope (Wh/s) of each adjacent pair of a strictly rising series.
+
+        Args:
+            Samples ordered by ``data_point_at``. ``update()`` rejects any
+            timestamp at or before the newest sample, so every adjacent
+            pair here has ``dt > 0``.
+
+        Returns:
+            One slope per adjacent pair.
+        """
+        slopes: list[float] = []
+        for (prev_ts, prev_gap), (cur_ts, cur_gap) in zip(samples, samples[1:]):
+            dt = (cur_ts - prev_ts).total_seconds()
+            slopes.append((cur_gap - prev_gap) / dt)
+        return slopes
+
+    def _fold_churn(self, samples: deque[tuple[datetime, float]]) -> None:
+        """Fold the newest ``|Δslope|`` into the churn EWMA, if measurable.
+
+        Jitter: the ``|delta|`` between the two newest slopes of
+        ``samples``, EWMA-smoothed so one calm fetch cannot mask an
+        oscillating quarter. Folded before the trust checks in
+        ``update()``: churn must be reported while the trend stays
+        untrusted — that dark zone is where consumers need it.
+
+        Args:
+            samples: The churn-eligible sample window. Needs
+                ``GAP_TREND_MIN_SLOPES + 1`` entries (two slopes);
+                otherwise the accumulator is left untouched (it stays
+                unmeasurable rather than dropping to zero).
+        """
+        if len(samples) < GAP_TREND_MIN_SLOPES + 1:
+            return
+        slopes = self._slopes(list(samples)[-(GAP_TREND_MIN_SLOPES + 1):])
+        pair_churn = abs(slopes[-1] - slopes[-2])
+        if self._churn is None:
+            self._churn = pair_churn
+        else:
+            self._churn = self._alpha * pair_churn + (1.0 - self._alpha) * self._churn
 
     def update(
         self,
         data_point_at: datetime,
         gap_wh: float,
         noise_floor: float = 0.0,
+        churn_ready: bool = True,
     ) -> tuple[float, bool]:
         """Record one cycle's adjusted gap and return the trend.
 
@@ -101,6 +155,17 @@ class GapTrendTracker:
                 trend never chases our own actions.
             noise_floor: Minimum |slope| (Wh/s) to trust.  Callers pass
                 ``hysteresis / seconds_remaining``.
+            churn_ready: Whether this sample may take part in churn
+                accumulation. Callers pass ``False`` while more than
+                ``JITTER_MAX_REMAINING_SECS`` of the quarter remain, where
+                the projection is dominated by ``prediction_w *
+                seconds_remaining`` extrapolation: seeding churn there
+                measured one quarter-opening sign flip as 1.10 Wh/s of
+                oscillation (bugs/2026-10-02-sunrise-marine-layer-jitter.log,
+                cluster B). The sample is still recorded for the trend —
+                slope, trust rule and ``churn_wh_per_s``'s resets are
+                unaffected; only the churn window skips it. When every
+                sample is ready the two windows are identical.
 
         Returns:
             Tuple of (ewma_slope_wh_per_s, trusted).  Rate is 0.0 whenever
@@ -112,8 +177,7 @@ class GapTrendTracker:
         """
         qh_start = floor_to_qh(data_point_at)
         if self._qh_start is not None and qh_start != self._qh_start:
-            self._samples.clear()
-            self._churn = None
+            self._clear_history()
         self._qh_start = qh_start
 
         if self._samples:
@@ -124,32 +188,19 @@ class GapTrendTracker:
             if span > self._max_span_secs:
                 # Too far from the last sample to describe the current
                 # regime; keep the new sample as a fresh seed only.
-                self._samples.clear()
-                self._churn = None
+                self._clear_history()
         self._samples.append((data_point_at, gap_wh))
+        if churn_ready:
+            self._churn_samples.append((data_point_at, gap_wh))
 
         if len(self._samples) < GAP_TREND_MIN_SLOPES + 1:
             return 0.0, False
 
         # Slopes over the last GAP_TREND_MIN_SLOPES intervals.
-        slopes: list[float] = []
-        recent = list(self._samples)[-(GAP_TREND_MIN_SLOPES + 1):]
-        # Samples are strictly increasing in data_point_at: update() rejects
-        # any timestamp at or before the newest sample, so every adjacent
-        # pair here has dt > 0.
-        for (prev_ts, prev_gap), (cur_ts, cur_gap) in zip(recent, recent[1:]):
-            dt = (cur_ts - prev_ts).total_seconds()
-            slopes.append((cur_gap - prev_gap) / dt)
+        slopes = self._slopes(list(self._samples)[-(GAP_TREND_MIN_SLOPES + 1):])
 
-        # Jitter: |delta| between the two newest slopes, EWMA-smoothed so
-        # one calm fetch cannot mask an oscillating quarter. Folded before
-        # the trust checks below: churn must be reported while the trend
-        # stays untrusted — that dark zone is where consumers need it.
-        pair_churn = abs(slopes[-1] - slopes[-2])
-        if self._churn is None:
-            self._churn = pair_churn
-        else:
-            self._churn = self._alpha * pair_churn + (1.0 - self._alpha) * self._churn
+        # Jitter (folded before the trust checks below).
+        self._fold_churn(self._churn_samples)
 
         # Zero slopes are neutral (repeated fetch of the same data carries
         # no new information), and so are slopes at or below the noise

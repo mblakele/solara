@@ -212,7 +212,10 @@ project-root
                            # DATA_STALE_ALERT_THRESHOLD_SECS=300 for Telegram data-health
                            # alerts, Tesla charging constants TESLA_HARD_MAX_AMPS, etc.,
                            # DEFAULT_HYSTERESIS_WH=20 residential fallback,
-                           # JITTER_GUARD_FRACTION=1.0 turn-on jitter guard)
+                           # JITTER_GUARD_FRACTION=1.0 turn-on jitter guard,
+                           # JITTER_FLOOR_WH_PER_S=0.2 churn noise floor,
+                           # JITTER_HORIZON_SECS=300 swing projection cap,
+                           # JITTER_MAX_REMAINING_SECS=600 churn readiness gate)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
@@ -237,14 +240,19 @@ project-root
                             # get_active_tesla_telemetry, FleetTelemetryProvisionConfig) plus
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
-├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider (incl. turn_on_jitter_guard_fires), PendingEffect factories
+├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider (incl. turn_on_jitter_guard_fires — JITTER_FLOOR_WH_PER_S noise floor and jitter_swing_wh()'s JITTER_HORIZON_SECS-capped swing, the one implementation shared by the predicate and every jitter log line), PendingEffect factories
 ├── gap_trend.py           # GapTrendTracker: EWMA slope of the adjusted gap across cycles
 │                          # (keyed on data_point_at; quarter-hour identity derived via
 │                          # floor_to_qh because ParsedMetricsQH.qh_name is the constant
 │                          # "QH1"; history clears on QH rollover or a data gap over
 │                          # GAP_TREND_MAX_SPAN_SECS; plateau-neutral; churn_wh_per_s
 │                          # reports the |Δslope| jitter EWMA (0.0 until measurable)
-│                          # behind the turn-on jitter guard). Feeds the
+│                          # behind the turn-on jitter guard, accumulated over a
+│                          # SEPARATE churn_ready window — update(churn_ready=False)
+│                          # still records the sample for the slope/trust rule but
+│                          # withholds it from churn, which is how a quarter-opening
+│                          # prediction_w sign flip no longer seeds a five-minute
+│                          # false "excessive jitter"). Feeds the
 │                          # ramp-aware Tesla stop in TeslaDecider.decide_reduce
  ├── logfmt.py              # Structured log formatters: render extra= fields as
  │                          #   [key=value ...] suffixes (default) or JSON lines
@@ -280,11 +288,18 @@ project-root
                            # ranges, DST days, detail rows/defaults and picker dates;
                            # test_app.py covers endpoint validation and range limits;
                            # test_gap_trend.py covers the gap-slope tracker (+ the churn /
-                           # jitter EWMA), test_tesla_decider.py the ramp-aware stop rule,
+                           # jitter EWMA, incl. the churn_ready readiness gate that
+                           # withholds the quarter-opening extrapolation),
+                           # test_tesla_decider.py the ramp-aware stop rule,
                            # test_tesla_ramp_replay.py the 2026-09-26 incident sequence,
                            # test_tesla_overshoot_replay.py the 2026-10-01 overshoot
                            # (status quo characterized; jitter-guard gate: |miss| < 10.7
-                           # toward target −9)
+                           # toward target −9),
+                           # test_marine_layer_jitter.py the 2026-10-02 calm-morning log
+                           # (all 35 logged jitter-guard triples replayed through the real
+                           # tracker: cluster A's quantization churn sits under
+                           # JITTER_FLOOR_WH_PER_S, cluster B's quarter-opening flip is
+                           # gated by JITTER_MAX_REMAINING_SECS, incident still fires)
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change
@@ -367,6 +382,13 @@ project-root
   30 s cycle; a TTL-paced read would cache-hit and skip the fetch, letting data age toward
   the stale-data threshold. The reader's fast path (`get_current_qh` with `force=False`)
   remains for other callers (e.g. `metrics.py`)
+- `_stage_compute_gap` in `load_manager.py` feeds `gap_trend.update(...)` with
+  `churn_ready=seconds_remaining <= JITTER_MAX_REMAINING_SECS`, so churn accumulates
+  only once at least a third of the quarter has observed data. Every sample still
+  reaches the trend window (slope, trust rule and `gap_trend_wh_per_s` unchanged);
+  only the churn accumulator skips the extrapolation-dominated opening. Its DEBUG
+  `gap_jitter ... swing_wh=` line goes through `load_nbc.jitter_swing_wh()`, the same
+  capped swing `turn_on_jitter_guard_fires` judges, so the log and the reason agree
 - `_resolve_prediction_window()` / `StateTracker.apply_prediction_window()` — the
   prediction/settle window is adaptive: it resolves lazily from shared-cache
   quantization (quantization data only exists after the first fetch of a cycle) and

@@ -194,13 +194,50 @@ turn-on cycle when `churn × seconds_remaining ≥ JITTER_GUARD_FRACTION ×
 gap` (constant `1.0` in `constants.py`, sized by the replay in
 `tests/test_tesla_overshoot_replay.py`, not by intuition): the estimate
 is swinging harder than its verdict, so the verdict is not actionable
-information. The guard returns no actions, logs `gapminder_jitter_guard`,
+information. Three gates keep that comparison honest, all sized by the
+same evidence-and-replay discipline:
+
+* `JITTER_FLOOR_WH_PER_S` (`0.2`) — churn below this is the forecast
+  window stepping between quantization levels, not oscillation. Without
+  it `churn ≥ gap / R` collapses to ~0.01 Wh/s on a calm quarter, where
+  it measured 0.0091–0.0124 — *below* that quarter's own realized
+  `sigma_rate` of 0.0222 — and reported "excessive jitter" 35 times
+  (`bugs/2026-10-02-sunrise-marine-layer-jitter.log`, cluster A, churn
+  0.0147–0.0468). The incident's churn (≈0.80 at c579) is 4× above it.
+* `JITTER_HORIZON_SECS` (`300`) — the swing is projected only over
+  `min(seconds_remaining, 300)`. Churn is measured from 30–60 s cycle
+  spacing with a 3-sample window; scaling it by the whole remaining
+  quarter (up to 900 s) projects a rate-change far past the horizon it
+  speaks to, so a low churn could veto any early-quarter surplus.
+* `JITTER_MAX_REMAINING_SECS` (`600`) — churn is not *measured* until at
+  least a third of the quarter has real data. `predicted_wh = raw +
+  prediction_w × remaining_seconds`, so past 600 s remaining at least two
+  thirds of the projection is extrapolation from a ≤300 s trailing
+  window; seeding the EWMA there measured one quarter-opening sign flip
+  — our own `jackery` `turn_off` seen through that window — as 1.10 Wh/s
+  of oscillation that then decayed ×0.7 for five minutes (cluster B).
+  `GapTrendTracker.update(..., churn_ready=)` keeps the sample in the
+  trend window (slope, trust rule and `gap_trend_wh_per_s` unchanged)
+  and withholds it only from the churn accumulator.
+
+`load_nbc.jitter_swing_wh()` is the single implementation of the
+capped swing, used by the predicate, by `decide()`'s
+`gapminder_jitter_guard` INFO line and by the manager's
+`gap_jitter ... swing_wh=` DEBUG line, so log, reason and decision can
+never disagree.
+
+The guard returns no actions, logs `gapminder_jitter_guard`,
 and `_decide_actions` recomputes the *same predicate* to set
 `reason="excessive_jitter"` — the outcome travels through the shared
 query rather than a `DecideContext` field because that dataclass is
 frozen, so decision and report can never disagree. The index forecast
 card then shows `⚠ jitter detected` (the cycle `status` itself stays
 `ok`).
+
+Regression coverage for both clusters of the marine-layer log — all 35
+logged triples, replayed through the real tracker — lives in
+`tests/test_marine_layer_jitter.py`, alongside the assertion that the
+guard still fires on the 2026-10-01 incident.
 
 Scope: **turn-on only**. Turn-off shedding and the ramp-aware Tesla stop
 are protective and never guarded; within hysteresis the guard never
