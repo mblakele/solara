@@ -1524,6 +1524,22 @@ def _status_label(status: str) -> str:
     return _STATUS_LABELS.get(status, "forecast this period")
 
 
+def _status_is_warn(status: str) -> bool:
+    """Return whether a cycle status carries an abnormal label.
+
+    Abnormal statuses (waiting for data, stale data) are marked by
+    the "⚠ " prefix on their label; this keeps that marking the
+    single source of truth instead of string-matching in templates.
+
+    Args:
+        status: CycleStatus string from the last CycleResult.
+
+    Returns:
+        True when the status's label is abnormal (warn-styled).
+    """
+    return _STATUS_LABELS.get(status, "").startswith("⚠")
+
+
 def create_app() -> Flask:
     """Create and configure the Flask application.
 
@@ -1551,6 +1567,7 @@ def create_app() -> Flask:
     application.jinja_env.filters["astimezonestr"] = astimezone_filter
     application.jinja_env.filters["per_second_sparkline"] = per_second_sparkline
     application.jinja_env.globals["_status_label"] = _status_label
+    application.jinja_env.globals["_status_is_warn"] = _status_is_warn
     application.json = CustomJSONProvider(application)
     application.register_error_handler(RetryableMetricsException, error_retryable)
     application.add_url_rule("/", "index", index)
