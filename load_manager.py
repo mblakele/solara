@@ -900,10 +900,16 @@ class LoadManager:
 
         if self.telegram_sender is not None:
             self.telegram_sender.reset_session()
+        pre_synced = (
+            list(ctx.plug_pre_sync_external)
+            if ctx.plug_pre_sync_done
+            else None
+        )
         res = asyncio.run(
             self._cycle_async_phase(
                 gap_wh, adjusted_wh, now_postfetch, seconds_remaining,
                 self.dry_run, qh_name, data_point_at=data_point_at,
+                pre_synced_external=pre_synced,
             )
         )
         ctx.tesla_state = res.tesla_state
@@ -970,6 +976,44 @@ class LoadManager:
         else:
             return
         self.state.sync_tesla_device_state(_not_charging_state(at_home=at_home))
+
+    def _sync_plugs_for_dashboard(self, ctx: CycleContext) -> None:
+        """Poll plug controllers so early exits still show fresh state.
+
+        The async phase reuses this poll instead of re-polling (see
+        ``plug_pre_sync_done`` on CycleContext), so each cycle issues
+        one controller round-trip per plug. This refresh reuses the
+        full ``_sync_plug_states`` reconcile (desired/actual update,
+        synthetic pending effects for NBC math, runtime books).
+        External flips observed here are alerted immediately with the
+        raw prediction since an early exit has no corrected gap yet;
+        the async phase must not re-queue them.
+
+        Args:
+            ctx: Current pipeline context (provides predicted_wh and
+                timestamps for the alert fallback; carries the
+                pre-sync result to Stage 5).
+        """
+        try:
+            external = asyncio.run(self._sync_plug_states())
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("Pre-gate plug sync failed", exc_info=True)
+            return
+        ctx.plug_pre_sync_done = True
+        ctx.plug_pre_sync_external = list(external)
+        if not external:
+            return
+        predicted_wh = ctx.predicted_wh
+        if predicted_wh is None:
+            predicted_wh = float(self.target_wh)
+        now = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
+        self._queue_surplus_notification(
+            actions=external,
+            predicted_wh=predicted_wh,
+            target_wh=self.target_wh,
+            dry_run=self.dry_run,
+            now=now,
+        )
 
     def _commanded_charge_echo(
         self, snapshot: dict[str, Any],
@@ -1130,13 +1174,17 @@ class LoadManager:
         """Stage 3: Check whether NBC data is stale or pending effects
         are not yet reflected in the prediction.
 
-        Refreshes the dashboard Tesla entry from live telemetry first so
-        early exits don't leave a stale charging display behind, then
+        Refreshes the dashboard Tesla entry from live telemetry and the
+        plug entries from their controllers first so early exits don't
+        leave a stale display behind (bugs/2026-10-03-plug-status-delay.log
+        showed sentinel + water heater stuck ON for ~4 min while
+        external_tesla_charge gates blocked the only plug poll), then
         runs the gates. When force=True, bypasses all checks and returns
         None immediately. Otherwise returns a CycleResult for early-exit
         conditions or None to continue the pipeline.
         """
         self._refresh_tesla_display_from_telemetry()
+        self._sync_plugs_for_dashboard(ctx)
         if ctx.force:
             return None
 
@@ -2662,12 +2710,18 @@ class LoadManager:
         dry_run: bool,
         qh_name: str | None = None,
         data_point_at: datetime | None = None,
+        *,
+        pre_synced_external: list[PendingEffect] | None = None,
     ) -> AsyncPhaseResult:
         """Run the async portion of a cycle in a single event loop.
 
         Syncs plug states from controllers, fetches Tesla state, calls decide()
         with that state, then executes all resulting actions. Consolidating into
         one coroutine means one event loop per cycle instead of one per action.
+
+        When ``pre_synced_external`` is not None the pre-gate dashboard poll
+        already reconciled plug state (and queued its alerts), so the body
+        reuses that state instead of re-polling controllers.
 
         Tesla amp-change effects have no power_watts so they're excluded from
         estimated_current_wh(). After fetching the vehicle state we recompute
@@ -2685,6 +2739,7 @@ class LoadManager:
             return await self._cycle_async_phase_body(
                 gap_wh, adjusted_wh, now, seconds_remaining,
                 dry_run, qh_name=qh_name, data_point_at=data_point_at,
+                pre_synced_external=pre_synced_external,
             )
         finally:
             await self._cleanup_sessions()
@@ -2698,12 +2753,21 @@ class LoadManager:
         dry_run: bool,
         qh_name: str | None = None,
         data_point_at: datetime | None = None,
+        *,
+        pre_synced_external: list[PendingEffect] | None = None,
     ) -> AsyncPhaseResult:
         """Body of _cycle_async_phase, extracted for try/finally cleanup."""
         self._vehicle_offline_this_cycle = False
-        early, external_actions = await self._async_sync_and_check_sentinel()
-        if early is not None:
-            return early
+        if pre_synced_external is not None:
+            # Pre-gate poll already reconciled state and queued its alerts;
+            # reuse it without re-polling controllers or double-queuing.
+            if self.is_sentinel_on():
+                return AsyncPhaseResult(sentinel_on=True)
+            external_actions: list[PendingEffect] = []
+        else:
+            early, external_actions = await self._async_sync_and_check_sentinel()
+            if early is not None:
+                return early
         tesla_state, tesla_error, tesla_login_url = (
             await self._fetch_tesla_state_async(now=now)
         )

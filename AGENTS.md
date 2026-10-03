@@ -370,7 +370,10 @@ project-root
   `_stage_pending_check`, `_stage_compute_gap`, `_stage_async_phase`, `_stage_commit`,
   `_stage_build_result`) — each independently testable. All early exits go through
   the `_early_exit()` builder (shared hysteresis/plugs/tesla/quantization defaults);
-  shared queries live in `_local_time()` (device-tz conversion), `_eligible_plugs()`
+  `_stage_pending_check` refreshes the Tesla display plus a pre-gate plug sync
+  (`_sync_plugs_for_dashboard` reusing `_sync_plug_states`, so early exits still
+  show fresh dashboard pills; carried on `CycleContext` for the async phase to
+  reuse — one controller round-trip per plug per cycle); shared queries live in `_local_time()` (device-tz conversion), `_eligible_plugs()`
   (engine-eligible vs out-of-range split), `is_sentinel_on()`, `_is_tesla_in_range()`,
   and `_waiting_sleep_hint()` (prediction-window-capped re-check delay). The async
   phase (`_cycle_async_phase` → `_cycle_async_phase_body`) returns an
