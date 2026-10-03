@@ -552,12 +552,8 @@ class LoadManager:
             the last compute_gap values.
         """
         return {
-            "gap_trend_wh_per_s": getattr(
-                self, "_last_gap_trend_wh_per_s", None
-            ),
-            "gap_jitter_wh_per_s": getattr(
-                self, "_last_gap_jitter_wh_per_s", None
-            ),
+            "gap_trend_wh_per_s": self._last_gap_trend_wh_per_s,
+            "gap_jitter_wh_per_s": self._last_gap_jitter_wh_per_s,
         }
 
     def is_enabled_at(self, now: datetime) -> bool:
@@ -2609,12 +2605,8 @@ class LoadManager:
                 and self.tesla_config.home_lat is not None
                 and self.tesla_config.home_lon is not None
             ),
-            gap_trend_wh_per_s=getattr(
-                self, "_last_gap_trend_wh_per_s", None
-            ),
-            gap_jitter_wh_per_s=getattr(
-                self, "_last_gap_jitter_wh_per_s", None
-            ),
+            gap_trend_wh_per_s=self._last_gap_trend_wh_per_s,
+            gap_jitter_wh_per_s=self._last_gap_jitter_wh_per_s,
             cycle_secs=self.config_interval_secs,
         )
         actions = self.engine.decide(
