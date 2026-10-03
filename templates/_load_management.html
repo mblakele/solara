@@ -73,9 +73,15 @@
       <dd class="{{ 'status--err' if diag.pending_effects_count > 0 else '' }}">{{ diag.pending_effects_count }}</dd>
     </div>
     {% endif %}
+    {% if diag.gap_jitter_wh_per_s is defined and diag.gap_jitter_wh_per_s is not none %}
+    <div class="kv__row">
+      <dt>Gap Jitter Wh/s</dt>
+      <dd>{{ "%.3f" % diag.gap_jitter_wh_per_s }}</dd>
+    </div>
+    {% endif %}
     <div class="kv__row">
       <dt>Reason</dt>
-      <dd class="{{ 'status--ok' if diag.reason == 'ok' else 'status--warn' if diag.reason in ['hysteresis', 'no_candidates', 'no_eligible', 'loads_too_large'] else 'status--err' }}">{{ diag.reason }}</dd>
+      <dd class="{{ 'status--ok' if diag.reason == 'ok' else 'status--warn' if diag.reason in ['hysteresis', 'no_candidates', 'no_eligible', 'loads_too_large', 'excessive_jitter'] else 'status--err' }}">{{ diag.reason }}</dd>
     </div>
   </dl>
 

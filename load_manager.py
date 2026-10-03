@@ -32,6 +32,7 @@ from constants import (
     DATA_STALE_ALERT_THRESHOLD_SECS,
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
+    JITTER_MAX_REMAINING_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
     STALE_DATA_THRESHOLD_SECS,
     TESLA_ARBITRATION_COOLDOWN_SECS,
@@ -96,11 +97,14 @@ from load_nbc import (
     StateTracker,
     GapMinder,
     DecideContext,
+    jitter_swing_wh,
     make_plug_effect,
 )
 from quantization import usable_window
 
 from energy_cache import EnergyCache
+
+from gap_trend import GapTrendTracker
 
 from metrics import DriftAlert, drain_drift_alerts
 
@@ -327,6 +331,16 @@ class LoadManager:
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
         )
+        # Ramp awareness: EWMA slope of the adjusted gap across cycles,
+        # fed in _stage_compute_gap and exposed in diagnostics. The last
+        # trusted rate (or None) is kept for early-exit result payloads.
+        self.gap_trend = GapTrendTracker()
+        self._last_gap_trend_wh_per_s: float | None = None
+        self._last_gap_jitter_wh_per_s: float | None = None
+        # Reset per async phase (like _vehicle_offline_this_cycle): set by
+        # _decide_actions when the turn-on jitter guard declined the cycle,
+        # read by _determine_no_action_reason. Never leaks across cycles.
+        self._jitter_guard_fired = False
         # Tracks the last known at_home value from Location telemetry snapshots.
         # Preserved when Location is absent so the requires_home_check gate in
         # GapMinder doesn't incorrectly block Tesla decisions.
@@ -527,6 +541,21 @@ class LoadManager:
             "settle_window_secs": self.state.effective_settle_secs,
         }
 
+    def _gap_trend_diagnostics(self) -> dict[str, Any]:
+        """Most recent gap-trend rate and gap jitter for cycle diagnostics.
+
+        Returns:
+            Dict with ``gap_trend_wh_per_s`` (None when no sustained
+            trend is confirmed) and ``gap_jitter_wh_per_s`` (churn in
+            Wh/s; None before the first compute_gap, 0.0 after a cycle
+            where churn was not yet measurable). Early-exit paths report
+            the last compute_gap values.
+        """
+        return {
+            "gap_trend_wh_per_s": self._last_gap_trend_wh_per_s,
+            "gap_jitter_wh_per_s": self._last_gap_jitter_wh_per_s,
+        }
+
     def is_enabled_at(self, now: datetime) -> bool:
         """Check if load management is enabled at the given moment.
 
@@ -629,6 +658,41 @@ class LoadManager:
         gap_wh = self.target_wh - adjusted_wh
         ctx.adjusted_wh = adjusted_wh
         ctx.gap_wh = gap_wh
+        # Feed the trend tracker on the pending-effect-corrected gap so the
+        # slope never chases our own actions. Keyed on data_point_at: stale
+        # or repeated fetches are ignored inside the tracker, which also
+        # resets itself on quarter-hour rollover and over-long data gaps.
+        noise_floor = (
+            self.engine.HYSTERESIS_WH / seconds_remaining
+            if seconds_remaining > 0
+            else 0.0
+        )
+        # Churn is withheld while the projection is still extrapolation-
+        # dominated: past JITTER_MAX_REMAINING_SECS of a quarter at least
+        # two thirds of predicted_wh is prediction_w * seconds_remaining, so
+        # a forecast-window step (or our own just-realized action entering
+        # that window) moves the gap with no new information. The sample is
+        # still recorded — the trend and its trust rule are unaffected.
+        rate, trusted = self.gap_trend.update(
+            data_point_at, gap_wh, noise_floor=noise_floor,
+            churn_ready=seconds_remaining <= JITTER_MAX_REMAINING_SECS,
+        )
+        ctx.gap_trend_wh_per_s = rate if trusted else None
+        self._last_gap_trend_wh_per_s = ctx.gap_trend_wh_per_s
+        # Jitter: the churn accumulator moves regardless of trust, so the
+        # payload reports swing even where the trend stays dark (the
+        # oscillating overshoot series). 0.0 = not yet measurable.
+        churn = self.gap_trend.churn_wh_per_s
+        ctx.gap_jitter_wh_per_s = churn
+        self._last_gap_jitter_wh_per_s = churn
+        if churn > 0.0:
+            logger.debug(
+                "gap_jitter churn=%.4f swing_wh=%.1f seconds_remaining=%d "
+                "trend_trusted=%s",
+                churn, jitter_swing_wh(churn, seconds_remaining),
+                seconds_remaining, trusted,
+                extra={"event": "gap_jitter"},
+            )
 
     def _stage_commit(self, ctx: CycleContext) -> CycleResult | None:
         """Stage 6: Sentinel check, commit effects, Tesla tracking, hysteresis.
@@ -796,6 +860,7 @@ class LoadManager:
                 active_tesla_telemetry=active_telemetry,
                 tesla_command_offline=self._vehicle_offline_this_cycle,
                 **self._quantization_diagnostics(),
+                **self._gap_trend_diagnostics(),
             ),
             sleep_hint=(
                 DEFAULT_SLEEP_HINT_SECS
@@ -816,6 +881,9 @@ class LoadManager:
         overwriting ctx.gap_wh and ctx.adjusted_wh with corrected values
         from the async phase. Always returns None.
         """
+        # Fresh per cycle: a guard-fired decision from the previous cycle
+        # must not color this cycle's no-action reason.
+        self._jitter_guard_fired = False
         gap_wh = ctx.gap_wh
         adjusted_wh = ctx.adjusted_wh
         now_postfetch = ctx.now_postfetch
@@ -1382,6 +1450,7 @@ class LoadManager:
                 sentinel_names=sentinel_names,
                 sentinel_on=sentinel_on,
                 **self._quantization_diagnostics(),
+                **self._gap_trend_diagnostics(),
             ),
             sleep_hint=sleep_hint,
             sleep_hint_at=sleep_hint_at,
@@ -1522,6 +1591,10 @@ class LoadManager:
         """
         if results:
             return "ok"
+        if self._jitter_guard_fired:
+            # The turn-on jitter guard declined the cycle (set by
+            # _decide_actions): report it ahead of candidate-based reasons.
+            return "excessive_jitter"
 
         gap_positive = gap_wh > 0
         has_eligible = False
@@ -2519,24 +2592,37 @@ class LoadManager:
         Returns:
             List of decided PendingEffect actions.
         """
-        return self.engine.decide(
-            ctx=DecideContext(
-                now=now,
-                seconds_remaining=seconds_remaining,
-                state=self.state,
-                plugs=eligible_plugs,
-                tesla=eligible_tesla,
-                dry_run=dry_run,
-                data_point_at=data_point_at,
-                requires_home_check=(
-                    self.tesla_config is not None
-                    and self.tesla_config.home_lat is not None
-                    and self.tesla_config.home_lon is not None
-                ),
+        decide_ctx = DecideContext(
+            now=now,
+            seconds_remaining=seconds_remaining,
+            state=self.state,
+            plugs=eligible_plugs,
+            tesla=eligible_tesla,
+            dry_run=dry_run,
+            data_point_at=data_point_at,
+            requires_home_check=(
+                self.tesla_config is not None
+                and self.tesla_config.home_lat is not None
+                and self.tesla_config.home_lon is not None
             ),
+            gap_trend_wh_per_s=self._last_gap_trend_wh_per_s,
+            gap_jitter_wh_per_s=self._last_gap_jitter_wh_per_s,
+            cycle_secs=self.config_interval_secs,
+        )
+        actions = self.engine.decide(
+            ctx=decide_ctx,
             predicted_wh=corrected_adjusted_wh,
             target_wh=self.target_wh,
         )
+        # Mirror the guard outcome for _determine_no_action_reason. Same
+        # predicate decide() applies (recomputed from identical inputs),
+        # so the report can never disagree with the decision.
+        self._jitter_guard_fired = self.engine.turn_on_jitter_guard_fires(
+            self.target_wh - corrected_adjusted_wh,
+            decide_ctx.gap_jitter_wh_per_s,
+            seconds_remaining,
+        )
+        return actions
 
     async def _run_actions(
         self, actions: list[PendingEffect], dry_run: bool

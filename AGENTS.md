@@ -15,6 +15,24 @@ failing test, **stop and ask** rather than continuing to iterate blindly.
 
 Write tests first, then diagnose and fix bugs.
 
+### Analyzing a log in `bugs/`
+
+**When a task mentions a path under `bugs/` (e.g. "analyze
+`bugs/2026-10-01-tesla-overshoot.log`"), your FIRST tool call is the scorer, and
+your FIRST output block is its raw output:**
+
+```bash
+uv run python tools/forecast_log_scoring.py bugs/<file>.log
+```
+
+It extracts every forecast anchor plus the completed-quarter actual in one pass
+and prints scored-anchor counts, signed/absolute error, `sigma_rate`, per-`R`
+buckets, and the quarter's realized total. Lead the reply with that output, then
+explain it with a hand reconstruction of the `nbc_set` lines. Do not derive
+anchor tables, errors, or the quarter's actual Wh by hand when the tool already
+computes them — hand numbers are for *explaining* the tool's numbers, not for
+*replacing* them.
+
 ### Tool Use
 
 Always invoke tools using structured function-calling JSON (not inline XML or markdown text).
@@ -41,7 +59,7 @@ front. For those changes you may **skip the Red-Green ceremony**:
 
 - No failing test is required before touching `templates/`, `static/style.css`,
   or presentation-only changes to markup.
-- Still run the full verification gate (`uv run pylint *.py`, `uv run mypy`,
+- Still run the full verification gate (`uv run pylint *.py tools/*.py`, `uv run mypy`,
   `uv run pytest`) after the change, and update any existing tests that assert
   on the changed markup so the suite stays green.
 - The exemption covers **presentation only**. Any change that alters behavior,
@@ -125,6 +143,36 @@ This is a flat-layout Python project. All source files live at the project root 
 
 ```
 project-root
+├── tools/                 # Offline-only analysis tools. No production module
+│                          # imports anything in here; they read log text and report.
+│                          # Linted and type-checked (`uv run pylint *.py tools/*.py`,
+│                          # mypy `files` includes `tools/*.py`), but not shipped in
+│                          # the gunicorn/Flask runtime path.
+│   └── forecast_log_scoring.py  # FIRST STEP for any task that names a `bugs/*.log`
+│                          # file — run it and lead with its output (see
+│                          # "Analyzing a log in `bugs/`" under General Advice).
+│                          # Scores NBC forecast quality against production logs:
+│                          # parses forecast anchors + completed-quarter actuals and
+│                          # reports forecast uncertainty. Despite the name it does NOT
+│                          # replay decisions (contrast tests/test_tesla_ramp_replay.py,
+│                          # which re-runs production classes); it measures the forecast.
+│                          # Identity: a realized error is *identically*
+│                          # -remaining_secs * rate_error (ForecastAnchor.error vs
+│                          # rate_shortfall), so U(R) = k * sigma_rate * R is complete,
+│                          # not an approximation. It also reports a churn band
+│                          # (k * churn * R, production's GapTrendTracker fed from the
+│                          # anchor series — raw predicted_wh stands in for the gap;
+│                          # constant offsets/signs cancel in |Δslope|) beside the
+│                          # sigma band, and reads — never re-executes — what
+│                          # production logged about its own decisions: CycleResult
+│                          # reprs (per-quarter target/miss, reason, production churn,
+│                          # scoped to the diagnostics=CycleDiagnostics(...) segment)
+│                          # and gapminder_jitter_guard INFO events (wall-time quarter,
+│                          # exact because previous_qh exits before decide()). Report
+│                          # output: churn-band coverage line, jitter-guard summary
+│                          # line, target/miss/guard columns in the quarter table.
+│                          # Run from the repo root:
+│                          #   uv run python tools/forecast_log_scoring.py bugs/*.log
 ├── app.py                 # Flask app factory (create_app()), route definitions (/, /health,
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
                            # _AppState runtime singletons, start_background_services();
@@ -150,7 +198,10 @@ project-root
                            # so every edge snaps onto whole device pixels (no AA
                            # hairlines even above shorter neighbors); always laid
                            # out for a full 300-second window (partial windows render
-                           # left-aligned at real time positions, blank right)
+                           # left-aligned at real time positions, blank right);
+                           # slot aggregation lives in _indexed_bars() (extracted
+                           # from per_second_sparkline to stay under pylint's local
+                           # budget; behavior unchanged, covered by the chart tests)
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
                            # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
 ├── config_loader.py       # Config loading helpers (load_tesla_config,
@@ -160,7 +211,11 @@ project-root
 ├── constants.py           # Named constants for magic numbers (STALE_DATA_THRESHOLD_SECS,
                            # DATA_STALE_ALERT_THRESHOLD_SECS=300 for Telegram data-health
                            # alerts, Tesla charging constants TESLA_HARD_MAX_AMPS, etc.,
-                           # DEFAULT_HYSTERESIS_WH=20 residential fallback)
+                           # DEFAULT_HYSTERESIS_WH=20 residential fallback,
+                           # JITTER_GUARD_FRACTION=1.0 turn-on jitter guard,
+                           # JITTER_FLOOR_WH_PER_S=0.2 churn noise floor,
+                           # JITTER_HORIZON_SECS=300 swing projection cap,
+                           # JITTER_MAX_REMAINING_SECS=600 churn readiness gate)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
@@ -176,15 +231,29 @@ project-root
                              # data-health Telegram alerts (_check_data_health_alerts:
                              # fatal fetch errors + 300 s stale/no-data, once per QH each,
                              # bypassing the devices whitelist)
- ├── load_models.py        # Shared data models (CycleContext, CycleResult, AsyncPhaseResult,
-                            # PendingEffect,
+ ├── load_models.py        # Shared data models (CycleContext (stage-4 gap_jitter_wh_per_s),
+                            # CycleResult, CycleDiagnostics (gap_jitter_wh_per_s + to_dict),
+                            # AsyncPhaseResult, PendingEffect,
                             # TeslaChargeState, TeslaDriveState, TeslaLocation, TeslaCallbackPayload,
                             # TeslaEvent, TeslaEventKind, TeslaVehicleTelemetry,
                             # parse_tesla_event_payload, update_tesla_telemetry,
                             # get_active_tesla_telemetry, FleetTelemetryProvisionConfig) plus
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
-├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider, PendingEffect factories
+├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider (incl. turn_on_jitter_guard_fires — JITTER_FLOOR_WH_PER_S noise floor and jitter_swing_wh()'s JITTER_HORIZON_SECS-capped swing, the one implementation shared by the predicate and every jitter log line), PendingEffect factories
+├── gap_trend.py           # GapTrendTracker: EWMA slope of the adjusted gap across cycles
+│                          # (keyed on data_point_at; quarter-hour identity derived via
+│                          # floor_to_qh because ParsedMetricsQH.qh_name is the constant
+│                          # "QH1"; history clears on QH rollover or a data gap over
+│                          # GAP_TREND_MAX_SPAN_SECS; plateau-neutral; churn_wh_per_s
+│                          # reports the |Δslope| jitter EWMA (0.0 until measurable)
+│                          # behind the turn-on jitter guard, accumulated over a
+│                          # SEPARATE churn_ready window — update(churn_ready=False)
+│                          # still records the sample for the slope/trust rule but
+│                          # withholds it from churn, which is how a quarter-opening
+│                          # prediction_w sign flip no longer seeds a five-minute
+│                          # false "excessive jitter"). Feeds the
+│                          # ramp-aware Tesla stop in TeslaDecider.decide_reduce
  ├── logfmt.py              # Structured log formatters: render extra= fields as
  │                          #   [key=value ...] suffixes (default) or JSON lines
  │                          #   (LOG_FORMAT=json); wired into app.py handlers
@@ -205,9 +274,32 @@ project-root
 ├── pyproject.toml         # Project metadata, dependencies & script entrypoints
 ├── render.yaml            # Render.com deployment configuration
 ├── env.example            # Template for required environment variables
-├── tests/                 # All pytest tests; test_tou_page.py covers inclusive date
+├── tests/                 # All pytest tests; test_forecast_log_scoring.py covers the
+                           # offline tool (parser quarter identity, actual resolution,
+                           # the error==-R*shortfall identity, sigma_rate/coverage,
+                           # the churn band — GapTrendTracker fed from anchors,
+                           # offset/sign invariance, reset across quarters,
+                           # churn_coverage — guard/cycle-result parsing incl. the
+                           # segment-scoping traps (action data_point_at before,
+                           # candidate reason after diagnostics), target/miss/guard
+                           # joins, and that the tool runs standalone; real-log
+                           # assertions skip because bugs/ is gitignored);
+                           # test_tou_page.py covers inclusive date
                            # ranges, DST days, detail rows/defaults and picker dates;
-                           # test_app.py covers endpoint validation and range limits
+                           # test_app.py covers endpoint validation and range limits;
+                           # test_gap_trend.py covers the gap-slope tracker (+ the churn /
+                           # jitter EWMA, incl. the churn_ready readiness gate that
+                           # withholds the quarter-opening extrapolation),
+                           # test_tesla_decider.py the ramp-aware stop rule,
+                           # test_tesla_ramp_replay.py the 2026-09-26 incident sequence,
+                           # test_tesla_overshoot_replay.py the 2026-10-01 overshoot
+                           # (status quo characterized; jitter-guard gate: |miss| < 10.7
+                           # toward target −9),
+                           # test_marine_layer_jitter.py the 2026-10-02 calm-morning log
+                           # (all 35 logged jitter-guard triples replayed through the real
+                           # tracker: cluster A's quantization churn sits under
+                           # JITTER_FLOOR_WH_PER_S, cluster B's quarter-opening flip is
+                           # gated by JITTER_MAX_REMAINING_SECS, incident still fires)
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change
@@ -236,7 +328,12 @@ project-root
                            # (the metrics fragment carries the hidden #data-freshness state
                            # strip mirrored onto the header #connection button by syncConnection()
                            # (dot-only when live+fresh; tap toggles data-show-text to reveal/hide
-                           # the age text); the
+                           # the age text) plus the forecast-period
+                           # label, which renders abnormal states
+                           # ("⚠ waiting for data" / "⚠ stale data" /
+                           # "⚠ low confidence" when
+                           # diag.reason == "excessive_jitter") in red
+                           # (forecast__period--warn); the
                            # sparkline filter receives quantization_seconds to feed
                            # chart.per_second_sparkline's bucket_secs downsampling)
 ├── static/                # Mobile-first design system (style.css) and the SSE dashboard
@@ -289,6 +386,13 @@ project-root
   30 s cycle; a TTL-paced read would cache-hit and skip the fetch, letting data age toward
   the stale-data threshold. The reader's fast path (`get_current_qh` with `force=False`)
   remains for other callers (e.g. `metrics.py`)
+- `_stage_compute_gap` in `load_manager.py` feeds `gap_trend.update(...)` with
+  `churn_ready=seconds_remaining <= JITTER_MAX_REMAINING_SECS`, so churn accumulates
+  only once at least a third of the quarter has observed data. Every sample still
+  reaches the trend window (slope, trust rule and `gap_trend_wh_per_s` unchanged);
+  only the churn accumulator skips the extrapolation-dominated opening. Its DEBUG
+  `gap_jitter ... swing_wh=` line goes through `load_nbc.jitter_swing_wh()`, the same
+  capped swing `turn_on_jitter_guard_fires` judges, so the log and the reason agree
 - `_resolve_prediction_window()` / `StateTracker.apply_prediction_window()` — the
   prediction/settle window is adaptive: it resolves lazily from shared-cache
   quantization (quantization data only exists after the first fetch of a cycle) and
@@ -639,7 +743,7 @@ After **any** code change, always run these commands in order. Do not proceed
 to the next step if a prior step fails.
 
 ```bash
-uv run pylint *.py                     # 1. Style and bug checks
+uv run pylint *.py tools/*.py          # 1. Style and bug checks
 uv run mypy                            # 2. Type correctness
 uv run pytest                          # 3. Full test suite (fast, no coverage)
 uv run pytest --cov=.                  # 4. Coverage check (opt-in)
@@ -655,7 +759,7 @@ is required (e.g. CI, or after changing test-relevant code).
 |---|---|
 | Run full test suite | `uv run pytest` |
 | Run a single test | `uv run pytest tests/test_app.py::test_function_name` |
-| Lint | `uv run pylint *.py` |
+| Lint | `uv run pylint *.py tools/*.py` |
 | Type check | `uv run mypy` |
 | Dev server | `uv run python app.py` |
 | Production-like server | `gunicorn --reload -c gunicorn.conf.py --worker-class=gthread --threads=4 --bind 127.0.0.1:8000 wsgi:app` |

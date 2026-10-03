@@ -48,7 +48,8 @@ dev = [
 ]
 
 [tool.mypy]
-files = ["*.py"]  # was: ["load_manager.py", "app.py"]
+# tools/ is offline-only but still ships in the repo, so it gets checked too.
+files = ["*.py", "tools/*.py"]
 exclude = ["tests/"]  # tests aren't type-checked; the bare `uv run mypy`
                       # gate uses `files = ["*.py"]` and stays untouched.
                       # Without this, `mypy .` trips on tests/helpers.py being

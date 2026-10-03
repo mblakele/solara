@@ -120,7 +120,7 @@ to be conservative and leave more surplus on the grid.
 
 ## Hysteresis
 
-Production `hysteresis_wh = int(abs(target_wh) / 3)` (`load_manager.py:309`,
+Production `hysteresis_wh = int(abs(target_wh) / 3)` (`load_manager.py`,
 proportion in `constants.py:HYSTERESIS_PROPORTION`). With the current
 `target_wh = -9` (`devices.json`) that is **3 Wh** — essentially no deadband
 against hundred-Wh gap errors (e.g. a 2000 W plug with ~800 s left is
@@ -129,6 +129,42 @@ default; the fallback is now **20 Wh** (`constants.py:DEFAULT_HYSTERESIS_WH`),
 used only when no explicit value is passed. Production always passes
 `int(abs(target_wh) / 3)` explicitly — do not rely on the fallback when
 reasoning about production over-commit risk.
+
+## Tesla stop deferral and ramp awareness
+
+At Tesla's 5 A minimum there is nothing to trim: the only shed action is
+an all-or-nothing stop (~1200 W × remaining seconds). The static rule
+(`TeslaDecider.decide_reduce`, `load_nbc.py`) defers the stop while
+`seconds_remaining > gap / (1200/3600)` (capped at `MAX_DEFER_SECS=120`),
+so an exact-hit stop lands precisely on target — assuming the prediction
+is frozen. On a sustained ramp (sunset, `bugs/2026-09-26-tesla-stop-
+charging.log`) the frozen assumption defers one cycle too long.
+
+`GapTrendTracker` (`gap_trend.py`, constants `GAP_TREND_*`) estimates the
+adjusted-gap slope across cycles: an EWMA over a 3-sample window keyed on
+`data_point_at`, with flat repeats neutral and opposing slopes rejecting.
+History clears on two boundaries — a quarter-hour rollover, and a
+`data_point_at` delta above `GAP_TREND_MAX_SPAN_SECS` (120 s, matching the
+furthest horizon a defer decision examines). The quarter-hour identity is
+**derived** via `floor_to_qh(data_point_at)`, not taken from the caller:
+`ParsedMetricsQH.qh_name` is the hardcoded literal `"QH1"` for every
+incomplete quarter, so keying on it could never detect a rollover. That
+bug let a 20:45 sample be slope-fitted against 20:43/20:44 samples from
+the previous hour, publishing a bogus −6.1 Wh/s trend
+(`bugs/2026-10-01-tesla-overshoot.log`, c587). Harmless for the Tesla stop
+— `_ramp_stop_now` only fires when the deficit already exceeds ~⅓ of the
+energy the car would draw over the remaining time, a regime where stopping
+is right regardless of trend — but it must not survive into plug Phase II,
+where a spurious trend could drop a 4857 W load.
+
+Fed in `_stage_compute_gap` on the pending-effect-corrected gap with noise
+floor `hysteresis / seconds_remaining`, exposed as `gap_trend_wh_per_s` in
+`CycleDiagnostics`/JSON/SSE. When trusted and positive, the exact-hit stop
+time `t* = (P·R − G₀)/(P + r)` (trend clamped to half the 5 A rate) stops
+now if `t*` falls within one cycle (`DecideContext.cycle_secs`); otherwise
+the static rule stands unchanged. Flat, shrinking, or unconfirmed trends
+never alter behavior. Plug
+decisions are intentionally out of scope (Phase I: Tesla stop only).
 
 **Two sign conventions, deliberately:**
 
@@ -140,6 +176,77 @@ reasoning about production over-commit risk.
   = excess solar, positive = grid draw, matching how NBC predictions are
   displayed everywhere else. Users are used to reading -N as solar;
   these lines say so explicitly (`positive=grid draw`).
+
+## Turn-on jitter guard
+
+Sometimes the adjusted-gap estimate oscillates so hard that its own
+cycle-to-cycle swing exceeds the gap it is claiming
+(`bugs/2026-10-01-tesla-overshoot.log`: `12.7 → 28.3 → 3.4 → 7.7 → −1.2`
+Wh across five data points, producing two Tesla increases that overshot
+the −9 Wh target to +1.74 Wh — miss +10.7). `GapTrendTracker.churn_wh_per_s`
+(`gap_trend.py`) measures this as an EWMA of `|Δslope|` — the jitter —
+and reports it as `gap_jitter_wh_per_s` in
+`CycleDiagnostics`/JSON/SSE even while the trend itself stays untrusted
+(a trend that never confirms is exactly where jitter matters).
+
+`GapMinder.turn_on_jitter_guard_fires()` (`load_nbc.py`) declines a
+turn-on cycle when `churn × seconds_remaining ≥ JITTER_GUARD_FRACTION ×
+gap` (constant `1.0` in `constants.py`, sized by the replay in
+`tests/test_tesla_overshoot_replay.py`, not by intuition): the estimate
+is swinging harder than its verdict, so the verdict is not actionable
+information. Three gates keep that comparison honest, all sized by the
+same evidence-and-replay discipline:
+
+* `JITTER_FLOOR_WH_PER_S` (`0.2`) — churn below this is the forecast
+  window stepping between quantization levels, not oscillation. Without
+  it `churn ≥ gap / R` collapses to ~0.01 Wh/s on a calm quarter, where
+  it measured 0.0091–0.0124 — *below* that quarter's own realized
+  `sigma_rate` of 0.0222 — and reported "excessive jitter" 35 times
+  (`bugs/2026-10-02-sunrise-marine-layer-jitter.log`, cluster A, churn
+  0.0147–0.0468). The incident's churn (≈0.80 at c579) is 4× above it.
+* `JITTER_HORIZON_SECS` (`300`) — the swing is projected only over
+  `min(seconds_remaining, 300)`. Churn is measured from 30–60 s cycle
+  spacing with a 3-sample window; scaling it by the whole remaining
+  quarter (up to 900 s) projects a rate-change far past the horizon it
+  speaks to, so a low churn could veto any early-quarter surplus.
+* `JITTER_MAX_REMAINING_SECS` (`600`) — churn is not *measured* until at
+  least a third of the quarter has real data. `predicted_wh = raw +
+  prediction_w × remaining_seconds`, so past 600 s remaining at least two
+  thirds of the projection is extrapolation from a ≤300 s trailing
+  window; seeding the EWMA there measured one quarter-opening sign flip
+  — our own `jackery` `turn_off` seen through that window — as 1.10 Wh/s
+  of oscillation that then decayed ×0.7 for five minutes (cluster B).
+  `GapTrendTracker.update(..., churn_ready=)` keeps the sample in the
+  trend window (slope, trust rule and `gap_trend_wh_per_s` unchanged)
+  and withholds it only from the churn accumulator.
+
+`load_nbc.jitter_swing_wh()` is the single implementation of the
+capped swing, used by the predicate, by `decide()`'s
+`gapminder_jitter_guard` INFO line and by the manager's
+`gap_jitter ... swing_wh=` DEBUG line, so log, reason and decision can
+never disagree.
+
+The guard returns no actions, logs `gapminder_jitter_guard`,
+and `_decide_actions` recomputes the *same predicate* to set
+`reason="excessive_jitter"` — the outcome travels through the shared
+query rather than a `DecideContext` field because that dataclass is
+frozen, so decision and report can never disagree. The index forecast
+card's period label then becomes `⚠ low confidence` in red (the cycle
+`status` itself stays `ok`) — the same format as the other abnormal
+labels `⚠ waiting for data` and `⚠ stale data`.
+
+Regression coverage for both clusters of the marine-layer log — all 35
+logged triples, replayed through the real tracker — lives in
+`tests/test_marine_layer_jitter.py`, alongside the assertion that the
+guard still fires on the 2026-10-01 incident.
+
+Scope: **turn-on only**. Turn-off shedding and the ramp-aware Tesla stop
+are protective and never guarded; within hysteresis the guard never
+fires (nothing was due anyway); a churn value that is not yet measurable
+(0.0) never fires, which is why the incident's *first* increase — taken
+before the oscillation was measurable — is deliberately allowed. In the
+replay the guarded variant lands the incident quarter within ~3 Wh of
+the −9 Wh target instead of +1.74 Wh (acceptance: `|miss| < 10.7`).
 
 ## Dry-Run Mode
 

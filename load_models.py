@@ -470,6 +470,10 @@ CycleStatus = Literal[
 
 @dataclass(frozen=True)
 class CycleDiagnostics:
+    # Too many instance attributes (22/17): diagnostic snapshot carries one
+    # field per signal by design; new signals (e.g. gap_trend_wh_per_s)
+    # extend it rather than nesting.
+    # pylint: disable=too-many-instance-attributes
     """Diagnostic snapshot for one load management cycle.
 
     Attributes:
@@ -502,6 +506,12 @@ class CycleDiagnostics:
         settle_window_secs: Effective prediction/settle window used for
             decisions (derived from quantization with a minimum floor),
             or None when not resolved.
+        gap_trend_wh_per_s: EWMA slope of the adjusted gap in Wh/s,
+            or None when no sustained trend is confirmed.
+        gap_jitter_wh_per_s: EWMA of consecutive-slope churn (the
+            cycle-to-cycle swing of the gap estimate) in Wh/s; 0.0 when
+            measured but not yet measurable (fewer than three samples),
+            None before the first compute_gap.
     """
 
     gap_wh: float | None = None
@@ -526,6 +536,8 @@ class CycleDiagnostics:
     quantization_offset: int | None = None
     quantization_confidence: float | None = None
     settle_window_secs: int | None = None
+    gap_trend_wh_per_s: float | None = None
+    gap_jitter_wh_per_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -564,6 +576,8 @@ class CycleDiagnostics:
             "quantization_offset": self.quantization_offset,
             "quantization_confidence": self.quantization_confidence,
             "settle_window_secs": self.settle_window_secs,
+            "gap_trend_wh_per_s": self.gap_trend_wh_per_s,
+            "gap_jitter_wh_per_s": self.gap_jitter_wh_per_s,
         }
 
 
@@ -824,6 +838,9 @@ class AsyncPhaseResult:
 
 @dataclass
 class CycleContext:
+    # Too many instance attributes (18/17): pipeline context accumulates one
+    # field per stage output by design (Direction A).
+    # pylint: disable=too-many-instance-attributes
     """Intermediate state carried through the run_cycle() pipeline stages.
 
     Stages read fields and write back new values. Not frozen to allow
@@ -843,6 +860,9 @@ class CycleContext:
         # Stage 4 (compute gap) outputs
         adjusted_wh: Prediction adjusted by pending effects, or None.
         gap_wh: Predicted surplus (+) or deficit (-) in Wh, or None.
+        gap_trend_wh_per_s: Sustained slope of the adjusted gap, or None.
+        gap_jitter_wh_per_s: Cycle-to-cycle churn of the gap estimate
+            (EWMA of |delta slope|), 0.0 when not yet measurable.
 
         # Stage 5 (async phase) outputs
         tesla_state: Current Tesla state, or None.
@@ -868,6 +888,8 @@ class CycleContext:
     # Stage 4 output
     adjusted_wh: float | None = None
     gap_wh: float | None = None
+    gap_trend_wh_per_s: float | None = None
+    gap_jitter_wh_per_s: float | None = None
 
     # Stage 5 output
     tesla_state: TeslaState | None = None

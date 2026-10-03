@@ -23,21 +23,23 @@ flowchart LR
 
     subgraph App["Solara App"]
         subgraph Web["Flask App (app.py)"]
-            ROUTES["Routes<br/>/ · /health · /api/v1/tou<br/>/api/v1/load/status · /stream/status<br/>/tesla/oauth"]
-            TEMPLATES["Jinja2 templates<br/>index.html · tou.html"]
+            ROUTES["Routes<br/>/ · /health · /api/v1/tou<br/>/api/v1/load/status · /stream/status<br/>/api/v1/tesla/auth/initiate · /callback<br/>/api/v1/tesla/status (tesla_oauth.py)"]
+            TEMPLATES["Jinja2 templates<br/>index.html · tou.html<br/>_metrics.html · _load_management.html<br/>error_retryable.html"]
             SSE["SSEBroadcaster<br/>(sse_event.py)"]
         end
 
         subgraph Data["Energy Data Path"]
-            METRICS["metrics.py<br/>HourlyProjection / TOUReporter"]
-            CACHE["EnergyCache<br/>(energy_cache.py)"]
+            METRICS["metrics.py<br/>HourlyProjection / TOUReporter<br/>cap_chart_start guard"]
+            CACHE["EnergyCache<br/>(energy_cache.py)<br/>TTL 30s, fetch timeout 30s"]
             AGGR["energy_aggregator.py<br/>TOU buckets"]
             QUANT["quantization.py<br/>window detection"]
+            CHART["chart.py<br/>per_second_sparkline SVG"]
         end
 
         subgraph LoadMgmt["Load Management"]
             LM["LoadManager<br/>(load_manager.py)"]
-            NBC["load_nbc.py<br/>NBCReader / StateTracker / GapMinder"]
+            NBC["load_nbc.py<br/>NBCReader / EffectStore /<br/>TeslaSettleTracker / StateTracker /<br/>GapMinder / TeslaDecider"]
+            TREND["gap_trend.py<br/>GapTrendTracker (EWMA slope)"]
             CTRL["load_controllers.py<br/>Plug / Tesla / Vocolinc controllers"]
             TELEM["mqtt_telemetry.py<br/>MQTT subscriber"]
             MODELS["load_models.py<br/>data models + parsing"]
@@ -58,6 +60,8 @@ flowchart LR
     CACHE --> NBC
     CACHE --> ROUTES
     METRICS --> ROUTES
+    QUANT --> CHART
+    CHART --> ROUTES
 
     MQTT --> TELEM
     TELEM --> MODELS
@@ -69,6 +73,7 @@ flowchart LR
     TELEM --> LM
     CTRL --> LM
     NBC --> LM
+    TREND --> NBC
     CACHE --> LM
     LM --> NOTIF
     NOTIF --> TG
@@ -91,9 +96,9 @@ quarter-hour windows (`util.inject_completed_qh`).
 ```mermaid
 flowchart TD
     VUE["Emporia VUE API"] -->|"pyemvue channel fetch"| HP["HourlyProjection.populate()<br/>(metrics.py)"]
-    HP -->|"per-second Wh samples"| CACHE["EnergyCache.get_or_fetch()<br/>TTL 60s, prune >3600s,<br/>quantization detect"]
+    HP -->|"per-second Wh samples"| CACHE["EnergyCache.get_or_fetch()<br/>TTL 30s, fetch timeout 30s,<br/>prune >3600s, quantization detect"]
     CACHE -->|"stale-cache serve on retryable errors"| INDEX["index()<br/>/ (HTML or JSON)"]
-    HP -->|"drift rejection"| DRIFT["DriftAlert → Telegram<br/>(_drain_drift_alerts)"]
+    HP -->|"drift rejection (firstUsageInstant != chart_start)"| DRIFT["DriftAlert → Telegram<br/>(_drain_drift_alerts)"]
 
     VUE -->|"TOUReporter.fetch_usage_data()"| AGGR["energy_aggregator.py<br/>TOU buckets"]
     AGGR -->|"TOU buckets"| TOUROUTE["/api/v1/tou"]
@@ -109,9 +114,10 @@ flowchart TD
 
 ## 3. Load Management Cycle
 
-`LoadManager.run_cycle()` runs a seven-stage pipeline every ~30 seconds on a
-background thread (or adaptively per `sleep_hint`). Each stage is an
-independently testable method; any stage may early-exit with a `CycleResult`.
+`LoadManager.run_cycle()` runs an eight-step pipeline (stages 0–7) every
+~30 seconds on a background thread (or adaptively per `sleep_hint`). Each
+stage is an independently testable method; any stage may early-exit with a
+`CycleResult`.
 
 ```mermaid
 flowchart LR
@@ -202,15 +208,16 @@ flowchart TD
     SUB --> ONMSG["on_message()<br/>parse + store snapshot"]
     ONMSG --> SNAP["get_telemetry_snapshot()<br/>in-memory store"]
     SNAP --> FETCH["_fetch_tesla_state_async()<br/>(load_manager.py)"]
-    FETCH -->|"ChargeAmts present → telemetry state<br/>(Location optional; at_home preserved)"| DECIDE["GapMinder.decide()"]
+    FETCH -->|"ChargeAmps present → telemetry state<br/>(Location optional; at_home preserved)"| DECIDE["GapMinder.decide()"]
     FETCH -->|"no telemetry → wait ≤60s then REST"| REST["RealTeslaController.init_tesla_state()<br/>(tesla-fleet-api)"]
     REST --> DECIDE
 
     DECIDE -->|"set_amps / stop-charge"| TESLA
 
-    subgraph OAuth["Tesla OAuth (tesla_oauth.py)"]
-        INIT["GET /tesla/oauth/initiate"] --> CALLBACK["GET /tesla/oauth/callback<br/>stores tokens → .tesla-tokens.json"]
+    subgraph OAuth["Tesla OAuth (tesla_oauth.py Blueprint)"]
+        INIT["GET /api/v1/tesla/auth/initiate"] --> CALLBACK["GET /callback<br/>stores tokens → .tesla-tokens.json"]
         CALLBACK --> REST
+        STATUS["GET /api/v1/tesla/status"]
     end
 
     %% unwrap_telemetry_value / parse_charge_amps (load_models.py) are shared
@@ -221,16 +228,16 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    WSGI["wsgi.py<br/>app = create_app()<br/>start_background_services()"] --> APP["app.py create_app()<br/>routes · JSON provider · error handlers"]
+    WSGI["wsgi.py<br/>app = create_app()<br/>start_background_services()"] --> APP["app.py create_app()<br/>routes · JSON provider · error handlers<br/>Tesla OAuth Blueprint"]
     MAIN["python app.py<br/>(dev server)"] --> APP
     CLI1["python app.py --pair-plug<br/>&lt;name> &lt;address> &lt;pin>"] --> PH["pair_homekit_accessory()"]
     CLI2["python app.py --tesla-auth"] --> TA["tesla_auth_cli()"]
-    CLI3["python app.py --provision-fleet-telemetry<br/>&lt;host> &lt;ca> [port]"] --> PT["provision_fleet_telemetry()"]
+    CLI3["python app.py --provision-fleet-telemetry"] --> PT["provision_fleet_telemetry(cfg)<br/>(FleetTelemetryProvisionConfig)"]
 
-    start_background_services["start_background_services()"] --> MQTTSTART["MQTT subscriber thread<br/>(if load_tesla_controller == 'real')"]
+    start_background_services["start_background_services()<br/>MQTT only if load_tesla_controller == 'real'<br/>load thread unless load_manage_enabled is False"] --> MQTTSTART["MQTT subscriber thread"]
     start_background_services --> LMTHREAD["Load management thread<br/>(if load management enabled)"]
-    LMTHREAD --> LOOP2["_load_management_loop()"]
-    APP --> REG["atexit → _shutdown_load_manager()"]
+    LMTHREAD --> LOOP2["_load_management_loop()<br/>_stop_event.wait(sleep_hint)"]
+    APP --> SHUT["cooperative shutdown<br/>request_shutdown() +<br/>install_shutdown_signal_hooks()<br/>gunicorn.conf.py hooks<br/>(post_worker_init / worker_int / worker_exit)"]
 ```
 
 ## Data Model Axioms
@@ -269,24 +276,28 @@ this axiom before adding defensive checks.
 
 | Concern | Module |
 |---|---|
-| Flask app, routes, background loops | `app.py` |
-| Gunicorn entry point | `wsgi.py` |
-| Energy fetch & hourly prediction | `metrics.py` |
-| Per-second sample cache | `energy_cache.py` |
+| Flask app, routes, background loops, cooperative shutdown | `app.py` |
+| Gunicorn entry point + shutdown hooks (timeout = 60) | `wsgi.py`, `gunicorn.conf.py` |
+| Energy fetch & hourly prediction, drift rejection | `metrics.py` |
+| Per-second sample cache (TTL 30s, fetch timeout 30s) | `energy_cache.py` |
+| Server-side per-second sparkline SVG | `chart.py` |
 | TOU aggregation | `energy_aggregator.py` |
-| NBC reading, state tracking, bin-packing decisions | `load_nbc.py` |
+| NBC reading, EffectStore / TeslaSettleTracker / StateTracker, TeslaDecider + GapMinder bin-packing | `load_nbc.py` |
+| Gap EWMA slope tracker (ramp-aware Tesla stop) | `gap_trend.py` |
 | Load cycle orchestration, OAuth, notifications queue | `load_manager.py` |
 | Device controllers (HomeKit, Tesla, Vocolinc), factories | `load_controllers.py` |
+| Vocolinc cloud API client | `vocolinc.py` |
 | Shared data models, telemetry parsing helpers | `load_models.py` |
 | Tesla MQTT telemetry parsing | `mqtt_telemetry.py` |
 | Quantization detection | `quantization.py` |
+| Named magic-number constants | `constants.py` |
 | Structured log formatting | `logfmt.py` |
 | SSE broadcaster | `sse_event.py` |
 | Telegram notifications | `telegram.py`, `telegram_client.py` |
 | Deferred config, Tesla/Plug config dataclasses | `config.py`, `config_loader.py` |
 | devices.json loader & integrity validation | `device_config.py` |
 | Quarter-hour helpers, compaction records | `util.py` |
-| Tesla OAuth routes | `tesla_oauth.py` |
+| Tesla OAuth Blueprint (`/api/v1/tesla/auth/initiate`, `/callback`, `/api/v1/tesla/status`) | `tesla_oauth.py` |
 | FakeClock / Clock protocol | `clock.py` |
 | Test data generation | `mockdata.py` |
 | Templates | `templates/` |
