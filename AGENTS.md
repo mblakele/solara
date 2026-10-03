@@ -328,9 +328,12 @@ project-root
                            # (the metrics fragment carries the hidden #data-freshness state
                            # strip mirrored onto the header #connection button by syncConnection()
                            # (dot-only when live+fresh; tap toggles data-show-text to reveal/hide
-                           # the age text) plus the "⚠ low confidence" period-label
-                           # replacement when
-                           # diag.reason == "excessive_jitter"; the
+                           # the age text) plus the forecast-period
+                           # label, which renders abnormal states
+                           # ("⚠ waiting for data" / "⚠ stale data" /
+                           # "⚠ low confidence" when
+                           # diag.reason == "excessive_jitter") in red
+                           # (forecast__period--warn); the
                            # sparkline filter receives quantization_seconds to feed
                            # chart.per_second_sparkline's bucket_secs downsampling)
 ├── static/                # Mobile-first design system (style.css) and the SSE dashboard

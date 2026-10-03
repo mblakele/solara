@@ -31,14 +31,16 @@
       </div>
     </header>
 
-    {# Reason-only signal: cycle status stays "ok" but the turn-on
-       jitter guard declined the cycle, so the forecast-period
-       label is replaced with a low-confidence marker.
+    {# Forecast-period label. Abnormal states — waiting for data,
+       stale data, and low confidence (cycle status stays "ok" but
+       the turn-on jitter guard declined the cycle) — carry the
+       "⚠ " prefix, which also drives the red warn styling.
        Server-rendered, arrives with the usual SSE fragment swap
        (no client-side ticking). #}
+    {% set period_label = "⚠ low confidence" if diag is not none and diag.reason == "excessive_jitter" else _status_label(load_management.last_cycle_result.status if load_management and load_management.last_cycle_result else "ok") %}
     <div class="forecast__value {{ 'forecast__value--gen' if qh1.predicted_wh is not none and qh1.predicted_wh < 0 else 'forecast__value--load' }}">
       {% if qh1.predicted_wh is not none %}
-      {{ "%+.0f" % (qh1.predicted_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period">{{ "⚠ low confidence" if diag is not none and diag.reason == "excessive_jitter" else _status_label(load_management.last_cycle_result.status if load_management and load_management.last_cycle_result else "ok") }}</span>
+      {{ "%+.0f" % (qh1.predicted_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period{{ ' forecast__period--warn' if period_label.startswith('⚠') else '' }}">{{ period_label }}</span>
       {% else %}
       <span class="forecast__placeholder">—</span>
       {% endif %}
