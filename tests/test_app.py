@@ -199,15 +199,15 @@ class TestApp(unittest.TestCase):
         from load_models import CycleResult
 
         cases = [
-            ("ok", "forecast this period"),
-            ("dry-run", "dry run"),
-            ("disabled", "disabled"),
-            ("no_incomplete_qh", "waiting for data"),
-            ("stale_data", "stale data"),
-            ("waiting_for_fresh_data", "waiting for data"),
+            ("ok", "forecast this period", False),
+            ("dry-run", "dry run", False),
+            ("disabled", "disabled", False),
+            ("no_incomplete_qh", "⚠ waiting for data", True),
+            ("stale_data", "⚠ stale data", True),
+            ("waiting_for_fresh_data", "⚠ waiting for data", True),
         ]
 
-        for status, expected_label in cases:
+        for status, expected_label, expect_warn in cases:
             with self.subTest(status=status):
                 mock_lm = unittest.mock.MagicMock()
                 mock_lm.enabled = True
@@ -230,6 +230,7 @@ class TestApp(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 data = response.data.decode("utf-8")
                 self.assertIn(expected_label, data)
+                self.assertEqual("forecast__period--warn" in data, expect_warn)
 
     def test_index_html_jitter_notice(self):
         """Forecast-period label is replaced by low confidence when the guard fired.
@@ -270,8 +271,10 @@ class TestApp(unittest.TestCase):
                 if reason == "excessive_jitter":
                     self.assertIn("⚠ low confidence", data)
                     self.assertNotIn("forecast this period", data)
+                    self.assertIn("forecast__period--warn", data)
                 else:
                     self.assertNotIn("⚠ low confidence", data)
+                    self.assertNotIn("forecast__period--warn", data)
 
     def test_index_real_mode_lm_disabled(self):
         """Index returns 200 in real mode when load management is disabled.

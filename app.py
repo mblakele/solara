@@ -1506,9 +1506,9 @@ _STATUS_LABELS = {
     "ok": "forecast this period",
     "dry-run": "dry run",
     "disabled": "disabled",
-    "no_incomplete_qh": "waiting for data",
-    "stale_data": "stale data",
-    "waiting_for_fresh_data": "waiting for data",
+    "no_incomplete_qh": "⚠ waiting for data",
+    "stale_data": "⚠ stale data",
+    "waiting_for_fresh_data": "⚠ waiting for data",
 }
 
 
