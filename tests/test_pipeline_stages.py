@@ -1536,3 +1536,150 @@ class TestBuildResultGapTrend:
         assert result.diagnostics is not None
         assert result.diagnostics.gap_jitter_wh_per_s is None
         assert result.diagnostics.to_dict()["gap_jitter_wh_per_s"] is None
+
+
+class TestPendingCheckRefreshesPlugState:
+    """_stage_pending_check() refreshes plug state even on early exit.
+
+    Regression for bugs/2026-10-03-plug-status-delay.log: Tesla
+    external-charge (and other pending-check gates) blocked the only
+    plug poll, so the dashboard kept showing sentinel + water heater
+    ON for ~4 min after they turned OFF. Decisions must stay gated,
+    but display state must go fresh.
+    """
+
+    def test_external_flip_visible_despite_tesla_gate(self) -> None:
+        """Plug flips are reconciled even when Tesla gate early-exits."""
+        from clock import FakeClock
+        from load_controllers import PlugController, TeslaController
+        from load_models import DeviceState, PlugConfig
+
+        now = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        plugs = {
+            "sentinel": PlugConfig(
+                name="sentinel", accessory_id="s1",
+                power_watts=10.0, priority=1,
+            ),
+            "water heater": PlugConfig(
+                name="water heater", accessory_id="w1",
+                power_watts=4857.0, priority=10,
+            ),
+        }
+        plug_ctrl = PlugController(plugs)
+        # Physical reality: both turned OFF (e.g. around Tesla start).
+        plug_ctrl._state["sentinel"] = False
+        plug_ctrl._state["water heater"] = False
+        mgr = LoadManager(LoadManagerConfig(
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=TeslaController(None),  # type: ignore[arg-type]
+            target_wh=-9,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=False,
+            clock=FakeClock(now),
+        ))
+        # Stale tracker: still thinks both are ON.
+        for name in ("sentinel", "water heater"):
+            mgr.state.devices[name] = DeviceState(
+                name=name, desired_state=True, actual_state=True,
+            )
+        local_ctx = CycleContext(now=now)
+        local_ctx.data_point_at = data_point
+        local_ctx.now_postfetch = now
+        local_ctx.seconds_remaining = 450
+        local_ctx.predicted_wh = -223.0
+        mgr.state.pending_effects.clear()
+        assert mgr.state.last_commanded_amps is None
+        with (
+            patch("load_manager.get_field_update_at", return_value=now),
+            patch(
+                "load_manager.get_telemetry_snapshot",
+                return_value={"ChargeAmps": 24, "ChargeState": "Charging"},
+            ),
+        ):
+            result = mgr._stage_pending_check(local_ctx)
+        # Gate still blocks decisions.
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.reason == "external_tesla_charge"
+        # But dashboard state is fresh.
+        assert mgr.state.devices["sentinel"].actual_state is False
+        assert mgr.state.devices["sentinel"].desired_state is False
+        assert mgr.state.devices["water heater"].actual_state is False
+        assert mgr.state.devices["water heater"].desired_state is False
+        by_name = {c.name: c for c in (result.candidates or [])}
+        assert by_name["sentinel"].actual_state is False
+        assert by_name["water heater"].actual_state is False
+
+
+class TestSinglePlugPollPerCycle:
+    """Full cycles poll each plug controller exactly once.
+
+    The pre-gate dashboard sync must be reused by the async phase,
+    not repeated — Vocolinc cloud calls are not free.
+    """
+
+    def test_run_cycle_polls_each_plug_once(self) -> None:
+        """A full run_cycle issues one get_state per plug, not two."""
+        import asyncio
+
+        from clock import FakeClock
+        from load_controllers import PlugController
+        from load_models import PlugConfig
+        from tests.helpers import _make_metrics_with_wh
+        from energy_cache import EnergyCache
+
+        now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
+        plugs = {
+            "water_heater": PlugConfig(
+                name="water_heater", accessory_id="abc123",
+                power_watts=4500.0, priority=20,
+            ),
+            "pool_pump": PlugConfig(
+                name="pool_pump", accessory_id="xyz789",
+                power_watts=1500.0, priority=10,
+            ),
+        }
+        plug_ctrl = PlugController(plugs)
+        metrics_data = _make_metrics_with_wh("main_panel", -6000.0)
+
+        def metrics_fetch():
+            return metrics_data
+
+        sample_value = -6000.0 / 900_000.0
+        qh_minute = (now.minute // 15) * 15
+        data_start = now.replace(
+            minute=qh_minute, second=0, microsecond=0
+        ) - timedelta(minutes=15)
+        sample_count = int((now - data_start).total_seconds())
+        energy_cache = EnergyCache(ttl_seconds=30)
+        with energy_cache._lock:
+            energy_cache.samples = [sample_value] * sample_count
+            energy_cache.data_start = data_start
+            energy_cache.last_sample_at = now - timedelta(seconds=1)
+            energy_cache.sample_count = sample_count
+            energy_cache.last_fetch_at = now
+            energy_cache._set_data_field(data_lag_secs=0.0)
+        mgr = LoadManager(LoadManagerConfig(
+            metrics_fetch=metrics_fetch,
+            energy_cache=energy_cache,
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=None,
+            target_wh=-500,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=False,
+            clock=FakeClock(now),
+        ))
+        counts: dict[str, int] = {"water_heater": 0, "pool_pump": 0}
+        orig_get_state = plug_ctrl.get_state
+
+        async def counting_get_state(name: str):
+            counts[name] = counts.get(name, 0) + 1
+            return await orig_get_state(name)
+
+        plug_ctrl.get_state = counting_get_state  # type: ignore[method-assign]
+        result = mgr.run_cycle()
+        assert result.status in ("ok", "dry-run")
+        assert counts == {"water_heater": 1, "pool_pump": 1}

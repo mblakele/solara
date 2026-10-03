@@ -838,7 +838,7 @@ class AsyncPhaseResult:
 
 @dataclass
 class CycleContext:
-    # Too many instance attributes (18/17): pipeline context accumulates one
+    # Too many instance attributes (20/17): pipeline context accumulates one
     # field per stage output by design (Direction A).
     # pylint: disable=too-many-instance-attributes
     """Intermediate state carried through the run_cycle() pipeline stages.
@@ -872,6 +872,12 @@ class CycleContext:
         actions: All actions decided by this cycle (including dry-run).
         sentinel_on: True when a sentinel device was found on.
         timings: Wall-clock seconds per pipeline stage, populated during run_cycle().
+
+        # Stage 3 (pending check) outputs
+        plug_pre_sync_done: Whether the pre-gate plug poll already ran.
+        plug_pre_sync_external: External flips found by the pre-gate poll,
+            already queued for Telegram. The async phase reuses the fresh
+            state instead of re-polling controllers.
     """
 
     # Input
@@ -898,6 +904,10 @@ class CycleContext:
     succeeded_effects: list[PendingEffect] = field(default_factory=list)
     actions: list[PendingEffect] = field(default_factory=list)
     sentinel_on: bool = False
+
+    # Stage 3 output: pre-gate plug poll reused by Stage 5.
+    plug_pre_sync_done: bool = False
+    plug_pre_sync_external: list[PendingEffect] = field(default_factory=list)
 
     # Timing
     timings: dict[str, float] = field(default_factory=dict)
