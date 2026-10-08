@@ -428,7 +428,7 @@ project-root
   answering us; bugs/2026-09-11-tesla-ghost-c.log), and `_arbitrate_tesla_state_from_rest()`
   polls REST `charge_state` for ambiguous (positive, uncorroborated, uncommanded) amps —
   load manager never starts charging itself, so every session begins this way. Polls are
-  spaced `TESLA_ARBITRATION_COOLDOWN_SECS` (300 s) apart; the verdict is sustained while
+  spaced `TESLA_ARBITRATION_COOLDOWN_SECS` (300 s) apart (definitive answers only — transport failures such as 408 offline leave the timestamp untouched so the next cycle retries instead of latching idle; bugs/2026-10-08-tesla-ghost.log); the verdict is sustained while
   amps stay positive and cleared on amps-zero, corroborated idle, or our own stop command
   (prevents a trim-restart loop). When live telemetry parses to `None` with no echo and
   no arbitration answer, the vehicle is treated as idle/disconnected — a not-charging
