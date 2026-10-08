@@ -1390,9 +1390,23 @@ class StateTracker:
         Returns:
             Number of effects removed.
         """
-        return self._effects.prune(
+        pruned = self._effects.prune(
             data_point_at, now, window_secs=self._pending_effect_min_secs
         )
+        if pruned:
+            # Orphaned-command guard (bugs/2026-10-08-weird-behavior.log):
+            # pruning the last Tesla set_amps effect must not leave
+            # settle.last_commanded_amps behind. With no surviving effect
+            # the settle-expired gate in inflight_wh() (which requires a
+            # recorded effect) can never fire, so a stale delta would persist
+            # all quarter whenever telemetry freezes at the old level.
+            has_tesla = any(
+                eff.device_name == "tesla" and eff.action == "set_amps"
+                for eff in self._effects.snapshot()
+            )
+            if not has_tesla and self.settle.last_commanded_amps is not None:
+                self.settle.record_command(None)
+        return pruned
 
     def can_toggle(
         self, device_name: str, now: datetime, turning_on: bool = True
