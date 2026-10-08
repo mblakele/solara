@@ -301,7 +301,9 @@ project-root
                            # JITTER_FLOOR_WH_PER_S, cluster B's quarter-opening flip is
                            # gated by JITTER_MAX_REMAINING_SECS, incident still fires);
                            # test_prune_orphaned_tesla_command.py the 2026-10-08 orphaned
-                           # 12A command (pruning the last set_amps clears last_commanded_amps)
+                           # 12A command (pruning the last set_amps clears last_commanded_amps);
+                           # test_commit_tesla_direction.py the 2026-10-08 7->5 cut
+                           # (commit classifies direction from live amps when the command expired)
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change

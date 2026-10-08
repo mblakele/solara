@@ -723,6 +723,17 @@ class LoadManager:
         for effect in ctx.succeeded_effects:
             if effect.device_name == "tesla" and effect.action == "set_amps":
                 prev_amps = self.state.last_commanded_amps
+                if (
+                    prev_amps is None
+                    and ctx.tesla_state is not None
+                    and ctx.tesla_state.current_amps is not None
+                ):
+                    # Expired/orphaned command (bugs/2026-10-08-tesla-chargeamps.log
+                    # c38): the tracker correctly holds None while the car is
+                    # actually at N A. Classify direction from live amps so a
+                    # 7->5 cut is a decrease (suppress turn_on), not an
+                    # increase.
+                    prev_amps = ctx.tesla_state.current_amps
                 new_amps = effect.target_amps
                 self.state.record_tesla_amp_command(new_amps)
                 if new_amps is not None and (
