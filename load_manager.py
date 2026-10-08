@@ -1165,7 +1165,6 @@ class LoadManager:
             < TESLA_ARBITRATION_COOLDOWN_SECS
         ):
             return None
-        self._last_rest_arbitration_at = now
         logger.debug(
             "tesla REST arbitration: polling charge_state for "
             "uncorroborated amps=%d",
@@ -1173,10 +1172,20 @@ class LoadManager:
         )
         rest_state = await self.tesla_ctrl._init_from_rest(snapshot=None)  # noqa: SLF001
         if rest_state is not None and rest_state.is_charging:
+            self._last_rest_arbitration_at = now
             self._last_rest_arbitration_charging = True
             self._last_tesla_at_home = rest_state.at_home
             return rest_state
-        self._last_rest_arbitration_charging = False
+        if rest_state is not None:
+            # Definitive idle answer: latch the cooldown so ghost periods
+            # don't poll-storm.
+            self._last_rest_arbitration_at = now
+            self._last_rest_arbitration_charging = False
+            return None
+        # Transport failure (408 offline, timeouts — bugs/2026-10-08-tesla-ghost.log
+        # c95): not an answer. Leave the timestamp and verdict untouched so the
+        # next cycle retries instead of serving a latched idle for 5 minutes
+        # while the car is actually charging.
         return None
 
     def _stage_pending_check(
