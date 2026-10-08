@@ -299,7 +299,9 @@ project-root
                            # (all 35 logged jitter-guard triples replayed through the real
                            # tracker: cluster A's quantization churn sits under
                            # JITTER_FLOOR_WH_PER_S, cluster B's quarter-opening flip is
-                           # gated by JITTER_MAX_REMAINING_SECS, incident still fires)
+                           # gated by JITTER_MAX_REMAINING_SECS, incident still fires);
+                           # test_prune_orphaned_tesla_command.py the 2026-10-08 orphaned
+                           # 12A command (pruning the last set_amps clears last_commanded_amps)
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change
@@ -612,7 +614,7 @@ project-root
   - `estimated_current_wh()`: adjusts raw NBC prediction with pending effect deltas
   - `has_pending_effect_since()`: checks if any action was taken after given timestamp
   - `pending_since_count()`: counts effects after a given timestamp (for diagnostics)
-  - `prune_old_effects()`: removes effects older than cutoff to prevent unbounded growth
+  - `prune_old_effects()`: removes effects older than cutoff to prevent unbounded growth; pruning the last Tesla `set_amps` effect also clears the orphaned `last_commanded_amps` (bugs/2026-10-08-weird-behavior.log)
   - `apply_prediction_window()`: resolves the prediction/settle window from shared-cache
     quantization; commits a new window only after two consecutive cycles and ignores
     dead-band jitter (see `_resolve_prediction_window`)
