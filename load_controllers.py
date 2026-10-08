@@ -275,6 +275,8 @@ class RealTeslaController(AbstractTeslaController):
         """Monotonic time of the last save_tokens() call (0 = never saved)."""
         self._last_command_vehicle_offline: bool = False
         """True when the last command failed with VehicleOffline."""
+        self._last_resolved_at_home: bool | None = None
+        """Last location-resolved at_home (None = never resolved)."""
 
     def _reset_runtime_state(self) -> None:
         """Reset cached session, API client, and last error.
@@ -763,8 +765,23 @@ class RealTeslaController(AbstractTeslaController):
                                 float(self.config.home_lat), float(self.config.home_lon),
                             )
                             at_home = dist_m <= self.config.home_radius_m
-                except Exception as e:
+                            self._last_resolved_at_home = at_home
+                        elif self._last_resolved_at_home is not None:
+                            # No coordinates in a successful response: not proof
+                            # the car moved — preserve the last resolved value.
+                            at_home = self._last_resolved_at_home
+                    elif self._last_resolved_at_home is not None:
+                        # Missing drive_state: same reasoning, preserve.
+                        at_home = self._last_resolved_at_home
+                except BaseException as e:
+                    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    # Location-fetch failure (timeouts, 408 offline, ...) is not
+                    # proof the car drove away (bugs/2026-10-08-tesla-ghost.log):
+                    # preserve the last resolved value instead of latching False.
                     logger.warning("_init_from_rest: tesla API location_data fetch failed: %s", e)
+                    if self._last_resolved_at_home is not None:
+                        at_home = self._last_resolved_at_home
             else:
                 logger.debug(
                     "_init_from_rest: skipping location_data fetch "

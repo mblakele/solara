@@ -437,7 +437,7 @@ project-root
   is NOT used as an answer (ghost-guard; bugs/2026-08-31-ghost-tesla-amps.log). Delegates
   to controller's `init_tesla_state()` (which waits up to 60 s for telemetry, then REST)
   when telemetry is not yet available or when `at_home` is unseeded and `Location` is
-  absent (to seed location). `_init_from_rest()` reports `current_amps=0` (not the stale
+  absent (to seed location). Location-fetch failures preserve the last resolved at_home instead of latching False (bugs/2026-10-08-tesla-ghost.log). `_init_from_rest()` reports `current_amps=0` (not the stale
   pilot) whenever REST `charging_state != "Charging"` (bugs/2026-09-09-tesla-ghost-b.log);
   same zeroing applies to the MQTT `DetailedChargeState`-present path
 - Data models in `load_models.py`
