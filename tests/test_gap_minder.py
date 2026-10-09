@@ -1733,7 +1733,7 @@ def test_jitter_guard_blocks_turn_on_when_swing_exceeds_gap():
         state=state,
         plugs=plugs,
         tesla=None,
-        gap_jitter_wh_per_s=0.25,  # swing = 0.25 * 100 = 25 Wh >= gap 20 Wh
+        gap_jitter_wh_per_s=0.5,  # swing = 0.5 * 100 = 50 Wh >= 2.0 * 20 Wh
     )
 
     actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
@@ -1760,7 +1760,7 @@ def test_jitter_guard_fires_at_exact_boundary():
         state=state,
         plugs=plugs,
         tesla=None,
-        gap_jitter_wh_per_s=0.2,  # swing = 20.0 Wh == gap 20 Wh
+        gap_jitter_wh_per_s=0.4,  # swing = 40.0 Wh == 2.0 * gap 20 Wh
     )
 
     actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
@@ -1787,7 +1787,7 @@ def test_jitter_guard_blocks_tesla_increase():
         state=state,
         plugs={},
         tesla=tesla,
-        gap_jitter_wh_per_s=0.25,  # swing 25 Wh >= gap 20 Wh
+        gap_jitter_wh_per_s=0.5,  # swing 50 Wh >= 2.0 * gap 20 Wh
     )
 
     actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
@@ -1963,9 +1963,9 @@ def test_jitter_guard_floor_is_inclusive():
     assert JITTER_FLOOR_WH_PER_S > 0.0
     assert (
         engine.turn_on_jitter_guard_fires(
-            20.0, JITTER_FLOOR_WH_PER_S, 100
+            15.0, JITTER_FLOOR_WH_PER_S, 150
         )
-        is True  # swing = 0.2 * 100 = 20 Wh == gap 20 Wh
+        is True  # swing = 0.2 * 150 = 30 Wh == 2.0 * gap 15 Wh
     )
 
 
@@ -1973,16 +1973,16 @@ def test_jitter_guard_swing_capped_at_horizon():
     """A long quarter can no longer be used to inflate a small churn.
 
     churn 0.25 at R=800 projects 200 Wh uncapped, which would block any
-    realistic gap; capped at JITTER_HORIZON_SECS it is 75 Wh and declines
-    a 100 Wh surplus instead of vetoing it.
+    realistic gap; capped at JITTER_HORIZON_SECS it is 37.5 Wh and a
+    100 Wh surplus proceeds instead of being vetoed.
     """
     engine = GapMinder(hysteresis_wh=3)
-    assert JITTER_HORIZON_SECS == 300
+    assert JITTER_HORIZON_SECS == 150
     assert (
         engine.turn_on_jitter_guard_fires(100.0, 0.25, 800) is False
     )
-    # Below the cap nothing changes: the same churn still fires a 60 Wh gap.
-    assert engine.turn_on_jitter_guard_fires(60.0, 0.25, 299) is True
+    # Below the cap nothing changes: enough churn still fires a 60 Wh gap.
+    assert engine.turn_on_jitter_guard_fires(60.0, 0.9, 149) is True
 
 
 def test_jitter_swing_logged_matches_predicate(caplog):
@@ -2001,13 +2001,13 @@ def test_jitter_swing_logged_matches_predicate(caplog):
         gap_jitter_wh_per_s=0.5,
     )
     with caplog.at_level(logging.INFO, logger="load_nbc"):
-        actions = engine.decide(ctx=ctx, predicted_wh=-109.0, target_wh=-9.0)
+        actions = engine.decide(ctx=ctx, predicted_wh=-39.0, target_wh=-9.0)
 
     assert actions == []
-    assert jitter_swing_wh(0.5, 800) == pytest.approx(150.0)
+    assert jitter_swing_wh(0.5, 800) == pytest.approx(75.0)
     guard_records = [
         r for r in caplog.records if r.getMessage().startswith("gapminder_jitter_guard")
     ]
     assert guard_records, "guard fired but logged nothing"
-    assert guard_records[0].swing_wh == pytest.approx(150.0)
+    assert guard_records[0].swing_wh == pytest.approx(75.0)
 

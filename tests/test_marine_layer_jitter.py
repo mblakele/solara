@@ -179,7 +179,7 @@ def test_incident_still_fires() -> None:
     churn around 0.80 Wh/s at R=111. Both gates are far below that.
     """
     assert JITTER_FLOOR_WH_PER_S == 0.2
-    assert JITTER_HORIZON_SECS == 300
+    assert JITTER_HORIZON_SECS == 150
     assert JITTER_MAX_REMAINING_SECS == 600
     # R below the horizon cap, churn four times the floor.
     assert _engine().turn_on_jitter_guard_fires(7.688, 0.7986, 111) is True
