@@ -191,8 +191,9 @@ and reports it as `gap_jitter_wh_per_s` in
 
 `GapMinder.turn_on_jitter_guard_fires()` (`load_nbc.py`) declines a
 turn-on cycle when `churn × seconds_remaining ≥ JITTER_GUARD_FRACTION ×
-gap` (constant `1.0` in `constants.py`, sized by the replay in
-`tests/test_tesla_overshoot_replay.py`, not by intuition): the estimate
+gap` (constant `2.0` in `constants.py`, sized by the replays in
+`tests/test_tesla_overshoot_replay.py` and
+`tests/test_undershoot_jitter_retune.py`, not by intuition): the estimate
 is swinging harder than its verdict, so the verdict is not actionable
 information. Three gates keep that comparison honest, all sized by the
 same evidence-and-replay discipline:
@@ -204,8 +205,8 @@ same evidence-and-replay discipline:
   `sigma_rate` of 0.0222 — and reported "excessive jitter" 35 times
   (`bugs/2026-10-02-sunrise-marine-layer-jitter.log`, cluster A, churn
   0.0147–0.0468). The incident's churn (≈0.80 at c579) is 4× above it.
-* `JITTER_HORIZON_SECS` (`300`) — the swing is projected only over
-  `min(seconds_remaining, 300)`. Churn is measured from 30–60 s cycle
+* `JITTER_HORIZON_SECS` (`150`) — the swing is projected only over
+  `min(seconds_remaining, 150)`. Churn is measured from 30–60 s cycle
   spacing with a 3-sample window; scaling it by the whole remaining
   quarter (up to 900 s) projects a rate-change far past the horizon it
   speaks to, so a low churn could veto any early-quarter surplus.

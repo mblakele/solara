@@ -212,9 +212,9 @@ project-root
                            # DATA_STALE_ALERT_THRESHOLD_SECS=300 for Telegram data-health
                            # alerts, Tesla charging constants TESLA_HARD_MAX_AMPS, etc.,
                            # DEFAULT_HYSTERESIS_WH=20 residential fallback,
-                           # JITTER_GUARD_FRACTION=1.0 turn-on jitter guard,
+                           # JITTER_GUARD_FRACTION=2.0 turn-on jitter guard,
                            # JITTER_FLOOR_WH_PER_S=0.2 churn noise floor,
-                           # JITTER_HORIZON_SECS=300 swing projection cap,
+                           # JITTER_HORIZON_SECS=150 swing projection cap,
                            # JITTER_MAX_REMAINING_SECS=600 churn readiness gate)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
@@ -300,6 +300,9 @@ project-root
                            # tracker: cluster A's quantization churn sits under
                            # JITTER_FLOOR_WH_PER_S, cluster B's quarter-opening flip is
                            # gated by JITTER_MAX_REMAINING_SECS, incident still fires);
+                           # test_undershoot_jitter_retune.py the 2026-10-09 undershoot
+                           # (fraction 2.0 / horizon 150: 4 of 5 sampled guard triples
+                           # stay quiet, highest-churn one still fires, c579 still fires);
                            # test_prune_orphaned_tesla_command.py the 2026-10-08 orphaned
                            # 12A command (pruning the last set_amps clears last_commanded_amps);
                            # test_commit_tesla_direction.py the 2026-10-08 7->5 cut

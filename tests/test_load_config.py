@@ -1883,8 +1883,8 @@ def test_decide_actions_propagates_jitter_guard_flag(mock_config):
         enabled=True,
         dry_run=False,
     ))
-    # Swing 0.25 * 100 s = 25 Wh >= gap (-9 - (-29)) = 20 Wh.
-    mgr._last_gap_jitter_wh_per_s = 0.25
+    # Swing 0.5 * 100 s = 50 Wh >= 2.0 * gap (-9 - (-29)) = 40 Wh.
+    mgr._last_gap_jitter_wh_per_s = 0.5
 
     tz = pytz.timezone("America/Los_Angeles")
     fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)

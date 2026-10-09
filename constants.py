@@ -149,15 +149,20 @@ window spanning a quarter-hour boundary), so the tracker clears history
 instead of trusting it. Real production deltas are 30-60 s, because half
 the cycles exit early on ``waiting_for_fresh_data``."""
 
-JITTER_GUARD_FRACTION: float = 1.0
+JITTER_GUARD_FRACTION: float = 2.0
 """Turn-on jitter guard: decline when ``churn * seconds_remaining`` reaches
 this multiple of the surplus gap it is claiming.
 
 Sized by the overshoot replay (``tests/test_tesla_overshoot_replay.py``),
 not by intuition: with 1.0 the guard blocks the oscillation-driven c579
 +1 A increase from ``bugs/2026-10-01-tesla-overshoot.log`` and lands the
-quarter within ~3 Wh of the -9 Wh target instead of +1.74 Wh. Turn-on
-only — turn-off and the ramp-aware stop are protective and unaffected."""
+quarter within ~3 Wh of the -9 Wh target instead of +1.74 Wh. Raised to
+2.0 for ``bugs/2026-10-09-undershoot.log`` (see
+``tests/test_undershoot_jitter_retune.py``): that morning's guard triples
+fired at swing/gap ratios of 1.5-3.9 while c579 fires at ~11.5, so 2.0
+keeps the incident blocked with wide margin while letting the persistent
+20-37 Wh surplus gaps act. Turn-on only — turn-off and the ramp-aware
+stop are protective and unaffected."""
 
 JITTER_FLOOR_WH_PER_S: float = 0.2
 """Minimum churn (Wh/s) the jitter guard will act on at all.
@@ -180,7 +185,7 @@ Sized from both ends:
 The comparison is strict (``churn < floor`` declines the guard), so a
 value exactly at the floor still participates."""
 
-JITTER_HORIZON_SECS: int = 300
+JITTER_HORIZON_SECS: int = 150
 """Longest remaining-quarter horizon a churn estimate may project over.
 
 Churn is an EWMA of ``|Δslope|`` measured across 30-60 s cycle spacing
@@ -188,10 +193,14 @@ with a 3-sample window. Multiplying it by the *whole* remaining quarter
 (up to 900 s) projects a rate-change far past the horizon over which it
 says anything: 0.2 Wh/s at R=900 becomes a 180 Wh "swing" that vetoes
 any realistic surplus. Capped here the same churn blocks gaps up to
-60 Wh, so the guard stays responsive to genuinely large early-quarter
+30 Wh, so the guard stays responsive to genuinely large early-quarter
 surplus while a measured oscillation no longer scales with how much of
-the quarter is left. Well above the incident horizons (c579 R=111,
-c575 R=209), which are therefore unaffected."""
+the quarter is left. Lowered from 300 for
+``bugs/2026-10-09-undershoot.log`` (see
+``tests/test_undershoot_jitter_retune.py``): at 300 s the morning's
+0.20-0.45 churn projected 50-116 Wh swings against 20-37 Wh gaps;
+at 150 s four of five triples stay quiet. Well above the incident
+horizon (c579 R=111), which is therefore unaffected."""
 
 JITTER_MAX_REMAINING_SECS: int = 600
 """Churn is not measurable while more than this much of a quarter remains.
