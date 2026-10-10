@@ -122,6 +122,100 @@ reliable NBC prediction.  Below this threshold the pipeline returns
 ``no_incomplete_qh`` with a short sleep hint instead of acting on a
 wildly extrapolated single-sample prediction."""
 
+# ── Gap trend (ramp-aware Tesla stop) ────────────────────────────────
+
+GAP_TREND_WINDOW: int = 3
+"""Number of recent (data_point_at, gap) samples retained for slope
+estimation.  Three samples yield two consecutive slopes, the minimum
+needed to confirm a sustained ramp before acting on it."""
+
+GAP_TREND_EWMA_ALPHA: float = 0.3
+"""Weight of the most recent slope in the exponentially weighted moving
+average over the window.  Dampens single-cycle spikes while tracking
+sustained ramps such as sunset."""
+
+GAP_TREND_MIN_SLOPES: int = 2
+"""Slopes required before a gap trend is trusted. A single slope (two
+samples) is never enough — clouds and meter jitter flip the sign within
+one cycle. Zero slopes are neutral and neither confirm nor break."""
+
+GAP_TREND_MAX_SPAN_SECS: int = 120
+"""Largest ``data_point_at`` delta the gap tracker will slope across.
+
+Matches ``TeslaDecider.MAX_DEFER_SECS``, the furthest horizon a stop
+decision ever examines. A slope averaged over more seconds than that
+describes a regime the decision cannot act on (e.g. a long stall, or a
+window spanning a quarter-hour boundary), so the tracker clears history
+instead of trusting it. Real production deltas are 30-60 s, because half
+the cycles exit early on ``waiting_for_fresh_data``."""
+
+JITTER_GUARD_FRACTION: float = 2.0
+"""Turn-on jitter guard: decline when ``churn * seconds_remaining`` reaches
+this multiple of the surplus gap it is claiming.
+
+Sized by the overshoot replay (``tests/test_tesla_overshoot_replay.py``),
+not by intuition: with 1.0 the guard blocks the oscillation-driven c579
++1 A increase from ``bugs/2026-10-01-tesla-overshoot.log`` and lands the
+quarter within ~3 Wh of the -9 Wh target instead of +1.74 Wh. Raised to
+2.0 for ``bugs/2026-10-09-undershoot.log`` (see
+``tests/test_undershoot_jitter_retune.py``): that morning's guard triples
+fired at swing/gap ratios of 1.5-3.9 while c579 fires at ~11.5, so 2.0
+keeps the incident blocked with wide margin while letting the persistent
+20-37 Wh surplus gaps act. Turn-on only — turn-off and the ramp-aware
+stop are protective and unaffected."""
+
+JITTER_FLOOR_WH_PER_S: float = 0.2
+"""Minimum churn (Wh/s) the jitter guard will act on at all.
+
+``churn * seconds_remaining >= gap`` collapses to ``churn >= gap / R``,
+and on a calm quarter that threshold is tiny: for the 6-8 Wh surplus of
+``bugs/2026-10-02-sunrise-marine-layer-jitter.log`` it was 0.0091-0.0124
+Wh/s — *below* that quarter's own realized ``sigma_rate`` of 0.0222 Wh/s,
+so any nonzero churn reported "excessive jitter" (35 times, on a
+morning where nothing was happening).
+
+Sized from both ends:
+  * Lower anchor (calm baseline): that log's churn never exceeded 0.0468
+    while firing, and the largest single ``|Δslope|`` its quantization
+    steps can produce is 0.1032. One ``prediction_w`` step of 0.0025
+    Wh/s moved across R≈650 s in 30 s yields ≈0.054 Wh/s of pure
+    extrapolation noise, so 0.2 clears roughly two such steps.
+  * Upper anchor (the incident): the overshoot replay needs the guard to
+    fire at c579 where churn ≈ 0.80 — 4x headroom below this floor.
+The comparison is strict (``churn < floor`` declines the guard), so a
+value exactly at the floor still participates."""
+
+JITTER_HORIZON_SECS: int = 150
+"""Longest remaining-quarter horizon a churn estimate may project over.
+
+Churn is an EWMA of ``|Δslope|`` measured across 30-60 s cycle spacing
+with a 3-sample window. Multiplying it by the *whole* remaining quarter
+(up to 900 s) projects a rate-change far past the horizon over which it
+says anything: 0.2 Wh/s at R=900 becomes a 180 Wh "swing" that vetoes
+any realistic surplus. Capped here the same churn blocks gaps up to
+30 Wh, so the guard stays responsive to genuinely large early-quarter
+surplus while a measured oscillation no longer scales with how much of
+the quarter is left. Lowered from 300 for
+``bugs/2026-10-09-undershoot.log`` (see
+``tests/test_undershoot_jitter_retune.py``): at 300 s the morning's
+0.20-0.45 churn projected 50-116 Wh swings against 20-37 Wh gaps;
+at 150 s four of five triples stay quiet. Well above the incident
+horizon (c579 R=111), which is therefore unaffected."""
+
+JITTER_MAX_REMAINING_SECS: int = 600
+"""Churn is not measurable while more than this much of a quarter remains.
+
+``predicted_wh = raw_wh + prediction_w * remaining_seconds``; past 600 s
+remaining at least two thirds of the projection is extrapolation from a
+≤300 s trailing window, so a ``prediction_w`` step — or our own
+just-realized action entering that window — moves the gap with no new
+information. Seeding the churn EWMA there produced
+``bugs/2026-10-02-sunrise-marine-layer-jitter.log`` cluster B: one
+quarter-opening sign flip of ``prediction_w`` seeded churn at 1.10 and it
+then decayed ×0.7 for five minutes of "excessive jitter" reports. The
+tracker still records every sample for the trend; only churn accumulation
+waits for the ready window."""
+
 # ── Fetch drift observability ────────────────────────────────────────
 
 DRIFT_REJECTION_ALERT_AFTER: int = 5

@@ -524,3 +524,40 @@ def test_stop_clears_arbitration_latch():
     ]
     mgr._stage_commit(ctx)  # noqa: SLF001
     assert mgr._last_rest_arbitration_charging is False  # noqa: SLF001
+
+
+def test_arbitration_transport_failure_does_not_latch_cooldown():
+    """REST failure (408 offline) is not an answer: no cooldown latch.
+
+    Reproduces bugs/2026-10-08-tesla-ghost.log c95: arbitration polled for
+    uncorroborated 8A, REST returned 408 vehicle-offline, and the failure
+    latched a 300 s idle verdict while the car was actually charging (Tesla
+    app). The next poll only ran after cooldown expiry and failed again.
+    A transport failure must leave _last_rest_arbitration_at unset so the
+    next cycle retries instead of reporting idle for 5 minutes.
+    """
+    from clock import FakeClock
+    from unittest.mock import AsyncMock
+
+    clock = FakeClock()
+    mgr, ctrl = _make_lm_with_real_ctrl_and_clock(clock)
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 8.0},
+        ),
+        patch.object(
+            ctrl, "_init_from_rest", new=AsyncMock(return_value=None)
+        ) as mock_rest,
+    ):
+        state1, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+        assert state1 is not None and state1.is_charging is False
+        assert mock_rest.call_count == 1
+        assert mgr._last_rest_arbitration_at is None  # noqa: SLF001
+        # Next cycle retries immediately instead of serving a latched idle.
+        clock.advance(60)
+        state2, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
+        assert state2 is not None and state2.is_charging is False
+        assert mock_rest.call_count == 2

@@ -202,3 +202,36 @@ class TestInitTeslaStateVehicleOffline:
                         assert result is None
 
         assert ctrl._backoff_secs == CAR_OFFLINE_BACKOFF_MAX
+
+
+@pytest.mark.asyncio
+async def test_init_from_rest_location_failure_preserves_prior_at_home(
+    tesla_config,
+):
+    """Location-fetch failure must not overwrite a resolved at_home=True.
+
+    Reproduces the at_home half of bugs/2026-10-08-tesla-ghost.log: charge_state
+    succeeds (charging) but location_data transiently fails. The default
+    at_home=False would then seed _last_tesla_at_home=False and block Tesla
+    decisions until a location fetch succeeds. A fetch failure is not proof
+    the car drove away — preserve the last resolved value.
+    """
+    from unittest.mock import patch
+
+    from load_controllers import RealTeslaController
+    ctrl = RealTeslaController(tesla_config)
+    mock_charge = {
+        "charge_state": {"charging_state": "Charging", "charge_amps": 8}
+    }
+    mock_location = {
+        "drive_state": {"latitude": 37.0, "longitude": -122.0}
+    }
+    with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
+        mock_fetch.side_effect = [mock_charge, mock_location]
+        first = await ctrl._init_from_rest()
+    assert first is not None and first.at_home is True
+
+    with patch.object(ctrl, "_fetch_vehicle_data") as mock_fetch:
+        mock_fetch.side_effect = [mock_charge, TimeoutError("location read timed out")]
+        second = await ctrl._init_from_rest()
+    assert second is not None and second.at_home is True

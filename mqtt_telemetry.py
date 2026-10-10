@@ -148,7 +148,7 @@ def has_telemetry() -> bool:
     with _telemetry_lock:
         result = bool(_telemetry_state)
     if not result and not _telemetry_warned_empty:
-        logger.warning("mqtt_telemetry: has_telemetry() is False — no MQTT messages received yet")
+        logger.warning("has_telemetry() is False — no MQTT messages received yet")
         _telemetry_warned_empty = True
     return result
 
@@ -202,7 +202,7 @@ def on_message(_client: Any, _userdata: Any, msg: Any) -> None:  # noqa: ARG001
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
-            logger.warning("mqtt_telemetry: non-JSON payload on %s", topic)
+            logger.warning("non-JSON payload on %s", topic)
             return
 
         # Unwrap fleet-telemetry's {"value": ..., "createdAt": ...} envelope.
@@ -214,12 +214,12 @@ def on_message(_client: Any, _userdata: Any, msg: Any) -> None:  # noqa: ARG001
             _field_update_at[field] = datetime.now(timezone.utc)
 
         if is_new:
-            logger.info("mqtt_telemetry: first value for field %s = %r", field, value)
+            logger.info("first value for field %s = %r", field, value)
         else:
-            logger.debug("mqtt_telemetry: %s = %r", field, value)
+            logger.debug("update %s = %r", field, value)
 
     except Exception:  # pylint: disable=broad-exception-caught
-        logger.exception("mqtt_telemetry.on_message: unexpected error")
+        logger.exception("on_message: unexpected error")
 
 
 def check_fleet_telemetry_dotfile() -> None:
@@ -235,12 +235,12 @@ def check_fleet_telemetry_dotfile() -> None:
             tz=timezone.utc,
         )
         logger.info(
-            "mqtt_telemetry: fleet-telemetry provisioned at %s (%s)",
+            "fleet-telemetry provisioned at %s (%s)",
             mtime.isoformat(), _FLEET_TELEMETRY_DOTFILE,
         )
     else:
         logger.warning(
-            "mqtt_telemetry: fleet-telemetry dotfile not found (%s) — "
+            "fleet-telemetry dotfile not found (%s) — "
             "vehicle may not be provisioned; run --provision-fleet-telemetry",
             _FLEET_TELEMETRY_DOTFILE,
         )
@@ -266,7 +266,7 @@ def stop_mqtt_subscriber() -> None:
         client.disconnect()
     except Exception:  # pylint: disable=broad-exception-caught
         logger.debug(
-            "mqtt_telemetry: disconnect during shutdown failed", exc_info=True
+            "disconnect during shutdown failed", exc_info=True
         )
 
 
@@ -297,7 +297,7 @@ def start_mqtt_subscriber(cfg: Any) -> None:
     with _subscriber_lock:
         if _subscriber_thread is not None and _subscriber_thread.is_alive():
             logger.info(
-                "mqtt_telemetry: subscriber already running; "
+                "subscriber already running; "
                 "ignoring duplicate start"
             )
             return
@@ -321,7 +321,7 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                         # Superseded session: never touch shared health state
                         # or subscribe — drop the connection instead.
                         logger.info(
-                            "mqtt_telemetry: ignoring CONNACK from "
+                            "ignoring CONNACK from "
                             "superseded session"
                         )
                         c.disconnect()
@@ -330,13 +330,13 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                         was_connected = True
                         _set_connection_ok(True)
                         logger.info(
-                            "mqtt_telemetry: connected to %s:%d, subscribing to %s/#",
+                            "connected to %s:%d, subscribing to %s/#",
                             host, port, topic_base,
                         )
                         c.subscribe(f"{topic_base}/#")
                     else:
                         logger.error(
-                            "mqtt_telemetry: connection failed rc=%d host=%s port=%d"
+                            "connection failed rc=%d host=%s port=%d"
                             " — check mqtt_host/mqtt_port config",
                             rc, host, port,
                         )
@@ -345,10 +345,10 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                     if _session_gen == gen:
                         _set_connection_ok(False)
                     if rc == 0:
-                        logger.info("mqtt_telemetry: disconnected cleanly")
+                        logger.info("disconnected cleanly")
                     else:
                         logger.warning(
-                            "mqtt_telemetry: unexpected disconnect rc=%s"
+                            "unexpected disconnect rc=%s"
                             " — will reconnect",
                             rc,
                         )
@@ -376,13 +376,13 @@ def start_mqtt_subscriber(cfg: Any) -> None:
                     if _stop_event.is_set() or _session_gen != gen:
                         return
                     logger.warning(
-                        "mqtt_telemetry: network loop exited — reconnecting"
+                        "network loop exited — reconnecting"
                     )
                 except Exception:  # pylint: disable=broad-exception-caught
                     if _stop_event.is_set() or _session_gen != gen:
                         return
                     logger.exception(
-                        "mqtt_telemetry: connection attempt failed host=%s port=%d",
+                        "connection attempt failed host=%s port=%d",
                         host, port,
                     )
                 finally:
@@ -412,7 +412,7 @@ def start_mqtt_subscriber(cfg: Any) -> None:
         _subscriber_thread = t
         t.start()
         logger.info(
-            "mqtt_telemetry: subscriber thread started host=%s port=%d topic=%s/#",
+            "subscriber thread started host=%s port=%d topic=%s/#",
             host, port, topic_base,
         )
 
@@ -446,12 +446,6 @@ def tesla_state_from_snapshot(
         Populated ``TeslaState``, or ``None`` if insufficient data.
     """
 
-    logger.debug(
-        "mqtt_telemetry: snapshot fields present: %s",
-        sorted(snapshot.keys()) if snapshot else "(empty)",
-    )
-
-
     # ── Parse DetailedChargeState (if available) ─────────────────────────
     detailed_charge_state_raw = snapshot.get("DetailedChargeState")
     if detailed_charge_state_raw is not None:
@@ -471,7 +465,7 @@ def tesla_state_from_snapshot(
         # corroboration; ChargeAmps alone is the pilot setting, not proof.
         if not telemetry_indicates_charging(snapshot):
             logger.warning(
-                "mqtt_telemetry: tesla_state_from_snapshot returning None — "
+                "tesla_state_from_snapshot returning None — "
                 "no corroborated charging state (snapshot keys: %s)",
                 sorted(snapshot.keys()),
             )
@@ -480,7 +474,7 @@ def tesla_state_from_snapshot(
         if charge_val is not None and charge_val > 0:
             # Corroborated charging (ChargeState == "Charging") with amps.
             logger.info(
-                "mqtt_telemetry: inferred charging from ChargeAmps=%s "
+                "inferred charging from ChargeAmps=%s "
                 "corroborated by ChargeState",
                 charge_val,
             )
@@ -491,7 +485,7 @@ def tesla_state_from_snapshot(
                 at_home=_compute_at_home_from_location(snapshot),
             )
         logger.warning(
-            "mqtt_telemetry: tesla_state_from_snapshot returning None — "
+            "tesla_state_from_snapshot returning None — "
             "corroborated charging state without positive ChargeAmps "
             "(snapshot keys: %s)",
             sorted(snapshot.keys()),

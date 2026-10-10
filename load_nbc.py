@@ -12,7 +12,7 @@ import logging
 import math
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 
@@ -25,6 +25,9 @@ from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTele
 from constants import (
     DEFAULT_HYSTERESIS_WH,
     DEFAULT_PREDICTION_WINDOW_SECS,
+    JITTER_FLOOR_WH_PER_S,
+    JITTER_GUARD_FRACTION,
+    JITTER_HORIZON_SECS,
     MIN_SECONDS_TO_ACT,
     SETTLE_WINDOW_DEADBAND_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
@@ -151,6 +154,7 @@ class NBCFetchResult:
     seconds_remaining: int
     data_point_at: datetime
     samples_used: int | None = None
+    raw_wh: float | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +168,7 @@ class ParsedMetricsQH:
     seconds_remaining: int
     data_lag_secs: float
     samples_used: int | None = None
+    raw_wh: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for backward compat."""
@@ -172,6 +177,7 @@ class ParsedMetricsQH:
             "predicted_wh": self.predicted_wh,
             "seconds_remaining": self.seconds_remaining,
             "_data_lag_secs": self.data_lag_secs,
+            "raw_wh": self.raw_wh,
         }
 
 
@@ -292,6 +298,7 @@ class NBCReader:
                     seconds_remaining=qh_data.get("seconds_remaining", 0),
                     data_point_at=data_point_at,
                     samples_used=qh_data.get("samples_used"),
+                    raw_wh=qh_data.get("raw_wh"),
                 )
             # Cache is valid but no incomplete QH (QH1 is complete) — fall
             # through to the fetch path below so we can check for a newer
@@ -322,6 +329,7 @@ class NBCReader:
                 seconds_remaining=parsed.seconds_remaining,
                 data_point_at=data_point_at,
                 samples_used=parsed.samples_used,
+                raw_wh=parsed.raw_wh,
             )
 
         # force=True but no fetch callable: fall back to reading from cache.
@@ -340,6 +348,7 @@ class NBCReader:
                 seconds_remaining=qh_data.get("seconds_remaining", 0),
                 data_point_at=data_point_at,
                 samples_used=qh_data.get("samples_used"),
+                raw_wh=qh_data.get("raw_wh"),
             )
 
         return None
@@ -413,6 +422,7 @@ class NBCReader:
                     seconds_remaining=remaining_seconds,
                     data_lag_secs=metrics_data.get("_data_lag_secs", 0.0),
                     samples_used=qh_data.get("samples_used"),
+                    raw_wh=qh_data.get("raw_wh"),
                 )
                 # Don't break — keep scanning for the last complete QH fallback.
             else:
@@ -1387,9 +1397,23 @@ class StateTracker:
         Returns:
             Number of effects removed.
         """
-        return self._effects.prune(
+        pruned = self._effects.prune(
             data_point_at, now, window_secs=self._pending_effect_min_secs
         )
+        if pruned:
+            # Orphaned-command guard (bugs/2026-10-08-weird-behavior.log):
+            # pruning the last Tesla set_amps effect must not leave
+            # settle.last_commanded_amps behind. With no surviving effect
+            # the settle-expired gate in inflight_wh() (which requires a
+            # recorded effect) can never fire, so a stale delta would persist
+            # all quarter whenever telemetry freezes at the old level.
+            has_tesla = any(
+                eff.device_name == "tesla" and eff.action == "set_amps"
+                for eff in self._effects.snapshot()
+            )
+            if not has_tesla and self.settle.last_commanded_amps is not None:
+                self.settle.record_command(None)
+        return pruned
 
     def can_toggle(
         self, device_name: str, now: datetime, turning_on: bool = True
@@ -1481,6 +1505,20 @@ class DecideContext:
             home_lat/home_lon, the engine checks ``tesla.at_home`` before
             issuing charging actions. When False (missing config), Tesla
             charging is allowed regardless of location.
+        gap_trend_wh_per_s: Sustained slope of the adjusted gap in Wh/s
+            (positive = deficit growing), or None when unconfirmed.
+            Only hastens Tesla stops; never delays them.
+        gap_jitter_wh_per_s: Cycle-to-cycle churn of the gap estimate in
+            Wh/s (EWMA of |delta slope|), or None before the first
+            compute_gap and 0.0 when not yet measurable. Turn-on consumers
+            multiply by ``seconds_remaining`` to bound the projection's
+            own cycle-to-cycle swing.
+        cycle_secs: Decision cadence in seconds. The ramp rule stops now
+            when the exact-hit stop time falls within one cycle.
+        banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``,
+            negative = net export), or None when unknown. Lets a plug
+            turn-on proceed despite jitter when the bank covers its full
+            cost (see ``banked_cover_cap_wh``); never consults Tesla.
     """
 
     now: datetime
@@ -1491,6 +1529,10 @@ class DecideContext:
     dry_run: bool = False
     data_point_at: datetime | None = None
     requires_home_check: bool = True
+    gap_trend_wh_per_s: float | None = None
+    gap_jitter_wh_per_s: float | None = None
+    cycle_secs: int = 30
+    banked_wh: float | None = None
 
 
 def make_plug_effect(
@@ -1594,6 +1636,12 @@ class TeslaDecider:
 
     TESLA_AMP_CHANGE_THRESHOLD = 1
     MAX_DEFER_SECS = 120          # cap on the safe defer window
+    RAMP_TREND_CLAMP_FRACTION = 0.5
+    """Cap on a trusted gap trend as a fraction of Tesla 5A draw.
+
+    A single-cycle spike must not slam the stop decision: the trend used
+    in the ramp rule is clamped to half the car's minimum draw rate.
+    """
     HARD_MAX_AMPS = TESLA_HARD_MAX_AMPS
     """Absolute max — never exceed, regardless of config."""
 
@@ -1663,6 +1711,34 @@ class TeslaDecider:
         return int(
             min(self.MAX_DEFER_SECS, remaining_reduction / (self.car_power_watts_5a / 3600))
         )
+
+    def _ramp_stop_now(self, ctx: DecideContext, reduce_wh: float) -> bool:
+        """Return True when a rising deficit pulls the stop into this cycle.
+
+        The static defer rule assumes a frozen prediction. With a sustained
+        deficit growth rate ``r`` the exact-hit stop time is
+        ``t* = (P·R − G₀)/(P + r)`` (P = 5A draw in Wh/s, R = remaining,
+        G₀ = gap). When ``t*`` falls within one decision cycle, waiting a
+        full cycle overshoots the optimum, so stop now. Only hastens stops
+        (positive trusted trends); flat, shrinking, or unconfirmed trends
+        keep the static rule byte-for-byte.
+
+        Args:
+            ctx: Decision context (carries the trusted trend and cadence).
+            reduce_wh: Wh reduction needed (always positive).
+
+        Returns:
+            True to stop now despite static defer headroom.
+        """
+        trend = ctx.gap_trend_wh_per_s
+        if trend is None or trend <= 0:
+            return False
+        power_wh_per_s = self.car_power_watts_5a / 3600
+        clamped = min(trend, power_wh_per_s * self.RAMP_TREND_CLAMP_FRACTION)
+        t_star = (power_wh_per_s * ctx.seconds_remaining - reduce_wh) / (
+            power_wh_per_s + clamped
+        )
+        return t_star <= ctx.cycle_secs
 
     def decide_increase(
         self,
@@ -1791,13 +1867,23 @@ class TeslaDecider:
             # remaining than the safe window (i.e., we have buffer to stop later).
             safe_defer_secs = self.safe_defer_secs(reduce_wh)
             if ctx.seconds_remaining > safe_defer_secs:
-                logger.debug(
-                    "[_decide_tesla_reduce] deferring stop: current_amps=%d, "
-                    "seconds_remaining=%d, safe_defer=%ds, gap=%.1f Wh",
-                    current_amps, ctx.seconds_remaining, safe_defer_secs,
-                    reduce_wh,
-                )
-                return None
+                if self._ramp_stop_now(ctx, reduce_wh):
+                    logger.debug(
+                        "[_decide_tesla_reduce] ramp stop: t* within one "
+                        "cycle (seconds_remaining=%d, safe_defer=%ds, "
+                        "gap=%.1f Wh, trend=%.3f Wh/s)",
+                        ctx.seconds_remaining, safe_defer_secs,
+                        reduce_wh,
+                        ctx.gap_trend_wh_per_s,
+                    )
+                else:
+                    logger.debug(
+                        "[_decide_tesla_reduce] deferring stop: current_amps=%d, "
+                        "seconds_remaining=%d, safe_defer=%ds, gap=%.1f Wh",
+                        current_amps, ctx.seconds_remaining, safe_defer_secs,
+                        reduce_wh,
+                    )
+                    return None
             logger.info(
                 "action=turn_off device=tesla reason=amps_min_reached current_amps=%d",
                 current_amps,
@@ -1864,6 +1950,29 @@ class TeslaDecider:
             new_amps, new_amps - current_amps, ctx.now,
             data_point_at=ctx.data_point_at,
         )
+
+
+def jitter_swing_wh(jitter_wh_per_s: float, seconds_remaining: int) -> float:
+    """Projected swing (Wh) a churn estimate claims over the rest of a quarter.
+
+    Churn is measured from 30-60 s cycle spacing with a 3-sample window, so
+    projecting it across the entire remaining quarter overstates the horizon
+    over which it means anything. The projection is therefore capped at
+    ``JITTER_HORIZON_SECS``.
+
+    This single helper is used by the guard predicate, by ``GapMinder.decide``'s
+    ``gapminder_jitter_guard`` INFO line, and by the manager's
+    ``gap_jitter ... swing_wh=`` DEBUG line, so log, reason, and decision can
+    never disagree about what swing was judged.
+
+    Args:
+        jitter_wh_per_s: Gap-slope churn in Wh/s (never ``None`` here).
+        seconds_remaining: Seconds left in the current quarter.
+
+    Returns:
+        The horizon-capped swing in Wh.
+    """
+    return jitter_wh_per_s * min(seconds_remaining, JITTER_HORIZON_SECS)
 
 
 class GapMinder:
@@ -2052,6 +2161,49 @@ class GapMinder:
             return []
 
         if gap > 0:
+            # Jitter guard (turn-on only): when the estimate's own
+            # cycle-to-cycle swing meets the gap it is claiming, the claim
+            # is not actionable information — decline and say so. Turn-off
+            # and the ramp-aware stop stay untouched (protective paths).
+            jitter = ctx.gap_jitter_wh_per_s
+            if jitter is not None and self.turn_on_jitter_guard_fires(
+                gap, jitter, ctx.seconds_remaining
+            ):
+                cover = self.banked_cover_cap_wh(
+                    ctx.banked_wh, target_wh,
+                )
+                if cover is not None:
+                    swing = jitter_swing_wh(jitter, ctx.seconds_remaining)
+                    logger.info(
+                        "gapminder_banked_override gap=%.1f banked=%.1f "
+                        "cover=%.1f jitter=%.4f swing=%.1f R=%d",
+                        gap, ctx.banked_wh, cover,
+                        jitter, swing, ctx.seconds_remaining,
+                        extra={"event": "gapminder_banked_override",
+                               "gap_wh": gap, "banked_wh": ctx.banked_wh,
+                               "cover_wh": cover,
+                               "jitter_wh_per_s": jitter,
+                               "swing_wh": swing,
+                               "seconds_remaining": ctx.seconds_remaining},
+                    )
+                    budget = self._turn_on_budget(gap)
+                    # Plugs only: a Tesla-less ctx keeps the amp increase
+                    # behind the guard (c579's 7.4 Wh bet would otherwise
+                    # sail through on banked cover).
+                    return self._decide_turn_on(
+                        replace(ctx, tesla=None), budget,
+                        capacity_cap_wh=cover,
+                    )
+                swing = jitter_swing_wh(jitter, ctx.seconds_remaining)
+                logger.info(
+                    "gapminder_jitter_guard gap=%.1f jitter=%.4f swing=%.1f R=%d",
+                    gap, jitter, swing, ctx.seconds_remaining,
+                    extra={"event": "gapminder_jitter_guard",
+                           "gap_wh": gap, "jitter_wh_per_s": jitter,
+                           "swing_wh": swing,
+                           "seconds_remaining": ctx.seconds_remaining},
+                )
+                return []
             budget = self._turn_on_budget(gap)
             logger.info(
                 "gapminder_decide direction=turn_on gap=%.1f edge_gap=%.1f hysteresis=%d",
@@ -2070,12 +2222,104 @@ class GapMinder:
             ctx, budget,
         )
 
-    def _decide_turn_on(self, ctx: DecideContext, gap: float) -> list[PendingEffect]:
+    def turn_on_jitter_guard_fires(
+        self,
+        gap_wh: float,
+        jitter_wh_per_s: float | None,
+        seconds_remaining: int,
+    ) -> bool:
+        """Whether the turn-on jitter guard must decline this cycle.
+
+        The guard fires when the adjusted gap estimate's own cycle-to-
+        cycle swing (churn x seconds remaining) meets the surplus gap it
+        is claiming: the estimate is oscillating harder than its verdict,
+        so it is not actionable information. One query serves both
+        ``decide()`` (which declines) and ``LoadManager._decide_actions``
+        (which reports ``reason="excessive_jitter"``), so the decision and
+        its report can never disagree. It is a method rather than a
+        ``DecideContext`` output because that dataclass is frozen by
+        contract (``tests/test_decide_context.py``).
+
+        Two gates keep the comparison honest, both sized from evidence
+        rather than intuition:
+
+        * ``JITTER_FLOOR_WH_PER_S`` — churn below the floor is the
+          forecast window's own quantization, not oscillation. Without
+          it ``churn >= gap / R`` collapses to ~0.01 Wh/s on a calm
+          quarter (``bugs/2026-10-02-sunrise-marine-layer-jitter.log``:
+          35 "excessive jitter" reports at churn 0.015-0.047).
+        * ``JITTER_HORIZON_SECS`` — the swing is projected only over the
+          horizon the churn measurement can speak to, so a 30-60 s slope
+          change is not scaled by however much quarter is left
+          (``jitter_swing_wh``).
+
+        Args:
+            gap_wh: The gap decide() computes (``target_wh -
+                predicted_wh``); positive = surplus (turn-on direction).
+            jitter_wh_per_s: Gap churn in Wh/s, or None when never
+                measured. None never fires.
+            seconds_remaining: Seconds left in the current quarter-hour.
+
+        Returns:
+            True when the guard must decline. False inside the hysteresis
+            band, on deficits (turn-off is protective and unguarded), when
+            ``jitter < JITTER_FLOOR_WH_PER_S``, and when
+            ``jitter_swing_wh(jitter, seconds_remaining) <
+            JITTER_GUARD_FRACTION * gap``.
+        """
+        if jitter_wh_per_s is None or gap_wh <= self.HYSTERESIS_WH:
+            return False
+        if jitter_wh_per_s < JITTER_FLOOR_WH_PER_S:
+            return False
+        swing = jitter_swing_wh(jitter_wh_per_s, seconds_remaining)
+        return swing >= JITTER_GUARD_FRACTION * gap_wh
+
+    def banked_cover_cap_wh(
+        self,
+        banked_wh: float | None,
+        target_wh: float,
+    ) -> float | None:
+        """Max plug Wh the banked quarter energy absorbs despite jitter.
+
+        Even under zero further export, turning on a plug costing at most
+        this much lands within ``target + hysteresis``: ``banked_wh`` is
+        measured, the plug rating and ``seconds_remaining`` are known, so
+        unlike the jittery extrapolation this side of the bet is certain.
+        Plugs only — callers must keep Tesla increases behind the guard
+        (``bugs/2026-10-01-tesla-overshoot.log`` c579: raw −49.4 would
+        "cover" the 7.4 Wh +1 A bet the guard exists to block).
+
+        Args:
+            banked_wh: Accumulated quarter energy (``qh1.raw_wh``,
+                negative = net export), or None when unknown.
+            target_wh: The quarter target (negative = surplus).
+
+        Returns:
+            Coverage cap in Wh, or None when there is no banked value or
+            the bank is already above the bar (no cover to grant).
+        """
+        if banked_wh is None:
+            return None
+        cover = target_wh + self.HYSTERESIS_WH - banked_wh
+        if cover < 0:
+            return None
+        return cover
+
+    def _decide_turn_on(
+        self,
+        ctx: DecideContext,
+        gap: float,
+        capacity_cap_wh: float | None = None,
+    ) -> list[PendingEffect]:
         """Turn on eligible loads to absorb excess solar.
 
         Args:
             ctx: Decision context.
             gap: The Wh surplus to absorb.
+            capacity_cap_wh: Optional banked-cover cap: candidates must
+                additionally cost at most this much (pass-through from the
+                ``gapminder_banked_override`` path in ``decide()``).
+                None preserves the unguarded behavior.
 
         Returns:
             List of PendingEffect objects.
@@ -2095,6 +2339,15 @@ class GapMinder:
 
         for _, name, plug in candidates:
             capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
+            if capacity_cap_wh is not None and capacity > capacity_cap_wh:
+                logger.debug(
+                    "[_decide_turn_on] %s: uncovered "
+                    "(capacity=%.1f Wh > banked cover %.1f Wh)",
+                    name,
+                    capacity,
+                    capacity_cap_wh,
+                )
+                continue
             if capacity <= remaining_gap:
                 logger.debug(
                     "[_decide_turn_on] %s: turning on "

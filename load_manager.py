@@ -32,6 +32,7 @@ from constants import (
     DATA_STALE_ALERT_THRESHOLD_SECS,
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
+    JITTER_MAX_REMAINING_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
     STALE_DATA_THRESHOLD_SECS,
     TESLA_ARBITRATION_COOLDOWN_SECS,
@@ -96,11 +97,14 @@ from load_nbc import (
     StateTracker,
     GapMinder,
     DecideContext,
+    jitter_swing_wh,
     make_plug_effect,
 )
 from quantization import usable_window
 
 from energy_cache import EnergyCache
+
+from gap_trend import GapTrendTracker
 
 from metrics import DriftAlert, drain_drift_alerts
 
@@ -327,6 +331,16 @@ class LoadManager:
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
         )
+        # Ramp awareness: EWMA slope of the adjusted gap across cycles,
+        # fed in _stage_compute_gap and exposed in diagnostics. The last
+        # trusted rate (or None) is kept for early-exit result payloads.
+        self.gap_trend = GapTrendTracker()
+        self._last_gap_trend_wh_per_s: float | None = None
+        self._last_gap_jitter_wh_per_s: float | None = None
+        # Reset per async phase (like _vehicle_offline_this_cycle): set by
+        # _decide_actions when the turn-on jitter guard declined the cycle,
+        # read by _determine_no_action_reason. Never leaks across cycles.
+        self._jitter_guard_fired = False
         # Tracks the last known at_home value from Location telemetry snapshots.
         # Preserved when Location is absent so the requires_home_check gate in
         # GapMinder doesn't incorrectly block Tesla decisions.
@@ -527,6 +541,21 @@ class LoadManager:
             "settle_window_secs": self.state.effective_settle_secs,
         }
 
+    def _gap_trend_diagnostics(self) -> dict[str, Any]:
+        """Most recent gap-trend rate and gap jitter for cycle diagnostics.
+
+        Returns:
+            Dict with ``gap_trend_wh_per_s`` (None when no sustained
+            trend is confirmed) and ``gap_jitter_wh_per_s`` (churn in
+            Wh/s; None before the first compute_gap, 0.0 after a cycle
+            where churn was not yet measurable). Early-exit paths report
+            the last compute_gap values.
+        """
+        return {
+            "gap_trend_wh_per_s": self._last_gap_trend_wh_per_s,
+            "gap_jitter_wh_per_s": self._last_gap_jitter_wh_per_s,
+        }
+
     def is_enabled_at(self, now: datetime) -> bool:
         """Check if load management is enabled at the given moment.
 
@@ -596,6 +625,7 @@ class LoadManager:
             )
         ctx.qh_name = qh_result.qh_name
         ctx.predicted_wh = qh_result.predicted_wh
+        ctx.banked_wh = qh_result.raw_wh
         ctx.seconds_remaining = qh_result.seconds_remaining
         ctx.data_point_at = qh_result.data_point_at
         fetch_end = _time_mod.perf_counter()
@@ -629,6 +659,41 @@ class LoadManager:
         gap_wh = self.target_wh - adjusted_wh
         ctx.adjusted_wh = adjusted_wh
         ctx.gap_wh = gap_wh
+        # Feed the trend tracker on the pending-effect-corrected gap so the
+        # slope never chases our own actions. Keyed on data_point_at: stale
+        # or repeated fetches are ignored inside the tracker, which also
+        # resets itself on quarter-hour rollover and over-long data gaps.
+        noise_floor = (
+            self.engine.HYSTERESIS_WH / seconds_remaining
+            if seconds_remaining > 0
+            else 0.0
+        )
+        # Churn is withheld while the projection is still extrapolation-
+        # dominated: past JITTER_MAX_REMAINING_SECS of a quarter at least
+        # two thirds of predicted_wh is prediction_w * seconds_remaining, so
+        # a forecast-window step (or our own just-realized action entering
+        # that window) moves the gap with no new information. The sample is
+        # still recorded — the trend and its trust rule are unaffected.
+        rate, trusted = self.gap_trend.update(
+            data_point_at, gap_wh, noise_floor=noise_floor,
+            churn_ready=seconds_remaining <= JITTER_MAX_REMAINING_SECS,
+        )
+        ctx.gap_trend_wh_per_s = rate if trusted else None
+        self._last_gap_trend_wh_per_s = ctx.gap_trend_wh_per_s
+        # Jitter: the churn accumulator moves regardless of trust, so the
+        # payload reports swing even where the trend stays dark (the
+        # oscillating overshoot series). 0.0 = not yet measurable.
+        churn = self.gap_trend.churn_wh_per_s
+        ctx.gap_jitter_wh_per_s = churn
+        self._last_gap_jitter_wh_per_s = churn
+        if churn > 0.0:
+            logger.debug(
+                "gap_jitter churn=%.4f swing_wh=%.1f seconds_remaining=%d "
+                "trend_trusted=%s",
+                churn, jitter_swing_wh(churn, seconds_remaining),
+                seconds_remaining, trusted,
+                extra={"event": "gap_jitter"},
+            )
 
     def _stage_commit(self, ctx: CycleContext) -> CycleResult | None:
         """Stage 6: Sentinel check, commit effects, Tesla tracking, hysteresis.
@@ -659,6 +724,17 @@ class LoadManager:
         for effect in ctx.succeeded_effects:
             if effect.device_name == "tesla" and effect.action == "set_amps":
                 prev_amps = self.state.last_commanded_amps
+                if (
+                    prev_amps is None
+                    and ctx.tesla_state is not None
+                    and ctx.tesla_state.current_amps is not None
+                ):
+                    # Expired/orphaned command (bugs/2026-10-08-tesla-chargeamps.log
+                    # c38): the tracker correctly holds None while the car is
+                    # actually at N A. Classify direction from live amps so a
+                    # 7->5 cut is a decrease (suppress turn_on), not an
+                    # increase.
+                    prev_amps = ctx.tesla_state.current_amps
                 new_amps = effect.target_amps
                 self.state.record_tesla_amp_command(new_amps)
                 if new_amps is not None and (
@@ -796,6 +872,7 @@ class LoadManager:
                 active_tesla_telemetry=active_telemetry,
                 tesla_command_offline=self._vehicle_offline_this_cycle,
                 **self._quantization_diagnostics(),
+                **self._gap_trend_diagnostics(),
             ),
             sleep_hint=(
                 DEFAULT_SLEEP_HINT_SECS
@@ -816,6 +893,9 @@ class LoadManager:
         overwriting ctx.gap_wh and ctx.adjusted_wh with corrected values
         from the async phase. Always returns None.
         """
+        # Fresh per cycle: a guard-fired decision from the previous cycle
+        # must not color this cycle's no-action reason.
+        self._jitter_guard_fired = False
         gap_wh = ctx.gap_wh
         adjusted_wh = ctx.adjusted_wh
         now_postfetch = ctx.now_postfetch
@@ -832,10 +912,17 @@ class LoadManager:
 
         if self.telegram_sender is not None:
             self.telegram_sender.reset_session()
+        pre_synced = (
+            list(ctx.plug_pre_sync_external)
+            if ctx.plug_pre_sync_done
+            else None
+        )
         res = asyncio.run(
             self._cycle_async_phase(
                 gap_wh, adjusted_wh, now_postfetch, seconds_remaining,
                 self.dry_run, qh_name, data_point_at=data_point_at,
+                pre_synced_external=pre_synced,
+                banked_wh=ctx.banked_wh,
             )
         )
         ctx.tesla_state = res.tesla_state
@@ -902,6 +989,44 @@ class LoadManager:
         else:
             return
         self.state.sync_tesla_device_state(_not_charging_state(at_home=at_home))
+
+    def _sync_plugs_for_dashboard(self, ctx: CycleContext) -> None:
+        """Poll plug controllers so early exits still show fresh state.
+
+        The async phase reuses this poll instead of re-polling (see
+        ``plug_pre_sync_done`` on CycleContext), so each cycle issues
+        one controller round-trip per plug. This refresh reuses the
+        full ``_sync_plug_states`` reconcile (desired/actual update,
+        synthetic pending effects for NBC math, runtime books).
+        External flips observed here are alerted immediately with the
+        raw prediction since an early exit has no corrected gap yet;
+        the async phase must not re-queue them.
+
+        Args:
+            ctx: Current pipeline context (provides predicted_wh and
+                timestamps for the alert fallback; carries the
+                pre-sync result to Stage 5).
+        """
+        try:
+            external = asyncio.run(self._sync_plug_states())
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("Pre-gate plug sync failed", exc_info=True)
+            return
+        ctx.plug_pre_sync_done = True
+        ctx.plug_pre_sync_external = list(external)
+        if not external:
+            return
+        predicted_wh = ctx.predicted_wh
+        if predicted_wh is None:
+            predicted_wh = float(self.target_wh)
+        now = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
+        self._queue_surplus_notification(
+            actions=external,
+            predicted_wh=predicted_wh,
+            target_wh=self.target_wh,
+            dry_run=self.dry_run,
+            now=now,
+        )
 
     def _commanded_charge_echo(
         self, snapshot: dict[str, Any],
@@ -1042,7 +1167,6 @@ class LoadManager:
             < TESLA_ARBITRATION_COOLDOWN_SECS
         ):
             return None
-        self._last_rest_arbitration_at = now
         logger.debug(
             "tesla REST arbitration: polling charge_state for "
             "uncorroborated amps=%d",
@@ -1050,10 +1174,20 @@ class LoadManager:
         )
         rest_state = await self.tesla_ctrl._init_from_rest(snapshot=None)  # noqa: SLF001
         if rest_state is not None and rest_state.is_charging:
+            self._last_rest_arbitration_at = now
             self._last_rest_arbitration_charging = True
             self._last_tesla_at_home = rest_state.at_home
             return rest_state
-        self._last_rest_arbitration_charging = False
+        if rest_state is not None:
+            # Definitive idle answer: latch the cooldown so ghost periods
+            # don't poll-storm.
+            self._last_rest_arbitration_at = now
+            self._last_rest_arbitration_charging = False
+            return None
+        # Transport failure (408 offline, timeouts — bugs/2026-10-08-tesla-ghost.log
+        # c95): not an answer. Leave the timestamp and verdict untouched so the
+        # next cycle retries instead of serving a latched idle for 5 minutes
+        # while the car is actually charging.
         return None
 
     def _stage_pending_check(
@@ -1062,13 +1196,17 @@ class LoadManager:
         """Stage 3: Check whether NBC data is stale or pending effects
         are not yet reflected in the prediction.
 
-        Refreshes the dashboard Tesla entry from live telemetry first so
-        early exits don't leave a stale charging display behind, then
+        Refreshes the dashboard Tesla entry from live telemetry and the
+        plug entries from their controllers first so early exits don't
+        leave a stale display behind (bugs/2026-10-03-plug-status-delay.log
+        showed sentinel + water heater stuck ON for ~4 min while
+        external_tesla_charge gates blocked the only plug poll), then
         runs the gates. When force=True, bypasses all checks and returns
         None immediately. Otherwise returns a CycleResult for early-exit
         conditions or None to continue the pipeline.
         """
         self._refresh_tesla_display_from_telemetry()
+        self._sync_plugs_for_dashboard(ctx)
         if ctx.force:
             return None
 
@@ -1382,6 +1520,7 @@ class LoadManager:
                 sentinel_names=sentinel_names,
                 sentinel_on=sentinel_on,
                 **self._quantization_diagnostics(),
+                **self._gap_trend_diagnostics(),
             ),
             sleep_hint=sleep_hint,
             sleep_hint_at=sleep_hint_at,
@@ -1522,6 +1661,10 @@ class LoadManager:
         """
         if results:
             return "ok"
+        if self._jitter_guard_fired:
+            # The turn-on jitter guard declined the cycle (set by
+            # _decide_actions): report it ahead of candidate-based reasons.
+            return "excessive_jitter"
 
         gap_positive = gap_wh > 0
         has_eligible = False
@@ -2504,6 +2647,7 @@ class LoadManager:
         seconds_remaining: int,
         dry_run: bool,
         data_point_at: datetime | None,
+        banked_wh: float | None = None,
     ) -> list[PendingEffect]:
         """Run GapMinder.decide() with the eligible candidates.
 
@@ -2515,28 +2659,44 @@ class LoadManager:
             seconds_remaining: Seconds left in the current quarter-hour.
             dry_run: When True, decide without mutating device state.
             data_point_at: Current NBC data-point-at timestamp.
+            banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``),
+                or None when unknown. Feeds the banked-cover override.
 
         Returns:
             List of decided PendingEffect actions.
         """
-        return self.engine.decide(
-            ctx=DecideContext(
-                now=now,
-                seconds_remaining=seconds_remaining,
-                state=self.state,
-                plugs=eligible_plugs,
-                tesla=eligible_tesla,
-                dry_run=dry_run,
-                data_point_at=data_point_at,
-                requires_home_check=(
-                    self.tesla_config is not None
-                    and self.tesla_config.home_lat is not None
-                    and self.tesla_config.home_lon is not None
-                ),
+        decide_ctx = DecideContext(
+            now=now,
+            seconds_remaining=seconds_remaining,
+            state=self.state,
+            plugs=eligible_plugs,
+            tesla=eligible_tesla,
+            dry_run=dry_run,
+            data_point_at=data_point_at,
+            requires_home_check=(
+                self.tesla_config is not None
+                and self.tesla_config.home_lat is not None
+                and self.tesla_config.home_lon is not None
             ),
+            gap_trend_wh_per_s=self._last_gap_trend_wh_per_s,
+            gap_jitter_wh_per_s=self._last_gap_jitter_wh_per_s,
+            cycle_secs=self.config_interval_secs,
+            banked_wh=banked_wh,
+        )
+        actions = self.engine.decide(
+            ctx=decide_ctx,
             predicted_wh=corrected_adjusted_wh,
             target_wh=self.target_wh,
         )
+        # Mirror the guard outcome for _determine_no_action_reason. Same
+        # predicate decide() applies (recomputed from identical inputs),
+        # so the report can never disagree with the decision.
+        self._jitter_guard_fired = self.engine.turn_on_jitter_guard_fires(
+            self.target_wh - corrected_adjusted_wh,
+            decide_ctx.gap_jitter_wh_per_s,
+            seconds_remaining,
+        )
+        return actions
 
     async def _run_actions(
         self, actions: list[PendingEffect], dry_run: bool
@@ -2576,12 +2736,19 @@ class LoadManager:
         dry_run: bool,
         qh_name: str | None = None,
         data_point_at: datetime | None = None,
+        *,
+        pre_synced_external: list[PendingEffect] | None = None,
+        banked_wh: float | None = None,
     ) -> AsyncPhaseResult:
         """Run the async portion of a cycle in a single event loop.
 
         Syncs plug states from controllers, fetches Tesla state, calls decide()
         with that state, then executes all resulting actions. Consolidating into
         one coroutine means one event loop per cycle instead of one per action.
+
+        When ``pre_synced_external`` is not None the pre-gate dashboard poll
+        already reconciled plug state (and queued its alerts), so the body
+        reuses that state instead of re-polling controllers.
 
         Tesla amp-change effects have no power_watts so they're excluded from
         estimated_current_wh(). After fetching the vehicle state we recompute
@@ -2599,6 +2766,8 @@ class LoadManager:
             return await self._cycle_async_phase_body(
                 gap_wh, adjusted_wh, now, seconds_remaining,
                 dry_run, qh_name=qh_name, data_point_at=data_point_at,
+                pre_synced_external=pre_synced_external,
+                banked_wh=banked_wh,
             )
         finally:
             await self._cleanup_sessions()
@@ -2612,12 +2781,22 @@ class LoadManager:
         dry_run: bool,
         qh_name: str | None = None,
         data_point_at: datetime | None = None,
+        *,
+        pre_synced_external: list[PendingEffect] | None = None,
+        banked_wh: float | None = None,
     ) -> AsyncPhaseResult:
         """Body of _cycle_async_phase, extracted for try/finally cleanup."""
         self._vehicle_offline_this_cycle = False
-        early, external_actions = await self._async_sync_and_check_sentinel()
-        if early is not None:
-            return early
+        if pre_synced_external is not None:
+            # Pre-gate poll already reconciled state and queued its alerts;
+            # reuse it without re-polling controllers or double-queuing.
+            if self.is_sentinel_on():
+                return AsyncPhaseResult(sentinel_on=True)
+            external_actions: list[PendingEffect] = []
+        else:
+            early, external_actions = await self._async_sync_and_check_sentinel()
+            if early is not None:
+                return early
         tesla_state, tesla_error, tesla_login_url = (
             await self._fetch_tesla_state_async(now=now)
         )
@@ -2664,6 +2843,7 @@ class LoadManager:
         actions = self._decide_actions(
             eligible_plugs, eligible_tesla, corrected_adjusted_wh,
             now, seconds_remaining, dry_run, data_point_at,
+            banked_wh=banked_wh,
         )
         succeeded_effects, results = await self._run_actions(actions, dry_run)
 
