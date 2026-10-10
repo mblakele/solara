@@ -854,6 +854,9 @@ class CycleContext:
         # Stage 2 (NBC fetch) outputs
         qh_name: Current quarter-hour identifier (QH1–QH4), or None.
         predicted_wh: Raw NBC prediction for the current QH, or None.
+        banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``,
+            negative = net export), or None when unknown. Feeds the
+            banked-cover jitter override for plug turn-ons.
         seconds_remaining: Seconds left in the current QH, or None.
         data_point_at: Timestamp of the most recent NBC data point, or None.
 
@@ -887,6 +890,7 @@ class CycleContext:
     # Stage 2 output
     qh_name: str | None = None
     predicted_wh: float | None = None
+    banked_wh: float | None = None
     seconds_remaining: int | None = None
     data_point_at: datetime | None = None
     now_postfetch: datetime | None = None
