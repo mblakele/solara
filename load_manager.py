@@ -625,6 +625,7 @@ class LoadManager:
             )
         ctx.qh_name = qh_result.qh_name
         ctx.predicted_wh = qh_result.predicted_wh
+        ctx.banked_wh = qh_result.raw_wh
         ctx.seconds_remaining = qh_result.seconds_remaining
         ctx.data_point_at = qh_result.data_point_at
         fetch_end = _time_mod.perf_counter()
@@ -921,6 +922,7 @@ class LoadManager:
                 gap_wh, adjusted_wh, now_postfetch, seconds_remaining,
                 self.dry_run, qh_name, data_point_at=data_point_at,
                 pre_synced_external=pre_synced,
+                banked_wh=ctx.banked_wh,
             )
         )
         ctx.tesla_state = res.tesla_state
@@ -2645,6 +2647,7 @@ class LoadManager:
         seconds_remaining: int,
         dry_run: bool,
         data_point_at: datetime | None,
+        banked_wh: float | None = None,
     ) -> list[PendingEffect]:
         """Run GapMinder.decide() with the eligible candidates.
 
@@ -2656,6 +2659,8 @@ class LoadManager:
             seconds_remaining: Seconds left in the current quarter-hour.
             dry_run: When True, decide without mutating device state.
             data_point_at: Current NBC data-point-at timestamp.
+            banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``),
+                or None when unknown. Feeds the banked-cover override.
 
         Returns:
             List of decided PendingEffect actions.
@@ -2676,6 +2681,7 @@ class LoadManager:
             gap_trend_wh_per_s=self._last_gap_trend_wh_per_s,
             gap_jitter_wh_per_s=self._last_gap_jitter_wh_per_s,
             cycle_secs=self.config_interval_secs,
+            banked_wh=banked_wh,
         )
         actions = self.engine.decide(
             ctx=decide_ctx,
@@ -2732,6 +2738,7 @@ class LoadManager:
         data_point_at: datetime | None = None,
         *,
         pre_synced_external: list[PendingEffect] | None = None,
+        banked_wh: float | None = None,
     ) -> AsyncPhaseResult:
         """Run the async portion of a cycle in a single event loop.
 
@@ -2760,6 +2767,7 @@ class LoadManager:
                 gap_wh, adjusted_wh, now, seconds_remaining,
                 dry_run, qh_name=qh_name, data_point_at=data_point_at,
                 pre_synced_external=pre_synced_external,
+                banked_wh=banked_wh,
             )
         finally:
             await self._cleanup_sessions()
@@ -2775,6 +2783,7 @@ class LoadManager:
         data_point_at: datetime | None = None,
         *,
         pre_synced_external: list[PendingEffect] | None = None,
+        banked_wh: float | None = None,
     ) -> AsyncPhaseResult:
         """Body of _cycle_async_phase, extracted for try/finally cleanup."""
         self._vehicle_offline_this_cycle = False
@@ -2834,6 +2843,7 @@ class LoadManager:
         actions = self._decide_actions(
             eligible_plugs, eligible_tesla, corrected_adjusted_wh,
             now, seconds_remaining, dry_run, data_point_at,
+            banked_wh=banked_wh,
         )
         succeeded_effects, results = await self._run_actions(actions, dry_run)
 

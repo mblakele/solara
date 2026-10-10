@@ -221,6 +221,20 @@ same evidence-and-replay discipline:
   trend window (slope, trust rule and `gap_trend_wh_per_s` unchanged)
   and withholds it only from the churn accumulator.
 
+* Banked cover (`GapMinder.banked_cover_cap_wh`, plugs only) — when the
+  guard fires but the already-banked quarter energy (`qh1.raw_wh`,
+  negative = net export, plumbed as `DecideContext.banked_wh`) covers a
+  plug's full remaining cost even under zero further export
+  (`banked + capacity ≤ target + hysteresis`), that plug may still turn
+  on via a Tesla-less `_decide_turn_on` pass (`gapminder_banked_override`
+  INFO line). Bin-packing budget, debounce, and `MIN_SECONDS_TO_ACT`
+  still apply, and the cover is inherently runway-aware (big early bets
+  stay blocked, shrinking late ones release). Tesla increases never take
+  this path: c579's raw −49.4 would "cover" the 7.4 Wh +1 A bet the
+  guard exists to block. Sized by `tests/test_banked_cover.py` against
+  `bugs/2026-10-09-T17-jitter.log` triples (5 of 15 anchored guard
+  events act, 10 stay blocked).
+
 `load_nbc.jitter_swing_wh()` is the single implementation of the
 capped swing, used by the predicate, by `decide()`'s
 `gapminder_jitter_guard` INFO line and by the manager's

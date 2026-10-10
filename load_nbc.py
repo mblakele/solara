@@ -12,7 +12,7 @@ import logging
 import math
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 
@@ -154,6 +154,7 @@ class NBCFetchResult:
     seconds_remaining: int
     data_point_at: datetime
     samples_used: int | None = None
+    raw_wh: float | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,7 @@ class ParsedMetricsQH:
     seconds_remaining: int
     data_lag_secs: float
     samples_used: int | None = None
+    raw_wh: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for backward compat."""
@@ -175,6 +177,7 @@ class ParsedMetricsQH:
             "predicted_wh": self.predicted_wh,
             "seconds_remaining": self.seconds_remaining,
             "_data_lag_secs": self.data_lag_secs,
+            "raw_wh": self.raw_wh,
         }
 
 
@@ -295,6 +298,7 @@ class NBCReader:
                     seconds_remaining=qh_data.get("seconds_remaining", 0),
                     data_point_at=data_point_at,
                     samples_used=qh_data.get("samples_used"),
+                    raw_wh=qh_data.get("raw_wh"),
                 )
             # Cache is valid but no incomplete QH (QH1 is complete) — fall
             # through to the fetch path below so we can check for a newer
@@ -325,6 +329,7 @@ class NBCReader:
                 seconds_remaining=parsed.seconds_remaining,
                 data_point_at=data_point_at,
                 samples_used=parsed.samples_used,
+                raw_wh=parsed.raw_wh,
             )
 
         # force=True but no fetch callable: fall back to reading from cache.
@@ -343,6 +348,7 @@ class NBCReader:
                 seconds_remaining=qh_data.get("seconds_remaining", 0),
                 data_point_at=data_point_at,
                 samples_used=qh_data.get("samples_used"),
+                raw_wh=qh_data.get("raw_wh"),
             )
 
         return None
@@ -416,6 +422,7 @@ class NBCReader:
                     seconds_remaining=remaining_seconds,
                     data_lag_secs=metrics_data.get("_data_lag_secs", 0.0),
                     samples_used=qh_data.get("samples_used"),
+                    raw_wh=qh_data.get("raw_wh"),
                 )
                 # Don't break — keep scanning for the last complete QH fallback.
             else:
@@ -1508,6 +1515,10 @@ class DecideContext:
             own cycle-to-cycle swing.
         cycle_secs: Decision cadence in seconds. The ramp rule stops now
             when the exact-hit stop time falls within one cycle.
+        banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``,
+            negative = net export), or None when unknown. Lets a plug
+            turn-on proceed despite jitter when the bank covers its full
+            cost (see ``banked_cover_cap_wh``); never consults Tesla.
     """
 
     now: datetime
@@ -1521,6 +1532,7 @@ class DecideContext:
     gap_trend_wh_per_s: float | None = None
     gap_jitter_wh_per_s: float | None = None
     cycle_secs: int = 30
+    banked_wh: float | None = None
 
 
 def make_plug_effect(
@@ -2157,6 +2169,31 @@ class GapMinder:
             if jitter is not None and self.turn_on_jitter_guard_fires(
                 gap, jitter, ctx.seconds_remaining
             ):
+                cover = self.banked_cover_cap_wh(
+                    ctx.banked_wh, target_wh,
+                )
+                if cover is not None:
+                    swing = jitter_swing_wh(jitter, ctx.seconds_remaining)
+                    logger.info(
+                        "gapminder_banked_override gap=%.1f banked=%.1f "
+                        "cover=%.1f jitter=%.4f swing=%.1f R=%d",
+                        gap, ctx.banked_wh, cover,
+                        jitter, swing, ctx.seconds_remaining,
+                        extra={"event": "gapminder_banked_override",
+                               "gap_wh": gap, "banked_wh": ctx.banked_wh,
+                               "cover_wh": cover,
+                               "jitter_wh_per_s": jitter,
+                               "swing_wh": swing,
+                               "seconds_remaining": ctx.seconds_remaining},
+                    )
+                    budget = self._turn_on_budget(gap)
+                    # Plugs only: a Tesla-less ctx keeps the amp increase
+                    # behind the guard (c579's 7.4 Wh bet would otherwise
+                    # sail through on banked cover).
+                    return self._decide_turn_on(
+                        replace(ctx, tesla=None), budget,
+                        capacity_cap_wh=cover,
+                    )
                 swing = jitter_swing_wh(jitter, ctx.seconds_remaining)
                 logger.info(
                     "gapminder_jitter_guard gap=%.1f jitter=%.4f swing=%.1f R=%d",
@@ -2237,12 +2274,52 @@ class GapMinder:
         swing = jitter_swing_wh(jitter_wh_per_s, seconds_remaining)
         return swing >= JITTER_GUARD_FRACTION * gap_wh
 
-    def _decide_turn_on(self, ctx: DecideContext, gap: float) -> list[PendingEffect]:
+    def banked_cover_cap_wh(
+        self,
+        banked_wh: float | None,
+        target_wh: float,
+    ) -> float | None:
+        """Max plug Wh the banked quarter energy absorbs despite jitter.
+
+        Even under zero further export, turning on a plug costing at most
+        this much lands within ``target + hysteresis``: ``banked_wh`` is
+        measured, the plug rating and ``seconds_remaining`` are known, so
+        unlike the jittery extrapolation this side of the bet is certain.
+        Plugs only — callers must keep Tesla increases behind the guard
+        (``bugs/2026-10-01-tesla-overshoot.log`` c579: raw −49.4 would
+        "cover" the 7.4 Wh +1 A bet the guard exists to block).
+
+        Args:
+            banked_wh: Accumulated quarter energy (``qh1.raw_wh``,
+                negative = net export), or None when unknown.
+            target_wh: The quarter target (negative = surplus).
+
+        Returns:
+            Coverage cap in Wh, or None when there is no banked value or
+            the bank is already above the bar (no cover to grant).
+        """
+        if banked_wh is None:
+            return None
+        cover = target_wh + self.HYSTERESIS_WH - banked_wh
+        if cover < 0:
+            return None
+        return cover
+
+    def _decide_turn_on(
+        self,
+        ctx: DecideContext,
+        gap: float,
+        capacity_cap_wh: float | None = None,
+    ) -> list[PendingEffect]:
         """Turn on eligible loads to absorb excess solar.
 
         Args:
             ctx: Decision context.
             gap: The Wh surplus to absorb.
+            capacity_cap_wh: Optional banked-cover cap: candidates must
+                additionally cost at most this much (pass-through from the
+                ``gapminder_banked_override`` path in ``decide()``).
+                None preserves the unguarded behavior.
 
         Returns:
             List of PendingEffect objects.
@@ -2262,6 +2339,15 @@ class GapMinder:
 
         for _, name, plug in candidates:
             capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
+            if capacity_cap_wh is not None and capacity > capacity_cap_wh:
+                logger.debug(
+                    "[_decide_turn_on] %s: uncovered "
+                    "(capacity=%.1f Wh > banked cover %.1f Wh)",
+                    name,
+                    capacity,
+                    capacity_cap_wh,
+                )
+                continue
             if capacity <= remaining_gap:
                 logger.debug(
                     "[_decide_turn_on] %s: turning on "

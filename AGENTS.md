@@ -240,7 +240,7 @@ project-root
                             # get_active_tesla_telemetry, FleetTelemetryProvisionConfig) plus
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
-├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider (incl. turn_on_jitter_guard_fires — JITTER_FLOOR_WH_PER_S noise floor and jitter_swing_wh()'s JITTER_HORIZON_SECS-capped swing, the one implementation shared by the predicate and every jitter log line), PendingEffect factories
+ ├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider (incl. turn_on_jitter_guard_fires — JITTER_FLOOR_WH_PER_S noise floor and jitter_swing_wh()'s JITTER_HORIZON_SECS-capped swing, the one implementation shared by the predicate and every jitter log line; banked_cover_cap_wh banked-cover override letting covered plug turn-ons proceed despite jitter, Tesla never), PendingEffect factories
 ├── gap_trend.py           # GapTrendTracker: EWMA slope of the adjusted gap across cycles
 │                          # (keyed on data_point_at; quarter-hour identity derived via
 │                          # floor_to_qh because ParsedMetricsQH.qh_name is the constant
@@ -303,6 +303,9 @@ project-root
                            # test_undershoot_jitter_retune.py the 2026-10-09 undershoot
                            # (fraction 2.0 / horizon 150: 4 of 5 sampled guard triples
                            # stay quiet, highest-churn one still fires, c579 still fires);
+                           # test_banked_cover.py the banked-cover override (covered plug
+                           # acts despite jitter, uncovered stays blocked, Tesla never
+                           # takes the cover path, banked=None behaves as today);
                            # test_prune_orphaned_tesla_command.py the 2026-10-08 orphaned
                            # 12A command (pruning the last set_amps clears last_commanded_amps);
                            # test_commit_tesla_direction.py the 2026-10-08 7->5 cut
