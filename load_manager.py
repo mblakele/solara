@@ -359,11 +359,13 @@ class LoadManager:
         # Used to select a shorter sleep hint so the next cycle retries quickly.
         self._vehicle_offline_this_cycle: bool = False
         # Data-health alerting (bugs/2026-09-16-metrics.VueAuthenticationError):
-        # per-QH throttles for fatal-fetch and stale/no-data Telegram alerts.
+        # per-QH throttles for fatal-fetch, stale-meter and pipeline-stall
+        # Telegram alerts (pipeline split: bugs/2026-10-13-stale-data-369s).
         # _boot_at anchors the empty-cache age when no data point exists yet.
         self._boot_at: datetime = self._clock.now()
         self._last_fetch_fatal_alert_qh: datetime | None = None
         self._last_stale_alert_qh: datetime | None = None
+        self._last_pipeline_alert_qh: datetime | None = None
         # Out-of-range ON alerts: per-device QH throttle so a forgotten
         # manual ON pages once per quarter-hour, not every 30 s cycle.
         self._last_out_of_range_alert_qh: dict[str, datetime] = {}
@@ -2365,14 +2367,17 @@ class LoadManager:
         now: datetime,
         reason: str,
     ) -> None:
-        """Alert when data age exceeds the threshold, at most once per QH.
+        """Alert when meter-data age exceeds the threshold, at most once per QH.
 
-        Age is wall-clock ``now - data_point_at``; when no data point has
-        ever been seen (boot-empty cache) age is measured from manager
-        start instead.
+        Age is wall-clock ``now - data_point_at`` measured from the
+        EnergyCache's most recent meter sample (``last_sample_at``); when
+        no sample has ever been fetched (boot-empty cache) age is measured
+        from manager start instead. This is strictly about the meter feed —
+        pipeline stalls with a fresh meter page via
+        :meth:`_check_pipeline_stall_alert` instead.
 
         Args:
-            data_point_at: Most recent NBC data point, or None when empty.
+            data_point_at: Most recent meter sample, or None when empty.
             now: Current wall-clock time for age math and the QH key.
             reason: Short tag included in the alert text (e.g.
                 ``stale_data`` or ``no_data``).
@@ -2394,19 +2399,98 @@ class LoadManager:
             )
         else:
             message = (
-                f"Solara data stale: last data point {age_secs:.0f}s old "
+                f"Solara data stale: last meter data {age_secs:.0f}s old "
                 f"(reason={reason})"
             )
         self._queue_stale_data_notification(message)
 
+    def _queue_pipeline_notification(self, message: str) -> None:
+        """Queue a Telegram alert for a stalled decision pipeline.
+
+        Same bypass rules as :meth:`_queue_stale_data_notification`:
+        whitelist and dry-run do not apply.
+
+        Args:
+            message: Human-readable stall text (already includes ages).
+        """
+        if self.telegram_sender is None:
+            logger.info(
+                "Pipeline-stall notification skipped: sender not configured",
+            )
+            return
+        if not self.telegram_sender.is_configured:
+            logger.info(
+                "Pipeline-stall notification skipped: sender not configured "
+                "(is_configured=False)",
+            )
+            return
+        now = self._clock.now()
+        event = build_error_notification(message, now=now)
+        self._pending_notifications.append(event)
+        logger.error("Pipeline-stall notification queued: %s", message)
+
+    def _check_pipeline_stall_alert(
+        self,
+        pipe_point_at: datetime | None,
+        meter_age_secs: float | None,
+        now: datetime,
+        reason: str,
+    ) -> None:
+        """Alert when no usable prediction exists, at most once per QH.
+
+        Fires only when the meter feed itself is fresh (the caller gates
+        on meter age): the Emporia data is arriving but the pipeline has
+        not produced a decision-grade point — e.g. QH-boundary
+        ``insufficient_samples`` or a long ``waiting_for_fresh_data``
+        stall. The message reports both ages so the page cannot be read
+        as meter staleness.
+
+        Args:
+            pipe_point_at: Last decision-grade data point, or None when
+                no decision has ever been made (then the meter alert
+                owns the page, not this one).
+            meter_age_secs: Age of the most recent meter sample, or None
+                when unknown.
+            now: Current wall-clock time for age math and the QH key.
+            reason: Short tag included in the alert text (e.g.
+                ``no_incomplete_qh``).
+        """
+        if pipe_point_at is None:
+            return
+        pipe_age_secs = (now - pipe_point_at).total_seconds()
+        if pipe_age_secs <= DATA_STALE_ALERT_THRESHOLD_SECS:
+            return
+        qh = floor_to_qh(now)
+        if self._last_pipeline_alert_qh == qh:
+            return
+        self._last_pipeline_alert_qh = qh
+        meter_txt = (
+            f"{meter_age_secs:.0f}s old" if meter_age_secs is not None
+            else "unknown age"
+        )
+        message = (
+            f"Solara prediction stalled: no usable prediction for "
+            f"{pipe_age_secs:.0f}s (last decision point "
+            f"{pipe_age_secs:.0f}s old, meter data {meter_txt}, "
+            f"reason={reason})"
+        )
+        self._queue_pipeline_notification(message)
+
     def _check_data_health_alerts(self, ctx: CycleContext) -> None:
-        """Run both data-health alert checks for the current cycle.
+        """Run data-health alert checks for the current cycle.
 
         Called by ``run_cycle()`` right after the NBC fetch stage (on both
         the success and early-exit paths) so a swallowed fetch exception
-        still pages: the fatal check reads the shared EnergyCache's stored
-        fetch error, and the stale check ages ``ctx.data_point_at``
-        (falling back to the last known data point for fetch misses).
+        still pages. Meter health is measured from the shared
+        EnergyCache's most recent sample (``last_sample_at``, falling back
+        to ``last_fetch_at``), never from the pipeline's last acted-on
+        point: a fresh fetch with ``insufficient_samples`` at a QH
+        boundary must not page as stale data
+        (bugs/2026-10-13-stale-data-369s-alert.log). A stalled pipeline
+        with a fresh meter pages separately via
+        :meth:`_check_pipeline_stall_alert` so the two failure modes stay
+        distinguishable; a stale meter suppresses the pipeline page to
+        avoid a double alert for one outage.
 
         Args:
             ctx: Current pipeline context.
@@ -2414,15 +2498,30 @@ class LoadManager:
         ec = getattr(self.nbc_reader, "energy_cache", None)
         err = getattr(ec, "last_fetch_error", None) if ec is not None else None
         self._check_fetch_fatal_alert(err, ctx.now)
-        data_point_at = ctx.data_point_at
-        reason = "stale_data"
-        if data_point_at is None:
-            data_point_at = self.state.last_data_point_at
-            reason = "no_incomplete_qh"
-            if data_point_at is None:
-                reason = "no_data"
         now_ref = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
-        self._check_stale_data_alert(data_point_at, now_ref, reason)
+        meter_point = None
+        if ec is not None:
+            meter_point = ec.last_sample_at
+            if meter_point is None:
+                meter_point = ec.last_fetch_at
+        if meter_point is not None:
+            self._check_stale_data_alert(meter_point, now_ref, "stale_data")
+            meter_age_secs: float | None = (
+                now_ref - meter_point
+            ).total_seconds()
+        else:
+            self._check_stale_data_alert(None, now_ref, "no_data")
+            meter_age_secs = None
+        if ctx.data_point_at is None:
+            pipe_point = self.state.last_data_point_at
+            if (
+                pipe_point is not None
+                and meter_age_secs is not None
+                and meter_age_secs <= DATA_STALE_ALERT_THRESHOLD_SECS
+            ):
+                self._check_pipeline_stall_alert(
+                    pipe_point, meter_age_secs, now_ref, "no_incomplete_qh"
+                )
 
     def _send_pending_notifications_sync(self) -> None:
         """Flush all queued Telegram notifications synchronously.

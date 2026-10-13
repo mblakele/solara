@@ -523,8 +523,9 @@ project-root
 - Tesla callback config tests in `tests/test_tesla_callback_config.py`
 - Tesla init state tests (telemetry-first, REST fallback) in `tests/test_tesla_init_state.py`
 - Tesla command VehicleOffline handling in `tests/test_vehicle_offline_command.py`
-- Data-health Telegram alerts (fatal fetch + 300 s stale/no-data, per-QH
-  throttle) in `tests/test_data_health_alerts.py`
+- Data-health Telegram alerts (fatal fetch + 300 s meter-stale/no-data +
+  prediction-stall with a fresh meter, per-QH throttle each) in
+  `tests/test_data_health_alerts.py`
 - File logging with rotation tests in `tests/test_file_logging.py` (`_setup_file_logging`)
 - Compaction tests in `tests/test_compaction.py` (`CompletedNBCPeriod`, `compact()`, `inject_completed_qh()`, replace-not-merge behavior)
 
