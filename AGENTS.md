@@ -306,6 +306,9 @@ project-root
                            # test_banked_cover.py the banked-cover override (covered plug
                            # acts despite jitter, uncovered stays blocked, Tesla never
                            # takes the cover path, banked=None behaves as today);
+                           # test_qh_boundary_forecast.py the 2026-10-14 QH-boundary
+                           # glitch (complete QH1 keeps the waiting-for-data period
+                           # label beside the placeholder instead of a blank);
                            # test_prune_orphaned_tesla_command.py the 2026-10-08 orphaned
                            # 12A command (pruning the last set_amps clears last_commanded_amps);
                            # test_commit_tesla_direction.py the 2026-10-08 7->5 cut
