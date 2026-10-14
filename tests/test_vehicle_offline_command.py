@@ -316,3 +316,59 @@ class TestLogLevelVerification:
         assert len(warning_msgs) >= 1
         assert any("vehicle not online" in r.message for r in warning_msgs)
         assert not any("Failed to stop Tesla charging" in r.message for r in error_msgs)
+
+
+# =============================================================================
+# Tests — wake-and-retry on VehicleOffline
+# =============================================================================
+
+
+class TestWakeAndRetry:
+
+    @pytest.mark.asyncio
+    async def test_stop_charging_wakes_and_retries_successfully(self, tesla_config):
+        """A cold car is woken and stop succeeds on the second try."""
+        ctrl = _make_offline_ctrl(tesla_config)
+        vehicle_mock = AsyncMock()
+        stops = {"n": 0}
+
+        async def charge_stop():
+            stops["n"] += 1
+            if stops["n"] == 1:
+                raise _make_vehicle_offline_exc()
+            return None
+
+        vehicle_mock.charge_stop = AsyncMock(side_effect=charge_stop)
+        vehicle_mock.wake_up = AsyncMock()
+        ctrl._get_vehicle = AsyncMock(return_value=vehicle_mock)
+
+        result = await ctrl.stop_charging()
+
+        assert result is True
+        assert vehicle_mock.wake_up.await_count == 1
+        assert vehicle_mock.charge_stop.await_count == 2
+        assert ctrl._last_command_vehicle_offline is False
+
+    @pytest.mark.asyncio
+    async def test_set_charge_amps_wakes_and_retries_successfully(self, tesla_config):
+        """A cold car is woken and amp update succeeds on the second try."""
+        ctrl = _make_offline_ctrl(tesla_config)
+        vehicle_mock = AsyncMock()
+        calls = {"n": 0}
+
+        async def set_amps(_amps):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _make_vehicle_offline_exc()
+            return None
+
+        vehicle_mock.set_charging_amps = AsyncMock(side_effect=set_amps)
+        vehicle_mock.wake_up = AsyncMock()
+        ctrl._get_vehicle = AsyncMock(return_value=vehicle_mock)
+
+        result = await ctrl.set_charge_amps(16)
+
+        assert result is True
+        assert vehicle_mock.wake_up.await_count == 1
+        assert vehicle_mock.set_charging_amps.await_count == 2
+        assert ctrl._last_command_vehicle_offline is False

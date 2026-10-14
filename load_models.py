@@ -90,6 +90,14 @@ class AbstractTeslaController(ABC):
         """
 
     @abstractmethod
+    async def wake_vehicle(self) -> bool:
+        """Wake the vehicle so subsequent commands can land.
+
+        Returns:
+            True on success, False on failure.
+        """
+
+    @abstractmethod
     async def set_charge_amps(self, amps: int) -> bool:
         """Set charging amps within [min, max] range.
 

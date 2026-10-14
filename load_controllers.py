@@ -159,6 +159,11 @@ class TeslaController(AbstractTeslaController):
         self._state.current_amps = None
         return True
 
+    async def wake_vehicle(self) -> bool:
+        """Stub vehicle wake: always succeeds."""
+        logger.debug("TeslaController.wake_vehicle() [stub]")
+        return True
+
     async def set_charge_amps(self, amps: int) -> bool:
         """Set charge amps within configured range and log the action."""
         clamped = max(
@@ -540,12 +545,74 @@ class RealTeslaController(AbstractTeslaController):
                 raise TeslaAuthError(str(e)) from e
             if _is_vehicle_offline_error(e):
                 self._last_command_vehicle_offline = True
-                logger.warning("Tesla vehicle not online, command deferred: %s", e)
+                logger.warning("Tesla vehicle not online, attempting wake + retry: %s", e)
+                woke = False
+                try:
+                    woke = await self.wake_vehicle()
+                except BaseException as wake_exc:  # pragma: no cover - defensive
+                    if isinstance(wake_exc, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    logger.warning("Tesla wake failed: %s", wake_exc)
+                if woke:
+                    try:
+                        vehicle = await self._get_vehicle()
+                        await vehicle.charge_stop()
+                        logger.info("Tesla charge_stop sent successfully after wake")
+                        self.save_tokens()
+                        self._last_command_vehicle_offline = False
+                        return True
+                    except BaseException as retry_exc:
+                        if isinstance(retry_exc, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        if _is_auth_error(retry_exc):
+                            raise TeslaAuthError(str(retry_exc)) from retry_exc
+                        if _is_vehicle_offline_error(retry_exc):
+                            self._last_command_vehicle_offline = True
+                            logger.warning("Tesla vehicle still offline after wake: %s", retry_exc)
+                            return False
+                        self._last_command_vehicle_offline = False
+                        logger.error(
+                            "Failed to stop Tesla charging after wake: %s",
+                            retry_exc,
+                            exc_info=True,
+                        )
+                        return False
                 return False
             self._last_command_vehicle_offline = False
             logger.error(
                 "Failed to stop Tesla charging: %s", e, exc_info=True
             )
+            return False
+        finally:
+            await self.close()
+
+    async def wake_vehicle(self) -> bool:
+        """Wake the vehicle via the Fleet API."""
+        await self._ensure_api()
+        if self._api is None:
+            logger.error("Cannot wake Tesla vehicle: API unavailable.")
+            return False
+        if not self._api.has_private_key:
+            logger.error("Cannot wake Tesla vehicle: private key not loaded.")
+            return False
+        try:
+            vehicle = await self._get_vehicle()
+            await vehicle.wake_up()
+            logger.info("Tesla wake_up sent successfully")
+            self.save_tokens()
+            self._last_command_vehicle_offline = False
+            return True
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
+            if _is_auth_error(e):
+                raise TeslaAuthError(str(e)) from e
+            if _is_vehicle_offline_error(e):
+                self._last_command_vehicle_offline = True
+                logger.warning("Tesla vehicle not online on wake: %s", e)
+                return False
+            self._last_command_vehicle_offline = False
+            logger.error("Failed to wake Tesla vehicle: %s", e, exc_info=True)
             return False
         finally:
             await self.close()
@@ -583,7 +650,39 @@ class RealTeslaController(AbstractTeslaController):
                 raise TeslaAuthError(str(e)) from e
             if _is_vehicle_offline_error(e):
                 self._last_command_vehicle_offline = True
-                logger.warning("Tesla vehicle not online, command deferred: %s", e)
+                logger.warning("Tesla vehicle not online, attempting wake + retry: %s", e)
+                woke = False
+                try:
+                    woke = await self.wake_vehicle()
+                except BaseException as wake_exc:  # pragma: no cover - defensive
+                    if isinstance(wake_exc, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    logger.warning("Tesla wake failed: %s", wake_exc)
+                if woke:
+                    clamped_retry = clamped
+                    try:
+                        vehicle = await self._get_vehicle()
+                        await vehicle.set_charging_amps(clamped_retry)
+                        logger.info("Tesla set_charge_amps(%d) sent successfully after wake", clamped_retry)
+                        self.save_tokens()
+                        self._last_command_vehicle_offline = False
+                        return True
+                    except BaseException as retry_exc:
+                        if isinstance(retry_exc, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        if _is_auth_error(retry_exc):
+                            raise TeslaAuthError(str(retry_exc)) from retry_exc
+                        if _is_vehicle_offline_error(retry_exc):
+                            self._last_command_vehicle_offline = True
+                            logger.warning("Tesla vehicle still offline after wake: %s", retry_exc)
+                            return False
+                        self._last_command_vehicle_offline = False
+                        logger.error(
+                            "Failed to set Tesla charge amps after wake: %s",
+                            retry_exc,
+                            exc_info=True,
+                        )
+                        return False
                 return False
             self._last_command_vehicle_offline = False
             logger.error(
