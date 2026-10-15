@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, time, timedelta, timezone
 from unittest.mock import patch
 
@@ -1277,3 +1278,408 @@ class TestAuthErrorFromInitTeslaState:
         ))
 
         lm_with_successful_tesla._queue_auth_error_notification.assert_not_called()  # type: ignore[attr-defined]
+
+class TestStageComputeGapTrend:
+    """_stage_compute_gap() feeds the gap-trend tracker (ramp awareness).
+
+    Trend is computed on the adjusted gap (pending-effect corrected) keyed
+    on data_point_at, so waiting/stale cycles never fabricate a slope and
+    our own plug toggles never chase themselves.
+    """
+
+    def _run_gap_cycle(
+        self,
+        lm: LoadManager,
+        ctx: CycleContext,
+        data_point: datetime,
+        predicted_wh: float,
+        seconds_remaining: int = 450,
+        qh_name: str = "QH1",
+    ) -> None:
+        ctx.qh_name = qh_name
+        ctx.data_point_at = data_point
+        ctx.now_postfetch = data_point + timedelta(seconds=30)
+        ctx.predicted_wh = predicted_wh
+        ctx.seconds_remaining = seconds_remaining
+        lm._stage_compute_gap(ctx)
+
+    def test_trend_none_until_three_cycles(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """ctx.gap_trend_wh_per_s is None until two slopes confirm."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        assert ctx.gap_trend_wh_per_s is None
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -37.5)
+        assert ctx.gap_trend_wh_per_s is None
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=60), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        assert abs(ctx.gap_trend_wh_per_s - 0.25) < 1e-9
+
+    def test_repeated_data_point_ignored(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A repeated data_point_at (stale fetch) never crashes or trends."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base, -37.5)
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_qh_change_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A real quarter-hour boundary discards the previous QH's ramp.
+
+        The crossing step is kept within the span guard's limit so this
+        exercises the quarter-hour reset specifically, not the span guard.
+        """
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 14, 30, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=10), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=20), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=31), -52.5, qh_name="QH2"
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_hour_boundary_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Crossing the hour (a new QH1) also resets — the production bug.
+
+        ctx.qh_name is the literal "QH1" either side of the hour boundary,
+        so only a timestamp-derived identity can catch this.
+        """
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 14, 40, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=5), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=10), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=21), -52.5, qh_name="QH1"
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_long_data_gap_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A data-point gap past the span limit clears history."""
+        from constants import GAP_TREND_MAX_SPAN_SECS
+
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=60), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm,
+            ctx,
+            base + timedelta(seconds=60 + GAP_TREND_MAX_SPAN_SECS + 1),
+            -52.5,
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_jitter_plumbed_from_tracker(self, lm: LoadManager, ctx: CycleContext):
+        """compute_gap exposes the tracker churn as ctx.gap_jitter_wh_per_s.
+
+        0.0 after a cycle where churn is not yet measurable (one or two
+        samples); the live churn value once the slope pair exists. The
+        oscillating series below never confirms a trend, so jitter and
+        trend are visible at the same time — jitter is measurable exactly
+        where the trend is not.
+        """
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)  # gap 21, churn unmeasurable
+        assert ctx.gap_jitter_wh_per_s == 0.0
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -45.0)  # gap 36
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=90), -36.0)  # gap 27
+        assert ctx.gap_trend_wh_per_s is None
+        assert ctx.gap_jitter_wh_per_s == lm.gap_trend.churn_wh_per_s
+        assert ctx.gap_jitter_wh_per_s > 0.0
+
+    def test_compute_gap_gates_churn_on_remaining(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Churn is withheld while more than JITTER_MAX_REMAINING_SECS remain.
+
+        Past 600 s of a quarter at least two thirds of the projection is
+        `prediction_w * seconds_remaining` extrapolation, so seeding the
+        churn EWMA there reported "excessive jitter" for five minutes
+        (bugs/2026-10-02-sunrise-marine-layer-jitter.log, cluster B).
+        The default 450 s window still measures churn as before.
+        """
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0, seconds_remaining=750)
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=30), -45.0, seconds_remaining=720
+        )
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=60), -69.0, seconds_remaining=690
+        )
+        assert ctx.gap_trend_wh_per_s is not None  # trend is unaffected
+        assert ctx.gap_jitter_wh_per_s == 0.0
+
+    def test_jitter_debug_log_when_measurable(
+        self, lm: LoadManager, ctx: CycleContext, caplog
+    ):
+        """A DEBUG line carries churn/swing once measurable, none before."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        with caplog.at_level(logging.DEBUG, logger="load_manager"):
+            self._run_gap_cycle(lm, ctx, base, -30.0)
+            assert not [r for r in caplog.records if "gap_jitter" in r.getMessage()]
+            self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -45.0)
+            self._run_gap_cycle(lm, ctx, base + timedelta(seconds=90), -36.0)
+        messages = [r.getMessage() for r in caplog.records if "gap_jitter" in r.getMessage()]
+        assert len(messages) == 1
+        assert "churn=" in messages[0]
+
+
+class TestBuildResultGapTrend:
+    """CycleDiagnostics carry the gap trend into logs/JSON/SSE."""
+
+    def test_build_result_includes_gap_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """After trending cycles, build_result diagnostics expose the rate."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        for i, predicted in enumerate([-30.0, -37.5, -45.0]):
+            ctx.qh_name = "QH1"
+            ctx.data_point_at = base + timedelta(seconds=30 * i)
+            ctx.now_postfetch = base + timedelta(seconds=30 * i + 30)
+            ctx.predicted_wh = predicted
+            ctx.seconds_remaining = 450 - 30 * i
+            lm._stage_compute_gap(ctx)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.gap_trend_wh_per_s is not None
+        assert abs(result.diagnostics.gap_trend_wh_per_s - 0.25) < 1e-9
+        payload = result.diagnostics.to_dict()
+        assert abs(payload["gap_trend_wh_per_s"] - 0.25) < 1e-9
+
+    def test_build_result_trend_none_when_flat(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Without a confirmed trend the field is None (not zero)."""
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = -100.0
+        ctx.seconds_remaining = 450
+        ctx.now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.gap_trend_wh_per_s is None
+        assert result.diagnostics.to_dict()["gap_trend_wh_per_s"] is None
+
+    def test_build_result_includes_gap_jitter(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """After jitter-producing cycles, diagnostics expose the churn."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        for i, predicted in enumerate([-30.0, -45.0, -36.0]):
+            ctx.qh_name = "QH1"
+            ctx.data_point_at = base + timedelta(seconds=(0, 30, 90)[i])
+            ctx.now_postfetch = ctx.data_point_at + timedelta(seconds=30)
+            ctx.predicted_wh = predicted
+            ctx.seconds_remaining = 450 - 30 * i
+            lm._stage_compute_gap(ctx)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        jitter = result.diagnostics.gap_jitter_wh_per_s
+        assert jitter is not None
+        assert jitter > 0.0
+        payload = result.diagnostics.to_dict()
+        assert payload["gap_jitter_wh_per_s"] == jitter
+
+    def test_build_result_jitter_none_before_first_compute_gap(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Before any compute_gap the field is None — churn never measured."""
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = -100.0
+        ctx.seconds_remaining = 450
+        ctx.now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.gap_jitter_wh_per_s is None
+        assert result.diagnostics.to_dict()["gap_jitter_wh_per_s"] is None
+
+
+class TestPendingCheckRefreshesPlugState:
+    """_stage_pending_check() refreshes plug state even on early exit.
+
+    Regression for bugs/2026-10-03-plug-status-delay.log: Tesla
+    external-charge (and other pending-check gates) blocked the only
+    plug poll, so the dashboard kept showing sentinel + water heater
+    ON for ~4 min after they turned OFF. Decisions must stay gated,
+    but display state must go fresh.
+    """
+
+    def test_external_flip_visible_despite_tesla_gate(self) -> None:
+        """Plug flips are reconciled even when Tesla gate early-exits."""
+        from clock import FakeClock
+        from load_controllers import PlugController, TeslaController
+        from load_models import DeviceState, PlugConfig
+
+        now = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        plugs = {
+            "sentinel": PlugConfig(
+                name="sentinel", accessory_id="s1",
+                power_watts=10.0, priority=1,
+            ),
+            "water heater": PlugConfig(
+                name="water heater", accessory_id="w1",
+                power_watts=4857.0, priority=10,
+            ),
+        }
+        plug_ctrl = PlugController(plugs)
+        # Physical reality: both turned OFF (e.g. around Tesla start).
+        plug_ctrl._state["sentinel"] = False
+        plug_ctrl._state["water heater"] = False
+        mgr = LoadManager(LoadManagerConfig(
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=TeslaController(None),  # type: ignore[arg-type]
+            target_wh=-9,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=False,
+            clock=FakeClock(now),
+        ))
+        # Stale tracker: still thinks both are ON.
+        for name in ("sentinel", "water heater"):
+            mgr.state.devices[name] = DeviceState(
+                name=name, desired_state=True, actual_state=True,
+            )
+        local_ctx = CycleContext(now=now)
+        local_ctx.data_point_at = data_point
+        local_ctx.now_postfetch = now
+        local_ctx.seconds_remaining = 450
+        local_ctx.predicted_wh = -223.0
+        mgr.state.pending_effects.clear()
+        assert mgr.state.last_commanded_amps is None
+        with (
+            patch("load_manager.get_field_update_at", return_value=now),
+            patch(
+                "load_manager.get_telemetry_snapshot",
+                return_value={"ChargeAmps": 24, "ChargeState": "Charging"},
+            ),
+        ):
+            result = mgr._stage_pending_check(local_ctx)
+        # Gate still blocks decisions.
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.reason == "external_tesla_charge"
+        # But dashboard state is fresh.
+        assert mgr.state.devices["sentinel"].actual_state is False
+        assert mgr.state.devices["sentinel"].desired_state is False
+        assert mgr.state.devices["water heater"].actual_state is False
+        assert mgr.state.devices["water heater"].desired_state is False
+        by_name = {c.name: c for c in (result.candidates or [])}
+        assert by_name["sentinel"].actual_state is False
+        assert by_name["water heater"].actual_state is False
+
+
+class TestSinglePlugPollPerCycle:
+    """Full cycles poll each plug controller exactly once.
+
+    The pre-gate dashboard sync must be reused by the async phase,
+    not repeated — Vocolinc cloud calls are not free.
+    """
+
+    def test_run_cycle_polls_each_plug_once(self) -> None:
+        """A full run_cycle issues one get_state per plug, not two."""
+        import asyncio
+
+        from clock import FakeClock
+        from load_controllers import PlugController
+        from load_models import PlugConfig
+        from tests.helpers import _make_metrics_with_wh
+        from energy_cache import EnergyCache
+
+        now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
+        plugs = {
+            "water_heater": PlugConfig(
+                name="water_heater", accessory_id="abc123",
+                power_watts=4500.0, priority=20,
+            ),
+            "pool_pump": PlugConfig(
+                name="pool_pump", accessory_id="xyz789",
+                power_watts=1500.0, priority=10,
+            ),
+        }
+        plug_ctrl = PlugController(plugs)
+        metrics_data = _make_metrics_with_wh("main_panel", -6000.0)
+
+        def metrics_fetch():
+            return metrics_data
+
+        sample_value = -6000.0 / 900_000.0
+        qh_minute = (now.minute // 15) * 15
+        data_start = now.replace(
+            minute=qh_minute, second=0, microsecond=0
+        ) - timedelta(minutes=15)
+        sample_count = int((now - data_start).total_seconds())
+        energy_cache = EnergyCache(ttl_seconds=30)
+        with energy_cache._lock:
+            energy_cache.samples = [sample_value] * sample_count
+            energy_cache.data_start = data_start
+            energy_cache.last_sample_at = now - timedelta(seconds=1)
+            energy_cache.sample_count = sample_count
+            energy_cache.last_fetch_at = now
+            energy_cache._set_data_field(data_lag_secs=0.0)
+        mgr = LoadManager(LoadManagerConfig(
+            metrics_fetch=metrics_fetch,
+            energy_cache=energy_cache,
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=None,
+            target_wh=-500,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=False,
+            clock=FakeClock(now),
+        ))
+        counts: dict[str, int] = {"water_heater": 0, "pool_pump": 0}
+        orig_get_state = plug_ctrl.get_state
+
+        async def counting_get_state(name: str):
+            counts[name] = counts.get(name, 0) + 1
+            return await orig_get_state(name)
+
+        plug_ctrl.get_state = counting_get_state  # type: ignore[method-assign]
+        result = mgr.run_cycle()
+        assert result.status in ("ok", "dry-run")
+        assert counts == {"water_heater": 1, "pool_pump": 1}

@@ -28,7 +28,7 @@ class TestParsedMetricsQH(unittest.TestCase):
         self.assertEqual(d["_data_lag_secs"], 1.0)
 
     def test_to_dict_has_all_expected_keys(self):
-        """to_dict() contains all 4 keys."""
+        """to_dict() contains all 5 keys (raw_wh feeds banked cover)."""
         qh = ParsedMetricsQH(
             qh_name="QH1",
             predicted_wh=0.0,
@@ -37,6 +37,7 @@ class TestParsedMetricsQH(unittest.TestCase):
         )
         self.assertEqual(set(qh.to_dict().keys()), {
             "qh_name", "predicted_wh", "seconds_remaining", "_data_lag_secs",
+            "raw_wh",
         })
 
     def test_is_frozen(self):

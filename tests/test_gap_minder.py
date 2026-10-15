@@ -1,10 +1,12 @@
 """Tests for GapMinder decision logic."""
 
+import logging
 from datetime import datetime, timedelta, timezone
 import pytest
 
+from constants import JITTER_FLOOR_WH_PER_S, JITTER_HORIZON_SECS
 from load_models import PlugConfig, DeviceState, TeslaState
-from load_nbc import DecideContext, GapMinder, StateTracker
+from load_nbc import DecideContext, GapMinder, StateTracker, jitter_swing_wh
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
 
@@ -1706,3 +1708,306 @@ def test_data_point_at_propagated_to_effects():
 
     assert len(actions) == 1
     assert actions[0].data_point_at == dp_at
+
+
+# --- Jitter guard (turn-on only) ------------------------------------
+#
+# When the gap estimate's own cycle-to-cycle swing (churn x seconds
+# remaining) meets or exceeds the gap it is claiming, the turn-on path
+# declines to act. The shared query GapMinder.turn_on_jitter_guard_fires()
+# is both the guard decide() applies and the source of the manager's
+# reason="excessive_jitter" report, so they can never disagree.
+# Turn-off and hysteresis are untouched.
+
+
+def test_jitter_guard_blocks_turn_on_when_swing_exceeds_gap():
+    """swing >= JITTER_GUARD_FRACTION * gap declines the plug turn-on."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=0.5,  # swing = 0.5 * 100 = 50 Wh >= 2.0 * 20 Wh
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert actions == []
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is True
+    )
+
+
+def test_jitter_guard_fires_at_exact_boundary():
+    """swing == JITTER_GUARD_FRACTION * gap still fires (>=, not >)."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=0.4,  # swing = 40.0 Wh == 2.0 * gap 20 Wh
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert actions == []
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is True
+    )
+
+
+def test_jitter_guard_blocks_tesla_increase():
+    """The incident path: a Tesla amp increase is declined under jitter."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    tesla = TeslaState(
+        is_charging=True, current_amps=10, plugged_in=True, at_home=True,
+    )
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs={},
+        tesla=tesla,
+        gap_jitter_wh_per_s=0.5,  # swing 50 Wh >= 2.0 * gap 20 Wh
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert actions == []
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is True
+    )
+
+
+def test_jitter_guard_inactive_when_jitter_none():
+    """No jitter value (never measured) → normal turn-on, no guard."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=None,
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert [a.action for a in actions] == ["turn_on"]
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )
+
+
+def test_jitter_guard_inactive_when_swing_below_fraction():
+    """A swing under the gap does not block: jitter is not a veto by size."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=0.19,  # swing 19 Wh < gap 20 Wh
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-29.0, target_wh=-9.0)
+
+    assert [a.action for a in actions] == ["turn_on"]
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            20.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )
+
+
+def test_jitter_guard_ignores_turn_off():
+    """Turn-off/shed runs regardless of jitter (protective, plan contract)."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    state.devices["heater"] = DeviceState(
+        name="heater", desired_state=True, actual_state=True,
+    )
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=50.0,  # absurd jitter: 5000 Wh swing
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=100.0, target_wh=-9.0)
+
+    assert [a.action for a in actions] == ["turn_off"]
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            -109.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )
+
+
+def test_jitter_guard_ignores_hysteresis_band():
+    """Within hysteresis nothing was due anyway: no guard either."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=100,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=50.0,
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-11.0, target_wh=-9.0)
+
+    assert actions == []
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            2.0, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )
+
+
+# --- Jitter guard: absolute floor and horizon cap --------------------
+#
+# bugs/2026-10-02-sunrise-marine-layer-jitter.log: on a calm marine-layer
+# morning the guard reported "excessive jitter" 35 times while churn sat
+# at 0.015-0.047 Wh/s — below the quarter's own realized sigma_rate of
+# 0.0222 Wh/s — because `churn >= gap / R` collapses to ~0.01 Wh/s when
+# the surplus is 6-8 Wh and R is 600 s. The floor rejects churn that is
+# indistinguishable from the forecast window's quantization; the horizon
+# cap stops a 30-60 s slope change being projected across the whole
+# remaining quarter.
+
+
+def test_jitter_guard_silent_below_floor():
+    """Calm-morning churn (0.0468 Wh/s) never trips the guard.
+
+    Cluster A of the marine-layer log: churn 0.0468 at R=569 against a
+    6.14 Wh surplus. Uncapped that is a 26.6 Wh "swing" and the guard
+    fired; below JITTER_FLOOR_WH_PER_S the churn is meter/forecast
+    quantization, not oscillation, so the turn-on proceeds.
+    """
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "small": PlugConfig(name="small", accessory_id="s", power_watts=20.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=569,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=0.0468,
+    )
+
+    actions = engine.decide(ctx=ctx, predicted_wh=-15.14, target_wh=-9.0)
+
+    assert [a.action for a in actions] == ["turn_on"]
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            6.14, ctx.gap_jitter_wh_per_s, ctx.seconds_remaining
+        )
+        is False
+    )
+
+
+def test_jitter_guard_floor_is_inclusive():
+    """Churn exactly at the floor still participates (comparison is <)."""
+    engine = GapMinder(hysteresis_wh=3)
+    assert JITTER_FLOOR_WH_PER_S > 0.0
+    assert (
+        engine.turn_on_jitter_guard_fires(
+            15.0, JITTER_FLOOR_WH_PER_S, 150
+        )
+        is True  # swing = 0.2 * 150 = 30 Wh == 2.0 * gap 15 Wh
+    )
+
+
+def test_jitter_guard_swing_capped_at_horizon():
+    """A long quarter can no longer be used to inflate a small churn.
+
+    churn 0.25 at R=800 projects 200 Wh uncapped, which would block any
+    realistic gap; capped at JITTER_HORIZON_SECS it is 37.5 Wh and a
+    100 Wh surplus proceeds instead of being vetoed.
+    """
+    engine = GapMinder(hysteresis_wh=3)
+    assert JITTER_HORIZON_SECS == 150
+    assert (
+        engine.turn_on_jitter_guard_fires(100.0, 0.25, 800) is False
+    )
+    # Below the cap nothing changes: enough churn still fires a 60 Wh gap.
+    assert engine.turn_on_jitter_guard_fires(60.0, 0.9, 149) is True
+
+
+def test_jitter_swing_logged_matches_predicate(caplog):
+    """gapminder_jitter_guard's swing_wh is the capped value the guard used."""
+    engine = GapMinder(hysteresis_wh=3)
+    state = StateTracker()
+    plugs = {
+        "heater": PlugConfig(name="heater", accessory_id="h", power_watts=500.0)
+    }
+    ctx = DecideContext(
+        now=fixed_now,
+        seconds_remaining=800,
+        state=state,
+        plugs=plugs,
+        tesla=None,
+        gap_jitter_wh_per_s=0.5,
+    )
+    with caplog.at_level(logging.INFO, logger="load_nbc"):
+        actions = engine.decide(ctx=ctx, predicted_wh=-39.0, target_wh=-9.0)
+
+    assert actions == []
+    assert jitter_swing_wh(0.5, 800) == pytest.approx(75.0)
+    guard_records = [
+        r for r in caplog.records if r.getMessage().startswith("gapminder_jitter_guard")
+    ]
+    assert guard_records, "guard fired but logged nothing"
+    assert guard_records[0].swing_wh == pytest.approx(75.0)
+
