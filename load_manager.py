@@ -142,6 +142,8 @@ class LoadManagerConfig:
         enabled: Whether load management is active. Accepts True/False, or a time range tuple.
             Defaults to LOAD_MANAGE_ENABLED env var parsed via _parse_load_manage_enabled.
         dry_run: If True, log actions without executing them (defaults to LOAD_MANAGE_DRY_RUN).
+        lumpy_first: If True, turn_off decides lumpy loads first on the residual
+            (defaults to LOAD_MANAGE_LUMPY_FIRST, off). Tests may pass an engine instead.
         config_interval_secs: Target interval between cycles in seconds (default 30).
     """
 
@@ -155,6 +157,7 @@ class LoadManagerConfig:
     nbc_device: str | None = None
     enabled: bool | tuple[Any, Any] | None = None  # type: ignore[type-arg]
     dry_run: bool | None = None
+    lumpy_first: bool | None = None
     config_interval_secs: int = 30
     telegram_sender: TelegramSender | None = None
     clock: Any | None = None  # clock.Clock | None — forward ref, resolved at runtime
@@ -315,6 +318,10 @@ class LoadManager:
         hysteresis_wh = int(abs(target_wh) / 3)
         self.tesla_config = load_tesla_config(config=self._cfg)
         tesla_config = self.tesla_config
+        lumpy_first = cfg.lumpy_first
+        if lumpy_first is None:
+            lumpy_first = self._cfg.lumpy_first
+        self.lumpy_first = lumpy_first
         if engine is not None:
             self.engine = engine
         else:
@@ -328,6 +335,7 @@ class LoadManager:
                     tesla_config.charge_amps_max
                     if tesla_config else TESLA_CHARGE_AMPS_MAX_DEFAULT
                 ),
+                lumpy_first=lumpy_first,
             )
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
@@ -3103,6 +3111,9 @@ class LoadManager:
                     hysteresis_wh=self.engine.HYSTERESIS_WH,
                     charge_amps_min=new_tesla.charge_amps_min,
                     charge_amps_max=new_tesla.charge_amps_max,
+                    lumpy_first=getattr(
+                        self.engine, "lumpy_first", self.lumpy_first
+                    ),
                 )
 
         tg_config = device_config.get_telegram_config()

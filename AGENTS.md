@@ -171,8 +171,18 @@ project-root
 │                          # exact because previous_qh exits before decide()). Report
 │                          # output: churn-band coverage line, jitter-guard summary
 │                          # line, target/miss/guard columns in the quarter table.
+│                          # It also attributes controllable watts per cycle from
+│                          # the candidates lists (prior-cycle join) and reports
+│                          # the residual series (net-of-ON rate error,
+│                          # sigma_residual, 260 W survival — residual never
+│                          # beat raw sigma on corpus/, so no margin ships).
 │                          # Run from the repo root:
 │                          #   uv run python tools/forecast_log_scoring.py bugs/*.log
+│   └── divergence_audit.py  # Status-quo vs residual shed-watts audit over logs:
+│                          # per-anchor ON states (deduped candidates) + logged
+│                          # priorities, lumpy-first iff implicated and beyond
+│                          # smalls capacity; corpus/ verdict 9/1015 quarters,
+│                          # always sheds less, max one 260 W plug.
 ├── app.py                 # Flask app factory (create_app()), route definitions (/, /health,
                            # /api/v1/tou, /api/v1/load/status, /api/tesla/callback),
                            # _AppState runtime singletons, start_background_services();
@@ -315,7 +325,20 @@ project-root
                            # (commit classifies direction from live amps when the command expired);
                            # test_decision_lag_adjustment.py the 2026-10-14 water-heater
                            # execution lag (fetch-start remainder shrunk to decision
-                           # time before decide books plug/Tesla savings)
+                           # time before decide books plug/Tesla savings);
+                           # test_sheddable_residual.py the controllable-load residual
+                           # prototype (net-of-lumpy counterfactual + replayed c658 /
+                           # c817 small-plug prescriptions, production unwired);
+                           # test_residual_feedback_replay.py the meter-feedback
+                           # harness (event-driven counterfactual meter + closed-loop
+                           # residual policy over both 2026-10-14 quarters; symmetric
+                           # margin pinned harmful in B);
+                           # test_divergence_audit.py the status-quo vs residual
+                           # audit (logged priorities, watts-compared; 9/1015
+                           # corpus quarters diverge, always sheds less);
+                           # test_lumpy_first.py the Subtask-4 wiring (flag-off
+                           # parity with history, flag-on c658/c817
+                           # prescriptions, config/env plumbing)
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change

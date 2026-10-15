@@ -285,6 +285,7 @@ def _anchor(
     predicted_wh: float,
     actual_wh: float | None,
     quarter: datetime | None = None,
+    wall_at: datetime | None = None,
 ) -> ForecastAnchor:
     """Build an anchor directly, bypassing the parser."""
     start = quarter or datetime(2026, 10, 1, 20, 30, tzinfo=timezone.utc)
@@ -299,6 +300,7 @@ def _anchor(
         prediction_w=prediction_w,
         predicted_wh=predicted_wh,
         actual_wh=actual_wh,
+        wall_at=wall_at,
     )
 
 
@@ -877,3 +879,123 @@ def test_real_log_has_no_guard_events() -> None:
     assert fls.parse_guard_events(
         _OVERSHOOT.read_text(errors="replace"), source=_OVERSHOOT.name
     ) == []
+
+
+# ── sheddable residual series ────────────────────────────────────────
+
+
+def _resid_cycle_line(
+    stamp: str, candidates: str, target: str = "-9", reason: str = "ok"
+) -> str:
+    """A CycleResult line carrying plug candidates for the ON-watts parse."""
+    return (
+        f"[{stamp} +0000] [628277] [DEBUG] app Load management cycle result: "
+        f"CycleResult(status='ok', qh='QH1', predicted_wh=100.0, "
+        f"adjusted_wh=100.0, target_wh={target}, actions=[], "
+        f"diagnostics=CycleDiagnostics(gap_wh=-109.0, hysteresis_wh=3, "
+        f"seconds_remaining=835, reason='{reason}'), candidates=[{candidates}])"
+    )
+
+
+def _candidate(
+    name: str, power: float | None, desired: bool | None
+) -> str:
+    """One CandidateDetail entry in production field order."""
+    return (
+        f"CandidateDetail(device_type='plug', name='{name}', "
+        f"power_watts={power}, capacity_wh=1.0, can_toggle=True, "
+        f"desired_state={desired}, actual_state={desired})"
+    )
+
+
+def test_parse_on_watts_timeline_sums_wanted_on_plugs() -> None:
+    """ON plugs add rated watts; off plugs and Tesla add nothing."""
+    text = "\n".join([
+        _resid_cycle_line("2026-10-14 23:16:40", ", ".join([
+            _candidate("jackery", 260.0, True),
+            _candidate("water heater", 4857.0, True),
+            _candidate("ecoflow", 260.0, False),
+            _candidate("tesla", None, None).replace(
+                "device_type='plug'", "device_type='tesla'"
+            ),
+        ])),
+        _resid_cycle_line("2026-10-14 23:18:03", ", ".join([
+            _candidate("jackery", 260.0, True),
+            _candidate("water heater", 4857.0, False),
+            _candidate("ecoflow", 260.0, False),
+        ])),
+    ])
+    timeline = fls.parse_on_watts_timeline(text, source="synthetic.log")
+    assert [w for _, w in timeline] == pytest.approx([5117.0, 260.0])
+    assert timeline[0][0] == datetime(2026, 10, 14, 23, 16, 40, tzinfo=timezone.utc)
+
+
+def test_parse_on_watts_timeline_dedupes_repeated_candidate_lists() -> None:
+    """The repr repeats candidates twice; each plug counts once."""
+    entry = (
+        "CandidateDetail(device_type='plug', name='water heater', "
+        "power_watts=4857.0, capacity_wh=1.0, can_toggle=True, "
+        "desired_state=True, actual_state=True)"
+    )
+    text = (
+        "[2026-10-14 23:16:40 +0000] [1] [DEBUG] app Load management cycle result: "
+        f"CycleResult(status='ok', candidates=[{entry}], "
+        f"diagnostics=CycleDiagnostics(gap_wh=1.0, candidates=[{entry}]))"
+    )
+    ((_, watts),) = fls.parse_on_watts_timeline(text, source="synthetic.log")
+    assert watts == pytest.approx(4857.0)
+
+
+def test_anchor_residual_matches_hand_calc() -> None:
+    """c658 full-net residual: netting 5377 W leaves a -97.6 Wh error."""
+    anchor = _anchor(840, 74.3072625, 1.295, 1162.1072625, 5.09)
+    assert anchor.residual_rate(5377.0) == pytest.approx(1.295 - 5377.0 / 3600.0)
+    assert anchor.residual_predicted(5377.0) == pytest.approx(-92.5, abs=0.1)
+    assert anchor.residual_error(5377.0) == pytest.approx(-97.6, abs=0.1)
+
+
+def test_residual_error_is_exactly_horizon_times_shortfall() -> None:
+    """The error identity holds for the residual series too."""
+    anchor = _anchor(870, 37.907825, 1.2635941666, 1137.23475, -28.65)
+    shortfall = anchor.residual_shortfall(5377.0)
+    assert anchor.residual_error(5377.0) == pytest.approx(
+        -870 * shortfall, abs=1e-6
+    )
+
+
+def test_assign_on_watts_uses_prior_cycle() -> None:
+    """Each anchor takes the latest cycle at or before its wall time."""
+    base = datetime(2026, 10, 14, 23, 15, 0, tzinfo=timezone.utc)
+    anchors = [
+        _anchor(840, 74.0, 1.0, 900.0, 5.0, wall_at=base + timedelta(seconds=65)),
+        _anchor(810, 70.0, 0.5, 400.0, 5.0, wall_at=base + timedelta(seconds=95)),
+    ]
+    timeline = [
+        (base + timedelta(seconds=40), 5117.0),
+        (base + timedelta(seconds=80), 260.0),
+    ]
+    assert fls.assign_on_watts(anchors, timeline) == [5117.0, 260.0]
+
+
+def test_assign_on_watts_none_before_first_cycle() -> None:
+    """Anchors predating every cycle line are excluded, not zero-filled."""
+    base = datetime(2026, 10, 14, 23, 15, 0, tzinfo=timezone.utc)
+    anchors = [
+        _anchor(840, 74.0, 1.0, 900.0, 5.0, wall_at=base + timedelta(seconds=10))
+    ]
+    timeline = [(base + timedelta(seconds=40), 5117.0)]
+    assert fls.assign_on_watts(anchors, timeline) == [None]
+
+
+def test_residual_report_exposes_sigma_and_plug_survival() -> None:
+    """Two hand-computed residual shortfalls size sigma; 260 W survives k=1."""
+    anchors = [
+        _anchor(840, 74.3072625, 1.295, 1162.1072625, 5.09),
+        _anchor(870, 37.907825, 1.2635941666, 1137.23475, -28.65),
+    ]
+    report = fls.summarize(anchors, on_watts=[5377.0, 5377.0])
+    assert report.residual_count == 2
+    assert report.sigma_residual == pytest.approx(0.0187, abs=0.001)
+    assert report.residual_coverage(1.0) == pytest.approx(0.0)
+    assert report.residual_coverage(10.0) == pytest.approx(1.0)
+    assert report.plug_survival(1.0) == pytest.approx(1.0)

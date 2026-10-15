@@ -338,6 +338,11 @@ class Config:
         return self._get_bool("LOAD_MANAGE_DRY_RUN")
 
     @property
+    def lumpy_first(self) -> bool:
+        """Return True when turn_off decides lumpy loads first on residual."""
+        return self._get_bool("LOAD_MANAGE_LUMPY_FIRST")
+
+    @property
     def vue_username(self) -> Optional[str]:
         """Return Emporia VUE username, or None if not configured."""
         val = self._get("VUE_USERNAME")

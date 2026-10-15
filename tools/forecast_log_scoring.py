@@ -36,10 +36,10 @@ from __future__ import annotations
 import math
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Sequence, TypeVar
 
 import pytz
 
@@ -116,6 +116,7 @@ class ForecastAnchor:
     prediction_w: float
     predicted_wh: float
     actual_wh: float | None
+    wall_at: datetime | None = None
 
     @property
     def horizon_ratio(self) -> float:
@@ -154,6 +155,31 @@ class ForecastAnchor:
         if fwd is None:
             return None
         return fwd - self.prediction_w
+
+    def residual_rate(self, on_watts: float) -> float:
+        """Trailing rate net of the controllable draw (Wh/s).
+
+        Subtracting what load management could remove leaves the
+        weather-plus-house rate the residual margin has to cover.
+        """
+        return self.prediction_w - on_watts / 3600.0
+
+    def residual_predicted(self, on_watts: float) -> float:
+        """Counterfactual quarter total with the ON loads shed."""
+        return self.raw_wh + self.residual_rate(on_watts) * self.remaining_secs
+
+    def residual_error(self, on_watts: float) -> float | None:
+        """Signed residual error (None without a known quarter total)."""
+        if self.actual_wh is None:
+            return None
+        return self.residual_predicted(on_watts) - self.actual_wh
+
+    def residual_shortfall(self, on_watts: float) -> float | None:
+        """How far the residual rate under-stated the forward rate."""
+        fwd = self.true_forward_rate
+        if fwd is None:
+            return None
+        return fwd - self.residual_rate(on_watts)
 
 
 @dataclass(frozen=True)
@@ -237,19 +263,19 @@ def parse_log(text: str, source: str = "<log>") -> list[ForecastAnchor]:
     # ``create_metrics result`` line that reports the same ``N``. Holding one
     # record bridges that ordering; the length must agree or the pairing is
     # not trustworthy and both sides are dropped.
-    pending: tuple[int, list[_Quarter]] | None = None
+    pending: tuple[int, list[_Quarter], datetime | None] | None = None
 
     for line in text.splitlines():
         if "create_metrics result:" in line:
             if pending is not None:
                 data_start = _parse_data_start(line)
                 total = _DATA_TOTAL_RE.search(line)
-                held_len, held_quarters = pending
+                held_len, held_quarters, held_wall = pending
                 if data_start is not None and total is not None:
                     if int(total.group(1)) == held_len:
                         _collect(
                             data_start, held_len, held_quarters,
-                            source, anchors, actuals,
+                            source, anchors, actuals, wall_at=held_wall,
                         )
             pending = None
             continue
@@ -258,7 +284,7 @@ def parse_log(text: str, source: str = "<log>") -> list[ForecastAnchor]:
         parsed_len, parsed_quarters = _parse_quarters(line)
         if parsed_len is None:
             continue
-        pending = (parsed_len, parsed_quarters)
+        pending = (parsed_len, parsed_quarters, _line_timestamp(line))
 
     return [
         anchor if anchor.quarter_start not in actuals
@@ -268,7 +294,8 @@ def parse_log(text: str, source: str = "<log>") -> list[ForecastAnchor]:
 
 
 def _to_anchor(
-    quarter: _Quarter, start: datetime, source: str
+    quarter: _Quarter, start: datetime, source: str,
+    wall_at: datetime | None = None,
 ) -> ForecastAnchor | None:
     """Build an anchor from a QH1 entry, or None if any field is missing."""
     if (
@@ -294,6 +321,7 @@ def _to_anchor(
         prediction_w=quarter.prediction_w,
         predicted_wh=quarter.predicted_wh,
         actual_wh=None,
+        wall_at=wall_at,
     )
 
 
@@ -304,6 +332,7 @@ def _collect(
     source: str,
     anchors: list[ForecastAnchor],
     actuals: dict[datetime, float],
+    wall_at: datetime | None = None,
 ) -> None:
     """File one parsed ``nbc_set`` record under its resolved data_start."""
     for quarter in quarters:
@@ -312,7 +341,7 @@ def _collect(
             if quarter.raw_wh is not None:
                 actuals[start] = quarter.raw_wh
             continue
-        anchor = _to_anchor(quarter, start, source)
+        anchor = _to_anchor(quarter, start, source, wall_at=wall_at)
         if anchor is not None:
             anchors.append(anchor)
 
@@ -497,6 +526,130 @@ def parse_cycles(text: str, source: str = "<log>") -> list[CycleRecord]:
     return records
 
 
+# Matches one candidate entry in production field order, e.g.
+# ``CandidateDetail(device_type='plug', name='jackery', power_watts=260.0,
+# ... desired_state=True, ...)``. Tesla entries carry power_watts=None
+# and are skipped by the caller, not the pattern.
+_CANDIDATE_RE = re.compile(
+    r"CandidateDetail\(device_type='(plug|tesla)', name='([^']*)', "
+    r"power_watts=([\d.eE+-]+|None),.*?desired_state=(True|False|None)"
+)
+
+
+def _iter_candidate_entries(line: str) -> Iterator[tuple[str, str, str, str]]:
+    """Yield ``(device_type, name, power, desired)`` per candidate entry.
+
+    Shared by the ON-watts timeline and the plug-state parser so the two
+    never disagree about field order or the repeated-list shape.
+    """
+    yield from _CANDIDATE_RE.findall(line)
+
+
+def _iter_result_lines(text: str) -> Iterator[tuple[datetime, str]]:
+    """Yield ``(wall_time, line)`` per timestamped cycle-result line.
+
+    Shared scan preamble for every parser reading ``CycleResult`` reprs;
+    lines without a parseable timestamp are skipped rather than guessed.
+    """
+    for line in text.splitlines():
+        if "CycleResult(" not in line:
+            continue
+        stamp = _line_timestamp(line)
+        if stamp is None:
+            continue
+        yield stamp, line
+
+
+def parse_on_watts_timeline(
+    text: str, source: str = "<log>"
+) -> list[tuple[datetime, float]]:
+    """Extract per-cycle controllable watts from cycle-result reprs.
+
+    Each ``CycleResult`` line's candidates report every plug's rated watts
+    and desired state; summing the wanted-on plugs gives the controllable
+    draw production saw embedded in the trailing rate at that wall time.
+
+    Args:
+        text: Full log contents.
+        source: Identifier (unused beyond symmetry with the other parsers).
+
+    Returns:
+        ``(wall_time, on_watts)`` in log order; lines without a parseable
+        timestamp are skipped rather than guessed.
+    """
+    _ = source
+    timeline: list[tuple[datetime, float]] = []
+    for stamp, line in _iter_result_lines(text):
+        # The repr carries the candidate list twice (top level and the
+        # diagnostics segment); first occurrence wins so each plug counts
+        # once no matter how many segments repeat it.
+        seen: set[str] = set()
+        watts = 0.0
+        for kind, name, power, desired in _iter_candidate_entries(line):
+            if kind != "plug" or power == "None" or name in seen:
+                continue
+            if desired != "True":
+                continue
+            seen.add(name)
+            watts += float(power)
+        timeline.append((stamp, watts))
+    return timeline
+
+
+_T = TypeVar("_T")
+"""Value type for the shared prior-cycle join."""
+
+
+def _prior_values(
+    walls: Sequence[datetime | None],
+    timeline: Sequence[tuple[datetime, _T]],
+) -> list[_T | None]:
+    """Latest timeline value at or before each wall time.
+
+    Shared two-pointer walk behind the ON-watts and plug-state joins: a
+    forecast only knows the cycle result already logged, never the one
+    still computing. Walls predating every entry yield None (excluded
+    downstream, never zero-filled).
+    """
+    ordered = sorted(timeline, key=lambda entry: entry[0])
+    values: list[_T | None] = []
+    cursor = 0
+    current: _T | None = None
+    for wall in walls:
+        if wall is None:
+            values.append(None)
+            continue
+        while cursor < len(ordered) and ordered[cursor][0] <= wall:
+            current = ordered[cursor][1]
+            cursor += 1
+        values.append(current)
+    return values
+
+
+def assign_on_watts(
+    anchors: Sequence[ForecastAnchor],
+    timeline: Sequence[tuple[datetime, float]],
+) -> list[float | None]:
+    """Attribute each anchor the latest cycle ON-watts at or before it.
+
+    A forecast can only be netted by what production knew when it was
+    fresh; the cycle result lags its fetch by ~30 s (Telegram sync), so the
+    prior cycle's ON set is the contemporaneous one, not a leak from the
+    future.
+
+    Args:
+        anchors: Anchors in log order (their ``wall_at`` stamps).
+        timeline: ``(wall_time, on_watts)`` in ascending order.
+
+    Returns:
+        One ON-watts value per anchor, aligned by index, or None for
+        anchors predating every cycle line (excluded, never zero-filled).
+    """
+    return _prior_values(
+        [anchor.wall_at for anchor in anchors], list(timeline)
+    )
+
+
 # ── reporting ────────────────────────────────────────────────────────
 
 BUCKET_EDGES: tuple[int, ...] = (0, 60, 120, 180, 240, 360, 901)
@@ -505,6 +658,14 @@ BUCKET_EDGES: tuple[int, ...] = (0, 60, 120, 180, 240, 360, 901)
 Zero ``remaining_seconds`` is the quarter boundary itself, where no decision
 could be made; the buckets above it are the ranges the load manager actually
 acts in.
+"""
+
+PLUG_ACTION_WATTS = 260.0
+"""Rated draw of the small dispatchable plug the survival check is sized on.
+
+A 260 W action moves the quarter at ``260/3600 Wh/s``; comparing that rate
+against the residual sigma answers the band plan's killer question in the
+residual currency. Both sides scale with R, so survival is R-independent.
 """
 
 
@@ -679,6 +840,49 @@ class GuardSummary:
 
 
 @dataclass(frozen=True)
+class ResidualSummary:
+    """Net-of-controllable error across the attributed anchors.
+
+    Kept separate so the main report stays under the attribute budget;
+    the residual margin question gets its own scope.
+    """
+
+    count: int = 0
+    sigma_rate: float = 0.0
+    errors: tuple[float, ...] = ()
+    horizons: tuple[int, ...] = ()
+
+    def coverage(self, k: float) -> float:
+        """Fraction of residual anchors inside ``k * sigma * R``."""
+        if not self.errors:
+            return 0.0
+        inside = sum(
+            1
+            for horizon, error in zip(self.horizons, self.errors)
+            if abs(error) <= forecast_uncertainty_wh(horizon, self.sigma_rate, k)
+        )
+        return inside / len(self.errors)
+
+    def plug_survival(self, k: float) -> float:
+        """Share of residual anchors where a 260 W action beats the band.
+
+        The counterpart of the band plan's killer question in the residual
+        currency: the action survives when its quarter effect exceeds the
+        residual band at the same horizon. Both sides scale with R, so the
+        verdict is horizon-independent for a fixed sigma.
+        """
+        if not self.errors:
+            return 0.0
+        action_rate = PLUG_ACTION_WATTS / 3600.0
+        survived = sum(
+            1
+            for horizon in self.horizons
+            if action_rate * horizon > k * self.sigma_rate * horizon
+        )
+        return survived / len(self.errors)
+
+
+@dataclass(frozen=True)
 class ForecastReport:
     """Aggregate view of forecast quality across every scored anchor."""
 
@@ -697,6 +901,39 @@ class ForecastReport:
     sigma_rate: float
     churns: tuple[float, ...]
     guard: GuardSummary
+    residual: ResidualSummary = field(default_factory=ResidualSummary)
+
+    @property
+    def residual_count(self) -> int:
+        """Anchors carrying ON-watts attribution."""
+        return self.residual.count
+
+    @property
+    def sigma_residual(self) -> float:
+        """Spread of the residual rate error, in Wh/s."""
+        return self.residual.sigma_rate
+
+    def residual_coverage(self, k: float) -> float:
+        """Fraction of residual anchors inside ``k * sigma_residual * R``.
+
+        Args:
+            k: Multiple of ``sigma_residual`` the band covers.
+
+        Returns:
+            Share inside the band, or 0.0 when there is nothing to score.
+        """
+        return self.residual.coverage(k)
+
+    def plug_survival(self, k: float) -> float:
+        """Share of residual anchors where a 260 W action beats the band.
+
+        Args:
+            k: Multiple of ``sigma_residual`` the band covers.
+
+        Returns:
+            Share surviving, or 0.0 when there is nothing to score.
+        """
+        return self.residual.plug_survival(k)
 
     @property
     def measurable_churn_count(self) -> int:
@@ -750,6 +987,41 @@ class ForecastReport:
             if abs(error) <= churn_uncertainty_wh(horizon, churn, k)
         )
         return inside / len(self.errors)
+
+
+def _residual_summary(
+    anchors: Sequence[ForecastAnchor],
+    watts_by_anchor: Sequence[float | None],
+) -> ResidualSummary:
+    """Roll the attributed anchors up into the residual error series.
+
+    Only scored anchors carrying ON-watts enter; the rest keep the base
+    statistics untouched.
+
+    Args:
+        anchors: All parsed anchors in log order.
+        watts_by_anchor: Controllable watts aligned with ``anchors``.
+
+    Returns:
+        The residual roll-up (empty when nothing is attributed).
+    """
+    pairs = [
+        (anchor, watts)
+        for anchor, watts in zip(anchors, watts_by_anchor)
+        if anchor.actual_wh is not None and watts is not None
+    ]
+    errors = [
+        e for e in (a.residual_error(w) for a, w in pairs) if e is not None
+    ]
+    shortfalls = [
+        s for s in (a.residual_shortfall(w) for a, w in pairs) if s is not None
+    ]
+    return ResidualSummary(
+        count=len(errors),
+        sigma_rate=stddev(shortfalls) if len(shortfalls) > 1 else 0.0,
+        errors=tuple(errors),
+        horizons=tuple(a.remaining_secs for a, _ in pairs),
+    )
 
 
 def _bucket(anchors: Sequence[ForecastAnchor], low: int, high: int) -> ErrorBucket:
@@ -840,11 +1112,57 @@ def _jitter_context(
     return targets, guard_counts, jitters, excessive
 
 
+def _quarter_tables(
+    scored: list[ForecastAnchor],
+    bucket_edges: Sequence[int],
+    targets: dict[tuple[str, datetime], float],
+    guard_counts: dict[tuple[str, datetime], int],
+) -> tuple[tuple[ErrorBucket, ...], tuple[QuarterSummary, ...]]:
+    """Bucket and quarter roll-ups for the scored anchors.
+
+    Args:
+        scored: Anchors with a known quarter total.
+        bucket_edges: Ascending ``remaining_seconds`` boundaries.
+        targets: Last logged target per ``(source, quarter)``.
+        guard_counts: Guard firings per ``(source, quarter)``.
+
+    Returns:
+        ``(buckets, quarters)`` in report order.
+    """
+    buckets = tuple(
+        _bucket(
+            [a for a in scored if low <= a.remaining_secs < high],
+            low,
+            high,
+        )
+        for low, high in zip(bucket_edges, bucket_edges[1:])
+    )
+    grouped: dict[tuple[str, datetime], list[ForecastAnchor]] = {}
+    for anchor in scored:
+        grouped.setdefault((anchor.source, anchor.quarter_start), []).append(anchor)
+    quarters = tuple(
+        summary
+        for summary in (
+            _quarter_summary(
+                source,
+                start,
+                items,
+                targets.get((source, start)),
+                guard_counts.get((source, start), 0),
+            )
+            for (source, start), items in sorted(grouped.items(), key=lambda kv: kv[0][1])
+        )
+        if summary is not None
+    )
+    return buckets, quarters
+
+
 def summarize(
     anchors: Iterable[ForecastAnchor],
     bucket_edges: Sequence[int] = BUCKET_EDGES,
     cycles: Sequence[CycleRecord] = (),
     guards: Sequence[GuardEvent] = (),
+    on_watts: Sequence[float | None] | None = None,
 ) -> ForecastReport:
     """Aggregate scored anchors into the report the plan's questions need.
 
@@ -856,12 +1174,24 @@ def summarize(
             the production jitter counts (optional).
         guards: Parsed guard events, supplying per-quarter firing
             counts (optional).
+        on_watts: Per-anchor controllable watts from
+            :func:`assign_on_watts` (aligned with ``anchors``); None
+            entries are excluded from the residual series. Omit entirely
+            for reports without ON-watts attribution.
 
     Returns:
         A report covering error magnitude, error sign, rate shortfall,
-        the churn band, and per-quarter target/miss/guard context.
+        the churn band, the residual series, and per-quarter
+        target/miss/guard context.
     """
     all_anchors = list(anchors)
+    if on_watts is not None and len(on_watts) != len(all_anchors):
+        raise ValueError(
+            f"on_watts has {len(on_watts)} entries for {len(all_anchors)} anchors"
+        )
+    watts_by_anchor = (
+        list(on_watts) if on_watts is not None else [None] * len(all_anchors)
+    )
     scored = [a for a in all_anchors if a.actual_wh is not None]
     churns_all = churn_by_anchor(all_anchors)
     churns = tuple(
@@ -899,37 +1229,12 @@ def summarize(
     signed = [e for e in (a.error for a in scored) if e is not None]
     optimistic = sum(1 for e in signed if e < 0)
     shortfalls = [s for s in (a.rate_shortfall for a in scored) if s is not None]
-
-    buckets = tuple(
-        _bucket(
-            [a for a in scored if low <= a.remaining_secs < high],
-            low,
-            high,
-        )
-        for low, high in zip(bucket_edges, bucket_edges[1:])
-    )
-
-    grouped: dict[tuple[str, datetime], list[ForecastAnchor]] = {}
-    for anchor in scored:
-        grouped.setdefault((anchor.source, anchor.quarter_start), []).append(anchor)
-    quarters = tuple(
-        summary
-        for summary in (
-            _quarter_summary(
-                source,
-                start,
-                items,
-                targets.get((source, start)),
-                guard_counts.get((source, start), 0),
-            )
-            for (source, start), items in sorted(grouped.items(), key=lambda kv: kv[0][1])
-        )
-        if summary is not None
-    )
+    residual = _residual_summary(all_anchors, watts_by_anchor)
+    buckets, quarters = _quarter_tables(scored, bucket_edges, targets, guard_counts)
 
     return ForecastReport(
         anchor_count=len(scored),
-        quarter_count=len(grouped),
+        quarter_count=len(quarters),
         dropped_count=len(all_anchors) - len(scored),
         mean_abs_error=sum(abs(e) for e in signed) / len(signed),
         max_abs_error=max(abs(e) for e in signed),
@@ -943,6 +1248,7 @@ def summarize(
         sigma_rate=stddev(shortfalls) if len(shortfalls) > 1 else 0.0,
         churns=churns,
         guard=guard_summary,
+        residual=residual,
     )
 
 
@@ -966,6 +1272,16 @@ def format_report(report: ForecastReport) -> str:
         "churn band coverage (|e| <= k * churn * R): "
         + "  ".join(f"k={k:g} -> {report.churn_coverage(float(k)):.0%}" for k in (1, 2, 3))
         + f"  (swing measurable: {report.measurable_churn_count}/{report.anchor_count})",
+        (
+            f"residual (net controllable): {report.residual_count} anchors, "
+            f"sigma_residual={report.sigma_residual:.4f} Wh/s, coverage "
+            + "  ".join(
+                f"k={k:g} -> {report.residual_coverage(float(k)):.0%}" for k in (1, 2, 3)
+            )
+            + f", 260W survives k=1: {report.plug_survival(1.0):.0%}"
+            if report.residual_count
+            else "residual (net controllable): no ON-watts attribution"
+        ),
         "jitter guard: "
         f"{report.guard.firing_count} guard event(s), "
         f"{report.guard.excessive_jitter_cycles} excessive_jitter cycle(s)"
@@ -1008,6 +1324,21 @@ def format_report(report: ForecastReport) -> str:
     return "\n".join(lines)
 
 
+def _iter_log_texts(paths: Sequence[Path]) -> Iterator[tuple[Path, str]]:
+    """Yield ``(path, text)`` for each readable log, skipping the rest.
+
+    Shared file loop for the offline CLIs so unreadable paths warn on
+    stderr and never abort a multi-file run.
+    """
+    for path in paths:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError as exc:
+            print(f"skipping {path}: {exc}", file=sys.stderr)
+            continue
+        yield path, text
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Print the forecast-error report for the given log paths.
 
@@ -1020,18 +1351,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     paths = [Path(a) for a in args] if args else sorted((Path("bugs")).glob("*.log"))
     anchors: list[ForecastAnchor] = []
+    on_watts: list[float | None] = []
     cycles: list[CycleRecord] = []
     guards: list[GuardEvent] = []
-    for path in paths:
-        try:
-            text = path.read_text(errors="replace")
-        except OSError as exc:
-            print(f"skipping {path}: {exc}", file=sys.stderr)
-            continue
-        anchors.extend(parse_log(text, source=path.name))
+    for path, text in _iter_log_texts(paths):
+        path_anchors = parse_log(text, source=path.name)
+        on_watts.extend(
+            assign_on_watts(
+                path_anchors, parse_on_watts_timeline(text, source=path.name)
+            )
+        )
+        anchors.extend(path_anchors)
         cycles.extend(parse_cycles(text, source=path.name))
         guards.extend(parse_guard_events(text, source=path.name))
-    report = summarize(anchors, cycles=cycles, guards=guards)
+    report = summarize(anchors, cycles=cycles, guards=guards, on_watts=on_watts)
     print(f"scanned {len(paths)} log(s)\n")
     print(format_report(report))
     return 0 if report.anchor_count else 1

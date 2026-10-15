@@ -45,6 +45,7 @@ If actions were taken after the last data point, the system enters a
 | `LOAD_MANAGE_ENABLED` | `False` | Enable/disable or time range `HH:MM-HH:MM` |
 | `LOAD_MANAGE_INTERVAL_SECS` | `30` | Seconds between load management cycles |
 | `LOAD_MANAGE_DRY_RUN` | `False` | Log actions without executing them |
+| `LOAD_MANAGE_LUMPY_FIRST` | `False` | Lumpy-first residual turn_off (see below) |
 | `LOAD_MANAGE_API_KEY` | *(empty, disabled)* | API key for manual trigger endpoint auth |
 | `LOAD_PLUG_CONTROLLER` | `stub` | `real` (aiohomekit) or `stub` (in-memory mock) |
 | `LOAD_TESLA_CONTROLLER` | `stub` | `real` (tesla-fleet-api) or `stub` (in-memory mock) |
@@ -129,6 +130,34 @@ default; the fallback is now **20 Wh** (`constants.py:DEFAULT_HYSTERESIS_WH`),
 used only when no explicit value is passed. Production always passes
 `int(abs(target_wh) / 3)` explicitly — do not rely on the fallback when
 reasoning about production over-commit risk.
+
+## Lumpy-first residual turn_off (flagged off by default)
+
+Turn-off shedding packs eligible loads in priority order until the deficit
+is covered, with no fit check — so at quarter-open, a 28x extrapolation
+of the water heater's own draw dictates how many 260 W plugs shed with it
+(`bugs/2026-10-14-water-heater-overshoot.log` c658:
+ecoflow + heater on gap 1171, residual −15.7, jackery chased a cycle later;
+`bugs/2026-10-14-no-overshoot.log` c817: same batch, quarter landed −28.65
+with one plug stranded off most of the quarter).
+
+When `LOAD_MANAGE_LUMPY_FIRST` is true, `_decide_turn_off` (`load_nbc.py`,
+`GapMinder.lumpy_first`) decides loads ≥ `LUMPY_PLUG_MIN_WATTS` (1000 W)
+first, but only when one of them is implicated in the trailing rate (its
+draw dominates what the forecast extrapolates, inferred from
+`banked_wh`) *and* the deficit exceeds the smalls' combined capacity
+(they could not cover it alone). Shedding it first through the shared
+remainder *is* the residual budget — small plugs then pack onto what is
+left, so the heater's own draw can no longer dictate their count. Without
+banked energy the rate is unknowable and the engine falls back to
+status-quo order; turn-on, Tesla, and the jitter guard are untouched.
+
+Measured, not modeled: the divergence audit (`tools/divergence_audit.py`)
+over 1,015 corpus quarters finds 9 divergences (11 anchors), unanimously
+shedding less and never more than one 260 W plug. The residual carries
+NO margin — corpus sizing (`tools/forecast_log_scoring.py` residual
+series: sigma 0.29 vs raw 0.18) supports none, and a symmetric margin
+demonstrably churns (six flip-flops, −63 vs −28.65 in the replay harness).
 
 ## Tesla stop deferral and ramp awareness
 

@@ -267,3 +267,13 @@ started external session against poll cost during long ghost periods."""
 
 TESLA_HOME_RADIUS_M_DEFAULT: float = 500.0
 """Default radius in metres around home used for at-home detection."""
+
+LUMPY_PLUG_MIN_WATTS: float = 1000.0
+"""Minimum rating for lumpy-first candidacy in turn_off decisions.
+
+Below this a plug is always a fine-tuning knob budgeted on the residual;
+at or above it (the 4857 W water heater in practice) the load can dominate
+the trailing NBC rate, so the residual policy may decide it first. Sized
+by the divergence audit (``tools/divergence_audit.py``): an order of
+magnitude above the fine-tuning scale (hysteresis 3 Wh, gaps of tens of
+Wh), which is what makes the quantum lumpy."""

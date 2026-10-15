@@ -28,6 +28,7 @@ from constants import (
     JITTER_FLOOR_WH_PER_S,
     JITTER_GUARD_FRACTION,
     JITTER_HORIZON_SECS,
+    LUMPY_PLUG_MIN_WATTS,
     MIN_SECONDS_TO_ACT,
     SETTLE_WINDOW_DEADBAND_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
@@ -1975,6 +1976,67 @@ def jitter_swing_wh(jitter_wh_per_s: float, seconds_remaining: int) -> float:
     return jitter_wh_per_s * min(seconds_remaining, JITTER_HORIZON_SECS)
 
 
+def on_sheddable_watts(
+    plugs: dict[str, Any], state: StateTracker
+) -> list[float]:
+    """Rated watts of plugs currently wanted on.
+
+    The controllable-load share of the trailing NBC rate: these loads'
+    draw is embedded in ``prediction_w`` but can be removed by command,
+    so budgeting against the raw rate double-counts them. Plugs already
+    wanted off contribute nothing. Sub-10 W reserve plugs (sentinel) are
+    included; at ~0.003 Wh/s they are far below any decision threshold.
+
+    Limitation: rated watts are nameplate, not measured draw. A
+    duty-cycling load (water heater thermostat) misattributes up to its
+    full rating into the residual; the residual margin must absorb that.
+
+    Args:
+        plugs: Plug configurations by name.
+        state: Current tracker (desired states decide inclusion).
+
+    Returns:
+        Rated watts of each wanted-on plug with a known rating.
+    """
+    watts: list[float] = []
+    for name, plug in plugs.items():
+        device = state.devices.get(name)
+        if device is None or device.desired_state is not True:
+            continue
+        if plug.power_watts is None:
+            continue
+        watts.append(plug.power_watts)
+    return watts
+
+
+def residual_prediction_wh(
+    raw_wh: float,
+    prediction_w: float,
+    on_watts: list[float],
+    seconds_remaining: int,
+) -> float:
+    """Counterfactual quarter total with the given loads shed.
+
+    Re-extrapolates the banked quarter energy at the trailing rate net of
+    the sheddable draw: ``raw_wh + (w - sum(on_watts) / 3600) * R``. Used
+    to budget small plugs after the lumpy load's decision is taken, so a
+    28x quarter-opening extrapolation of the heater's own draw cannot
+    dictate how many 260 W plugs to shed (bugs/2026-10-14 logs). The
+    production forecast (``compute_nbc_quarter``) is untouched; this only
+    re-attributes its rate decision-side.
+
+    Args:
+        raw_wh: Banked quarter energy so far.
+        prediction_w: Trailing per-second rate (Wh/s).
+        on_watts: Rated watts assumed shed for the rest of the quarter.
+        seconds_remaining: Extrapolation horizon in seconds.
+
+    Returns:
+        Counterfactual quarter total in Wh.
+    """
+    return raw_wh + (prediction_w - sum(on_watts) / 3600.0) * seconds_remaining
+
+
 class GapMinder:
     """Bin-pack eligible loads to fill (or reduce) the NBC surplus/deficit gap."""
 
@@ -2004,6 +2066,7 @@ class GapMinder:
         charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
         turn_on_margin_wh: int | None = None,
         turn_off_margin_wh: int | None = None,
+        lumpy_first: bool = False,
     ) -> None:
         """Initialize the GapMinder.
 
@@ -2024,6 +2087,11 @@ class GapMinder:
                 ``_decide_turn_off``. Defaults to 0 (aim at target); pass
                 the hysteresis value to restore the old deadband-edge
                 behavior. ``None`` is treated as 0.
+            lumpy_first: When True, turn_off decides >=1000 W
+                (``LUMPY_PLUG_MIN_WATTS``) loads first when one dominates
+                the trailing rate and the deficit exceeds the smalls'
+                combined capacity, then budgets small plugs on the
+                residual. Defaults to False (status-quo binpack).
         """
         # Residential default (20 Wh); the load manager passes an explicit
         # config-derived value (abs(target_wh) * 1/3) in production.
@@ -2032,6 +2100,7 @@ class GapMinder:
         # To revert either, construct with turn_*_margin_wh=hysteresis_wh.
         self.TURN_ON_MARGIN_WH = turn_on_margin_wh if turn_on_margin_wh is not None else 0
         self.TURN_OFF_MARGIN_WH = turn_off_margin_wh if turn_off_margin_wh is not None else 0
+        self.lumpy_first = lumpy_first
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.tesla_decider = TeslaDecider(
@@ -2219,7 +2288,7 @@ class GapMinder:
             extra={"event": "gapminder_decide", "direction": "turn_off", "gap_wh": abs(gap), "edge_gap_wh": budget, "hysteresis_wh": self.HYSTERESIS_WH},
         )
         return self._decide_turn_off(
-            ctx, budget,
+            ctx, budget, predicted_wh,
         )
 
     def turn_on_jitter_guard_fires(
@@ -2394,21 +2463,81 @@ class GapMinder:
 
         return actions
 
+    def _lumpy_first_names(
+        self,
+        ctx: DecideContext,
+        predicted_wh: float,
+        candidates: list[tuple[int, str, Any]],
+        gap_wh: float,
+    ) -> list[str]:
+        """Names of lumpy loads to shed before small plugs, if any.
+
+        A lumpy load (``LUMPY_PLUG_MIN_WATTS``) leads only when it is
+        implicated in the trailing rate (its draw dominates what the
+        forecast extrapolates) *and* the deficit exceeds the smalls'
+        combined capacity (they could not cover it alone). Shedding it
+        first through the shared remainder is exactly the residual
+        budget, so no separate arithmetic is needed downstream.
+
+        Args:
+            ctx: Decision context (banked raw energy, horizon).
+            predicted_wh: Raw quarter prediction feeding the gap.
+            candidates: Eligible plugs in production order.
+            gap_wh: Positive turn_off deficit.
+
+        Returns:
+            Lumpy plug names largest-first, or [] to keep production order
+            (flag off, no banked energy, non-positive horizon, nothing
+            implicated, or smalls cover the gap).
+        """
+        if not self.lumpy_first:
+            return []
+        if ctx.banked_wh is None or ctx.seconds_remaining <= 0:
+            return []
+        trailing_w = (predicted_wh - ctx.banked_wh) / ctx.seconds_remaining
+        lumpies = [
+            (priority, name, plug)
+            for priority, name, plug in candidates
+            if plug.power_watts is not None
+            and plug.power_watts >= LUMPY_PLUG_MIN_WATTS
+            and abs(trailing_w) >= 0.5 * plug.power_watts / 3600.0
+        ]
+        if not lumpies:
+            return []
+        small_cap_wh = sum(
+            StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
+            for _, _, plug in candidates
+            if plug not in [entry[2] for entry in lumpies]
+        )
+        if gap_wh <= small_cap_wh:
+            return []
+        return [
+            name
+            for _, name, _ in sorted(
+                lumpies, key=lambda entry: entry[2].power_watts, reverse=True
+            )
+        ]
+
     def _decide_turn_off(
         self,
         ctx: DecideContext,
         gap_wh: float,
+        predicted_wh: float,
     ) -> list[PendingEffect]:
         """Turn off loads to reduce consumption.
 
         Priority order:
           1. Reduce Tesla charge amps (partial, no stop).
-          2. Disable plugs in priority order (lowest-priority first).
+          2. Disable plugs in priority order (lowest-priority first), or
+             lumpy-first when ``lumpy_first`` applies (see
+             :meth:`_lumpy_first_names`).
           3. Stop Tesla charging if a deficit still remains.
 
         Args:
             ctx: Decision context.
             gap_wh: Wh reduction needed.
+            predicted_wh: Raw quarter prediction (with banked energy,
+                implies the trailing rate for the lumpy-first gate).
 
         Returns:
             List of PendingEffect objects.
@@ -2453,8 +2582,16 @@ class GapMinder:
                 remaining_reduction -= savings
 
         # ── Step 2: disable plugs in priority order ────────────────────────────
-        # Least important eligible plugs (currently on) first.
+        # Least important eligible plugs (currently on) first. With
+        # lumpy_first, implicated lumpy loads lead (largest first) and the
+        # smalls then budget off the remainder, which the shared
+        # remaining_reduction decrement turns into the residual exactly.
         candidates = self._eligible_plugs(ctx, want_on=False)
+        lead_names = self._lumpy_first_names(ctx, predicted_wh, candidates, gap_wh)
+        if lead_names:
+            lead = [c for c in candidates if c[1] in lead_names]
+            tail = [c for c in candidates if c[1] not in lead_names]
+            candidates = lead + tail
 
         for _, name, plug in candidates:
             if remaining_reduction <= 0:
