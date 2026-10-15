@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, time, timezone
 import itertools
 import logging
+import math
 import sys
 import threading
 import time as _time_mod
@@ -2737,6 +2738,30 @@ class LoadManager:
             eligible_tesla = None
         return eligible_plugs, eligible_tesla
 
+    @staticmethod
+    def _effective_seconds_remaining(
+        seconds_remaining: int, elapsed_secs: float
+    ) -> int:
+        """Shrink the fetch-start remainder by measured execution lag.
+
+        The NBC fetch reports wall-clock seconds left at fetch start, but
+        the decision runs after the fetch plus plug/Tesla sync round-trips,
+        during which the enabled loads keep burning at full rate
+        (bugs/2026-10-14-water-heater-overshoot.log c658: 835 s booked vs
+        ~831 s realizable, ~5.7 Wh overbooked). Ceil rounds the lag up so
+        savings are never booked for time already spent.
+
+        Args:
+            seconds_remaining: Fetch-start seconds left in the quarter-hour.
+            elapsed_secs: Seconds between post-fetch and decision time.
+
+        Returns:
+            Remaining seconds at decision time, floored at zero.
+        """
+        if elapsed_secs <= 0:
+            return seconds_remaining
+        return max(0, seconds_remaining - math.ceil(elapsed_secs))
+
     def _decide_actions(
         self,
         eligible_plugs: dict[str, PlugConfig],
@@ -2900,6 +2925,15 @@ class LoadManager:
             await self._fetch_tesla_state_async(now=now)
         )
         self._record_tesla_auth_error(tesla_error, tesla_login_url)
+        # Execution-lag correction (bugs/2026-10-14-water-heater-overshoot.log
+        # c658): the fetch-start remainder overbooks savings for the fetch +
+        # sync time already spent. Shrink it to decision time; the in-flight
+        # correction, decide, and actuation below share the same horizon.
+        # ``now`` itself is left alone: it stamps effects and gates
+        # time-range/debounce checks, whose contract is post-fetch time.
+        seconds_remaining = self._effective_seconds_remaining(
+            seconds_remaining, (self._clock.now() - now).total_seconds()
+        )
         corrected_adjusted_wh, corrected_gap_wh = self._correct_gap_with_inflight(
             adjusted_wh, tesla_state, seconds_remaining, now, data_point_at
         )

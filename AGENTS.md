@@ -312,7 +312,10 @@ project-root
                            # test_prune_orphaned_tesla_command.py the 2026-10-08 orphaned
                            # 12A command (pruning the last set_amps clears last_commanded_amps);
                            # test_commit_tesla_direction.py the 2026-10-08 7->5 cut
-                           # (commit classifies direction from live amps when the command expired)
+                           # (commit classifies direction from live amps when the command expired);
+                           # test_decision_lag_adjustment.py the 2026-10-14 water-heater
+                           # execution lag (fetch-start remainder shrunk to decision
+                           # time before decide books plug/Tesla savings)
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change
