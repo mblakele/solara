@@ -94,7 +94,7 @@ class TestAsyncPhaseUsesEffectiveRemaining:
         ):
             asyncio.run(mgr._cycle_async_phase_body(
                 -1171.0, 1162.0, now, 835, True,
-                qh_name="QH1", data_point_at=now,
+                data_point_at=now,
             ))
 
         assert captured["seconds_remaining"] == 831

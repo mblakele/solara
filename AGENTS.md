@@ -157,6 +157,10 @@ project-root
 │                          # Linted and type-checked (`uv run pylint *.py tools/*.py`,
 │                          # mypy `files` includes `tools/*.py`), but not shipped in
 │                          # the gunicorn/Flask runtime path.
+│                          # Every `Corpus`/`corpus/` figure quoted below is a
+│                          # SNAPSHOT of the corpus at measurement time — the
+│                          # corpus is refreshed over time, so treat the numbers
+│                          # as a measurement of a moment, not a fixed baseline.
 │   └── forecast_log_scoring.py  # FIRST STEP for any task that names a `bugs/*.log`
 │                          # file — run it and lead with its output (see
 │                          # "Analyzing a log in `bugs/`" under General Advice).
@@ -437,29 +441,44 @@ project-root
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --guards live
 │   ├── settle_window_counterfactual.py  # Prices the *adaptive* prediction/
 │                          # settle window against a pinned one (Subtask 6 of
-│                          # the guard-observability plan). The window reaches
-│                          # decisions only through the fresh-data gate
-│                          # (`EffectStore.has_since`) and the post-amp-change
-│                          # suppression (`_suppressed_by_settle`), so the tool
-│                          # rebuilds the effect store from the logged
+│                          # the guard-observability plan). The window is the
+│                          # EffectStore freshness window — the fresh-data gate
+│                          # (`EffectStore.has_since`), the one consumer priced
+│                          # here — and separately the forecast's trailing-rate
+│                          # length, which this tool does NOT price (it holds the
+│                          # logged forecast fixed; see the estimator-
+│                          # responsiveness plan). So the tool rebuilds the
+│                          # effect store from the logged
 │                          # `actions=[PendingEffect(...)]` reprs and replays
-│                          # production's own EffectStore/TeslaSettleTracker once
-│                          # per cycle under two arms: the window the log
-│                          # committed, and `--pinned-secs` (default
+│                          # production's own EffectStore once per cycle under
+│                          # two arms: the window the log committed, and
+│                          # `--pinned-secs` (default
 │                          # DEFAULT_PREDICTION_WINDOW_SECS, 30 s). Reports per
-│                          # log the window histogram and the cycles where the
-│                          # arms disagree, where "disagree" is the effective
-│                          # decision (wait OR suppress; production's gate
-│                          # pre-empts the suppression). Corpus verdict: 55,406
-│                          # cycles / 13 logs, 107 non-default (44@15s on
-│                          # 10-12; 59@15s + 4@21s on 10-16), 0 gate flips, 0
-│                          # suppression flips -> no decision changed, no quarter
-│                          # affected. The suppression path is subsumed (an
-│                          # active settle always trips the gate first), so the
-│                          # window's only live consumer is the gate, and the
-│                          # adaptation is decision-inert on the corpus. Nothing
-│                          # simplified: it guards a failure mode the corpus never
-│                          # exercises. Spec: tests/test_settle_window_counterfactual.py.
+│                          # log the histogram of non-default windows and the
+│                          # cycles where the arms disagree. Snapshot (corpus/,
+│                          # 2026-10-18, 14 logs, 58,390 cycles): 111 non-default
+│                          # (15 s/21 s/24 s), 0 gate flips -> no decision
+│                          # changed, no quarter affected, gate fires 2672 under
+│                          # both arms. The corpus is refreshed over time, so
+│                          # these figures are a snapshot, not a fixed baseline.
+│                          # The post-amp-change suppression
+│                          # `_suppressed_by_settle` — a would-be settle-window
+│                          # consumer that never decided a cycle — was retired
+│                          # 2026-10-18 as unreachable: whenever an active settle
+│                          # exists the gate is already true (both compare the
+│                          # effect's wall and data-point ages against the same
+│                          # window, and the settle's `now` is at or after
+│                          # `data_point_at`), so production exits on the gate
+│                          # first; it fired in no recorded cycle. Its accessors
+│                          # (`StateTracker.get_active_tesla_settle`,
+│                          # `TeslaSettleTracker.get_active`), the
+│                          # `GapMinder.TESLA_SETTLE_SUPPRESS_WH` threshold and
+│                          # the vestigial `PendingEffect.suppress_action` went
+│                          # with it. The adaptation itself stays: it guards a
+│                          # failure mode (a sustained meter change to a slower
+│                          # quantum) the corpus never exercises, and the tool's
+│                          # 60 s committed-window fixture shows the flip that
+│                          # would restore. Spec: tests/test_settle_window_counterfactual.py.
 │                          # Run from the repo root:
 │                          #   uv run python tools/settle_window_counterfactual.py corpus/*.log
 │                          #   uv run python tools/settle_window_counterfactual.py corpus/*.log --pinned-secs 30
@@ -705,10 +724,12 @@ project-root
                            # test_settle_window_counterfactual.py the Subtask-6
                            # counterfactual (cycle/effect repr parsing + UTC
                            # conversion, the short-window wait the pinned window
-                           # takes, agreement when the effect is far, the window
-                           # histogram/non-default count, the suppression subsumed
-                           # by the fresh-data gate, wide-gap exclusion, report
-                           # totals + gate counts, default constant, standalone CLI);
+                           # takes, the adaptation's protection case — a 60 s
+                           # committed window defers where the pinned 30 s decides
+                           # — agreement when the effect is far, tolerance of the
+                           # retired suppress_action token, the window histogram /
+                           # non-default count, report totals + gate counts,
+                           # default constant, standalone CLI);
                            # test_lumpy_first.py the Subtask-4 wiring (flag-off
                            # parity with history, flag-on c658/c817
                            # prescriptions, config/env plumbing, and the 4a
@@ -795,7 +816,7 @@ project-root
   phase (`_cycle_async_phase` → `_cycle_async_phase_body`) returns an
   `AsyncPhaseResult` dataclass (named fields, not a tuple) and is split into
   `_async_sync_and_check_sentinel()`, `_record_tesla_auth_error()`,
-  `_correct_gap_with_inflight()`, `_suppressed_by_settle()`,
+  `_correct_gap_with_inflight()`,
   `_eligible_for_decision()`, `_decide_actions()`, `_run_actions()`; Tesla
   execute paths share `_mark_vehicle_offline()` + `_handle_tesla_auth_error()`;
   `run_cycle()` stage timings go through `_timed()`

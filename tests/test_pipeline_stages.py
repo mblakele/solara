@@ -543,7 +543,6 @@ class TestStageAsyncPhase:
                 now=now,
                 seconds_remaining=450,
                 dry_run=True,
-                qh_name="QH2",
                 data_point_at=now,
             )
 

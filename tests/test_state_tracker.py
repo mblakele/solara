@@ -17,7 +17,6 @@ def make_settle_effect(
     target_amps: int = 20,
     *,
     direction: str = "increase",
-    suppress_action: str = "turn_off",
     data_point_at: datetime | None = None,
 ) -> PendingEffect:
     """Build a Tesla ``set_amps`` pending effect for settle-window tests.
@@ -26,7 +25,6 @@ def make_settle_effect(
         age_secs: How long ago the command was issued.
         target_amps: The commanded amp level.
         direction: Effect direction metadata.
-        suppress_action: Suppress metadata for the opposite action.
         data_point_at: Defaults to the same age as the command timestamp.
     """
     return PendingEffect(
@@ -36,7 +34,7 @@ def make_settle_effect(
         if data_point_at is not None
         else fixed_now - timedelta(seconds=age_secs),
         power_watts=0, target_amps=target_amps,
-        direction=direction, suppress_action=suppress_action,
+        direction=direction,
         qh_name="QH1",
     )
 
@@ -521,7 +519,7 @@ class TestTeslaInflightWh:
             timestamp=fixed_now - timedelta(seconds=200),
             data_point_at=command_dp,
             power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
+            direction="increase",
             qh_name="QH1",
         ))
         # Both timestamps are past 120s settle
@@ -802,7 +800,7 @@ class TestIsSettling:
     def test_decrease_settle_active(self) -> None:
         """is_settling(direction='decrease') returns True within window."""
         tracker = StateTracker(prediction_window_seconds=60)
-        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease", suppress_action="turn_on")
+        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease")
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=30), current_qh="QH1",
@@ -812,7 +810,7 @@ class TestIsSettling:
     def test_decrease_settle_expired(self) -> None:
         """is_settling(direction='decrease') returns False after window."""
         tracker = StateTracker(prediction_window_seconds=30)
-        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease", suppress_action="turn_on")
+        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease")
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=61), current_qh="QH1",
@@ -834,7 +832,7 @@ class TestIsSettling:
             device_name="tesla", action="set_amps",
             timestamp=fixed_now, data_point_at=record_dp,
             power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
+            direction="increase",
             qh_name="QH1",
         )
         tracker.pending_effects.append(eff)
@@ -853,7 +851,7 @@ class TestIsSettling:
             device_name="tesla", action="set_amps",
             timestamp=fixed_now, data_point_at=record_dp,
             power_watts=0, target_amps=20,
-            direction="increase", suppress_action="turn_off",
+            direction="increase",
             qh_name="QH1",
         )
         tracker.pending_effects.append(eff)
@@ -893,7 +891,7 @@ class TestIsSettling:
     def test_decrease_settle_expires_on_qh_change(self) -> None:
         """A new QH expires the decrease settle window."""
         tracker = StateTracker()
-        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease", suppress_action="turn_on")
+        eff = make_settle_effect(age_secs=0, target_amps=10, direction="decrease")
         tracker.pending_effects.append(eff)
         assert tracker.is_settling(
             fixed_now + timedelta(seconds=10), current_qh="QH2",
@@ -923,7 +921,7 @@ class TestLatestTeslaCommand:
     def test_returns_most_recent_tesla_effect(self) -> None:
         """Returns the most recent Tesla set_amps effect."""
         tracker = StateTracker()
-        eff1 = make_settle_effect(age_secs=10, target_amps=10, direction="decrease", suppress_action="turn_on")
+        eff1 = make_settle_effect(age_secs=10, target_amps=10, direction="decrease")
         eff2 = make_settle_effect(age_secs=0)
         tracker.pending_effects.extend([eff1, eff2])
         assert tracker._latest_tesla_command() is eff2

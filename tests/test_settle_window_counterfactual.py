@@ -1,11 +1,12 @@
 """Tests for the settle-window counterfactual tool.
 
 The tool prices the *adaptive* prediction/settle window against a pinned one
-on a log. It reaches decisions only through two consumers — the fresh-data
-gate (``EffectStore.has_since``) and the post-amp-change suppression
-(``_suppressed_by_settle``) — so these tests pin, on synthetic text and
-constructed cycles: the parser, the two predicates, the arm comparison and
-the report. No `corpus/` needed; the real logs stay a measurement input.
+on a log. It reaches decisions through one consumer — the fresh-data gate
+(``EffectStore.has_since``); the post-amp-change suppression it once also
+priced was removed as unreachable. These tests pin, on synthetic text and
+constructed cycles: the parser, the predicate, the arm comparison, the
+adaptation's own protection case and the report. No `corpus/` needed; the
+real logs stay a measurement input.
 """
 
 from __future__ import annotations
@@ -16,11 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from load_models import PendingEffect
-from load_nbc import EffectStore, TeslaSettleTracker
 from tools.settle_window_counterfactual import (
     PINNED_DEFAULT_SECS,
     Cycle,
-    _suppressed,
     compare,
     format_comparison,
     parse_cycles,
@@ -45,15 +44,22 @@ def _effect(
     *,
     target_amps: str = "None",
     direction: str = "None",
-    suppress_action: str = "None",
     qh_name: str = "None",
+    legacy_suppress: str | None = None,
 ) -> str:
-    """One ``PendingEffect(...)`` repr for a synthetic log line."""
+    """One ``PendingEffect(...)`` repr for a synthetic log line.
+
+    ``legacy_suppress`` emits the retired ``suppress_action=`` token the
+    pre-retirement logs carry, so the parser's tolerance is exercised.
+    """
+    suppress = (
+        "" if legacy_suppress is None else f"suppress_action={legacy_suppress}, "
+    )
     return (
         f"PendingEffect(device_name='{device}', action='{action}', "
         f"timestamp={stamp}, data_point_at={point}, power_watts={power}, "
         f"target_amps={target_amps}, direction={direction}, "
-        f"suppress_action={suppress_action}, qh_name={qh_name})"
+        f"{suppress}qh_name={qh_name})"
     )
 
 
@@ -97,21 +103,6 @@ def _plug_effect(
     )
 
 
-def _settle_effect(*, at: datetime, point: datetime, direction: str) -> PendingEffect:
-    """A Tesla amp-change effect with a settle direction."""
-    return PendingEffect(
-        device_name="tesla",
-        action="set_amps",
-        timestamp=at,
-        data_point_at=point,
-        power_watts=240.0 if direction == "increase" else -240.0,
-        target_amps=6,
-        direction=direction,  # type: ignore[arg-type]
-        suppress_action="turn_off" if direction == "increase" else "turn_on",
-        qh_name="QH1",
-    )
-
-
 # ── parsing ──────────────────────────────────────────────────────────
 
 
@@ -151,7 +142,7 @@ def test_parse_cycles_reads_cycle_and_effect_fields() -> None:
 
 
 def test_parse_cycles_keeps_tesla_settle_fields() -> None:
-    """A set_amps effect's direction, suppress action and QH round-trip."""
+    """A set_amps effect's direction and QH round-trip."""
     line = _cycle_line(
         at="2026-10-12 19:01:00",
         data_point=_dt(2026, 10, 12, 12, 0, 31, PDT),
@@ -165,7 +156,6 @@ def test_parse_cycles_keeps_tesla_settle_fields() -> None:
                 240.0,
                 target_amps="6",
                 direction="'increase'",
-                suppress_action="'turn_off'",
                 qh_name="'QH1'",
             ),
         ),
@@ -174,7 +164,31 @@ def test_parse_cycles_keeps_tesla_settle_fields() -> None:
     assert effect.action == "set_amps"
     assert effect.target_amps == 6
     assert effect.direction == "increase"
-    assert effect.suppress_action == "turn_off"
+    assert effect.qh_name == "QH1"
+
+
+def test_parse_cycles_tolerates_legacy_suppress_action() -> None:
+    """Logs written before the vestigial field was retired still parse."""
+    line = _cycle_line(
+        at="2026-10-12 19:01:00",
+        data_point=_dt(2026, 10, 12, 12, 0, 31, PDT),
+        window=30,
+        actions=(
+            _effect(
+                "tesla",
+                "set_amps",
+                _dt(2026, 10, 12, 19, 0, 40, UTC),
+                _dt(2026, 10, 12, 12, 0, 16, PDT),
+                240.0,
+                target_amps="6",
+                direction="'increase'",
+                qh_name="'QH1'",
+                legacy_suppress="'turn_off'",
+            ),
+        ),
+    )
+    effect = parse_cycles(line)[0].effects[0]
+    assert effect.direction == "increase"
     assert effect.qh_name == "QH1"
 
 
@@ -242,7 +256,7 @@ def _short_window_cycles() -> list[Cycle]:
 
 
 def test_short_window_skips_a_wait_the_pinned_window_takes() -> None:
-    """The whole point: a committed 15 s window decides where 30 s defers."""
+    """A committed 15 s window decides where 30 s defers."""
     cycles = _short_window_cycles()
     adaptive = replay(cycles, None)
     pinned = replay(cycles, PINNED_DEFAULT_SECS)
@@ -250,9 +264,46 @@ def test_short_window_skips_a_wait_the_pinned_window_takes() -> None:
     assert pinned[1].waits is True
     comparison = compare(cycles, PINNED_DEFAULT_SECS)
     assert comparison.wait_flips == 1
-    assert comparison.suppress_flips == 0
     assert comparison.changed == (cycles[1],)
     assert comparison.quarters_changed == 1
+
+
+def test_committed_slow_window_defers_what_pinned_30_would_decide() -> None:
+    """The adaptation's protection: a slower meter widens the gate's wait.
+
+    A 60 s committed window (a slow quantization period) treats an effect
+    taken 50 s before the newest data point as not-yet-reflected, so the gate
+    defers; the pinned 30 s window would decide. That failure mode — deciding
+    before the prediction has absorbed a load change on a slow meter — is
+    what the adaptation guards, and the all-30 s corpus never exercises it.
+    """
+    line = "\n".join(
+        (
+            _cycle_line(
+                at="2026-10-12 19:00:02",
+                data_point=_dt(2026, 10, 12, 11, 59, 31, PDT),
+                window=60,
+                actions=(
+                    _effect(
+                        "jackery",
+                        "turn_off",
+                        _dt(2026, 10, 12, 19, 0, 0, UTC),
+                        _dt(2026, 10, 12, 18, 59, 31, UTC),
+                        -260.0,
+                    ),
+                ),
+            ),
+            _cycle_line(
+                at="2026-10-12 19:00:52",
+                data_point=_dt(2026, 10, 12, 12, 0, 50, PDT),
+                window=60,
+            ),
+        )
+    )
+    cycles = parse_cycles(line)
+    assert replay(cycles, None)[1].waits is True
+    assert replay(cycles, 30)[1].waits is False
+    assert compare(cycles, 30).wait_flips == 1
 
 
 def test_both_arms_agree_when_the_effect_is_far_behind() -> None:
@@ -305,77 +356,6 @@ def test_windows_and_non_default_counted() -> None:
     assert comparison.non_default == 2
 
 
-# ── the suppression predicate ────────────────────────────────────────
-
-
-def test_settle_suppression_is_subsumed_by_the_fresh_data_gate() -> None:
-    """An active settle always trips the gate, so suppression never decides.
-
-    The predicate itself can fire (proven directly), but when it would,
-    ``has_pending_effect_since`` is already true for the same cycle, and
-    production exits on the gate before reaching the suppression.
-    """
-    effect = _settle_effect(
-        at=datetime(2026, 10, 12, 19, 0, 40, tzinfo=timezone.utc),
-        point=datetime(2026, 10, 12, 19, 0, 16, tzinfo=timezone.utc),
-        direction="increase",
-    )
-    seed = Cycle(
-        source="s",
-        at=datetime(2026, 10, 12, 19, 0, 45, tzinfo=timezone.utc),
-        status="ok",
-        qh_name="QH1",
-        gap_wh=-50.0,
-        data_point_at=datetime(2026, 10, 12, 19, 0, 16, tzinfo=timezone.utc),
-        window=30,
-        effects=(effect,),
-    )
-    decide = Cycle(
-        source="s",
-        at=datetime(2026, 10, 12, 19, 1, 0, tzinfo=timezone.utc),
-        status="ok",
-        qh_name="QH1",
-        gap_wh=-50.0,
-        data_point_at=datetime(2026, 10, 12, 19, 0, 31, tzinfo=timezone.utc),
-        window=30,
-        effects=(),
-    )
-    # The predicate fires when evaluated on its own inputs ...
-    store = EffectStore(window_secs=30)
-    store.add(effect)
-    tracker = TeslaSettleTracker(store, window_secs=30)
-    assert _suppressed(tracker, decide) is True
-    # ... but the fresh-data gate is already true for the same cycle, so the
-    # suppression never decides alone (production exits on the gate first).
-    verdict = replay([seed, decide], None)[1]
-    assert verdict.waits is True
-    assert verdict.suppressed is True
-    assert not (verdict.suppressed and not verdict.waits)
-
-
-def test_settle_suppression_excluded_when_the_gap_is_wide() -> None:
-    """A genuine deficit over the suppress threshold is not suppressed."""
-    effect = _settle_effect(
-        at=datetime(2026, 10, 12, 19, 0, 40, tzinfo=timezone.utc),
-        point=datetime(2026, 10, 12, 19, 0, 16, tzinfo=timezone.utc),
-        direction="increase",
-    )
-    store = EffectStore(window_secs=30)
-    store.add(effect)
-    tracker = TeslaSettleTracker(store, window_secs=30)
-    cycle = Cycle(
-        source="s",
-        at=datetime(2026, 10, 12, 19, 1, 0, tzinfo=timezone.utc),
-        status="ok",
-        qh_name="QH1",
-        gap_wh=-500.0,
-        data_point_at=datetime(2026, 10, 12, 19, 0, 31, tzinfo=timezone.utc),
-        window=30,
-        effects=(),
-    )
-    assert _suppressed(tracker, cycle) is False
-
-
 # ── report + CLI ─────────────────────────────────────────────────────
 
 
@@ -385,9 +365,9 @@ def test_format_comparison_reports_totals_and_gate_counts() -> None:
     out = format_comparison(comparisons, 30)
     assert "settle-window counterfactual — committed vs pinned 30 s" in out
     assert "synthetic.log" in out
+    assert "15s:2" in out
     assert "total: 2 cycles, 2 non-default window, 1 changed decisions" in out
-    assert "fresh-data gate fires: committed 0, pinned 1;" in out
-    assert "settle suppression fires: committed 0, pinned 0" in out
+    assert "fresh-data gate fires: committed 0, pinned 1" in out
 
 
 def test_pinned_default_is_the_classic_window() -> None:

@@ -229,27 +229,39 @@ consecutive confirmations and ignores values within
 `SETTLE_WINDOW_DEADBAND_SECS` (5 s) of the committed window as detector
 jitter, so a genuine meter-behaviour change is tracked but ±1 s noise is not.
 
-That one window is the `EffectStore`/`TeslaSettleTracker` freshness window, so
-it reaches decisions through exactly two consumers: the fresh-data gate
+That one window is the `EffectStore` freshness window, so as a *gate* parameter
+it reaches decisions through exactly one consumer: the fresh-data gate
 `has_pending_effect_since` (an early exit that defers a decision while an
-effect taken after the newest data point has not been reflected yet) and the
-post-amp-change suppression `_suppressed_by_settle`.
+effect taken after the newest data point has not been reflected yet). The same
+resolved value is *also* the forecast's trailing-rate length
+(`util.compute_nbc_quarter(prediction_window_seconds=...)`), which changes
+`predicted_wh` and therefore decisions; the counterfactual below holds the
+logged forecast fixed, so it prices the gate only (the forecast-rate axis is
+the estimator-responsiveness plan).
 
-Both are priced by `tools/settle_window_counterfactual.py`: it rebuilds the
+It is priced by `tools/settle_window_counterfactual.py`: it rebuilds the
 effect store from the logged `actions=[PendingEffect(...)]` reprs and replays
-production's own `EffectStore`/`TeslaSettleTracker` once per cycle under the
-committed window and a pinned one (default 30 s). Corpus (55,406 cycles,
-13 logs): the window is 30 s everywhere except 107 cycles
-(2026-10-12: 44 at 15 s; 2026-10-16: 59 at 15 s + 4 at 21 s), and the two arms
-agree on **every** cycle — 0 gate flips, 0 suppression flips, no decision
-changed. The suppression is in fact subsumed: whenever an active settle
-effect exists the gate is already true (both compare the effect's wall and
-data-point ages against the same window, and the settle's `now` is at or after
-`data_point_at`), so production exits on the gate before reaching the
-suppression; it never decides a cycle. Nothing was simplified on this
-measurement — the adaptation guards a failure mode (a sustained meter change
-to a slower quantum) the corpus never exercises. The detector period's second
-consumer, the sparkline's bucket size, is display-only and out of scope.
+production's own `EffectStore` once per cycle under the committed window and a
+pinned one (default 30 s). Snapshot (corpus/, 2026-10-18, 14 logs, 58,390
+cycles; the corpus is refreshed over time, so these figures are a snapshot,
+not a fixed baseline): the window is 30 s everywhere except 111 cycles
+(15 s/21 s/24 s), and the two arms agree on **every** cycle — 0 gate flips,
+no decision changed, the gate firing 2,672 times under both arms. The
+adaptation guards a failure mode (a sustained meter change to a slower
+quantum) the corpus never exercises; the tool's 60 s committed-window fixture
+shows the flip that would appear if the meter genuinely slowed. The detector
+period's second consumer, the sparkline's bucket size, is display-only and out
+of scope.
+
+The window's second consumer, the post-amp-change suppression
+`_suppressed_by_settle`, was **retired 2026-10-18 as unreachable**. Whenever
+an active settle effect exists the gate is already true — both compare the
+effect's wall-clock and data-point ages against the same window, and the
+settle's `now` is at or after `data_point_at` — so production exits on the
+gate before reaching the suppression, and it fired in no recorded cycle. Its
+support went with it: `StateTracker.get_active_tesla_settle`,
+`TeslaSettleTracker.get_active`, the `GapMinder.TESLA_SETTLE_SUPPRESS_WH`
+threshold and the vestigial `PendingEffect.suppress_action` field.
 
 ## Turn-on jitter guard
 

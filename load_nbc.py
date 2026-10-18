@@ -812,30 +812,6 @@ class TeslaSettleTracker:
                 return None
         return None
 
-    def get_active(
-        self, now: datetime, current_qh: str | None = None,
-        data_point_at: datetime | None = None,
-        direction: str = "increase",
-    ) -> PendingEffect | None:
-        """Return the active settle effect for the given direction, or None.
-
-        Like :meth:`is_settling` but returns the effect itself so callers
-        can access its timestamp for logging or diagnostics.
-
-        Args:
-            now: Current wall-clock timestamp.
-            current_qh: Current QH name for QH-boundary expiry.
-            data_point_at: Current NBC data-point-at timestamp.
-            direction: "increase" or "decrease".
-
-        Returns:
-            The active settle effect, or None if no active settle exists.
-        """
-        return self._find_active(
-            now, current_qh=current_qh, data_point_at=data_point_at,
-            direction=direction,
-        )
-
     def is_settling(
         self, now: datetime, current_qh: str | None = None,
         data_point_at: datetime | None = None,
@@ -1273,30 +1249,6 @@ class StateTracker:
             The most recent Tesla effect, or None if none exist.
         """
         return self._effects.latest_for("tesla")
-
-    def get_active_tesla_settle(
-        self, now: datetime, current_qh: str | None = None,
-        data_point_at: datetime | None = None,
-        direction: str = "increase",
-    ) -> PendingEffect | None:
-        """Return the active settle effect for the given direction, or None.
-
-        Like ``is_settling()`` but returns the effect itself so callers can
-        access its timestamp for logging or diagnostics.
-
-        Args:
-            now: Current wall-clock timestamp.
-            current_qh: Current QH name for QH-boundary expiry.
-            data_point_at: Current NBC data-point-at timestamp.
-            direction: "increase" or "decrease".
-
-        Returns:
-            The active settle effect, or None if no active settle exists.
-        """
-        return self.settle.get_active(
-            now, current_qh=current_qh, data_point_at=data_point_at,
-            direction=direction,
-        )
 
     def is_settling(
         self, now: datetime, current_qh: str | None = None,
@@ -2079,12 +2031,6 @@ class GapMinder:
     MAX_DEFER_SECS = 120          # cap on the safe defer window
     HARD_MAX_AMPS = TESLA_HARD_MAX_AMPS
     """Absolute max — never exceed, regardless of config."""
-    # During the post-amp-increase settle window, suppress turn-off decisions
-    # only if the apparent deficit is below this threshold.  Deficits larger
-    # than this are treated as genuine even during the settle period (e.g. a
-    # new QH starting with Tesla at a high amp level that immediately overwhelms
-    # solar production).
-    TESLA_SETTLE_SUPPRESS_WH = 240
 
     @property
     def car_power_watts_5a(self) -> float:

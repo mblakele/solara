@@ -48,7 +48,6 @@ def test_commit_decrease_with_expired_command_uses_live_amps():
     lm._stage_commit(ctx)
     eff = ctx.succeeded_effects[0]
     assert eff.direction == "decrease"
-    assert eff.suppress_action == "turn_on"
     assert eff.qh_name == "QH1"
     assert lm.state.last_commanded_amps == 5
 
@@ -80,4 +79,3 @@ def test_commit_first_command_without_live_state_stays_increase():
     lm._stage_commit(ctx)
     eff = ctx.succeeded_effects[0]
     assert eff.direction == "increase"
-    assert eff.suppress_action == "turn_off"

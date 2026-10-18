@@ -26,7 +26,6 @@ def test_prune_last_tesla_effect_clears_orphaned_command():
             power_watts=1680.0,
             target_amps=12,
             direction="increase",
-            suppress_action="turn_off",
             qh_name="QH1",
         )
     )
@@ -51,7 +50,6 @@ def test_prune_keeps_command_when_newer_tesla_effect_remains():
         power_watts=1680.0,
         target_amps=8,
         direction="increase",
-        suppress_action="turn_off",
         qh_name="QH1",
     )
     fresh_ts = t0 + timedelta(seconds=110)
@@ -63,7 +61,6 @@ def test_prune_keeps_command_when_newer_tesla_effect_remains():
         power_watts=720.0,
         target_amps=12,
         direction="increase",
-        suppress_action="turn_off",
         qh_name="QH1",
     )
     tracker.record_tesla_amp_command(12)

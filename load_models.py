@@ -241,8 +241,6 @@ class PendingEffect:
         power_watts: Expected power impact of the action in Watts.
         direction: For Tesla "set_amps" actions, whether amps increased or
             decreased. Used by settle-window queries. None for plug effects.
-        suppress_action: The action type to suppress during the settle window
-            (e.g. "turn_off" after an amp increase). None for plug effects.
         qh_name: Quarter-hour name when the effect was created. Used for
             QH-boundary expiry in settle-window checks. None for plug effects.
     """
@@ -254,7 +252,6 @@ class PendingEffect:
     power_watts: float
     target_amps: int | None = None
     direction: Literal["increase", "decrease"] | None = None
-    suppress_action: Literal["turn_off", "turn_on"] | None = None
     qh_name: str | None = None
 
     def __post_init__(self) -> None:

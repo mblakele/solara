@@ -3,43 +3,50 @@
 The prediction/settle window is adaptive: ``EnergyCache`` quantization is
 detected each fetch, ``_resolve_prediction_window`` filters it, and
 ``StateTracker.apply_prediction_window`` commits a change only after two
-consecutive confirmations outside ``SETTLE_WINDOW_DEADBAND_SECS``. That one
-window is the ``EffectStore``/``TeslaSettleTracker`` freshness window, so it
-reaches decisions in exactly two places:
+consecutive confirmations outside ``SETTLE_WINDOW_DEADBAND_SECS``. The window
+is derived once from ``quantization.usable_window`` and used in two places:
 
-* the fresh-data gate ``has_pending_effect_since`` — an early exit that
-  defers a decision while an effect taken after the newest data point has
-  not been reflected in the API data yet; and
-* the post-amp-change suppression ``_suppressed_by_settle``.
+* as the ``EffectStore`` freshness window, reaching decisions through the
+  fresh-data gate ``has_pending_effect_since`` (an early exit that defers a
+  decision while an effect taken after the newest data point has not been
+  reflected in the API data yet) — the only consumer this tool prices; and
+* as the forecast's trailing-rate length
+  (``util.compute_nbc_quarter(prediction_window_seconds=...)``), which changes
+  ``predicted_wh`` and so *does* reach decisions. That axis is out of this
+  tool's scope: it replays the gate against the **logged** forecast and holds
+  the forecast fixed, so a window change's forecast-rate consequence is not
+  priced here (see the estimator-responsiveness plan).
+
+The window once also fed a post-amp-change suppression
+(``LoadManager._suppressed_by_settle``). That path was removed as unreachable:
+whenever a Tesla settle effect is active, ``has_pending_effect_since`` is
+already true (both compare the effect's wall and data-point ages against the
+same window, and the settle's ``now`` is at or after ``data_point_at``), so
+the gate exits first and production never consults the suppression. It fired
+in no recorded cycle. Only the gate is priced here now.
 
 This tool prices the adaptation against a *pinned* window (default
 ``DEFAULT_PREDICTION_WINDOW_SECS``, the classic 30 s) on a log. It rebuilds
 the pending-effect store from the logged ``actions=[PendingEffect(...)]``
-reprs, replays those two consumers once per cycle under two arms — the window
-the log committed at that cycle, and the pinned value — and reports every
-cycle where the arms disagree. A disagreement is a decision the adaptation
-changed; the price is the miss impact of the quarters those cycles fall in
-(the scorer's target/miss table), which is zero when no cycle disagrees.
+reprs, replays the gate once per cycle under two arms — the window the log
+committed at that cycle, and the pinned value — and reports every cycle where
+the arms disagree. A disagreement is a decision the adaptation changed; the
+price is the miss impact of the quarters those cycles fall in (the scorer's
+target/miss table), which is zero when no cycle disagrees.
 
-Fidelity: the store, the tracker and both predicates are production's own
-(``EffectStore``/``TeslaSettleTracker``), driven with the window the log
-committed. The effect set is rebuilt from the cycle-result ``actions=`` repr,
-i.e. the effects production committed (the corpus is not dry-run —
-``pending_effects_count`` is non-zero). One stated deviation: production
-evaluates the fresh-data gate and the suppression at different points inside
-a cycle; this tool evaluates both against the same pre-decision effect set,
-which is the set production itself sees at the gate.
+Fidelity: the store and the predicate are production's own (``EffectStore``),
+driven with the window the log committed. The effect set is rebuilt from the
+cycle-result ``actions=`` repr, i.e. the effects production committed (the
+corpus is not dry-run — ``pending_effects_count`` is non-zero). One stated
+deviation: production evaluates the fresh-data gate inside
+``_stage_pending_check`` while the tool evaluates it against the same
+pre-decision effect set.
 
-Corpus verdict: over ``corpus/`` the window differs from 30 s in 107 of
-55,406 cycles (2026-10-12: 44 at 15 s; 2026-10-16: 59 at 15 s + 4 at 21 s),
-the two arms disagree on **no** cycle, and the fresh-data gate fires the same
-``wait`` count under both (2,628). The suppression predicate fires in no
-cycle under either arm. It is in fact subsumed: whenever a Tesla settle
-effect is active, ``has_pending_effect_since`` is also true (both compare the
-effect's wall and data-point ages against the same window, and the settle's
-``now`` is at or after ``data_point_at``), so the fresh-data gate exits
-before the suppression is reached. The adaptation guards a failure mode this
-corpus never exercises; nothing is simplified on the strength of it.
+Snapshot: measured on ``corpus/`` as of 2026-10-18 (14 logs, 58,390 cycles),
+the window differs from 30 s in 111 cycles (15 s, 21 s and 24 s) and the two
+arms disagree on **no** cycle — the gate fires the same ``wait`` count under
+both. The corpus is refreshed over time, so these figures are a snapshot, not
+a fixed baseline.
 
 Run from the repo root::
 
@@ -87,11 +94,7 @@ from constants import (  # noqa: E402 # pylint: disable=wrong-import-position
     DEFAULT_PREDICTION_WINDOW_SECS,
 )
 from load_models import PendingEffect  # noqa: E402 # pylint: disable=wrong-import-position
-from load_nbc import (  # noqa: E402 # pylint: disable=wrong-import-position
-    EffectStore,
-    GapMinder,
-    TeslaSettleTracker,
-)
+from load_nbc import EffectStore  # noqa: E402 # pylint: disable=wrong-import-position
 from util import floor_to_qh  # noqa: E402 # pylint: disable=wrong-import-position
 
 PINNED_DEFAULT_SECS = DEFAULT_PREDICTION_WINDOW_SECS
@@ -109,13 +112,15 @@ _REPR_DATETIME_RE = re.compile(
 # One PendingEffect repr. The timestamp/data_point args hold no parentheses
 # (the tzinfo rendering is ``<DstTzInfo 'Zone' PDT-1 day, 17:00:00 DST>`` or
 # ``datetime.timezone.utc``), so ``[^()]*`` spans each datetime exactly.
+# ``suppress_action`` is optional: logs written before that vestigial field
+# was retired still carry it, and the field is ignored either way.
 _EFFECT_RE = re.compile(
     r"device_name='([^']*)', action='([^']*)', "
     r"timestamp=datetime\.datetime\(([^()]*)\), "
     r"data_point_at=datetime\.datetime\(([^()]*)\), "
     r"power_watts=(-?[\d.]+), target_amps=(\d+|None), "
     r"direction=(?:'([^']*)'|None), "
-    r"suppress_action=(?:'([^']*)'|None), "
+    r"(?:suppress_action=(?:'[^']*'|None), )?"
     r"qh_name=(?:'([^']*)'|None)\)"
 )
 
@@ -184,8 +189,7 @@ def _parse_effects(line: str) -> tuple[PendingEffect, ...]:
                     None if match.group(6) == "None" else int(match.group(6))
                 ),
                 direction=match.group(7),  # type: ignore[arg-type]
-                suppress_action=match.group(8),  # type: ignore[arg-type]
-                qh_name=match.group(9),
+                qh_name=match.group(8),
             )
         )
     return tuple(effects)
@@ -207,20 +211,9 @@ class Cycle:
 
 @dataclass(frozen=True)
 class Verdict:
-    """The two window-dependent predicates for one cycle, one arm."""
+    """The window-dependent predicate for one cycle, one arm."""
 
     waits: bool
-    suppressed: bool
-
-    @property
-    def deferred(self) -> bool:
-        """True when either consumer keeps production from deciding.
-
-        Production checks the fresh-data gate before ``decide()``, so a
-        ``wait`` pre-empts the suppression; the effective outcome is the
-        disjunction, which is what a change in window can move.
-        """
-        return self.waits or self.suppressed
 
 
 @dataclass(frozen=True)
@@ -231,10 +224,7 @@ class Comparison:
     windows: dict[int, int]
     waits: int
     pinned_waits: int
-    suppressions: int
-    pinned_suppressions: int
     wait_flips: int
-    suppress_flips: int
     changed: tuple[Cycle, ...]
 
     @property
@@ -308,29 +298,8 @@ def parse_cycles(text: str, source: str = "<log>") -> list[Cycle]:
     return cycles
 
 
-def _suppressed(tracker: TeslaSettleTracker, cycle: Cycle) -> bool:
-    """Production's ``_suppressed_by_settle`` over one cycle's logged inputs."""
-    if cycle.data_point_at is None or cycle.gap_wh is None:
-        return False
-    gap = cycle.gap_wh
-    suppress_wh = GapMinder.TESLA_SETTLE_SUPPRESS_WH
-    increase = tracker.get_active(
-        cycle.at, current_qh=cycle.qh_name,
-        data_point_at=cycle.data_point_at, direction="increase",
-    )
-    if gap < 0 and abs(gap) < suppress_wh and increase is not None:
-        return True
-    decrease = tracker.get_active(
-        cycle.at, current_qh=cycle.qh_name,
-        data_point_at=cycle.data_point_at, direction="decrease",
-    )
-    if 0 < gap < suppress_wh and decrease is not None:
-        return True
-    return False
-
-
 def replay(cycles: Sequence[Cycle], pinned: int | None) -> list[Verdict]:
-    """Replay the two window consumers over a log, one arm per call.
+    """Replay the fresh-data gate over a log, one arm per call.
 
     Args:
         cycles: The log's cycles in order.
@@ -341,19 +310,15 @@ def replay(cycles: Sequence[Cycle], pinned: int | None) -> list[Verdict]:
         One :class:`Verdict` per cycle, in order.
     """
     store = EffectStore()
-    tracker = TeslaSettleTracker(store)
     verdicts: list[Verdict] = []
     for cycle in cycles:
         window = cycle.window if pinned is None else pinned
         store.window_secs = window
-        tracker.window_secs = window
         waits = (
             cycle.data_point_at is not None
             and store.has_since(cycle.data_point_at)
         )
-        verdicts.append(
-            Verdict(waits=waits, suppressed=_suppressed(tracker, cycle))
-        )
+        verdicts.append(Verdict(waits=waits))
         if cycle.data_point_at is not None:
             store.prune(cycle.data_point_at, now=cycle.at)
         for effect in cycle.effects:
@@ -371,25 +336,28 @@ def compare(cycles: Sequence[Cycle], pinned: int) -> Comparison:
     changed = tuple(
         cycle
         for cycle, left, right in zip(cycles, adaptive, fixed)
-        if left.deferred != right.deferred
+        if left.waits != right.waits
     )
     return Comparison(
         cycles=len(cycles),
         windows=windows,
         waits=sum(v.waits for v in adaptive),
         pinned_waits=sum(v.waits for v in fixed),
-        suppressions=sum(v.suppressed for v in adaptive),
-        pinned_suppressions=sum(v.suppressed for v in fixed),
         wait_flips=sum(
             1 for left, right in zip(adaptive, fixed) if left.waits != right.waits
         ),
-        suppress_flips=sum(
-            1
-            for left, right in zip(adaptive, fixed)
-            if left.suppressed != right.suppressed
-        ),
         changed=changed,
     )
+
+
+def _window_histogram(item: Comparison, pinned: int) -> str:
+    """Compact ``15s:59 21s:4`` text of the non-default committed windows."""
+    parts = [
+        f"{window}s:{count}"
+        for window, count in sorted(item.windows.items())
+        if window != pinned
+    ]
+    return " ".join(parts) if parts else "-"
 
 
 def format_comparison(
@@ -398,8 +366,8 @@ def format_comparison(
     """Render one counterfactual table plus its total row."""
     lines = [
         f"settle-window counterfactual — committed vs pinned {pinned} s",
-        f"  {'log':<34} {'cycles':>7} {'nonstd':>7} {'15s':>5} "
-        f"{'21s':>5} {'waitflip':>9} {'suppflip':>9}",
+        f"  {'log':<34} {'cycles':>7} {'nonstd':>7} {'windows':<18} "
+        f"{'waitflip':>9}",
     ]
     total_cycles = 0
     total_nonstd = 0
@@ -407,18 +375,10 @@ def format_comparison(
     total_quarters: set[datetime] = set()
     total_waits = 0
     total_pinned_waits = 0
-    total_suppressions = 0
-    total_pinned_suppressions = 0
     for label, item in comparisons:
-        short = {
-            window: count
-            for window, count in item.windows.items()
-            if window != pinned
-        }
         lines.append(
             f"  {label:<34} {item.cycles:>7} {item.non_default:>7} "
-            f"{short.get(15, 0):>5} {short.get(21, 0):>5} "
-            f"{item.wait_flips:>9} {item.suppress_flips:>9}"
+            f"{_window_histogram(item, pinned):<18} {item.wait_flips:>9}"
         )
         total_cycles += item.cycles
         total_nonstd += item.non_default
@@ -430,8 +390,6 @@ def format_comparison(
         )
         total_waits += item.waits
         total_pinned_waits += item.pinned_waits
-        total_suppressions += item.suppressions
-        total_pinned_suppressions += item.pinned_suppressions
     lines.append("")
     lines.append(
         f"  total: {total_cycles} cycles, {total_nonstd} non-default window, "
@@ -439,8 +397,7 @@ def format_comparison(
     )
     lines.append(
         f"  fresh-data gate fires: committed {total_waits}, "
-        f"pinned {total_pinned_waits}; settle suppression fires: "
-        f"committed {total_suppressions}, pinned {total_pinned_suppressions}"
+        f"pinned {total_pinned_waits}"
     )
     return "\n".join(lines)
 

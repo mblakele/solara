@@ -777,7 +777,6 @@ class LoadManager:
                     prev_amps is None or new_amps > prev_amps
                 ):
                     effect.direction = "increase"
-                    effect.suppress_action = "turn_off"
                     effect.qh_name = ctx.qh_name
                     logger.debug(
                         "Tesla amp increase recorded: %s → %d A "
@@ -791,7 +790,6 @@ class LoadManager:
                     and new_amps < prev_amps
                 ):
                     effect.direction = "decrease"
-                    effect.suppress_action = "turn_on"
                     effect.qh_name = ctx.qh_name
                     logger.debug(
                         "Tesla amp decrease recorded: %s → %d A "
@@ -940,7 +938,6 @@ class LoadManager:
         adjusted_wh = ctx.adjusted_wh
         now_postfetch = ctx.now_postfetch
         seconds_remaining = ctx.seconds_remaining
-        qh_name = ctx.qh_name
         data_point_at = ctx.data_point_at
         assert gap_wh is not None
         assert adjusted_wh is not None
@@ -960,7 +957,7 @@ class LoadManager:
         res = asyncio.run(
             self._cycle_async_phase(
                 gap_wh, adjusted_wh, now_postfetch, seconds_remaining,
-                self.dry_run, qh_name, data_point_at=data_point_at,
+                self.dry_run, data_point_at=data_point_at,
                 pre_synced_external=pre_synced,
                 banked_wh=ctx.banked_wh,
             )
@@ -2690,83 +2687,6 @@ class LoadManager:
         )
         return corrected_adjusted_wh, corrected_gap_wh
 
-    def _suppressed_by_settle(
-        self,
-        corrected_gap_wh: float,
-        now: datetime,
-        qh_name: str | None,
-        data_point_at: datetime | None,
-    ) -> bool:
-        """Return True when a Tesla settle window suppresses this decision.
-
-        After a Tesla amp increase the NBC prediction needs a few cycles to
-        absorb the new load — the Emporia API data lags behind wall-clock time
-        by ~60 s, so some of the fetch history is still at the old amp level.
-        Combined with solar variability this can produce a large apparent
-        deficit on the very first post-confirmation cycle, triggering an
-        unwarranted cascade of plug shutoffs and Tesla stop.
-
-        Similarly, after an amp decrease the prediction still includes the
-        now-removed load, producing a large apparent surplus that would
-        trigger re-enabling loads that were just turned off (bounce-back).
-
-        Suppression applies while the relevant settle window is active AND
-        the apparent gap is below ``TESLA_SETTLE_SUPPRESS_WH``. Large
-        genuine gaps (e.g. new QH, clouds) still fire immediately; the
-        QH-name check auto-expires the window on a QH transition.
-
-        Args:
-            corrected_gap_wh: Gap after Tesla in-flight correction.
-            now: Current wall-clock time.
-            qh_name: Current QH name for QH-boundary expiry.
-            data_point_at: Current NBC data-point-at timestamp.
-
-        Returns:
-            True when the decision should be suppressed.
-        """
-        # ── Post-increase: suppress turn-off ──
-        increase_eff = self.state.get_active_tesla_settle(
-            now, current_qh=qh_name, data_point_at=data_point_at,
-            direction="increase",
-        )
-        if (
-            corrected_gap_wh < 0
-            and abs(corrected_gap_wh) < self.engine.TESLA_SETTLE_SUPPRESS_WH
-            and increase_eff is not None
-        ):
-            settle_remaining = (
-                self.state.effective_settle_secs
-                - (now - increase_eff.timestamp).total_seconds()
-            )
-            logger.info(
-                "[_cycle_async_phase] suppressing turn-off: settling after Tesla "
-                "amp increase (gap=%.1f Wh, %.0f s left in settle window)",
-                corrected_gap_wh,
-                settle_remaining,
-            )
-            return True
-        # ── Post-decrease: suppress turn-on ──
-        decrease_eff = self.state.get_active_tesla_settle(
-            now, current_qh=qh_name, data_point_at=data_point_at,
-            direction="decrease",
-        )
-        if (
-            0 < corrected_gap_wh < self.engine.TESLA_SETTLE_SUPPRESS_WH
-            and decrease_eff is not None
-        ):
-            settle_remaining = (
-                self.state.effective_settle_secs
-                - (now - decrease_eff.timestamp).total_seconds()
-            )
-            logger.info(
-                "[_cycle_async_phase] suppressing turn-on: settling after Tesla "
-                "amp decrease (gap=%.1f Wh, %.0f s left in settle window)",
-                corrected_gap_wh,
-                settle_remaining,
-            )
-            return True
-        return False
-
     def _eligible_for_decision(
         self, now: datetime, tesla_state: TeslaState | None,
         gap_wh: float | None = None,
@@ -2927,7 +2847,6 @@ class LoadManager:
         now: datetime,
         seconds_remaining: int,
         dry_run: bool,
-        qh_name: str | None = None,
         data_point_at: datetime | None = None,
         *,
         pre_synced_external: list[PendingEffect] | None = None,
@@ -2958,7 +2877,7 @@ class LoadManager:
         try:
             return await self._cycle_async_phase_body(
                 gap_wh, adjusted_wh, now, seconds_remaining,
-                dry_run, qh_name=qh_name, data_point_at=data_point_at,
+                dry_run, data_point_at=data_point_at,
                 pre_synced_external=pre_synced_external,
                 banked_wh=banked_wh,
             )
@@ -2972,7 +2891,6 @@ class LoadManager:
         now: datetime,
         seconds_remaining: int,
         dry_run: bool,
-        qh_name: str | None = None,
         data_point_at: datetime | None = None,
         *,
         pre_synced_external: list[PendingEffect] | None = None,
@@ -3022,16 +2940,6 @@ class LoadManager:
         self._check_out_of_range_alert(now)
         # Hysteresis guard uses corrected gap so in-flight Tesla draw is counted.
         if abs(corrected_gap_wh) <= self.engine.HYSTERESIS_WH:
-            return AsyncPhaseResult(
-                tesla_state=tesla_state,
-                tesla_error=tesla_error,
-                tesla_login_url=tesla_login_url,
-                gap_wh=corrected_gap_wh,
-                adjusted_wh=corrected_adjusted_wh,
-            )
-        if self._suppressed_by_settle(
-            corrected_gap_wh, now, qh_name, data_point_at
-        ):
             return AsyncPhaseResult(
                 tesla_state=tesla_state,
                 tesla_error=tesla_error,

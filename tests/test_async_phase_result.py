@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from load_manager import LoadManager, LoadManagerConfig
 from load_models import AsyncPhaseResult, CycleContext
+from load_nbc import GapMinder, StateTracker, TeslaSettleTracker
 
 
 def _lm() -> LoadManager:
@@ -74,11 +75,17 @@ def test_timed_records_stage_seconds():
     assert ctx.timings["probe"] >= 0.0
 
 
-def test_suppressed_by_settle_false_without_effects():
-    """No settle effects means no suppression."""
-    lm = _lm()
-    ctx = _ctx()
-    assert (
-        lm._suppressed_by_settle(-100.0, ctx.now, "QH2", ctx.data_point_at)
-        is False
-    )
+def test_settle_suppression_path_retired():
+    """The post-amp-change suppression path was removed as unreachable.
+
+    ``_stage_pending_check``'s fresh-data gate is true whenever a Tesla
+    settle effect is active (both compare the effect's wall and data-point
+    ages against the same window, and the settle's ``now`` is at or after
+    ``data_point_at``), so production always exits on the gate before the
+    suppression is consulted. It fired in no recorded cycle, so the path,
+    its accessors and its threshold are gone.
+    """
+    assert not hasattr(LoadManager, "_suppressed_by_settle")
+    assert not hasattr(StateTracker, "get_active_tesla_settle")
+    assert not hasattr(TeslaSettleTracker, "get_active")
+    assert not hasattr(GapMinder, "TESLA_SETTLE_SUPPRESS_WH")
