@@ -1659,7 +1659,6 @@ class TeslaDecider:
         self,
         charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT,
         charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
-        amp_floor: bool = False,
         defer_stop: bool = True,
         max_defer_secs: int | None = None,
         ramp_aware: bool = False,
@@ -1673,31 +1672,24 @@ class TeslaDecider:
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
                 to ``TESLA_CHARGE_AMPS_MAX_DEFAULT``, clamped to
                 HARD_MAX_AMPS.
-            amp_floor: When True, round a reduction *down* to the amps the
-                gap can afford instead of up to the amps it might need (the
-                shipped ceil). Experimental: measured by
-                ``tools/estimator_replay.py --amp-floor``, not yet wired to
-                config. Defaults to False (shipped behaviour).
         """
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
-        self.amp_floor = amp_floor
         self.defer_stop = defer_stop
         self.max_defer_secs = (
             max_defer_secs if max_defer_secs is not None else self.MAX_DEFER_SECS
         )
         self.ramp_aware = ramp_aware
+
     def reduce_amps_for(self, reduce_wh: float, seconds_remaining: int) -> int:
         """The amp step a reduction of ``reduce_wh`` over the window buys.
 
         An amp step is indivisible and worth ``volts * R / 3600`` Wh (40 Wh
         at R=600 s and 240 V), so a step size that closes a gap exactly
-        usually does not exist. ``ceil`` (shipped) takes the step that covers
-        the gap, overshooting by up to one quantum; ``amp_floor`` takes the
-        step the gap can afford and leaves the residue to a later cycle, when
-        the shrinking window has made the quantum smaller. The increase
-        direction already truncates (``int``), so the floor also makes the two
-        symmetric.
+        usually does not exist. ``ceil`` takes the step that covers the gap,
+        overshooting by up to one quantum; the floor that would instead take
+        the step the gap can afford was measured and rejected (verdict in
+        ``AGENTS.md``; the knob was removed 2026-10-18).
 
         Args:
             reduce_wh: Wh reduction needed (positive).
@@ -1707,7 +1699,7 @@ class TeslaDecider:
             Whole amps to remove, possibly 0 when the gap is under a quantum.
         """
         amps = StateTracker.wh_to_amps(reduce_wh, seconds_remaining)
-        return math.floor(amps) if self.amp_floor else math.ceil(amps)
+        return math.ceil(amps)
 
     def supports(
         self, tesla: TeslaState | None, requires_home_check: bool
@@ -2111,8 +2103,6 @@ class GapMinder:
         turn_off_margin_wh: int | None = None,
         *,
         lumpy_first: bool = False,
-        amp_floor: bool = False,
-        dispatch_secs: int | None = None,
         defer_stop: bool = True,
         max_defer_secs: int | None = None,
         ramp_aware: bool = False,
@@ -2142,18 +2132,6 @@ class GapMinder:
                 the trailing rate and the deficit exceeds the smalls'
                 combined capacity, then budgets small plugs on the
                 residual. Defaults to False (status-quo binpack).
-            amp_floor: Forwarded to :class:`TeslaDecider` — round a reduction
-                down to the amps the gap can afford instead of up to the amps
-                it might need. Experimental; defaults to False.
-            dispatch_secs: The horizon a *starting* load is priced over, in
-                seconds — one dispatch, i.e. the meter's reporting
-                quantization window (~30 s), which is also the shortest a
-                command can be held before the loop's next decision. When
-                set, a load may start if its first dispatch fits the surplus
-                instead of requiring the whole remaining window to fit;
-                ``None`` (shipped) keeps the whole-window fit test. Only the
-                admissibility changes: the running debit and the
-                pending-effect estimate stay window-priced. Must be positive.
             defer_stop: Forwarded to :class:`TeslaDecider` — whether to defer
                 stopping at minimum amps while a safe buffer remains (and
                 let the ramp rule hasten the stop on a rising deficit). When
@@ -2164,12 +2142,8 @@ class GapMinder:
                 (shipped behaviour).
 
         Raises:
-            ValueError: If ``dispatch_secs`` is not positive.
+            ValueError: If ``max_defer_secs`` is not positive.
         """
-        if dispatch_secs is not None and dispatch_secs <= 0:
-            raise ValueError(
-                f"dispatch_secs must be positive, got {dispatch_secs}"
-            )
         if max_defer_secs is not None and max_defer_secs <= 0:
             raise ValueError(
                 f"max_defer_secs must be positive, got {max_defer_secs}"
@@ -2183,7 +2157,6 @@ class GapMinder:
         self.TURN_ON_MARGIN_WH = turn_on_margin_wh if turn_on_margin_wh is not None else 0
         self.TURN_OFF_MARGIN_WH = turn_off_margin_wh if turn_off_margin_wh is not None else 0
         self.lumpy_first = lumpy_first
-        self.dispatch_secs = dispatch_secs
         self.defer_stop = defer_stop
         self.max_defer_secs = max_defer_secs
         self.ramp_aware = ramp_aware
@@ -2192,7 +2165,6 @@ class GapMinder:
         self.tesla_decider = TeslaDecider(
             charge_amps_min=charge_amps_min,
             charge_amps_max=charge_amps_max,
-            amp_floor=amp_floor,
             defer_stop=defer_stop,
             max_defer_secs=max_defer_secs,
             ramp_aware=ramp_aware,
@@ -2216,26 +2188,6 @@ class GapMinder:
             Maximum defer window in seconds, capped at MAX_DEFER_SECS.
         """
         return self.tesla_decider.safe_defer_secs(remaining_reduction)
-
-    def _dispatch_horizon_secs(self, ctx: DecideContext) -> int:
-        """Seconds a starting load is priced over.
-
-        Shipped (``dispatch_secs is None``): the whole remaining window, so
-        a load may only start if its *held* cost fits the surplus. With a
-        dispatch quantum, one dispatch — the meter's quantization window and
-        the loop's own decision cadence — so a load may start if its first
-        dispatch fits; the window only bounds it, since a command cannot
-        outlive the quarter.
-
-        Args:
-            ctx: Decision context (carries the remaining window).
-
-        Returns:
-            The pricing horizon in seconds (never negative).
-        """
-        if self.dispatch_secs is None:
-            return ctx.seconds_remaining
-        return min(self.dispatch_secs, ctx.seconds_remaining)
 
     def _eligible_plugs(
         self, ctx: DecideContext, want_on: bool
@@ -2518,9 +2470,6 @@ class GapMinder:
 
         for _, name, plug in candidates:
             capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
-            start_wh = StateTracker.watts_to_wh(
-                plug.power_watts, self._dispatch_horizon_secs(ctx)
-            )
             if capacity_cap_wh is not None and capacity > capacity_cap_wh:
                 logger.debug(
                     "[_decide_turn_on] %s: uncovered "
@@ -2530,14 +2479,13 @@ class GapMinder:
                     capacity_cap_wh,
                 )
                 continue
-            if start_wh <= remaining_gap:
+            if capacity <= remaining_gap:
                 logger.debug(
                     "[_decide_turn_on] %s: turning on "
-                    "(first dispatch=%.1f Wh fits in gap %.1f Wh, held=%.1f Wh)",
+                    "(capacity=%.1f Wh fits in gap %.1f Wh)",
                     name,
-                    start_wh,
-                    remaining_gap,
                     capacity,
+                    remaining_gap,
                 )
                 logger.info(
                     "action=turn_on device=%s capacity=%.1f gap=%.1f priority=%d",
@@ -2706,6 +2654,17 @@ class GapMinder:
             lead = [c for c in candidates if c[1] in lead_names]
             tail = [c for c in candidates if c[1] not in lead_names]
             candidates = lead + tail
+            # The reorder emits the same action=turn_off lines as production
+            # order, so announce the lead that was actually taken — otherwise
+            # the flag's effect is invisible in a log (Subtask 4a census hook).
+            logger.info(
+                "gapminder_lumpy_first lead=%s gap=%.1f remaining=%.1f",
+                ",".join(lead_names), gap_wh, remaining_reduction,
+                extra={"event": "gapminder_lumpy_first",
+                       "lead": list(lead_names),
+                       "gap_wh": gap_wh,
+                       "remaining_wh": remaining_reduction},
+            )
 
         for _, name, plug in candidates:
             if remaining_reduction <= 0:

@@ -10,7 +10,11 @@ TeslaDecider and asserts the outcome difference:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
 
 from gap_trend import GapTrendTracker
 from load_models import TeslaState
@@ -124,3 +128,33 @@ def test_ramp_landing_beats_static_landing() -> None:
     assert abs(ramp_landed - TARGET_WH) < 5.0
     assert abs(static_landed - TARGET_WH) > 10.0
     assert abs(ramp_landed - TARGET_WH) < abs(static_landed - TARGET_WH)
+
+
+_LOG = (
+    Path(__file__).resolve().parents[1]
+    / "bugs"
+    / "2026-09-26-tesla-stop-charging.log"
+)
+_TURN_OFF_GAP = re.compile(r"gapminder_decide direction=turn_off gap=([\d.]+)")
+
+
+@pytest.mark.skipif(not _LOG.exists(), reason="incident log is not checked in")
+def test_incident_fixture_matches_the_log() -> None:
+    """Drift check: the inline ``INCIDENT_POINTS`` gaps still match the log.
+
+    ``bugs/`` is untracked, so this only runs where the log is present. The
+    fixture's gap sequence must appear in the log's own turn_off gap
+    sequence, in order; a miss means the replay's verdict no longer
+    describes the incident it names.
+    """
+    gaps = [
+        round(float(gap), 1)
+        for gap in _TURN_OFF_GAP.findall(_LOG.read_text(errors="replace"))
+    ]
+    index = 0
+    for _, want in INCIDENT_POINTS:
+        target = round(want, 1)
+        while index < len(gaps) and gaps[index] != target:
+            index += 1
+        assert index < len(gaps), f"fixture gap {target} absent from {_LOG.name}"
+        index += 1

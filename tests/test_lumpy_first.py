@@ -8,6 +8,7 @@ behavior is byte-identical by construction, asserted below.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from config import Config
@@ -144,3 +145,39 @@ def test_flag_reads_env() -> None:
         config=Config(overrides={"LOAD_MANAGE_LUMPY_FIRST": "True"}),
     ))
     assert mgr.engine.lumpy_first is True
+
+
+# ── 4a: make the reordering observable ──────────────────────────────────
+# The reorder emits the same action=turn_off lines either way, so before
+# this the flag's effect was invisible in a log. A dedicated INFO event when
+# the lumpy lead is actually taken is the census hook.
+
+
+def _decide(engine: GapMinder, ctx: DecideContext, predicted_wh: float) -> None:
+    engine.decide(ctx=ctx, predicted_wh=predicted_wh, target_wh=TARGET_WH)
+
+
+def test_lumpy_lead_is_logged(caplog) -> None:
+    """Wired engine announces the lead it took (names in the record)."""
+    engine = GapMinder(hysteresis_wh=3, lumpy_first=True)
+    with caplog.at_level(logging.INFO, logger="load_nbc"):
+        _decide(engine, _ctx(A_PREDICTED, A_BANKED, A_REMAINING), A_PREDICTED)
+    events = [r for r in caplog.records if r.getMessage().startswith("gapminder_lumpy_first")]
+    assert len(events) == 1
+    assert getattr(events[0], "lead", None) == ["water heater"]
+
+
+def test_no_lumpy_log_when_flag_off(caplog) -> None:
+    """Unwired engine reorders nothing, so nothing is announced."""
+    engine = GapMinder(hysteresis_wh=3)
+    with caplog.at_level(logging.INFO, logger="load_nbc"):
+        _decide(engine, _ctx(A_PREDICTED, A_BANKED, A_REMAINING), A_PREDICTED)
+    assert not [r for r in caplog.records if r.getMessage().startswith("gapminder_lumpy_first")]
+
+
+def test_no_lumpy_log_when_not_implicated(caplog) -> None:
+    """Heater idle: the flag is on but takes no lead, so nothing is logged."""
+    engine = GapMinder(hysteresis_wh=3, lumpy_first=True)
+    with caplog.at_level(logging.INFO, logger="load_nbc"):
+        _decide(engine, _ctx(30.0, 20.0, 800), 30.0)
+    assert not [r for r in caplog.records if r.getMessage().startswith("gapminder_lumpy_first")]

@@ -963,7 +963,7 @@ def test_policy_defaults_are_the_shipped_engine() -> None:
     assert engine.lumpy_first is False
     assert er.Policy().label == (
         "turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
-        "amp floor off, defer on, defer cap 120 s, ramp-aware off, dispatch whole window"
+        "defer on, defer cap 120 s, ramp-aware off"
     )
 
 
@@ -1022,55 +1022,17 @@ def test_banked_energy_unlocks_the_lumpy_first_gate() -> None:
     assert lumpy.actions == (("water heater", "turn_off"),)
 
 
-def test_dispatch_quantum_reaches_the_engine() -> None:
-    """The knob is production's, so the replay constructs it, not fakes it."""
-    assert er.Policy().engine().dispatch_secs is None
-    assert er.Policy(dispatch_secs=30).engine().dispatch_secs == 30
-    assert er.Policy().label.endswith("dispatch whole window")
-    assert er.Policy(dispatch_secs=30).label.endswith("dispatch 30 s")
+def test_shipped_fit_declines_a_load_that_cannot_hold_the_window() -> None:
+    """Whole-window fit (shipped): a 21 Wh surplus cannot hold a 260 W plug.
 
-
-def test_dispatch_quantum_starts_a_plug_the_shipped_fit_declines() -> None:
-    """Closed loop: a 21 Wh surplus starts a plug instead of nothing.
-
-    At R=600 s the shipped fit test wants 43.3 Wh of surplus to hold the
-    260 W plug for the rest of the quarter, so the plug never starts and
-    the surplus stays in the meter. One dispatch (30 s, 2.2 Wh) fits, so
-    the loop starts it; the running debit is still the whole window's
-    43.3 Wh, which is exactly what the pending-effect estimate credits.
+    At R=600 s the plug's held cost is 43.3 Wh, so the surplus stays in the
+    meter and the plug never starts. The dispatch-quantum alternative (price
+    only the first dispatch) was measured a variance trade and removed
+    2026-10-18 (see ``AGENTS.md``).
     """
     quarter = _plug_quarter(predicted_wh=-30.0, remaining_secs=600, all_on=False)
     shipped = er.replay(quarter, er.rate_status_quo)
-    dispatched = er.replay(
-        quarter, er.rate_status_quo, policy=er.Policy(dispatch_secs=30)
-    )
     assert shipped.actions == ()
-    assert dispatched.actions == (("jackery", "turn_on"),)
-
-
-def test_amp_floor_reaches_the_engine() -> None:
-    """The knob is production's, so the replay constructs it, not fakes it."""
-    assert er.Policy().engine().tesla_decider.amp_floor is False
-    assert er.Policy(amp_floor=True).engine().tesla_decider.amp_floor is True
-    assert "amp floor off" in er.Policy().label
-    assert "amp floor on" in er.Policy(amp_floor=True).label
-
-
-def test_amp_floor_defers_the_overshooting_tesla_step() -> None:
-    """The 20 Wh deficit is declined rather than overshot by 40.
-
-    Exactly the quarter ``test_replay_lands_the_tesla_amp_step_by_its_quantum``
-    pins: 11.0 Wh predicted against -9 Wh, so one amp into a 20 Wh gap. Ceil
-    books the amp; the floor declines it and the car keeps drawing, landing on
-    the logged actual. That is a 20 Wh miss the other way — and the whole
-    question is whether the loop closes it on a later, finer step or not.
-    """
-    quarter = _tesla_quarter(6.0, predicted_wh=11.0, remaining_secs=600)
-    shipped = er.replay(quarter, er.rate_status_quo)
-    floored = er.replay(quarter, er.rate_status_quo, policy=er.Policy(amp_floor=True))
-    assert shipped.actions == (("tesla", "set_amps"),)
-    assert floored.actions == ()
-    assert floored.landing_wh == pytest.approx(0.0)
 
 
 def test_a_default_policy_is_the_shipped_replay(
@@ -1240,22 +1202,12 @@ def test_main_reports_the_policy_it_ran(tmp_path: Path, capsys) -> None:
     assert er.main([str(log), "--turn-off-margin", "40"]) == 0
     assert (
         "policy: turn-on margin 0 Wh, turn-off margin 40 Wh, lumpy-first off, "
-        "amp floor off, defer on, defer cap 120 s, ramp-aware off, dispatch whole window" in capsys.readouterr().out
+        "defer on, defer cap 120 s, ramp-aware off" in capsys.readouterr().out
     )
     assert er.main([str(log), "--lumpy-first"]) == 0
     assert (
         "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first on, "
-        "amp floor off, defer on, defer cap 120 s, ramp-aware off, dispatch whole window" in capsys.readouterr().out
-    )
-    assert er.main([str(log), "--amp-floor"]) == 0
-    assert (
-        "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
-        "amp floor on, defer on, defer cap 120 s, ramp-aware off, dispatch whole window" in capsys.readouterr().out
-    )
-    assert er.main([str(log), "--dispatch-secs", "30"]) == 0
-    assert (
-        "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
-        "amp floor off, defer on, defer cap 120 s, ramp-aware off, dispatch 30 s" in capsys.readouterr().out
+        "defer on, defer cap 120 s, ramp-aware off" in capsys.readouterr().out
     )
 
 

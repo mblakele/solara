@@ -20,11 +20,21 @@ The other axis is the decision policy itself (``Policy``), expressed only
 through existing production surface — ``GapMinder``'s constructor:
 ``--turn-on-margin``, ``--turn-off-margin`` (whole Wh withheld from each
 budget, the deliberate form of the hedge the loop currently gets by accident),
-``--lumpy-first`` (production's ``LOAD_MANAGE_LUMPY_FIRST``), ``--amp-floor``
-(round a Tesla reduction down to the amps the gap affords instead of up to the
-amps it might need) and ``--dispatch-secs`` (price a starting load over one
-meter dispatch instead of the whole remaining window). A candidate that wins
-on this axis has a shipping path that is a flag, not a rewrite.
+``--lumpy-first`` (production's ``LOAD_MANAGE_LUMPY_FIRST``). The Tesla-stop
+trio prices the *reluctance to stop charging*: ``--defer {on,off}`` (the defer rule
+itself; off stops the moment a deficit exists), ``--max-defer-secs`` (the safe
+buffer the defer rule requires, shipped 120 s) and ``--ramp-aware`` (the
+trend-based hastener that pulls the stop one cycle earlier on a rising
+deficit; shipped off, production's ``LOAD_MANAGER_RAMP_AWARE``). A candidate
+that wins on this axis has a shipping path that is a flag, not a rewrite.
+
+Measured: the defer rule is load-bearing (car-active mean |miss| 17.99 on vs
+25.90 off — plug-only is bit-identical, since the policy never commands a car
+that is not drawing), but the specific buffer is not (30–180 s spans
+17.90–18.17). Folding the trend into ``safe_defer_secs`` (the plan's
+``G_eff = G₀ + r·min(R, cap)``) is *not* equivalent to the ramp rule and does
+not hasten the incident stop — the 120 s cap swallows the trend (c54 still
+defers) — so the ``t*`` hastener stands as the one trend-aware form.
 
 Fidelity note: ``DecideContext`` carries what the parsed anchors hold
 (``banked_wh``, the quarter's accumulated raw energy, so the lumpy-first
@@ -124,57 +134,17 @@ fell into. The granularity cure therefore has to beat the shipped policy
 *without* shedding less on average, which is what the quantum-aware form
 (floor the amp step, time-box the shed) claims and a scalar budget cannot.
 
-Amp-floor verdict (``--amp-floor``, car-active only — the plug-only regime is
-bit-identical, as it must be with no car commanded): it *loses*, and the
-mechanism is the point. Car-active 19.34 mean |miss| against 17.99 shipped,
-with churn 19.30 against 15.73 actions/quarter and reversals 5.67 against
-2.09 — and on 2026-10-17 itself 11.55 against 10.54 (worst miss 18.52 against
-17.77). The floor's premise was that the residue gets closed on a later, finer
-step: it does not, because the quantum is R-scaled and R shrinks ~30 s per
-cycle, so an amp is 40.0 Wh at R=600 s and still 38.0 Wh one cycle later; the
-quantum only falls below a 20 Wh gap once R < 300 s, two-thirds of the way
-through the quarter. For most of a quarter no finer step exists, so declining
-the step only routes the deficit to the plugs (hence +3.5 actions and +3.6
-reversals — nearly one extra duty-cycle per declined step) while the worst
-quarter is untouched (its 287 Wh miss is not amp-quantum-driven).
-
-The duration form is closed as well, by the meter rather than by a measurement:
-the minimum dispatch time IS the reporting quantization window (typically 30 s,
-also the settle window; ``MIN_SECONDS_TO_ACT`` gates the tail), so a
+Two granularity candidates were measured and **removed 2026-10-18**; the
+full verdicts (with the numbers) live in ``AGENTS.md``. In brief: flooring
+the Tesla amp step *loses* (car-active 19.34 vs 17.99 mean |miss|) because
+the quantum is R-scaled, so no finer step appears later — the deficit just
+routes to the plugs; and pricing a *starting* load over one dispatch instead
+of the whole window is a variance trade, not resolution (plug-only
+23.41 -> 19.29 at 60 s, but 238 quarters improve and 160 worsen; car-active
+regresses 17.99 -> 24.66). The duration form is closed by the meter: the
+minimum dispatch time IS the reporting quantization window, so a
 minimum-length dispatch is one full observation step and the loop cannot
-confirm it before re-deciding. A *scheduled* restore would be open-loop exactly
-where the closed loop is blind — strictly worse than today, where the loop's
-re-decide already performs the restore and the reversal is that mechanism
-(2.09 reversals/quarter shipped, median 136 s ≈ 4-5 dispatch windows). The
-dispatchable unit is ``power * quantization / 3600`` (2.2 Wh per 260 W plug,
-2.0 Wh per amp, 40.5 Wh per heater run) — not the R-scaled 43.3 Wh production
-books for that plug at R=600 s. The booking describes a duration the actuator
-is never asked to hold; whether that mismatch feeds the over-shedding is the
-open measurable question — its admissibility half is the candidate below (a
-wash), the booking half is still open.
-
-Dispatch-quantum verdict (``--dispatch-secs SECS``, the open question above
-answered as a candidate): the *admissibility* horizon is the one place the
-R-scaled belief forbids a real action — a starting load must fit the surplus
-with its whole-window cost (43.3 Wh for a 260 W plug at R=600 s), which is
-production's ``loads_too_large`` no-action reason (12-17% of worst-decile
-cycles). ``--dispatch-secs`` admits a load whose *first* dispatch fits
-instead, keeping the running debit and the pending-effect estimate
-window-priced (that credit is what makes the loop undo a partial use). It is
-a variance trade, not the resolution gain it looked like, and it nets out:
-plug-only 23.41 -> 19.29 at 60 s, but **238 quarters improve and 160 get
-worse** (median delta exactly 0.00, 61% untouched) — the mean is carried by
-five rescues of 100-268 Wh each, the 400 Wh surpluses the whole-window fit
-test declines outright. Car-active regresses the other way (17.99 -> 24.66 at
-60 s; 30 improve, 73 worsen, median +2.66), and 2026-10-17 agrees (10.54 ->
-23.84). The all-regime number only improves because 90% of the corpus is
-plug-only. Best value is 60 s, the *toggle* debounce rather than the meter's
-30 s quantum: 10 s (every load always fits) is worst in both regimes
-(plug-only 31.41, car-active 45.72), and 300 s is the coarsest that still
-helps the car side (17.10 against 17.99). So the whole-window fit test is not
-a resolution defect but a conservative prior about whether a small predicted
-surplus materializes — the same hedge, on the surplus side, that the turn-off
-margin sweep found on the shed side. No ship.
+confirm it before re-deciding — today's re-decide is already the restore.
 
 Run from the repo root::
 
@@ -183,8 +153,6 @@ Run from the repo root::
     uv run python tools/estimator_replay.py corpus/*.log --regime tesla
     uv run python tools/estimator_replay.py corpus/*.log --date 2026-10-14
     uv run python tools/estimator_replay.py corpus/*.log --turn-off-margin 40
-    uv run python tools/estimator_replay.py corpus/*.log --amp-floor --regime tesla
-    uv run python tools/estimator_replay.py corpus/*.log --dispatch-secs 60
     uv run python tools/estimator_replay.py corpus/*.log --guards live
 """
 
@@ -418,11 +386,9 @@ class Policy:
     way to decline those; it cannot see the load's quantum, which is what a
     quantum-aware rule would add.
 
-    ``dispatch_secs`` is the other end of the same question: the *fit* test
-    on a starting load. Shipped, a load must fit the surplus with its whole
-    window's cost; dispatched, one dispatch is enough to start it, and the
-    loop's next decision is the undo. Measured, it is a variance trade, not
-    resolution (see the module docstring's verdict).
+    The dispatch-quantum form of the same question (price a starting load
+    over one dispatch, not the whole window) was measured a variance trade
+    and removed 2026-10-18 (see ``AGENTS.md``).
     """
 
     turn_on_margin_wh: int = 0
@@ -431,10 +397,6 @@ class Policy:
     """Wh withheld from the turn-off budget (0 aims at the target)."""
     lumpy_first: bool = False
     """Shed an implicated lumpy load before the smalls (production flag)."""
-    amp_floor: bool = False
-    """Round a Tesla reduction down to the amps the gap affords, not up."""
-    dispatch_secs: int | None = None
-    """Pricing horizon for a *starting* load: one dispatch, or the window."""
     defer_stop: bool = True
     """Whether to defer stopping at minimum amps while a safe buffer remains
     (shipped). False stops immediately at minimum amps, relaxing the defer
@@ -449,18 +411,13 @@ class Policy:
     @property
     def label(self) -> str:
         """One self-describing line, for the report header."""
-        horizon = (
-            "whole window" if self.dispatch_secs is None else f"{self.dispatch_secs} s"
-        )
         return (
             f"turn-on margin {self.turn_on_margin_wh:g} Wh, "
             f"turn-off margin {self.turn_off_margin_wh:g} Wh, "
             f"lumpy-first {'on' if self.lumpy_first else 'off'}, "
-            f"amp floor {'on' if self.amp_floor else 'off'}, "
             f"defer {'on' if self.defer_stop else 'off'}, "
             f"defer cap {self.max_defer_secs if self.max_defer_secs is not None else 120} s, "
-            f"ramp-aware {'on' if self.ramp_aware else 'off'}, "
-            f"dispatch {horizon}"
+            f"ramp-aware {'on' if self.ramp_aware else 'off'}"
         )
 
     def engine(self) -> GapMinder:
@@ -470,8 +427,6 @@ class Policy:
             turn_on_margin_wh=self.turn_on_margin_wh,
             turn_off_margin_wh=self.turn_off_margin_wh,
             lumpy_first=self.lumpy_first,
-            amp_floor=self.amp_floor,
-            dispatch_secs=self.dispatch_secs,
             defer_stop=self.defer_stop,
             max_defer_secs=self.max_defer_secs,
             ramp_aware=self.ramp_aware,
@@ -1709,8 +1664,9 @@ _USAGE = (
     "usage: estimator_replay.py [LOG ...] [--variant NAME ...] "
     "[--date YYYY-MM-DD] [--worst N] [--trend-floor WH] "
     "[--regime {all,tesla,plug-only}] [--turn-on-margin WH] "
-    "[--turn-off-margin WH] [--lumpy-first] [--amp-floor] "
-    "[--dispatch-secs SECS] [--guards {inert,churn,live}]"
+    "[--turn-off-margin WH] [--lumpy-first] "
+    "[--defer {on,off}] [--max-defer-secs SECS] "
+    "[--ramp-aware] [--guards {inert,churn,live}]"
 )
 
 
@@ -1783,24 +1739,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="shed an implicated lumpy load before the smalls "
         "(production's LOAD_MANAGE_LUMPY_FIRST)",
-    )
-    parser.add_argument(
-        "--amp-floor",
-        action="store_true",
-        help="round a Tesla amp reduction down to the amps the gap affords "
-        "instead of up to the amps it might need (the shipped ceil); the "
-        "residue is left for a later, finer step",
-    )
-    parser.add_argument(
-        "--dispatch-secs",
-        type=int,
-        default=None,
-        metavar="SECS",
-        help="price a starting load over one dispatch (the meter's "
-        "quantization window, ~30 s) instead of the whole remaining window, "
-        "so a load may start if its first dispatch fits the surplus; the "
-        "running debit stays window-priced (default: %(default)s = whole "
-        "window, shipped)",
     )
     parser.add_argument(
         "--defer",
@@ -1882,8 +1820,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         turn_on_margin_wh=args.turn_on_margin,
         turn_off_margin_wh=args.turn_off_margin,
         lumpy_first=args.lumpy_first,
-        amp_floor=args.amp_floor,
-        dispatch_secs=args.dispatch_secs,
         defer_stop=(args.defer == "on"),
         max_defer_secs=args.max_defer_secs,
         ramp_aware=args.ramp_aware,

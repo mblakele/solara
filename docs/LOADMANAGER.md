@@ -192,7 +192,18 @@ floor `hysteresis / seconds_remaining`, exposed as `gap_trend_wh_per_s` in
 time `t* = (P·R − G₀)/(P + r)` (trend clamped to half the 5 A rate) stops
 now if `t*` falls within one cycle (`DecideContext.cycle_secs`); otherwise
 the static rule stands unchanged. Flat, shrinking, or unconfirmed trends
-never alter behavior. Plug
+never alter behavior.
+
+The hastener is **opt-in**: `LOAD_MANAGER_RAMP_AWARE` (default `off`, wired
+through `Config.ramp_aware` → `LoadManagerConfig` → `GapMinder.ramp_aware` /
+`TeslaDecider.ramp_aware`) gates `_ramp_stop_now`. With the flag off the
+defer rule still applies, but no trend-based hastening occurs. The fork is
+deliberate: the hastener fired 0 times across the corpus (172 deferrals, 14
+eligible) and only the `2026-09-26` incident benefits, so the default keeps
+the reluctance-to-stop stance and leaves the incident fix one env var away.
+The defer rule itself is load-bearing and stays (car-active closed-loop mean
+|miss| 17.99 on vs 25.90 off), while the buffer value is not (30–180 s spans
+17.90–18.17). Plug
 decisions are intentionally out of scope (Phase I: Tesla stop only).
 
 **Two sign conventions, deliberately:**
@@ -205,6 +216,40 @@ decisions are intentionally out of scope (Phase I: Tesla stop only).
   = excess solar, positive = grid draw, matching how NBC predictions are
   displayed everywhere else. Users are used to reading -N as solar;
   these lines say so explicitly (`positive=grid draw`).
+
+## Prediction/settle window adaptation
+
+The prediction window is **adaptive**. Each fetch's `EnergyCache` quantization
+period is filtered by `_resolve_prediction_window` (`load_manager.py`): a
+period at or above `MIN_QUANTIZATION_WINDOW_SECS` (15 s) with confidence at or
+above threshold is taken, anything shorter (the flat-data N=2 artifact) falls
+back to `DEFAULT_PREDICTION_WINDOW_SECS` (30 s).
+`StateTracker.apply_prediction_window` commits a change only after two
+consecutive confirmations and ignores values within
+`SETTLE_WINDOW_DEADBAND_SECS` (5 s) of the committed window as detector
+jitter, so a genuine meter-behaviour change is tracked but ±1 s noise is not.
+
+That one window is the `EffectStore`/`TeslaSettleTracker` freshness window, so
+it reaches decisions through exactly two consumers: the fresh-data gate
+`has_pending_effect_since` (an early exit that defers a decision while an
+effect taken after the newest data point has not been reflected yet) and the
+post-amp-change suppression `_suppressed_by_settle`.
+
+Both are priced by `tools/settle_window_counterfactual.py`: it rebuilds the
+effect store from the logged `actions=[PendingEffect(...)]` reprs and replays
+production's own `EffectStore`/`TeslaSettleTracker` once per cycle under the
+committed window and a pinned one (default 30 s). Corpus (55,406 cycles,
+13 logs): the window is 30 s everywhere except 107 cycles
+(2026-10-12: 44 at 15 s; 2026-10-16: 59 at 15 s + 4 at 21 s), and the two arms
+agree on **every** cycle — 0 gate flips, 0 suppression flips, no decision
+changed. The suppression is in fact subsumed: whenever an active settle
+effect exists the gate is already true (both compare the effect's wall and
+data-point ages against the same window, and the settle's `now` is at or after
+`data_point_at`), so production exits on the gate before reaching the
+suppression; it never decides a cycle. Nothing was simplified on this
+measurement — the adaptation guards a failure mode (a sustained meter change
+to a slower quantum) the corpus never exercises. The detector period's second
+consumer, the sparkline's bucket size, is display-only and out of scope.
 
 ## Turn-on jitter guard
 

@@ -101,70 +101,20 @@ def test_gapminder_owns_configured_decider():
     assert engine.tesla_decider.charge_amps_max == 32
 
 
-def test_amp_floor_declines_the_step_that_would_overshoot():
-    """The shipped ceil books a whole quantum for any gap above zero.
+def test_reduce_rounds_up_to_the_step_that_covers_the_gap():
+    """A ``ceil``, not a floor: any gap above zero books a whole quantum.
 
-    At R=600 s and 240 V one amp is 40 Wh, so a 20 Wh deficit is closed by a
-    1-amp step that is 20 Wh too big — the overshoot mechanism behind the
-    2026-10-17 census. With ``amp_floor`` the step is declined instead; the
-    residue is left for a later cycle, when the shrinking window has made the
-    quantum smaller than what is left. The increase direction already
-    truncates, so the floor also makes the two directions symmetric.
+    At R=600 s and 240 V one amp is 40 Wh, so a 20 Wh deficit takes a 1-amp
+    step (20 Wh of overshoot) and a 100 Wh deficit takes 3 (2.5 quanta,
+    rounded up). The floor that would decline or undershoot that step was
+    measured and rejected (``tools/estimator_replay.py --amp-floor``,
+    removed 2026-10-18; verdict in ``AGENTS.md``).
     """
-    ctx = _ctx(seconds_remaining=600)
-    shipped = GapMinder(hysteresis_wh=3).tesla_decider.decide_reduce(ctx, 20.0)
-    floored = GapMinder(hysteresis_wh=3, amp_floor=True).tesla_decider.decide_reduce(
-        ctx, 20.0
-    )
-    assert shipped is not None
-    assert shipped.target_amps == 9
-    assert floored is None
-
-
-def test_amp_floor_takes_the_step_the_gap_can_afford():
-    """A gap worth two-and-a-half quanta becomes two amps, not three.
-
-    100 Wh at R=600 s is 2.5 amps: ceil books 3 (120 Wh, 20 Wh past the gap),
-    floor books 2 (80 Wh, 20 Wh short). Both are one quantum off; only the
-    floor's residue can be closed later, because a step down is available
-    while an overshoot is not.
-    """
-    ctx = _ctx(seconds_remaining=600)
-    shipped = GapMinder(hysteresis_wh=3).tesla_decider.decide_reduce(ctx, 100.0)
-    floored = GapMinder(hysteresis_wh=3, amp_floor=True).tesla_decider.decide_reduce(
-        ctx, 100.0
-    )
-    assert shipped is not None
-    assert shipped.target_amps == 7
-    assert floored is not None
-    assert floored.target_amps == 8
-
-
-@pytest.mark.parametrize("reduce_wh", [1.0, 20.0, 39.9, 100.0, 240.0])
-def test_amp_floor_never_books_more_than_the_shipped_step(reduce_wh: float) -> None:
-    """One-way tightening: the floor may decline a step, never enlarge one."""
-
-    def booked(effect) -> int:
-        return 0 if effect is None or effect.target_amps is None else 10 - effect.target_amps
-
-    ctx = _ctx(seconds_remaining=600)
-    shipped = GapMinder(hysteresis_wh=3).tesla_decider.decide_reduce(
-        ctx, reduce_wh, stop_allowed=False
-    )
-    floored = GapMinder(hysteresis_wh=3, amp_floor=True).tesla_decider.decide_reduce(
-        ctx, reduce_wh, stop_allowed=False
-    )
-    assert 0 <= booked(floored) <= booked(shipped)
-
-
-def test_amp_floor_off_is_the_shipped_rounding():
-    """Flag-off parity: the same effect as an engine built without the knob."""
-    ctx = _ctx(seconds_remaining=600)
-    default = GapMinder(hysteresis_wh=3).tesla_decider.decide_reduce(ctx, 100.0)
-    off = GapMinder(hysteresis_wh=3, amp_floor=False).tesla_decider.decide_reduce(
-        ctx, 100.0
-    )
-    assert off == default
+    twenty = _ctx(seconds_remaining=600)
+    hundred = _ctx(seconds_remaining=600)
+    decider = GapMinder(hysteresis_wh=3).tesla_decider
+    assert decider.decide_reduce(twenty, 20.0).target_amps == 9
+    assert decider.decide_reduce(hundred, 100.0).target_amps == 7
 
 
 def test_eligible_plugs_turn_on_order():

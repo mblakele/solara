@@ -2020,8 +2020,9 @@ def test_jitter_swing_logged_matches_predicate(caplog):
     "knob",
     [
         {"lumpy_first": True},
-        {"amp_floor": True},
-        {"dispatch_secs": 30},
+        {"defer_stop": False},
+        {"max_defer_secs": 60},
+        {"ramp_aware": True},
     ],
 )
 def test_policy_knobs_are_keyword_only(knob):
