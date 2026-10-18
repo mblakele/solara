@@ -142,7 +142,11 @@ sample. A single `bugs/<file>.log` is a case study, not a population.
   forecast's trailing-rate length (`util.compute_nbc_quarter`). The
   settle-window counterfactual prices the **gate only** — it holds the logged
   forecast fixed. Do not read its "0 changed decisions" as "the window changes
-  nothing".
+  nothing". The natural unit of *both* is the **quantum, not seconds**: the meter
+  reports a power at the end of each quantum and holds it across the quantum, so a
+  window equal to the quantum makes the trailing rate the latest reading (a
+  zero-order hold) and a sub-quantum window is degenerate. Frame any window or
+  estimator-horizon sweep in quanta.
 - **Constant metadata.** `ParsedMetricsQH.qh_name` is the literal `"QH1"` on both
   sides of comparisons, so any QH-boundary clause keyed on it is dead in
   production. Verify a "QH expiry" is live before crediting it.

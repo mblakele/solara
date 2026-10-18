@@ -229,6 +229,30 @@ consecutive confirmations and ignores values within
 `SETTLE_WINDOW_DEADBAND_SECS` (5 s) of the committed window as detector
 jitter, so a genuine meter-behaviour change is tracked but ±1 s noise is not.
 
+### The sensing model behind the window
+
+Why the window tracks the *quantum* specifically: within a quantum the smart
+meter cannot measure a real Wh delta — the quantum is too short for the sensor —
+so what it reports is a **power at the end of the quantum**, and the per-second
+series is that value **held constant across the quantum** (the
+contiguity/quantization axiom the pipeline is built on). Because every sample
+inside a quantum is the same number, the forecast's trailing mean
+(`util.compute_nbc_quarter`) is the time-weighted mean of the `k` overlapping
+end-of-quantum readings. The shipped window *is* the detected quantum, so
+`k = 1`: the rate is the **latest reading held forward** (a zero-order hold),
+and `predicted_wh = raw_wh + remaining_seconds * prediction_w` is "measured
+energy so far + latest power × remaining". The consequences are structural. The shipped rate
+is already maximally responsive — there is no lag to win back — and a window
+shorter than a quantum is degenerate (identical to one quantum when it sits
+inside a quantum, an aliasing mix of two when it straddles one, worse with a
+non-zero `quantization_offset`). What remains is a bias-variance trade on that
+single reading (is the latest reading too noisy to predict the next quantum?),
+which is measured at *quantum* resolution by the estimator-responsiveness plan,
+not by sweeping seconds. The same model sets the gate's natural buffer: exactly
+one quantum answers "could the newest data point predate my action?" under
+end-of-quantum reporting; less is unsatisfiable and more is the removed
+post-amp-change suppression.
+
 That one window is the `EffectStore` freshness window, so as a *gate* parameter
 it reaches decisions through exactly one consumer: the fresh-data gate
 `has_pending_effect_since` (an early exit that defers a decision while an

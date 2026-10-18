@@ -841,7 +841,13 @@ project-root
   `SETTLE_WINDOW_DEADBAND_SECS` (5 s) of the committed window are treated as detector
   jitter (e.g. 29/30/31 s around a true 30 s period). Periods below
   `MIN_QUANTIZATION_WINDOW_SECS` (15 s) — e.g. the flat-data N=2 artifact — are
-  rejected by `_resolve_prediction_window` and fall back to the default
+  rejected by `_resolve_prediction_window` and fall back to the default. The window
+  tracks the *quantum* because the meter reports a per-quantum power held constant
+  across the quantum (a quantum is too short to measure a real Wh delta), so a window
+  equal to the quantum makes the forecast's trailing rate the latest end-of-quantum
+  reading — a zero-order hold — and a sub-quantum window is degenerate (identical
+  inside one quantum, an aliasing mix across a boundary). Rationale and the
+  gate-vs-rate consequence: docs/LOADMANAGER.md
 - `_quantization_diagnostics()` in `load_manager.py` — snapshots the current
   quantization state (from the shared `EnergyCache`, refreshed every fetch) plus the
   derived settle window (`StateTracker.effective_settle_secs`); every
