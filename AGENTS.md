@@ -433,12 +433,30 @@ project-root
 │                          # Wh to an early stop the deferral would not have taken).
 │                          # 2026-10-17 separately: 12.06 live vs 12.23 inert overall,
 │                          # 13.22 vs 14.37 on its car-active quarters, ramp 0 changed.
+│                          # Rate-window verdict (`--rate-window-quanta`,
+│                          # closed loop, both regimes; snapshot): the shipped
+│                          # 1-quantum window is best or tied. A 2-quantum
+│                          # average HELPS plug-only (23.36 -> 22.99 mean|miss|)
+│                          # but regresses car-active hard (17.99 -> 23.53), far
+│                          # past the +/-0.2 Wh noise bar, and worsens more
+│                          # plug-only quarters than it fixes (142 worse / 108
+│                          # better of 1035, median delta 0.00 — the mean is a
+│                          # handful of 30-115 Wh rescues). Longer windows are
+│                          # monotone worse, and 2026-10-17 shows no window win
+│                          # either (2q 16.23 vs 14.37 on its 15 car-active
+│                          # quarters). The rate axis is not where the residual
+│                          # miss lives: the loop pays for the level's freshness,
+│                          # not its smoothness. No ship; status-quo stays.
+│                          # Composed only when `--rate-window-quanta K|all` is
+│                          # given (K=1 is the shipped status-quo, always
+│                          # reported), so default output is byte-identical.
 │                          # Run from the repo root:
 │                          #   uv run python tools/estimator_replay.py bugs/*.log
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --variant prior
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --regime tesla
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --turn-off-margin 40
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --guards live
+│                          #   uv run python tools/estimator_replay.py corpus/*.log --rate-window-quanta 2,3,4,all
 │   ├── settle_window_counterfactual.py  # Prices the *adaptive* prediction/
 │                          # settle window against a pinned one (Subtask 6 of
 │                          # the guard-observability plan). The window is the

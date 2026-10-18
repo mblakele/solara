@@ -146,6 +146,27 @@ minimum dispatch time IS the reporting quantization window, so a
 minimum-length dispatch is one full observation step and the loop cannot
 confirm it before re-deciding — today's re-decide is already the restore.
 
+The rate-window axis (``--rate-window-quanta``) prices the shipped
+estimator's *trailing horizon* rather than a different estimator formula.
+The meter reports one power per quantization window and the shipped window is
+one quantum wide, so the shipped rate is the latest end-of-quantum reading
+held forward; a longer window is a bias-variance question (does averaging k
+quanta beat the single reading?). Each value adds a ``window@Kq`` (or
+``window@all``) row measured against the shipped ``status-quo``: the knob
+re-averages the counterfactual meter over K windows (history reconstructed
+from the anchor series, divergence over the same span) and moves *nothing
+else* — ``raw_wh``, the gate's banked side and the decision cadence are
+identical, so any delta is the rate's alone.
+
+Closed-loop verdict (corpus, both regimes; snapshot — the corpus is refreshed
+over time): the shipped 1-quantum window is best or tied. A 2-quantum average
+helps plug-only (23.36 -> 22.99 mean |miss|) but regresses car-active hard
+(17.99 -> 23.53), far past the +/-0.2 Wh noise bar, and worsens more plug-only
+quarters than it fixes (142 worse / 108 better of 1035, median delta 0.00 — the
+mean is a handful of 30-115 Wh rescues). Longer windows are monotone worse, and
+the one-log counter-example (2026-10-17) shows no window win either. The loop
+pays for the level's freshness, not its smoothness, so no window ships.
+
 Run from the repo root::
 
     uv run python tools/estimator_replay.py bugs/*.log
@@ -154,6 +175,7 @@ Run from the repo root::
     uv run python tools/estimator_replay.py corpus/*.log --date 2026-10-14
     uv run python tools/estimator_replay.py corpus/*.log --turn-off-margin 40
     uv run python tools/estimator_replay.py corpus/*.log --guards live
+    uv run python tools/estimator_replay.py corpus/*.log --rate-window-quanta 2,3,4,all
 """
 
 from __future__ import annotations
@@ -244,6 +266,13 @@ LAG_MAX_SECS = 90.0
 
 QUARTER_SECS = 900.0
 """Length of a quarter-hour, the integration window of every landing."""
+
+RATE_WINDOW_SECS = 30.0
+"""The shipped trailing window (s), and one 'quanta' of the window sweep.
+
+The meter reports a power per quantization window, so the shipped estimator's
+trailing mean is one window wide; ``--rate-window-quanta`` counts windows of
+this size."""
 
 RateFn = Callable[[float, ForecastAnchor], float]
 """Estimator under test: counterfactual window rate in, rate out."""
@@ -713,22 +742,80 @@ class _Counterfactual:
     """Trailing-window rate (Wh/s) — the estimator's input, not its output."""
 
 
+def _history_energy_wh(anchors: Sequence[ForecastAnchor], t: float) -> float:
+    """Logged cumulative energy through ``t``, step-held between anchors.
+
+    ``raw_wh`` is cumulative from the quarter start, so the difference between
+    two lookups is the logged energy over the span. The per-second series is
+    not in the log, so a re-averaged window reconstructs the history side from
+    the anchor series rather than the true samples.
+    """
+    value = 0.0
+    for anchor in anchors:
+        if anchor.samples_used <= t:
+            value = anchor.raw_wh
+        else:
+            break
+    return value
+
+
 def _counterfactual(
     quarter: Quarter,
     anchor: ForecastAnchor,
     commands: Sequence[tuple[float, str, bool]],
     policy_tesla: Sequence[TeslaSample],
+    window_secs: float | None = None,
 ) -> _Counterfactual:
-    """The counterfactual window's accumulated Wh and trailing rate."""
+    """The counterfactual window's accumulated Wh and trailing rate.
+
+    ``window_secs`` None reproduces the shipped estimator exactly: the
+    anchor's own logged window mean (``prediction_w``) plus the meter
+    divergence over the trailing :data:`RATE_WINDOW_SECS`. A positive value
+    re-averages the counterfactual meter over that many seconds instead — the
+    history reconstructed from the anchor series and the divergence taken over
+    the same span. The returned ``raw_wh`` is the cumulative either way: the
+    window is the rate's business only.
+    """
     t_data = float(anchor.samples_used)
-    return _Counterfactual(
-        raw_wh=anchor.raw_wh
-        + _meter_divergence_wh(quarter, commands, policy_tesla, 0.0, t_data),
-        rate=anchor.prediction_w
-        + _meter_divergence_wh(
-            quarter, commands, policy_tesla, max(0.0, t_data - 30.0), t_data
-        )
-        / 30.0,
+    raw_wh = anchor.raw_wh + _meter_divergence_wh(
+        quarter, commands, policy_tesla, 0.0, t_data
+    )
+    if window_secs is None:
+        t0 = max(0.0, t_data - RATE_WINDOW_SECS)
+        rate = anchor.prediction_w + _meter_divergence_wh(
+            quarter, commands, policy_tesla, t0, t_data
+        ) / RATE_WINDOW_SECS
+    else:
+        t0 = max(0.0, t_data - window_secs)
+        span = max(t_data - t0, 1.0)
+        history = _history_energy_wh(
+            quarter.anchors, t_data
+        ) - _history_energy_wh(quarter.anchors, t0)
+        rate = (
+            history + _meter_divergence_wh(quarter, commands, policy_tesla, t0, t_data)
+        ) / span
+    return _Counterfactual(raw_wh=raw_wh, rate=rate)
+
+
+def _rate_window_secs(quanta: int | str | None, t_data: float) -> float | None:
+    """Translate the rate-window selector into a window in seconds, or None.
+
+    ``None`` and ``1`` both mean the shipped estimator (its window is the
+    anchor's own). ``"all"`` re-averages the whole elapsed quarter; an integer
+    of two or more re-averages that many :data:`RATE_WINDOW_SECS`.
+
+    Raises:
+        ValueError: On a value that is neither the shipped one nor a valid
+            sweep point.
+    """
+    if quanta in (None, 1):
+        return None
+    if quanta == "all":
+        return t_data
+    if isinstance(quanta, int) and quanta >= 2:
+        return quanta * RATE_WINDOW_SECS
+    raise ValueError(
+        f"unknown rate window: {quanta!r}; use an integer >= 2 or 'all'"
     )
 
 
@@ -789,6 +876,7 @@ def replay(
     *,
     policy: Policy = Policy(),
     guards: str = "inert",
+    rate_window_quanta: int | str = 1,
 ) -> Replay:
     """Run one quarter closed-loop under ``rate_fn`` and ``policy``.
 
@@ -804,13 +892,19 @@ def replay(
             its override); ``"live"`` feeds both signals, as production
             does, which also makes the ramp rule reachable. History mode
             pins the logged events, so no arm can change it.
+        rate_window_quanta: Trailing window the counterfactual rate is
+            averaged over, in windows of :data:`RATE_WINDOW_SECS` (``1`` =
+            the shipped window; an integer ≥2 re-averages that many windows;
+            ``"all"`` the whole elapsed quarter). Only the rate moves —
+            ``raw_wh`` and the decision cadence are unchanged.
 
     Returns:
         The run's per-step actions, its landing Wh, and the guard arm's
         activity.
 
     Raises:
-        ValueError: If ``guards`` is not one of :data:`GUARD_MODES`.
+        ValueError: If ``guards`` is not one of :data:`GUARD_MODES`, or
+            ``rate_window_quanta`` is not a valid sweep point.
     """
     if guards not in GUARD_MODES:
         raise ValueError(f"unknown guard arm: {guards!r}; known: {GUARD_MODES}")
@@ -830,18 +924,27 @@ def replay(
             _pin_history(state, quarter, t_data)
             steps.append(())
             continue
-        cf = _counterfactual(quarter, anchor, commands, policy_tesla)
+        cf = _counterfactual(
+            quarter,
+            anchor,
+            commands,
+            policy_tesla,
+            _rate_window_secs(rate_window_quanta, t_data),
+        )
         _sync_plug_states(state, quarter, commands, t_data)
         predicted_wh = cf.raw_wh + rate_fn(cf.rate, anchor) * anchor.remaining_secs
-        adjusted_wh = state.estimated_current_wh(predicted_wh, anchor.remaining_secs)
         signals: _GuardSignals | None = None
         if guards != "inert":
+            # The gap the tracker is fed is production's own: the prediction
+            # minus the pending effects already taken, against the target.
+            # Only the arm that can act needs it.
             signals = _cycle_guard_signals(
                 tracker,
                 engine,
                 anchor,
                 quarter.qh_start + timedelta(seconds=t_data),
-                TARGET_WH - adjusted_wh,
+                TARGET_WH
+                - state.estimated_current_wh(predicted_wh, anchor.remaining_secs),
                 guards,
             )
             activities.append(signals.activity)
@@ -1413,6 +1516,7 @@ def replay_all(
     *,
     policy: Policy = Policy(),
     guards: str = "inert",
+    rate_window_quanta: int | str = 1,
 ) -> dict[datetime, QuarterRun]:
     """Run one estimator over every quarter.
 
@@ -1421,6 +1525,8 @@ def replay_all(
         rate_fn: The estimator under test.
         policy: The decision knobs the engine is constructed with.
         guards: Which guard arm to measure under (see :data:`GUARD_MODES`).
+        rate_window_quanta: Trailing window the counterfactual rate averages
+            over (see :func:`replay`); ``1`` is the shipped window.
 
     Returns:
         Each quarter's miss against target, actions, reversals, and the
@@ -1428,7 +1534,13 @@ def replay_all(
     """
     runs: dict[datetime, QuarterRun] = {}
     for quarter_start, quarter in quarters.items():
-        run = replay(quarter, rate_fn, policy=policy, guards=guards)
+        run = replay(
+            quarter,
+            rate_fn,
+            policy=policy,
+            guards=guards,
+            rate_window_quanta=rate_window_quanta,
+        )
         runs[quarter_start] = QuarterRun(
             miss_wh=run.landing_wh - TARGET_WH,
             actions=run.action_count,
@@ -1666,8 +1778,41 @@ _USAGE = (
     "[--regime {all,tesla,plug-only}] [--turn-on-margin WH] "
     "[--turn-off-margin WH] [--lumpy-first] "
     "[--defer {on,off}] [--max-defer-secs SECS] "
-    "[--ramp-aware] [--guards {inert,churn,live}]"
+    "[--ramp-aware] [--guards {inert,churn,live}] "
+    "[--rate-window-quanta K|all]"
 )
+
+
+def parse_rate_windows(spec: str) -> list[tuple[str, int | str]]:
+    """Parse ``--rate-window-quanta`` into ``(variant name, quanta)`` pairs.
+
+    Each comma-separated token is either ``all`` or an integer of at least 2:
+    ``1`` is the shipped status-quo and is always in the report, so it is not
+    a sweep point.
+
+    Args:
+        spec: The flag's raw value (may be empty).
+
+    Returns:
+        ``("window@2q", 2)``-style pairs, in the order given.
+
+    Raises:
+        ValueError: On a token that is neither ``all`` nor an integer ≥ 2.
+    """
+    pairs: list[tuple[str, int | str]] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token == "all":
+            pairs.append(("window@all", "all"))
+        elif token.isdigit() and int(token) >= 2:
+            pairs.append((f"window@{token}q", int(token)))
+        else:
+            raise ValueError(
+                f"rate window must be an integer >= 2 or 'all', got {token!r}"
+            )
+    return pairs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1773,6 +1918,16 @@ def build_parser() -> argparse.ArgumentParser:
         "'churn' feeds only the jitter signal, the control that isolates the "
         "ramp rule. Any non-inert arm prints the verdict against both controls",
     )
+    parser.add_argument(
+        "--rate-window-quanta",
+        default="",
+        metavar="K|all",
+        help="trailing-window variant(s) to add, comma-separated, in quanta: "
+        "an integer >=2 re-averages the shipped rate over K x 30 s windows, "
+        "'all' over the whole elapsed quarter, each added as a "
+        "'window@Kq'/'window@all' row measured against status-quo (K=1, "
+        "always reported)",
+    )
     return parser
 
 
@@ -1789,9 +1944,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         an argument, a variant name, or the input itself yields nothing.
     """
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        window_specs = parse_rate_windows(args.rate_window_quanta)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
+        return 1
+    window_quanta = dict(window_specs)
     available = variants(args.trend_floor)
     display = list(args.variant) if args.variant else list(available)
-    unknown = [name for name in display if name not in available]
+    display = list(dict.fromkeys([*display, *window_quanta]))
+    unknown = [
+        name for name in display if name not in available and name not in window_quanta
+    ]
     if unknown:
         print(f"error: unknown variant(s): {', '.join(unknown)}", file=sys.stderr)
         print(f"known: {', '.join(available)}", file=sys.stderr)
@@ -1825,7 +1990,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ramp_aware=args.ramp_aware,
     )
     runs = {
-        name: replay_all(quarters, available[name], policy=policy, guards=args.guards)
+        name: replay_all(
+            quarters,
+            available.get(name, rate_status_quo),
+            policy=policy,
+            guards=args.guards,
+            rate_window_quanta=window_quanta.get(name, 1),
+        )
         for name in names
     }
     base = runs["status-quo"]
@@ -1840,6 +2011,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(format_stats(len(paths), stats))
     print(f"  regime: {args.regime} ({len(quarters)} quarter(s))")
     print(f"  policy: {policy.label}")
+    if window_quanta:
+        print(
+            f"  rate windows: {', '.join(window_quanta)} "
+            "vs status-quo (1q = shipped)"
+        )
     if args.date:
         print(f"  restricted to {args.date}: {len(quarters)} quarters")
     print()

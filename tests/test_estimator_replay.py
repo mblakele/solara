@@ -1057,6 +1057,138 @@ def test_replay_all_forwards_the_policy() -> None:
     assert withheld[quarter.qh_start].actions == 0
 
 
+# ── the rate-window axis (trailing horizon, in quanta) ───────────────
+#
+# The shipped rate is the *latest* end-of-quantum reading held forward: the
+# meter reports a power per quantum and the shipped window equals the quantum,
+# so the trailing mean uses one quantum of history. A longer window is a
+# bias-variance question — does averaging k quanta beat the single reading? —
+# and the knob must move *only* the rate: the cumulative energy the engine is
+# handed (``raw_wh``, the gate's banked side) and the decision cadence stay
+# fixed.
+
+
+def _window_quarter() -> er.Quarter:
+    """Four 30 s windows with different rates, so the horizon is legible.
+
+    Window energies 10/60/30/20 Wh over (0,30]/(30,60]/(60,90]/(90,120] s give
+    window rates 0.333/2.0/1.0/0.667 Wh/s. At the last anchor the shipped
+    1-quantum rate is 0.667, the 2-quantum mean is (30+20)/60 = 0.833, the
+    3-quantum mean is (60+30+20)/90 = 1.222 and the whole-quarter mean is
+    120/120 = 1.0.
+    """
+    rows = (
+        (30, 10.0, 10.0 / 30.0),
+        (60, 70.0, 60.0 / 30.0),
+        (90, 100.0, 30.0 / 30.0),
+        (120, 120.0, 20.0 / 30.0),
+    )
+    return er.Quarter(
+        name="window-synth",
+        qh_start=_SYNTH_Q,
+        actual_wh=0.0,
+        decide_lag=8.0,
+        initial_on=dict.fromkeys(er.POWERS, False),
+        anchors=tuple(
+            fls.ForecastAnchor(
+                source="window-synth",
+                quarter_start=_SYNTH_Q,
+                data_point_at=_SYNTH_Q + timedelta(seconds=used),
+                remaining_secs=900 - used,
+                samples_used=used,
+                prediction_values=30,
+                raw_wh=raw_wh,
+                prediction_w=prediction_w,
+                predicted_wh=raw_wh + prediction_w * (900 - used),
+                actual_wh=0.0,
+                wall_at=None,
+                prior_rate=0.0,
+            )
+            for used, raw_wh, prediction_w in rows
+        ),
+        events=(),
+    )
+
+
+def test_rate_window_one_is_the_shipped_estimator() -> None:
+    """k = 1 takes the shipped path: the anchor's own window mean."""
+    seen: list[float] = []
+
+    def spy(w_cf: float, _anchor: fls.ForecastAnchor) -> float:
+        seen.append(w_cf)
+        return w_cf
+
+    quarter = _window_quarter()
+    er.replay(quarter, spy)
+    er.replay(quarter, spy, rate_window_quanta=1)
+    assert seen[:4] == pytest.approx(seen[4:], abs=1e-9)
+
+
+def test_rate_window_re_averages_the_counterfactual_meter() -> None:
+    """k quanta means the last k windows; 'all' means the elapsed quarter."""
+    seen: list[float] = []
+
+    def spy(w_cf: float, _anchor: fls.ForecastAnchor) -> float:
+        seen.append(w_cf)
+        return w_cf
+
+    quarter = _window_quarter()
+    er.replay(quarter, spy)
+    shipped = seen[-1]
+    seen.clear()
+    er.replay(quarter, spy, rate_window_quanta=2)
+    assert seen[-1] == pytest.approx(50.0 / 60.0, abs=1e-6)  # (30+20)/60
+    assert seen[-1] != pytest.approx(shipped)
+    seen.clear()
+    er.replay(quarter, spy, rate_window_quanta=3)
+    assert seen[-1] == pytest.approx(110.0 / 90.0, abs=1e-6)  # (60+30+20)/90
+    seen.clear()
+    er.replay(quarter, spy, rate_window_quanta="all")
+    assert seen[-1] == pytest.approx(120.0 / 120.0, abs=1e-6)
+
+
+def test_rate_window_leaves_the_banked_energy_untouched() -> None:
+    """Only the rate moves; the cumulative ``raw_wh`` is identical.
+
+    The engine's ``banked_wh`` and the gate's cumulative side read ``raw_wh``,
+    so this is what "the window is only the rate's business" means in the
+    replay: the knob cannot leak into the gate.
+    """
+    quarter = _window_quarter()
+    for anchor in quarter.anchors:
+        shipped = er._counterfactual(quarter, anchor, (), ())
+        wide = er._counterfactual(quarter, anchor, (), (), 60.0)
+        assert shipped.raw_wh == pytest.approx(wide.raw_wh)
+
+
+def test_rate_window_does_not_move_the_cadence() -> None:
+    """The knob re-averages the rate only; every anchor still decides."""
+    quarter = _window_quarter()
+    base = er.replay(quarter, er.rate_status_quo)
+    wide = er.replay(quarter, er.rate_status_quo, rate_window_quanta=4)
+    assert len(base.steps) == len(wide.steps) == len(quarter.anchors)
+
+
+def test_replay_all_forwards_the_rate_window() -> None:
+    """The aggregate path carries the window, not just the single quarter."""
+    seen: list[float] = []
+
+    def spy(w_cf: float, _anchor: fls.ForecastAnchor) -> float:
+        seen.append(w_cf)
+        return w_cf
+
+    quarter = _window_quarter()
+    er.replay_all({quarter.qh_start: quarter}, spy, rate_window_quanta=2)
+    assert seen[-1] == pytest.approx(50.0 / 60.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_replay_rejects_a_degenerate_rate_window(bad: int) -> None:
+    """Below one quantum is not a window; k = 1 is the shipped status-quo."""
+    with pytest.raises(ValueError):
+        er.replay(_window_quarter(), er.rate_status_quo, rate_window_quanta=bad)
+
+
 # ── the reporting layer ──────────────────────────────────────────────
 
 
@@ -1234,6 +1366,38 @@ def test_main_reports_the_regime_it_measured(tmp_path: Path, capsys) -> None:
     assert er.main([str(log), "--regime", "plug-only"]) == 0
     out = capsys.readouterr().out
     assert "regime: plug-only (1 quarter(s))" in out
+
+
+def test_main_adds_window_variants(tmp_path: Path, capsys) -> None:
+    """``--rate-window-quanta`` adds a re-averaged shipped-rate variant."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log), "--rate-window-quanta", "2,all"]) == 0
+    out = capsys.readouterr().out
+    assert "rate windows: window@2q, window@all" in out
+    assert "window@2q vs status-quo |miss|" in out
+    assert "window@all vs status-quo |miss|" in out
+
+
+def test_main_default_output_carries_no_window_rows(
+    tmp_path: Path, capsys
+) -> None:
+    """Flag-off parity: without the flag the report is the shipped one."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log)]) == 0
+    out = capsys.readouterr().out
+    assert "window@" not in out
+    assert "rate windows:" not in out
+
+
+def test_main_rejects_a_degenerate_rate_window(tmp_path: Path, capsys) -> None:
+    """k = 1 is the shipped status-quo, so it is not an accepted value."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log), "--rate-window-quanta", "1"]) == 1
+    assert "rate window" in capsys.readouterr().err
+    assert er.main([str(log), "--rate-window-quanta", "wide"]) == 1
 
 
 # ── fixture drift (needs the logs; skipped without them) ─────────────

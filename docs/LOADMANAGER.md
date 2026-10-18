@@ -263,6 +263,16 @@ resolved value is *also* the forecast's trailing-rate length
 logged forecast fixed, so it prices the gate only (the forecast-rate axis is
 the estimator-responsiveness plan).
 
+That forecast-rate axis was then swept closed-loop at quantum resolution
+(`tools/estimator_replay.py --rate-window-quanta`, plan C; snapshot, corpus/):
+**no count above one wins.** A two-quantum rate helps plug-only (23.36 → 22.99
+mean |miss|) but regresses car-active (17.99 → 23.53) and worsens more plug-only
+quarters than it fixes (142 worse / 108 better), and longer windows are
+monotone worse. So the shipped `k = 1` stands; the open/closed paradox is the
+level's lag, not its point accuracy, and the adaptation's protective value is
+the **gate**, not the rate — lengthening the rate to match a slower quantum is
+not wanted.
+
 It is priced by `tools/settle_window_counterfactual.py`: it rebuilds the
 effect store from the logged `actions=[PendingEffect(...)]` reprs and replays
 production's own `EffectStore` once per cycle under the committed window and a

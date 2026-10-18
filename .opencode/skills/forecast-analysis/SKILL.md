@@ -75,6 +75,7 @@ uv run python tools/estimator_replay.py corpus/*.log --variant prior
 uv run python tools/estimator_replay.py corpus/*.log --regime tesla
 uv run python tools/estimator_replay.py corpus/*.log --turn-off-margin 40
 uv run python tools/estimator_replay.py corpus/*.log --guards live
+uv run python tools/estimator_replay.py corpus/*.log --rate-window-quanta 2,3,4,all
 
 # 4. counterfactual
 uv run python tools/settle_window_counterfactual.py corpus/*.log
@@ -146,7 +147,9 @@ sample. A single `bugs/<file>.log` is a case study, not a population.
   reports a power at the end of each quantum and holds it across the quantum, so a
   window equal to the quantum makes the trailing rate the latest reading (a
   zero-order hold) and a sub-quantum window is degenerate. Frame any window or
-  estimator-horizon sweep in quanta.
+  estimator-horizon sweep in quanta — the replay's `--rate-window-quanta` is the
+  closed-loop form of that sweep (it re-averages the rate only; `raw_wh` and the
+  cadence stay fixed).
 - **Constant metadata.** `ParsedMetricsQH.qh_name` is the literal `"QH1"` on both
   sides of comparisons, so any QH-boundary clause keyed on it is dead in
   production. Verify a "QH expiry" is live before crediting it.
