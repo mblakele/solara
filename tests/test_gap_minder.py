@@ -2011,3 +2011,26 @@ def test_jitter_swing_logged_matches_predicate(caplog):
     assert guard_records, "guard fired but logged nothing"
     assert guard_records[0].swing_wh == pytest.approx(75.0)
 
+
+
+# --- Constructor API ---
+
+
+@pytest.mark.parametrize(
+    "knob",
+    [
+        {"lumpy_first": True},
+        {"amp_floor": True},
+        {"dispatch_secs": 30},
+    ],
+)
+def test_policy_knobs_are_keyword_only(knob):
+    """The opt-in policy knobs cannot be passed positionally.
+
+    They sit past pylint's ``max-positional-arguments`` ceiling, so a silent
+    positional shift would drop a knob into the wrong slot. Keyword-only turns
+    that into a TypeError at the call site.
+    """
+    positional = [None, 5, 48, 0, 0, *knob.values()]
+    with pytest.raises(TypeError):
+        GapMinder(*positional)

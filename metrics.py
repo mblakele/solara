@@ -198,7 +198,8 @@ def _chart_start_for(energy_cache: EnergyCache, now: datetime) -> datetime:
     if data_start is None:
         return ceil_to_qh(now - MAX_FETCH_WINDOW)
     current_qh_start = floor_to_qh(now)
-    if data_start < current_qh_start and data_start == ceil_to_qh(data_start):
+    aligned = data_start == ceil_to_qh(data_start)
+    if data_start < current_qh_start and aligned:
         # Anchor to the stale QH-aligned data_start so samples accumulate to
         # 900 and compact() materialises a CompletedNBCPeriod.  This applies
         # to any number of QHs back — compact() processes all complete chunks

@@ -20,9 +20,9 @@ Method (the step-function meter model is the one
 hand-fixtured): each anchor is a step over quarter-relative time, history
 events are the quarter's logged plug lines, policy commands land at the data
 end plus the quarter's observed decision lag, and the landing is the logged
-actual plus the integrated ON-time divergence over the quarter. Only
-``rate_fn`` differs between runs, and it takes the counterfactual window rate
-``w_cf`` so the variant's formula is identical to
+actual plus the integrated divergence over the quarter. Only ``rate_fn``
+differs between runs, and it takes the counterfactual window rate ``w_cf`` so
+the variant's formula is identical to
 ``tools.forecast_log_scoring.estimate_prior_only`` / ``estimate_prior_blend``
 (pinned by test, so the replay cannot evaluate a different variant than the
 scorer scored).
@@ -33,10 +33,23 @@ Runs:
   * ``status-quo`` — production's trailing-window rate through ``decide()``.
   * variant — the estimator's rate through the same ``decide()``.
 
-Scope: the two plug-only quarters this model covers (no Tesla activity).
-Nameplate watts stand in for measured draw, so absolute landings are model
-values; the *deltas against the status-quo run* are the result, following the
-``test_tesla_overshoot_replay`` convention.
+The two axes are independent: a run is an estimator *and* a ``Policy`` (the
+decision knobs, built from ``GapMinder``'s constructor — margins and
+``lumpy_first``). The default policy has to reproduce the shipped engine
+exactly, which is what keeps the pinned verdicts below from moving; the
+policy tests drive it on synthetic quarters where a coarse quantum (43.3 Wh
+of 260 W plug at R=600 s) makes the margin's effect legible.
+
+Scope: the two plug-only quarters the checked-in fixtures cover (no Tesla
+activity), plus a synthetic car leg. The meter's second actuator population
+is the car: ``TeslaSample`` steps of *reported* amps, which a policy command
+replaces, priced at ``nominal_voltage()`` watts per amp so one amp over the
+remaining window is ``240 * R / 3600`` Wh — the quantum behind the
+2026-10-17 overshoots. ``plugged_in`` comes from the log, so the
+counterfactual can never charge an absent car. Nameplate watts stand in for
+measured draw, so absolute landings are model values; the *deltas against the
+status-quo run* are the result, following the ``test_tesla_overshoot_replay``
+convention.
 """
 
 from __future__ import annotations
@@ -48,6 +61,7 @@ from typing import Sequence
 
 import pytest
 
+from constants import JITTER_FLOOR_WH_PER_S
 from tools import estimator_replay as er
 from tools import forecast_log_scoring as fls
 
@@ -307,13 +321,20 @@ def test_reversals_respect_the_log_side_window() -> None:
 # the mean absolute miss"). Do not ship the flat prior; the trend-gated mix is
 # the variant that has to earn B back.
 #
-# The corpus replay (1,107 clean quarters of 13 logs, tools/estimator_replay.py)
-# confirmed it at scale and killed the whole line: status-quo 23.56 mean |miss|
-# against prior 28.25, prior-blend@60 26.64 and trend-gated 24.92, with churn
-# roughly halved (2.79 -> 1.40 actions/quarter). Every smoother variant is
-# worse closed-loop even though the shipped window is 2x worse open-loop
-# (27.61 vs 13.98 mean |e|) — a 30 s loop pays for responsiveness, not
-# smoothness.
+# The corpus replay (1,029 plug-only quarters of 13 logs,
+# tools/estimator_replay.py) confirmed it at scale and killed the whole line:
+# status-quo 23.41 mean |miss| against prior 27.71, prior-blend@60 26.26 and
+# trend-gated 24.11, with churn roughly halved (2.07 -> 1.41 actions/quarter).
+# Every smoother variant is worse closed-loop even though the shipped window is
+# 2x worse open-loop — a 30 s loop pays for responsiveness, not smoothness.
+#
+# The car regime agrees (--regime tesla: 117 car-active quarters carrying
+# 1,269 Tesla commands): status-quo 17.99 against prior 31.99,
+# prior-blend@60 19.31 and trend-gated 24.15, churn 15.73 -> 9.65-11.97
+# actions/quarter. The 2026-10-17 log is the counter-example that does not
+# survive the corpus (prior-blend@60 6.88 vs status-quo 10.54 on its four
+# car-active quarters).
+
 
 
 def test_prior_rate_cuts_churn_in_both_quarters(
@@ -577,8 +598,13 @@ def test_ingest_log_drops_a_repeated_data_point() -> None:
     assert [a.samples_used for a in quarter.anchors] == [60, 120, 180, 240, 300]
 
 
-def test_ingest_log_drops_a_quarter_where_the_tesla_may_draw() -> None:
-    """The meter is plugs-only, so a charging quarter is unusable."""
+def test_ingest_log_models_a_quarter_where_the_tesla_charges() -> None:
+    """A charging car is an actuator now, not a disqualifier.
+
+    The meter carries a commanded-amps leg, so the quarters the plugs-only
+    model had to refuse (every cycle in the corpus where the car drew) are
+    replayable, and the reported amps become their history.
+    """
     log = "\n".join(
         [
             "\n".join(_anchor_fetch(60 * (i + 1)) for i in range(5)),
@@ -591,8 +617,46 @@ def test_ingest_log_drops_a_quarter_where_the_tesla_may_draw() -> None:
         ]
     )
     quarters, stats = er.ingest_log(Path("synth.log"), log)
-    assert quarters == {}
-    assert stats.tesla == 1
+    (quarter,) = quarters.values()
+    assert (stats.clean, stats.tesla, stats.tesla_active) == (1, 1, 1)
+    assert quarter.tesla_samples == (er.TeslaSample(571.0, 12.0, True, True),)
+    assert quarter.car_active is True
+    assert er.replay(quarter, er.rate_status_quo, mode="history").landing_wh == (
+        pytest.approx(quarter.actual_wh)
+    )
+
+
+def test_ingest_log_reads_the_amp_history_in_time_order() -> None:
+    """Each cycle's reported amps become one step of the car's draw."""
+    log = "\n".join(
+        [
+            "\n".join(_anchor_fetch(60 * (i + 1)) for i in range(5)),
+            _actual_fetch(12.5),
+            _cycle_line(
+                candidates=_candidate("jackery", True),
+                tesla="{'is_charging': True, 'current_amps': 12, "
+                "'plugged_in': True, 'at_home': True}",
+            ),
+            _cycle_line(
+                stamp="2026-10-01 20:44:31",
+                candidates=_candidate("jackery", True),
+                tesla="{'is_charging': True, 'current_amps': 6, "
+                "'plugged_in': True, 'at_home': True}",
+            ),
+        ]
+    )
+    quarters, _ = er.ingest_log(Path("synth.log"), log)
+    (quarter,) = quarters.values()
+    assert [(s.t, s.amps) for s in quarter.tesla_samples] == [(571.0, 12.0), (871.0, 6.0)]
+
+
+def test_ingest_log_marks_an_idle_car_as_modelled_but_not_active() -> None:
+    """Replayed with a car in the meter, but the car never drew."""
+    quarters, stats = er.ingest_log(Path("synth.log"), _replayable_log())
+    (quarter,) = quarters.values()
+    assert (stats.clean, stats.tesla, stats.tesla_active) == (1, 1, 0)
+    assert quarter.tesla_samples == (er.TeslaSample(571.0, 0.0, False, True),)
+    assert quarter.car_active is False
 
 
 def test_ingest_log_drops_a_quarter_with_unknown_tesla_state() -> None:
@@ -712,6 +776,325 @@ def test_ingest_log_skips_an_unreadable_path(tmp_path: Path, capsys) -> None:
     assert "skipping" in capsys.readouterr().err
 
 
+# ── the Tesla leg of the meter ───────────────────────────────────────
+
+
+def _tesla_quarter(
+    amps: float,
+    *,
+    predicted_wh: float,
+    remaining_secs: int,
+    plugged_in: bool = True,
+    at_home: bool = True,
+    actual_wh: float = 0.0,
+    car_active: bool = True,
+) -> er.Quarter:
+    """One anchor with every plug already off: the car in isolation.
+
+    Plugs off leaves the car as the only actuator, so a landing other than
+    ``actual_wh`` is exactly the car's own commanded deviation — the same
+    isolation the log-side ``--turn-offs`` collection relies on. ``amps`` is
+    also the opening state: one reported sample is back-inferred flat, the
+    way ``opening_states`` back-infers a plug.
+    """
+    samples_used = 900 - remaining_secs
+    return er.Quarter(
+        name="tesla-synth",
+        qh_start=_SYNTH_Q,
+        actual_wh=actual_wh,
+        decide_lag=8.0,
+        initial_on=dict.fromkeys(er.POWERS, False),
+        anchors=(
+            fls.ForecastAnchor(
+                source="tesla-synth",
+                quarter_start=_SYNTH_Q,
+                data_point_at=_SYNTH_Q + timedelta(seconds=samples_used),
+                remaining_secs=remaining_secs,
+                samples_used=samples_used,
+                prediction_values=30,
+                raw_wh=predicted_wh,
+                prediction_w=0.0,
+                predicted_wh=predicted_wh,
+                actual_wh=actual_wh,
+                wall_at=None,
+                prior_rate=0.0,
+            ),
+        ),
+        events=(),
+        tesla_samples=(
+            er.TeslaSample(
+                t=float(samples_used), amps=amps, plugged_in=plugged_in, at_home=at_home
+            ),
+        ),
+        car_active=car_active,
+    )
+
+
+def test_replay_lands_the_tesla_amp_step_by_its_quantum() -> None:
+    """One amp for the remaining window is ``240 W * R / 3600`` Wh.
+
+    11.0 Wh predicted against a -9 Wh target is a 20 Wh deficit; at R=600 s
+    one amp is worth 40 Wh, so ``ceil`` books one amp. The command lands one
+    decision lag (8 s) after the data point, so the car's draw falls by
+    ``240 * (600 - 8) / 3600`` — the lag is part of the model, not slop.
+    """
+    quarter = _tesla_quarter(6.0, predicted_wh=11.0, remaining_secs=600)
+    run = er.replay(quarter, er.rate_status_quo)
+    assert run.actions == (("tesla", "set_amps"),)
+    assert run.landing_wh == pytest.approx(-240.0 * (600 - 8.0) / 3600.0)
+
+
+def test_replay_reproduces_the_tesla_ceil_overshoot() -> None:
+    """The model books the step it can, not the gap it was asked for.
+
+    22:01 in ``bugs/2026-10-17-small-overshoots.log``: a 76.5 Wh gap at
+    R=841 s with the car at 8 A becomes a 2-amp step (production logs
+    ``savings=112.1``), 35.6 Wh past the target at decision time. The landing
+    integrates from where the command lands, so it books
+    ``2 * 240 * (841 - 8) / 3600`` = 111.07 Wh — still 33.6 Wh past a 76.5 Wh
+    gap. Pinning it here keeps the overshoot a measured property of the model
+    rather than a claim read off an untracked log.
+    """
+    quarter = _tesla_quarter(8.0, predicted_wh=67.5, remaining_secs=841)
+    run = er.replay(quarter, er.rate_status_quo)
+    assert run.actions == (("tesla", "set_amps"),)
+    assert run.landing_wh == pytest.approx(-2 * 240.0 * (841 - 8.0) / 3600.0)
+    assert abs(run.landing_wh) - 76.5 == pytest.approx(34.57, abs=0.01)
+
+
+def test_replay_never_commands_an_unplugged_car() -> None:
+    """A car that is away cannot be asked to draw.
+
+    Production gates both directions on ``plugged_in``; a model that let the
+    policy charge an absent car would manufacture the energy out of nothing.
+    """
+    quarter = _tesla_quarter(
+        0.0, predicted_wh=67.5, remaining_secs=841, plugged_in=False
+    )
+    run = er.replay(quarter, er.rate_status_quo)
+    assert run.actions == ()
+    assert run.landing_wh == pytest.approx(0.0)
+
+
+def test_history_mode_lands_on_the_logged_actual_with_a_car() -> None:
+    """History pins the car too, so a driven quarter is a framing control."""
+    quarter = _tesla_quarter(
+        6.0, predicted_wh=11.0, remaining_secs=600, actual_wh=-12.0
+    )
+    run = er.replay(quarter, er.rate_status_quo, mode="history")
+    assert run.landing_wh == pytest.approx(-12.0)
+    assert run.action_count == 0
+
+
+def test_plug_only_quarters_never_command_the_tesla(
+    quarter_a: er.Quarter, quarter_b: er.Quarter
+) -> None:
+    """No car in the meter means no car command, whatever the gap.
+
+    The pinned A/B fixtures carry no ``tesla_samples``, so the Tesla leg must
+    stay inert and their verdicts unchanged.
+    """
+    for quarter in (quarter_a, quarter_b):
+        assert quarter.tesla_samples == ()
+        run = er.replay(quarter, er.rate_status_quo)
+        assert all(device != "tesla" for device, _ in run.actions)
+
+
+# ── the decision policy ──────────────────────────────────────────────
+#
+# The estimator is one axis of the replay; the decision knobs are the other
+# and are *also* production surface (GapMinder's constructor), so a candidate
+# that wins here has a shipping path that is a flag rather than a rewrite.
+# Defaults must reproduce the shipped engine exactly, which is what keeps the
+# pinned A/B verdicts above from moving.
+
+
+def _plug_quarter(
+    *,
+    predicted_wh: float,
+    remaining_secs: int,
+    all_on: bool,
+    prediction_w: float = 0.0,
+    actual_wh: float = 0.0,
+) -> er.Quarter:
+    """One anchor with no car: the plugs in isolation.
+
+    ``all_on`` sets every modelled plug's opening state, so a turn-off test
+    starts with candidates to shed and a turn-on test with candidates to
+    bring on. There are no logged events, so the counterfactual and the
+    history agree until the policy touches something. ``predicted_wh`` is the
+    total the engine sees; ``prediction_w`` sets the window rate and the raw
+    bank behind it.
+    """
+    samples_used = 900 - remaining_secs
+    raw_wh = predicted_wh - prediction_w * remaining_secs
+    return er.Quarter(
+        name="plug-synth",
+        qh_start=_SYNTH_Q,
+        actual_wh=actual_wh,
+        decide_lag=8.0,
+        initial_on=dict.fromkeys(er.POWERS, all_on),
+        anchors=(
+            fls.ForecastAnchor(
+                source="plug-synth",
+                quarter_start=_SYNTH_Q,
+                data_point_at=_SYNTH_Q + timedelta(seconds=samples_used),
+                remaining_secs=remaining_secs,
+                samples_used=samples_used,
+                prediction_values=30,
+                raw_wh=raw_wh,
+                prediction_w=prediction_w,
+                predicted_wh=predicted_wh,
+                actual_wh=actual_wh,
+                wall_at=None,
+                prior_rate=0.0,
+            ),
+        ),
+        events=(),
+    )
+
+
+def test_policy_defaults_are_the_shipped_engine() -> None:
+    """The default policy is production's, and the header says so."""
+    engine = er.Policy().engine()
+    assert engine.HYSTERESIS_WH == er.HYSTERESIS_WH
+    assert engine.TURN_ON_MARGIN_WH == 0.0
+    assert engine.TURN_OFF_MARGIN_WH == 0.0
+    assert engine.lumpy_first is False
+    assert er.Policy().label == (
+        "turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
+        "amp floor off, defer on, defer cap 120 s, ramp-aware off, dispatch whole window"
+    )
+
+
+def test_turn_off_margin_withholds_a_coarse_shed() -> None:
+    """A margin as wide as the load's quantum declines the shed outright.
+
+    This is the overshoot mechanism in miniature: at R=600 s the 260 W plug
+    is worth 43.3 Wh, so a 14 Wh deficit cannot be closed without booking
+    more than three times what was asked. Booking ``14 - 50`` asks for
+    nothing, and the cheap plug stays on — the alternative to overshooting is
+    not acting, which is the trade the margin buys.
+    """
+    quarter = _plug_quarter(predicted_wh=5.0, remaining_secs=600, all_on=True)
+    shipped = er.replay(quarter, er.rate_status_quo)
+    withheld = er.replay(
+        quarter, er.rate_status_quo, policy=er.Policy(turn_off_margin_wh=50)
+    )
+    assert shipped.actions == (("ecoflow", "turn_off"),)
+    # The command lands one decision lag after the data point (t = 300 s
+    # here), so the realized divergence is the 592 s the plug was actually
+    # off — not the 43.3 Wh booked at decision time.
+    assert shipped.landing_wh == pytest.approx(-260.0 * 592 / 3600.0)
+    assert withheld.actions == ()
+    assert withheld.landing_wh == pytest.approx(quarter.actual_wh)
+
+
+def test_turn_on_margin_keeps_the_surplus_unspent() -> None:
+    """The same knob on the surplus side: a withheld budget buys nothing."""
+    quarter = _plug_quarter(predicted_wh=-80.0, remaining_secs=600, all_on=False)
+    shipped = er.replay(quarter, er.rate_status_quo)
+    withheld = er.replay(
+        quarter, er.rate_status_quo, policy=er.Policy(turn_on_margin_wh=50)
+    )
+    assert shipped.action_count == 1
+    assert withheld.actions == ()
+
+
+def test_banked_energy_unlocks_the_lumpy_first_gate() -> None:
+    """Lumpy-first is unreachable unless the bank reaches the gate.
+
+    Production reads ``ctx.banked_wh`` (``qh1.raw_wh``) to learn the trailing
+    rate the lumpy load must be implicated in; a replay that left it None
+    made ``--lumpy-first`` a silent no-op on every quarter. With the bank
+    supplied, the 4,857 W heater leads the shed instead of following the
+    260 W plugs — the smalls cover only 86.7 Wh of this 200 Wh deficit.
+    """
+    quarter = _plug_quarter(
+        predicted_wh=191.0, remaining_secs=600, all_on=True, prediction_w=-1.35
+    )
+    shipped = er.replay(quarter, er.rate_status_quo)
+    lumpy = er.replay(quarter, er.rate_status_quo, policy=er.Policy(lumpy_first=True))
+    assert shipped.actions == (
+        ("ecoflow", "turn_off"),
+        ("water heater", "turn_off"),
+    )
+    assert lumpy.actions == (("water heater", "turn_off"),)
+
+
+def test_dispatch_quantum_reaches_the_engine() -> None:
+    """The knob is production's, so the replay constructs it, not fakes it."""
+    assert er.Policy().engine().dispatch_secs is None
+    assert er.Policy(dispatch_secs=30).engine().dispatch_secs == 30
+    assert er.Policy().label.endswith("dispatch whole window")
+    assert er.Policy(dispatch_secs=30).label.endswith("dispatch 30 s")
+
+
+def test_dispatch_quantum_starts_a_plug_the_shipped_fit_declines() -> None:
+    """Closed loop: a 21 Wh surplus starts a plug instead of nothing.
+
+    At R=600 s the shipped fit test wants 43.3 Wh of surplus to hold the
+    260 W plug for the rest of the quarter, so the plug never starts and
+    the surplus stays in the meter. One dispatch (30 s, 2.2 Wh) fits, so
+    the loop starts it; the running debit is still the whole window's
+    43.3 Wh, which is exactly what the pending-effect estimate credits.
+    """
+    quarter = _plug_quarter(predicted_wh=-30.0, remaining_secs=600, all_on=False)
+    shipped = er.replay(quarter, er.rate_status_quo)
+    dispatched = er.replay(
+        quarter, er.rate_status_quo, policy=er.Policy(dispatch_secs=30)
+    )
+    assert shipped.actions == ()
+    assert dispatched.actions == (("jackery", "turn_on"),)
+
+
+def test_amp_floor_reaches_the_engine() -> None:
+    """The knob is production's, so the replay constructs it, not fakes it."""
+    assert er.Policy().engine().tesla_decider.amp_floor is False
+    assert er.Policy(amp_floor=True).engine().tesla_decider.amp_floor is True
+    assert "amp floor off" in er.Policy().label
+    assert "amp floor on" in er.Policy(amp_floor=True).label
+
+
+def test_amp_floor_defers_the_overshooting_tesla_step() -> None:
+    """The 20 Wh deficit is declined rather than overshot by 40.
+
+    Exactly the quarter ``test_replay_lands_the_tesla_amp_step_by_its_quantum``
+    pins: 11.0 Wh predicted against -9 Wh, so one amp into a 20 Wh gap. Ceil
+    books the amp; the floor declines it and the car keeps drawing, landing on
+    the logged actual. That is a 20 Wh miss the other way — and the whole
+    question is whether the loop closes it on a later, finer step or not.
+    """
+    quarter = _tesla_quarter(6.0, predicted_wh=11.0, remaining_secs=600)
+    shipped = er.replay(quarter, er.rate_status_quo)
+    floored = er.replay(quarter, er.rate_status_quo, policy=er.Policy(amp_floor=True))
+    assert shipped.actions == (("tesla", "set_amps"),)
+    assert floored.actions == ()
+    assert floored.landing_wh == pytest.approx(0.0)
+
+
+def test_a_default_policy_is_the_shipped_replay(
+    quarter_a: er.Quarter, quarter_b: er.Quarter
+) -> None:
+    """Flag-off parity: the pinned verdicts cannot move under the new axis."""
+    for quarter in (quarter_a, quarter_b):
+        assert er.replay(
+            quarter, er.rate_status_quo, policy=er.Policy()
+        ) == er.replay(quarter, er.rate_status_quo)
+
+
+def test_replay_all_forwards_the_policy() -> None:
+    """The aggregate path carries the knobs, not just the single quarter."""
+    quarter = _plug_quarter(predicted_wh=5.0, remaining_secs=600, all_on=True)
+    quarters = {quarter.qh_start: quarter}
+    shipped = er.replay_all(quarters, er.rate_status_quo)
+    withheld = er.replay_all(
+        quarters, er.rate_status_quo, policy=er.Policy(turn_off_margin_wh=50)
+    )
+    assert shipped[quarter.qh_start].actions == 1
+    assert withheld[quarter.qh_start].actions == 0
+
+
 # ── the reporting layer ──────────────────────────────────────────────
 
 
@@ -767,6 +1150,32 @@ def test_rank_regressions_puts_the_biggest_loss_first() -> None:
     assert format(rows[0][2].miss_wh) == "30.0"
 
 
+def test_select_regime_separates_car_and_plug_only_quarters(
+    quarter_a: er.Quarter,
+) -> None:
+    """The verdict has to be readable per metering regime.
+
+    Adding a car to the meter changes what the corpus measures, so the two
+    populations (the car was in play, or the plugs were the only actuators)
+    must be separable — the extended numbers cannot be read either way
+    otherwise.
+    """
+    car = _tesla_quarter(6.0, predicted_wh=11.0, remaining_secs=600)
+    idle = _tesla_quarter(
+        0.0, predicted_wh=11.0, remaining_secs=600, plugged_in=False,
+        car_active=False,
+    )
+    quarters = {car.qh_start: car, quarter_a.qh_start: quarter_a}
+    assert set(er.select_regime(quarters, "tesla")) == {car.qh_start}
+    assert set(er.select_regime(quarters, "plug-only")) == {quarter_a.qh_start}
+    assert set(er.select_regime(quarters, "all")) == set(quarters)
+    assert er.select_regime({idle.qh_start: idle}, "plug-only") == {
+        idle.qh_start: idle
+    }
+    with pytest.raises(ValueError, match="unknown regime"):
+        er.select_regime(quarters, "nope")
+
+
 def test_variants_carry_the_documented_names_and_fresh_state() -> None:
     """Trend-gated holds tracker state, so it must not be shared between runs."""
     first = er.variants()
@@ -819,6 +1228,37 @@ def test_main_fails_when_a_log_holds_no_replayable_quarter(
     assert "no replayable quarters" in capsys.readouterr().err
 
 
+def test_main_reports_the_policy_it_ran(tmp_path: Path, capsys) -> None:
+    """The decision knobs are part of the result's identity, so they show.
+
+    A margin sweep is only readable if each run says which policy produced
+    it; the flags compose with ``--regime`` and ``--variant`` rather than
+    replacing them.
+    """
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log), "--turn-off-margin", "40"]) == 0
+    assert (
+        "policy: turn-on margin 0 Wh, turn-off margin 40 Wh, lumpy-first off, "
+        "amp floor off, defer on, defer cap 120 s, ramp-aware off, dispatch whole window" in capsys.readouterr().out
+    )
+    assert er.main([str(log), "--lumpy-first"]) == 0
+    assert (
+        "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first on, "
+        "amp floor off, defer on, defer cap 120 s, ramp-aware off, dispatch whole window" in capsys.readouterr().out
+    )
+    assert er.main([str(log), "--amp-floor"]) == 0
+    assert (
+        "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
+        "amp floor on, defer on, defer cap 120 s, ramp-aware off, dispatch whole window" in capsys.readouterr().out
+    )
+    assert er.main([str(log), "--dispatch-secs", "30"]) == 0
+    assert (
+        "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
+        "amp floor off, defer on, defer cap 120 s, ramp-aware off, dispatch 30 s" in capsys.readouterr().out
+    )
+
+
 def test_main_restricts_to_one_date(tmp_path: Path, capsys) -> None:
     """``--date`` filters the quarter set after ingestion."""
     log = tmp_path / "synth.log"
@@ -826,6 +1266,22 @@ def test_main_restricts_to_one_date(tmp_path: Path, capsys) -> None:
     assert er.main([str(log), "--variant", "prior", "--date", "2026-10-01"]) == 0
     assert "restricted to 2026-10-01" in capsys.readouterr().out
     assert er.main([str(log), "--date", "2026-10-02"]) == 1
+
+
+def test_main_reports_the_regime_it_measured(tmp_path: Path, capsys) -> None:
+    """``--regime`` filters after ingestion and names the population.
+
+    The idle-car log is one quarter where the plugs were the only actuators,
+    so a car-active request has nothing to measure and says so instead of
+    printing zeros.
+    """
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log), "--regime", "tesla"]) == 1
+    assert "no replayable quarters" in capsys.readouterr().err
+    assert er.main([str(log), "--regime", "plug-only"]) == 0
+    out = capsys.readouterr().out
+    assert "regime: plug-only (1 quarter(s))" in out
 
 
 # ── fixture drift (needs the logs; skipped without them) ─────────────
@@ -868,3 +1324,205 @@ def test_checked_in_fixtures_still_match_the_logs() -> None:
         for got_event, want_event in zip(parsed.events, sorted(events)):
             assert got_event[1:] == want_event[1:]
             assert got_event[0] == pytest.approx(want_event[0], abs=1.0)
+
+
+# ── the guard arm (Subtask 2) ────────────────────────────────────────
+#
+# Until now the replay modelled a machine production does not run: the
+# ``DecideContext`` it built omitted ``gap_jitter_wh_per_s`` and
+# ``gap_trend_wh_per_s``, so the turn-on jitter guard, its banked-cover
+# override and the ramp-aware Tesla stop could never fire. These tests pin the
+# fidelity wiring (one tracker per quarter, fed production's own order and
+# inputs), the inert arm's bit-parity with the published numbers, and the
+# decline/rescue split the report has to name.
+
+
+def _churning_quarter(banked_wh: float = 20.0) -> er.Quarter:
+    """A quarter whose gap oscillates, so the tracker measures churn.
+
+    Four anchors 30 s apart with the gap alternating 40 / 5 Wh. Two slopes of
+    opposite sign make churn ~2.33 Wh/s — an order above the guard's floor —
+    and the projected swing at that horizon swamps either claim, so the
+    guard fires on *both* cycles that reach the turn-on side (5 Wh is past
+    the 3 Wh deadband, so the second one is not swallowed by hysteresis).
+    The first two anchors decide nothing (the cheapest 260 W plug costs 43.3
+    Wh over 600 s, more than either surplus), which is what keeps the two
+    arms' gap series identical up to the first decline.
+
+    ``banked_wh`` is the quarter's accumulated energy: +20 Wh sits above the
+    bar the cover needs (no override, so the guard's fire is a decline),
+    while a deep export grants the cover and the fire becomes a rescue.
+    """
+    anchors = []
+    for index, gap in enumerate((40.0, 5.0, 40.0, 5.0)):
+        remaining = 600 - 30 * index
+        predicted = er.TARGET_WH - gap
+        anchors.append(
+            (900 - remaining, remaining, 30, banked_wh,
+             (predicted - banked_wh) / remaining, None)
+        )
+    return _build_quarter(
+        "churn",
+        "2026-10-16 12:00",
+        8.0,
+        11.0,
+        anchors,
+        (),
+        initial_on=dict.fromkeys(er.POWERS, False),
+    )
+
+
+def test_guard_arm_defaults_to_inert_and_is_bit_identical() -> None:
+    """The shipped arm is the default, and it carries no guard activity."""
+    quarter = _churning_quarter()
+    default = er.replay(quarter, er.rate_status_quo)
+    inert = er.replay(quarter, er.rate_status_quo, guards="inert")
+    assert default == inert
+    assert inert.guard == er.GuardActivity()
+
+
+def test_live_guard_declines_a_churning_turn_on() -> None:
+    """With the tracker fed, the guard withholds the turn-ons it protects."""
+    quarter = _churning_quarter()
+    inert = er.replay(quarter, er.rate_status_quo)
+    live = er.replay(quarter, er.rate_status_quo, guards="live")
+    assert inert.guard.declines == 0
+    # Both cycles that claim a surplus are declined: the inert arm starts a
+    # plug into the first one and sheds it again one cycle later, so the arm
+    # suppresses two commands and lands back on the logged actual.
+    assert live.guard.declines == 2
+    assert inert.action_count == 2
+    assert live.action_count == 0
+    assert live.landing_wh != inert.landing_wh
+    # An oscillating gap is not a ramp: the trend stays untrusted, so the
+    # ramp rule had nothing to hasten here.
+    assert live.guard.trusted_trend_cycles == 0
+
+
+def test_live_guard_override_releases_a_covered_turn_on() -> None:
+    """A bank deep enough to cover the load is a rescue, not a decline.
+
+    The rescue happens at the first fire, so the rest of the quarter then
+    unfolds exactly as it does in the inert arm — including the shed that
+    follows, which the guard never touches (turning off is not guarded).
+    """
+    quarter = _churning_quarter(banked_wh=-49.0)
+    inert = er.replay(quarter, er.rate_status_quo)
+    live = er.replay(quarter, er.rate_status_quo, guards="live")
+    assert live.guard.declines == 0
+    assert live.guard.rescues == 1
+    assert live.steps == inert.steps
+    assert live.landing_wh == inert.landing_wh
+
+
+def test_live_arm_feeds_the_tracker_productions_own_signals() -> None:
+    """The ctx decide() reads carries the churn/trend the tracker measured."""
+    seen: list[er.DecideContext] = []
+    original = er.GapMinder.decide
+
+    def spy(self, ctx, predicted_wh, target_wh):  # type: ignore[no-untyped-def]
+        seen.append(ctx)
+        return original(self, ctx, predicted_wh, target_wh)
+
+    er.GapMinder.decide = spy  # type: ignore[method-assign]
+    try:
+        er.replay(_churning_quarter(), er.rate_status_quo, guards="live")
+        live_seen = list(seen)
+        seen.clear()
+        er.replay(_churning_quarter(), er.rate_status_quo, guards="churn")
+        churn_seen = list(seen)
+        seen.clear()
+        er.replay(_churning_quarter(), er.rate_status_quo, guards="inert")
+        inert_seen = list(seen)
+    finally:
+        er.GapMinder.decide = original  # type: ignore[method-assign]
+    # Two cycles of samples are not enough for churn; the third measures it.
+    assert live_seen[0].gap_jitter_wh_per_s == 0.0
+    assert live_seen[2].gap_jitter_wh_per_s > JITTER_FLOOR_WH_PER_S
+    assert all(ctx.gap_trend_wh_per_s is None for ctx in live_seen)
+    # The churn arm feeds the same jitter signal but not the ramp rule's
+    # trend — that separation is the whole point of the control.
+    assert [ctx.gap_jitter_wh_per_s for ctx in churn_seen] == [
+        ctx.gap_jitter_wh_per_s for ctx in live_seen
+    ]
+    assert all(ctx.gap_trend_wh_per_s is None for ctx in churn_seen)
+    # The inert arm leaves both dark, which is the old machine.
+    assert all(ctx.gap_jitter_wh_per_s is None for ctx in inert_seen)
+    assert all(ctx.gap_trend_wh_per_s is None for ctx in inert_seen)
+
+
+def test_churn_arm_isolates_the_ramp_rule_signal() -> None:
+    """With no car to command, ``churn`` and ``live`` are the same machine.
+
+    That identity is what licenses reading their difference elsewhere as the
+    ramp rule's own effect rather than the bundle's.
+    """
+    quarter = _churning_quarter()
+    churn = er.replay(quarter, er.rate_status_quo, guards="churn")
+    live = er.replay(quarter, er.rate_status_quo, guards="live")
+    assert churn == live
+    assert churn.guard.declines > 0  # the guard is live in both
+
+
+def test_guard_arm_rejects_an_unknown_name() -> None:
+    """A typo is an error, not a silent fallback to inert."""
+    with pytest.raises(ValueError):
+        er.replay(_churning_quarter(), er.rate_status_quo, guards="sometimes")
+
+
+def test_replay_all_forwards_the_guard_arm() -> None:
+    """The aggregate path carries the arm, not just the single quarter."""
+    quarter = _churning_quarter()
+    quarters = {quarter.qh_start: quarter}
+    inert = er.replay_all(quarters, er.rate_status_quo)
+    live = er.replay_all(quarters, er.rate_status_quo, guards="live")
+    assert inert[quarter.qh_start].guard.declines == 0
+    assert live[quarter.qh_start].guard.declines == 2
+
+
+def test_format_guard_arm_names_the_mechanisms_and_the_control() -> None:
+    """The verdict block says what fired, against which controls, where."""
+    quarter = _churning_quarter()
+    quarters = {quarter.qh_start: quarter}
+    body = er.format_guard_arm(
+        er.replay_all(quarters, er.rate_status_quo, guards="live"),
+        churn=er.replay_all(quarters, er.rate_status_quo, guards="churn"),
+        inert=er.replay_all(quarters, er.rate_status_quo),
+        rate_name="status-quo",
+        worst=1,
+    )
+    assert "guard arm: live" in body
+    assert "status-quo" in body
+    assert "jitter guard" in body
+    assert "decline" in body
+    assert "rescue" in body
+    assert "trusted-trend" in body
+    assert "live vs inert" in body
+    # The ramp rule gets its own line, and the changed quarters are listed.
+    assert "churn-only vs inert" in body
+    assert "live vs churn-only" in body
+    assert "quarters the arm moved" in body
+    assert "--guards" in body
+
+
+def test_main_prints_the_guard_arm_only_for_live(tmp_path: Path, capsys) -> None:
+    """``--guards inert`` is the shipped report; live adds the verdict block."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log)]) == 0
+    default = capsys.readouterr().out
+    assert "guard arm" not in default
+    assert er.main([str(log), "--guards", "inert"]) == 0
+    assert capsys.readouterr().out == default
+    assert er.main([str(log), "--guards", "live"]) == 0
+    live = capsys.readouterr().out
+    assert "guard arm: live" in live
+    assert "scanned 1 log(s)" in live
+
+
+def test_main_rejects_an_unknown_guard_arm(tmp_path: Path) -> None:
+    """argparse owns the arm vocabulary, so a typo never runs silently."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    with pytest.raises(SystemExit):
+        er.main([str(log), "--guards", "sometimes"])

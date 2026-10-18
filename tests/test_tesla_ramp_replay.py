@@ -81,7 +81,7 @@ def _tesla_5a() -> TeslaState:
 
 def _replay(use_trend: bool) -> list:
     """Run the incident sequence; return one decide_reduce result per step."""
-    decider = TeslaDecider()
+    decider = TeslaDecider(ramp_aware=True)
     tracker = GapTrendTracker()
     results = []
     for data_point_at, (remaining, gap) in zip(_timestamps(), INCIDENT_POINTS):

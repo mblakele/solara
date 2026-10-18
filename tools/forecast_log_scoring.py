@@ -41,11 +41,22 @@ That path has no minimum-horizon floor and no overshoot cap by design, so
 the data is collected before any guard is considered. Also opt-in; the
 default output is unchanged.
 
+``--guards`` adds the suppression census: every mechanism that only
+*declines* work is invisible to a closed loop that watches actions, so this
+section counts what each one withheld and how reachable its trigger was —
+jitter-guard declines (and the loads that were on offer in the same cycle),
+banked-cover rescues, stop deferrals with their horizon distribution, the
+ramp rule's arithmetical reach, and the committed settle window. A guarded
+quarter is reported beside an unguarded one with the confound stated: the
+guard fires *in* the churning-forecast quarters, so the split is a
+correlation, never the guard's effect.
+
 Run from the repo root::
 
     uv run python tools/forecast_log_scoring.py bugs/*.log
     uv run python tools/forecast_log_scoring.py bugs/*.log --estimator
     uv run python tools/forecast_log_scoring.py bugs/*.log --turn-offs
+    uv run python tools/forecast_log_scoring.py bugs/*.log --guards
 """
 
 from __future__ import annotations
@@ -72,7 +83,11 @@ if str(_ROOT) not in sys.path:
 # Flat-layout script: every local import must follow the _ROOT sys.path
 # bootstrap above, so they deliberately sit below module-level code (flake8
 # E402 and pylint wrong-import-position are the same complaint).
-from constants import DEFAULT_HYSTERESIS_WH  # noqa: E402 # pylint: disable=wrong-import-position
+from constants import (  # noqa: E402 # pylint: disable=wrong-import-position
+    DEFAULT_HYSTERESIS_WH,
+    TESLA_CHARGE_AMPS_MIN_DEFAULT,
+    TESLA_NOMINAL_VOLTAGE,
+)
 from gap_trend import GapTrendTracker  # noqa: E402 # pylint: disable=wrong-import-position
 from util import QH_PERIOD_SECONDS, floor_to_qh # noqa: E402 # pylint: disable=wrong-import-position
 
@@ -603,6 +618,12 @@ class CycleStateSnapshot:
             None when the diagnostics logged no Tesla state at all (the
             cycle exited before the async phase — unknown, never "idle").
         tesla_amps: The Tesla's reported amps, or None when unknown.
+        tesla_plugged_in: Whether the car was plugged in, or None when no
+            state was logged. The replay gates every command on it, so a
+            counterfactual that dropped it could charge an absent car.
+        tesla_at_home: Whether the car was at home, or None when no state
+            was logged. Production gates on it when a home location is
+            configured.
     """
 
     source: str
@@ -611,6 +632,8 @@ class CycleStateSnapshot:
     plugs: tuple[tuple[str, bool | None, bool | None], ...]
     tesla_charging: bool | None = None
     tesla_amps: float | None = None
+    tesla_plugged_in: bool | None = None
+    tesla_at_home: bool | None = None
 
 
 def _flag(value: str) -> bool | None:
@@ -653,6 +676,8 @@ def parse_cycle_states(text: str, source: str = "<log>") -> list[CycleStateSnaps
             tesla_chunk = segment[marker:]
         charging = _TESLA_CHARGING_RE.search(tesla_chunk)
         amps = _TESLA_AMPS_RE.search(tesla_chunk)
+        plugged = _TESLA_PLUGGED_RE.search(tesla_chunk)
+        at_home = _TESLA_AT_HOME_RE.search(tesla_chunk)
         snapshots.append(
             CycleStateSnapshot(
                 source=source,
@@ -666,6 +691,8 @@ def parse_cycle_states(text: str, source: str = "<log>") -> list[CycleStateSnaps
                     None if charging is None else charging.group(1) == "True"
                 ),
                 tesla_amps=None if amps is None else float(amps.group(1)),
+                tesla_plugged_in=_flag(plugged.group(1)) if plugged else None,
+                tesla_at_home=_flag(at_home.group(1)) if at_home else None,
             )
         )
     return snapshots
@@ -687,6 +714,8 @@ _CANDIDATE_STATE_RE = re.compile(
 _TESLA_STATE_MARKER = "tesla_state={"
 _TESLA_CHARGING_RE = re.compile(r"'is_charging':\s*(True|False)")
 _TESLA_AMPS_RE = re.compile(r"'current_amps':\s*(-?\d+(?:\.\d+)?)")
+_TESLA_PLUGGED_RE = re.compile(r"'plugged_in':\s*(True|False|None)")
+_TESLA_AT_HOME_RE = re.compile(r"'at_home':\s*(True|False|None)")
 
 
 # Matches one candidate entry in production field order, e.g.
@@ -2343,15 +2372,600 @@ def _iter_log_texts(paths: Sequence[Path]) -> Iterator[tuple[Path, str]]:
 _ESTIMATOR_FLAG = "--estimator"
 _TREND_FLOOR_FLAG = "--trend-floor"
 _TURN_OFFS_FLAG = "--turn-offs"
+_GUARDS_FLAG = "--guards"
+# ── suppression census (--guards) ────────────────────────────────────
+#
+# A guard is only visible after the fact: it leaves no action behind, so
+# every measurement that watches actions is blind to it. This section reads
+# the log for each declining mechanism (the turn-on jitter guard, the banked
+# cover that releases it, the stop deferral, the ramp rule that pre-empts it,
+# the adaptive settle window) and for how reachable each trigger was.
+
+# The ramp stop fires when ``t* = (P*R - gap) / (P + trend)`` fits inside one
+# cycle, where P is the car's draw at the amp floor and ``trend`` is clamped
+# to ``RAMP_TREND_CLAMP_FRACTION`` of P. The largest possible denominator
+# (a fully clamped trend) bounds the reach: P*R - gap <= cycle*(1+frac)*P,
+# so the rule can only ever bite below ``gap/P + cycle*(1+frac)`` seconds.
+RAMP_BAND_CYCLE_SECS = 30
+RAMP_BAND_DRAW_WH_PER_S = TESLA_CHARGE_AMPS_MIN_DEFAULT * TESLA_NOMINAL_VOLTAGE / 3600
+RAMP_BAND_CLAMP_FRACTION = 0.5
+"""Mirrors ``TeslaDecider.RAMP_TREND_CLAMP_FRACTION``; pinned by the tests
+so the census can never drift from the rule it prices."""
+
+
+def ramp_band_remaining_secs(gap_wh: float) -> float:
+    """The largest horizon the ramp rule can reach, for a given gap.
+
+    Args:
+        gap_wh: Gap the stop would cover (Wh, positive).
+
+    Returns:
+        ``seconds_remaining`` above which ``t*`` cannot fit inside one
+        cycle, so the ramp rule is arithmetically unable to fire.
+    """
+    return gap_wh / RAMP_BAND_DRAW_WH_PER_S + RAMP_BAND_CYCLE_SECS * (
+        1 + RAMP_BAND_CLAMP_FRACTION
+    )
+
+
+@dataclass(frozen=True)
+class GuardedDecline:
+    """One cycle whose diagnostics reason was the jitter guard's own.
+
+    The candidate list in the same repr is the only evidence of what the
+    decline withheld: production logs the loads that were *available*, not
+    the ones the guard turned away.
+    """
+
+    source: str
+    at: datetime
+    quarter_start: datetime | None
+    available_candidates: int
+    """Plug candidates that were off and toggleable in the same cycle."""
+
+
+@dataclass(frozen=True)
+class BankedOverride:
+    """One ``gapminder_banked_override`` line: a guarded turn-on released."""
+
+    source: str
+    at: datetime
+    gap_wh: float
+    cover_wh: float
+
+
+@dataclass(frozen=True)
+class DeferEntry:
+    """One stop the defer rule declined to take this cycle."""
+
+    source: str
+    at: datetime
+    seconds_remaining: int
+    gap_wh: float
+    safe_defer_secs: int
+
+
+@dataclass(frozen=True)
+class RampStop:
+    """One stop the ramp rule pre-empted the defer rule with."""
+
+    source: str
+    at: datetime
+
+
+@dataclass(frozen=True)
+class SettleWindowTrace:
+    """One log's committed prediction window, cycle by cycle.
+
+    Production never logs the commit itself, so a change between two
+    consecutive cycles is the only visible form of one.
+    """
+
+    source: str
+    windows: tuple[int, ...]
+
+    @property
+    def commits(self) -> tuple[tuple[int, int], ...]:
+        """``(from, to)`` per window change, in log order."""
+        return tuple(
+            (before, after)
+            for before, after in zip(self.windows, self.windows[1:])
+            if before != after
+        )
+
+
+@dataclass(frozen=True)
+class GuardCohort:
+    """One side of the guarded-vs-unguarded quarter comparison.
+
+    ``mean_abs_error_wh`` is the unweighted mean over the cohort's quarters
+    of each quarter's own mean |anchor error|, so a quarter with many
+    anchors does not dominate the column.
+    """
+
+    quarters: int = 0
+    mean_abs_miss_wh: float | None = None
+    mean_abs_error_wh: float | None = None
+
+
+@dataclass(frozen=True)
+class SuppressionCensus:
+    """What every declining mechanism did across the scanned logs."""
+
+    declines: int = 0
+    declined_cycles: int = 0
+    declined_with_candidate: int = 0
+    rescues: int = 0
+    deferrals: int = 0
+    median_defer_secs: int | None = None
+    p25_defer_secs: int | None = None
+    p75_defer_secs: int | None = None
+    max_defer_secs: int | None = None
+    ramp_fires: int = 0
+    ramp_eligible: int = 0
+    settle_cycles: tuple[tuple[int, int], ...] = ()
+    settle_commits: int = 0
+    guarded: GuardCohort = GuardCohort()
+    unguarded: GuardCohort = GuardCohort()
+
+
+# The guard's own reason string, read only from the diagnostics segment: a
+# candidate entry carries a ``reason`` field of its own, so an unscoped
+# search could mistake a candidate's reason for the cycle's.
+_DECLINE_REASON = "excessive_jitter"
+_DECLINE_CANDIDATE_RE = re.compile(
+    r"CandidateDetail\(device_type='plug', name='([^']*)', "
+    r"power_watts=([\d.eE+-]+|None).*?can_toggle=(True|False), "
+    r"desired_state=(True|False|None)"
+)
+_BANKED_RE = re.compile(
+    r"gapminder_banked_override gap=([\d.eE+-]+) banked=([\d.eE+-]+) "
+    r"cover=([\d.eE+-]+)"
+)
+_DEFER_RE = re.compile(
+    r"\[_decide_tesla_reduce\] deferring stop: current_amps=\d+, "
+    r"seconds_remaining=(\d+), safe_defer=(\d+)s, gap=([\d.eE+-]+) Wh"
+)
+_RAMP_RE = re.compile(r"\[_decide_tesla_reduce\] ramp stop: t\* within one cycle")
+_SETTLE_RE = re.compile(r"settle_window_secs=(\d+)")
+
+
+def parse_guarded_declines(
+    text: str, source: str = "<log>"
+) -> list[GuardedDecline]:
+    """Extract cycles the turn-on jitter guard left inactive.
+
+    Args:
+        text: Full log contents.
+        source: Identifier recorded on each decline (usually the filename).
+
+    Returns:
+        Declines in log order, one per cycle whose diagnostics reason is
+        ``excessive_jitter``. Available loads are counted from the same
+        repr, deduped by name because the repr repeats the candidate list.
+    """
+    declines: list[GuardedDecline] = []
+    for stamp, line in _iter_result_lines(text):
+        diags = line.find(_CYCLE_DIAGS)
+        if diags < 0:
+            continue
+        segment = line[diags:]
+        reason = _CYCLE_REASON_RE.search(segment)
+        if reason is None or reason.group(1) != _DECLINE_REASON:
+            continue
+        available = {
+            name
+            for name, _power, toggleable, desired in _DECLINE_CANDIDATE_RE.findall(
+                line
+            )
+            if toggleable == "True" and desired == "False"
+        }
+        declines.append(
+            GuardedDecline(
+                source=source,
+                at=stamp,
+                quarter_start=_cycle_quarter(segment),
+                available_candidates=len(available),
+            )
+        )
+    return declines
+
+
+def parse_banked_overrides(
+    text: str, source: str = "<log>"
+) -> list[BankedOverride]:
+    """Extract ``gapminder_banked_override`` INFO events from one log.
+
+    Args:
+        text: Full log contents.
+        source: Identifier recorded on each event (usually the filename).
+
+    Returns:
+        Events in log order; empty for logs written before the override
+        shipped. Events without a parseable timestamp prefix are skipped.
+    """
+    events: list[BankedOverride] = []
+    for line in text.splitlines():
+        if "gapminder_banked_override" not in line:
+            continue
+        match = _BANKED_RE.search(line)
+        if match is None:
+            continue
+        stamp = _line_timestamp(line)
+        if stamp is None:
+            continue
+        events.append(
+            BankedOverride(
+                source=source,
+                at=stamp,
+                gap_wh=float(match.group(1)),
+                cover_wh=float(match.group(3)),
+            )
+        )
+    return events
+
+
+def parse_defer_entries(text: str, source: str = "<log>") -> list[DeferEntry]:
+    """Extract stops the defer rule declined to take.
+
+    A deferral means the quarter-hour still had more room than the car's
+    own draw would eat, so the stop was left for a later cycle.
+
+    Args:
+        text: Full log contents.
+        source: Identifier recorded on each entry (usually the filename).
+
+    Returns:
+        Entries in log order; empty for logs written before the defer rule
+        shipped (or when it never declined a stop).
+    """
+    entries: list[DeferEntry] = []
+    for line in text.splitlines():
+        match = _DEFER_RE.search(line)
+        if match is None:
+            continue
+        stamp = _line_timestamp(line)
+        if stamp is None:
+            continue
+        entries.append(
+            DeferEntry(
+                source=source,
+                at=stamp,
+                seconds_remaining=int(match.group(1)),
+                safe_defer_secs=int(match.group(2)),
+                gap_wh=float(match.group(3)),
+            )
+        )
+    return entries
+
+
+def parse_ramp_stops(text: str, source: str = "<log>") -> list[RampStop]:
+    """Extract stops the ramp rule pulled into the current cycle.
+
+    This is the one declining path that *acts*, so a fire here is a
+    deferral that was pre-empted rather than taken.
+
+    Args:
+        text: Full log contents.
+        source: Identifier recorded on each stop (usually the filename).
+
+    Returns:
+        Stops in log order; empty when the rule never fired.
+    """
+    stops: list[RampStop] = []
+    for line in text.splitlines():
+        if _RAMP_RE.search(line) is None:
+            continue
+        stamp = _line_timestamp(line)
+        if stamp is not None:
+            stops.append(RampStop(source=source, at=stamp))
+    return stops
+
+
+def parse_settle_windows(text: str, source: str = "<log>") -> SettleWindowTrace:
+    """Extract the committed prediction window per cycle-result line.
+
+    Args:
+        text: Full log contents.
+        source: Identifier recorded on the trace (usually the filename).
+
+    Returns:
+        The windows in cycle order. The field only exists in logs written
+        after the adaptive window shipped; earlier logs yield an empty
+        trace.
+    """
+    windows: list[int] = []
+    for _stamp, line in _iter_result_lines(text):
+        match = _SETTLE_RE.search(line)
+        if match is not None:
+            windows.append(int(match.group(1)))
+    return SettleWindowTrace(source=source, windows=tuple(windows))
+
+
+def _separate_percentiles(
+    values: Sequence[int],
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """Return ``(p25, median, p75, max)``, Nones when too few to separate."""
+    if not values:
+        return None, None, None, None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return None, ordered[0], None, ordered[0]
+    quartiles = statistics.quantiles(ordered, n=4, method="inclusive")
+    first, middle, third = (round(value) for value in quartiles)
+    return first, middle, third, ordered[-1]
+
+
+def _cohort(
+    quarters: Sequence[QuarterSummary],
+    errors: dict[tuple[str, datetime | None], list[float]],
+) -> GuardCohort:
+    """Summarize one side of the guarded/unguarded split."""
+    if not quarters:
+        return GuardCohort()
+    misses = [abs(miss) for miss in (q.miss_wh for q in quarters) if miss is not None]
+    per_quarter: list[float] = []
+    for quarter in quarters:
+        found = errors.get((quarter.source, quarter.quarter_start))
+        if found:
+            per_quarter.append(sum(abs(error) for error in found) / len(found))
+    return GuardCohort(
+        quarters=len(quarters),
+        mean_abs_miss_wh=(
+            sum(misses) / len(misses) if misses else None
+        ),
+        mean_abs_error_wh=(
+            sum(per_quarter) / len(per_quarter) if per_quarter else None
+        ),
+    )
+
+
+def _guard_cohorts(
+    quarters: Sequence[QuarterSummary], anchors: Sequence[ForecastAnchor]
+) -> tuple[GuardCohort, GuardCohort]:
+    """Split quarters by whether the jitter guard fired in them.
+
+    Errors are grouped by the anchor's own source and quarter, so one
+    log's anchors only ever price that log's quarters.
+    """
+    errors: dict[tuple[str, datetime | None], list[float]] = {}
+    for anchor in anchors:
+        error = anchor.error
+        if error is None:
+            continue
+        errors.setdefault((anchor.source, anchor.quarter_start), []).append(error)
+    guarded = [q for q in quarters if q.guard_firings]
+    unguarded = [q for q in quarters if not q.guard_firings]
+    return _cohort(guarded, errors), _cohort(unguarded, errors)
+
+
+def summarize_suppressions(
+    *,
+    guard_events: Sequence[GuardEvent] = (),
+    declines: Sequence[GuardedDecline] = (),
+    overrides: Sequence[BankedOverride] = (),
+    defers: Sequence[DeferEntry] = (),
+    ramp_fires: Sequence[RampStop] = (),
+    settle_windows: Sequence[SettleWindowTrace] = (),
+    quarters: Sequence[QuarterSummary] = (),
+    anchors: Sequence[ForecastAnchor] = (),
+) -> SuppressionCensus:
+    """Roll the parsed suppression evidence into one census.
+
+    Args:
+        guard_events: Parsed ``gapminder_jitter_guard`` fires — one event
+            per decline production *logged*, which is not the same count
+            as the cycles it left inactive.
+        declines: Parsed declined cycles, carrying the available loads.
+        overrides: Parsed banked-cover rescues.
+        defers: Parsed deferrals, whose horizons the ramp band is judged
+            against.
+        ramp_fires: Parsed ramp stops.
+        settle_windows: One trace per log; commits are counted inside a
+            trace, never across logs.
+        quarters: Per-quarter roll-ups supplying the miss and the guard
+            count of the guarded/unguarded split.
+        anchors: Scored anchors, supplying the split's error column.
+
+    Returns:
+        The census, with zero counts and empty cohorts when nothing was
+        parsed.
+    """
+    p25, median, p75, longest = _separate_percentiles(
+        [entry.seconds_remaining for entry in defers]
+    )
+    cycles: dict[int, int] = {}
+    for trace in settle_windows:
+        for window in trace.windows:
+            cycles[window] = cycles.get(window, 0) + 1
+    guarded, unguarded = _guard_cohorts(quarters, anchors)
+    return SuppressionCensus(
+        declines=len(guard_events),
+        declined_cycles=len(declines),
+        declined_with_candidate=sum(
+            1 for decline in declines if decline.available_candidates
+        ),
+        rescues=len(overrides),
+        deferrals=len(defers),
+        median_defer_secs=median,
+        p25_defer_secs=p25,
+        p75_defer_secs=p75,
+        max_defer_secs=longest,
+        ramp_fires=len(ramp_fires),
+        ramp_eligible=sum(
+            1
+            for entry in defers
+            if entry.seconds_remaining <= ramp_band_remaining_secs(entry.gap_wh)
+        ),
+        settle_cycles=tuple(sorted(cycles.items(), key=lambda row: (-row[1], row[0]))),
+        settle_commits=sum(len(trace.commits) for trace in settle_windows),
+        guarded=guarded,
+        unguarded=unguarded,
+    )
+
+
+def _census_has_data(census: SuppressionCensus) -> bool:
+    """Whether anything at all was parsed into the census."""
+    return any(
+        (
+            census.declines,
+            census.declined_cycles,
+            census.rescues,
+            census.deferrals,
+            census.ramp_fires,
+            census.settle_cycles,
+            census.guarded.quarters,
+            census.unguarded.quarters,
+        )
+    )
+
+
+def _cohort_line(label: str, cohort: GuardCohort) -> str:
+    """Render one cohort as a single line fragment."""
+    if not cohort.quarters:
+        return f"{label}: none"
+    miss = (
+        f"{cohort.mean_abs_miss_wh:.2f} Wh"
+        if cohort.mean_abs_miss_wh is not None
+        else "n/a"
+    )
+    error = (
+        f"{cohort.mean_abs_error_wh:.2f} Wh"
+        if cohort.mean_abs_error_wh is not None
+        else "n/a"
+    )
+    return f"{label}: {cohort.quarters} quarter(s), mean|miss| {miss}, mean|e| {error}"
+
+
+def _settle_line(census: SuppressionCensus) -> str:
+    """Render the settle-window distribution."""
+    if not census.settle_cycles:
+        return "none seen"
+    return ", ".join(
+        f"{window} s x {count}" for window, count in census.settle_cycles
+    )
+
+
+def _availability_note(census: SuppressionCensus) -> str:
+    """Say plainly whether the availability count can tell declines apart.
+
+    Production lists *every* configured plug in a cycle's candidates, so
+    whenever one is off and past its debounce the count is universal. That
+    makes it a measure of what was on offer, never of what the decline
+    changed — the question the closed-loop replay has to answer instead.
+    """
+    if census.declined_cycles and (
+        census.declined_with_candidate == census.declined_cycles
+    ):
+        return (
+            "universal, because every configured plug is listed, so this is "
+            "what was available, not what the decline withheld"
+        )
+    return "some declined cycles had nothing to turn on"
+
+
+def format_suppressions(census: SuppressionCensus) -> str:
+    """Render the suppression census as plain text tables."""
+    if not _census_has_data(census):
+        return (
+            "no suppression events: no guard, defer, ramp, or settle-window "
+            "evidence was found in the logs"
+        )
+    horizon = (
+        f"median R {census.median_defer_secs} s "
+        f"(p25 {census.p25_defer_secs}, p75 {census.p75_defer_secs}, "
+        f"max {census.max_defer_secs})"
+        if census.median_defer_secs is not None
+        else "no horizon logged"
+    )
+    return "\n".join(
+        [
+            "suppression census",
+            f"  jitter guard: {census.declines} logged decline event(s) across "
+            f"{census.declined_cycles} declined cycle(s)",
+            f"  available turn-on: {census.declined_with_candidate} of "
+            f"{census.declined_cycles} declined cycle(s) had an off, toggleable "
+            f"plug candidate — {_availability_note(census)}",
+            f"  rescue: {census.rescues} banked-cover turn-on(s) released again",
+            "  " + _cohort_line("guarded quarters", census.guarded),
+            "  " + _cohort_line("unguarded quarters", census.unguarded),
+            "  confound: the guard fires in the churning-forecast quarters, so "
+            "this split is correlation, not the guard's effect",
+            f"  stop deferral: {census.deferrals} deferral(s), {horizon}",
+            f"  ramp rule: {census.ramp_fires} fire(s); {census.ramp_eligible} "
+            f"deferral(s) were eligible (R <= gap/P + "
+            f"{RAMP_BAND_CYCLE_SECS * (1 + RAMP_BAND_CLAMP_FRACTION):.0f} s), "
+            f"so only those could ever have fired",
+            f"  settle window: {_settle_line(census)}, "
+            f"{census.settle_commits} commit(s) visible as a change",
+        ]
+    )
+
+
+@dataclass
+class _CensusInputs:
+    """Mutable accumulator for the opt-in suppression-census parsers.
+
+    Kept as one object so ``main`` does not carry five parallel lists
+    through its per-log loop (pylint's local-variable budget).
+    """
+
+    declines: list[GuardedDecline] = field(default_factory=list)
+    overrides: list[BankedOverride] = field(default_factory=list)
+    defers: list[DeferEntry] = field(default_factory=list)
+    ramp_fires: list[RampStop] = field(default_factory=list)
+    settle_windows: list[SettleWindowTrace] = field(default_factory=list)
+
+    def ingest(self, text: str, source: str) -> None:
+        """Parse one log's suppression evidence into the accumulator.
+
+        Args:
+            text: Full log contents.
+            source: Identifier recorded on each parsed item.
+        """
+        self.declines.extend(parse_guarded_declines(text, source=source))
+        self.overrides.extend(parse_banked_overrides(text, source=source))
+        self.defers.extend(parse_defer_entries(text, source=source))
+        self.ramp_fires.extend(parse_ramp_stops(text, source=source))
+        self.settle_windows.append(parse_settle_windows(text, source=source))
+
+    def summarize(
+        self,
+        guard_events: Sequence[GuardEvent],
+        quarters: Sequence[QuarterSummary],
+        anchors: Sequence[ForecastAnchor],
+    ) -> SuppressionCensus:
+        """Roll the accumulated evidence into the census.
+
+        Args:
+            guard_events: Jitter-guard fires parsed for every scan.
+            quarters: Per-quarter roll-ups from the scored report.
+            anchors: Scored anchors, for the cohort split's error column.
+
+        Returns:
+            The census over everything ingested so far.
+        """
+        return summarize_suppressions(
+            guard_events=guard_events,
+            declines=self.declines,
+            overrides=self.overrides,
+            defers=self.defers,
+            ramp_fires=self.ramp_fires,
+            settle_windows=self.settle_windows,
+            quarters=quarters,
+            anchors=anchors,
+        )
+
+
 _USAGE = (
     "usage: forecast_log_scoring.py [LOG ...] "
-    "[--estimator[=NAME,...]] [--trend-floor=WH] [--turn-offs]"
+    "[--estimator[=NAME,...]] [--trend-floor=WH] [--turn-offs] [--guards]"
 )
 
 
 def _parse_cli(
     args: Sequence[str],
-) -> tuple[list[Path], tuple[str, ...] | None, float, bool]:
+) -> tuple[list[Path], tuple[str, ...] | None, float, bool, bool]:
     """Split argv into log paths, requested variants, and the flags.
 
     Args:
@@ -2359,10 +2973,10 @@ def _parse_cli(
             With no paths, every ``*.log`` under ``bugs/`` is used.
 
     Returns:
-        ``(paths, names, trend_floor_wh, turn_offs)``. ``names`` is None
-        when ``--estimator`` was not given (the shipped report only), else
-        the variants to compare. ``turn_offs`` asks for the turn-off path
-        collection report.
+        ``(paths, names, trend_floor_wh, turn_offs, guards)``. ``names`` is
+        None when ``--estimator`` was not given (the shipped report only),
+        else the variants to compare. ``turn_offs`` asks for the turn-off
+        path collection report, ``guards`` for the suppression census.
 
     Raises:
         ValueError: On an unknown flag, an unknown variant name, or a
@@ -2372,6 +2986,7 @@ def _parse_cli(
     names: tuple[str, ...] | None = None
     trend_floor = TREND_GATE_NOISE_FLOOR_WH
     turn_offs = False
+    guards = False
     for arg in args:
         if arg == _ESTIMATOR_FLAG:
             names = ESTIMATOR_NAMES
@@ -2391,13 +3006,15 @@ def _parse_cli(
             trend_floor = float(arg.split("=", 1)[1])
         elif arg == _TURN_OFFS_FLAG:
             turn_offs = True
+        elif arg == _GUARDS_FLAG:
+            guards = True
         elif arg.startswith("-"):
             raise ValueError(f"unknown flag: {arg}")
         else:
             paths.append(Path(arg))
     if not paths:
         paths = sorted(Path("bugs").glob("*.log"))
-    return paths, names, trend_floor, turn_offs
+    return paths, names, trend_floor, turn_offs, guards
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2407,9 +3024,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Log paths, plus optional ``--estimator[=NAME,...]`` (score
             the named forecast variants and print the comparison),
             ``--trend-floor=WH`` (trust floor for the trend-gated
-            variant), and ``--turn-offs`` (add the turn-off path
-            collection report). Defaults to every ``*.log`` under
-            ``bugs/``.
+            variant), ``--turn-offs`` (add the turn-off path
+            collection report), and ``--guards`` (add the suppression
+            census). Defaults to every ``*.log`` under ``bugs/``.
 
     Returns:
         Process exit status: 0 on success, 1 if a log cannot be read or an
@@ -2417,7 +3034,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = list(sys.argv[1:] if argv is None else argv)
     try:
-        paths, names, trend_floor, turn_offs = _parse_cli(args)
+        paths, names, trend_floor, turn_offs, guards = _parse_cli(args)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         print(_USAGE, file=sys.stderr)
@@ -2425,9 +3042,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     anchors: list[ForecastAnchor] = []
     on_watts: list[float | None] = []
     cycles: list[CycleRecord] = []
-    guards: list[GuardEvent] = []
+    guard_events: list[GuardEvent] = []
     decisions: list[TurnOffDecision] = []
     turn_ons: list[TurnOnRecord] = []
+    census = _CensusInputs()
     for path, text in _iter_log_texts(paths):
         path_anchors = parse_log(text, source=path.name)
         on_watts.extend(
@@ -2437,11 +3055,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         anchors.extend(path_anchors)
         cycles.extend(parse_cycles(text, source=path.name))
-        guards.extend(parse_guard_events(text, source=path.name))
+        guard_events.extend(parse_guard_events(text, source=path.name))
         if turn_offs:
             decisions.extend(parse_turn_offs(text, source=path.name))
             turn_ons.extend(parse_turn_ons(text, source=path.name))
-    report = summarize(anchors, cycles=cycles, guards=guards, on_watts=on_watts)
+        if guards:
+            census.ingest(text, path.name)
+    report = summarize(
+        anchors, cycles=cycles, guards=guard_events, on_watts=on_watts
+    )
     print(f"scanned {len(paths)} log(s)\n")
     print(format_report(report))
     if names is not None:
@@ -2459,6 +3081,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             format_turn_offs(
                 summarize_turn_offs(decisions, turn_ons, report.quarters)
+            )
+        )
+    if guards:
+        print()
+        print(
+            format_suppressions(
+                census.summarize(guard_events, report.quarters, anchors)
             )
         )
     return 0 if report.anchor_count else 1

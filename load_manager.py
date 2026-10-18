@@ -144,6 +144,9 @@ class LoadManagerConfig:
         dry_run: If True, log actions without executing them (defaults to LOAD_MANAGE_DRY_RUN).
         lumpy_first: If True, turn_off decides lumpy loads first on the residual
             (defaults to LOAD_MANAGE_LUMPY_FIRST, off). Tests may pass an engine instead.
+        ramp_aware: If True, enable the ramp-aware Tesla stop hastener that stops
+            one cycle early on a rising deficit (defaults to LOAD_MANAGER_RAMP_AWARE,
+            off). Tests may pass an engine instead.
         config_interval_secs: Target interval between cycles in seconds (default 30).
     """
 
@@ -158,6 +161,7 @@ class LoadManagerConfig:
     enabled: bool | tuple[Any, Any] | None = None  # type: ignore[type-arg]
     dry_run: bool | None = None
     lumpy_first: bool | None = None
+    ramp_aware: bool | None = None
     config_interval_secs: int = 30
     telegram_sender: TelegramSender | None = None
     clock: Any | None = None  # clock.Clock | None — forward ref, resolved at runtime
@@ -208,6 +212,19 @@ def _not_charging_state(*, at_home: bool) -> TeslaState:
         plugged_in=False,
         at_home=at_home,
     )
+
+
+def _sleep_hint_at_iso(ctx: CycleContext) -> str:
+    """Default wake timestamp for an exit that does not supply one.
+
+    Args:
+        ctx: Current pipeline context.
+
+    Returns:
+        ISO-8601 ``now_postfetch`` when the fetch ran, else ``now``.
+    """
+    base = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
+    return base.isoformat()
 
 
 def _write_fleet_telemetry_dotfile(dotfile_path: Any) -> None:
@@ -322,6 +339,11 @@ class LoadManager:
         if lumpy_first is None:
             lumpy_first = self._cfg.lumpy_first
         self.lumpy_first = lumpy_first
+
+        ramp_aware = cfg.ramp_aware
+        if ramp_aware is None:
+            ramp_aware = self._cfg.ramp_aware
+        self.ramp_aware = ramp_aware
         if engine is not None:
             self.engine = engine
         else:
@@ -336,6 +358,7 @@ class LoadManager:
                     if tesla_config else TESLA_CHARGE_AMPS_MAX_DEFAULT
                 ),
                 lumpy_first=lumpy_first,
+                ramp_aware=ramp_aware,
             )
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
@@ -499,8 +522,8 @@ class LoadManager:
         above ``MIN_QUANTIZATION_WINDOW_SECS``, returns
         ``quantization_seconds``.  Shorter periods are almost always
         detection artifacts (e.g. the flat-data N=2 case), so they fall
-        back to ``DEFAULT_PREDICTION_WINDOW_SECS`` (30 seconds, the
-        classic default pre-quantization prediction window).
+        back to ``DEFAULT_PREDICTION_WINDOW_SECS`` (the classic
+        pre-quantization prediction window).
 
         Safe to call before ``nbc_reader`` is initialized (returns default), and
         when ``nbc_reader`` is replaced with a mock that doesn't expose
@@ -1541,8 +1564,7 @@ class LoadManager:
             CycleResult with diagnostics attached.
         """
         if sleep_hint_at is None:
-            base = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
-            sleep_hint_at = base.isoformat()
+            sleep_hint_at = _sleep_hint_at_iso(ctx)
         return CycleResult(
             status=status,
             qh=qh,
@@ -2817,6 +2839,7 @@ class LoadManager:
         seconds_remaining: int,
         dry_run: bool,
         data_point_at: datetime | None,
+        *,
         banked_wh: float | None = None,
     ) -> list[PendingEffect]:
         """Run GapMinder.decide() with the eligible candidates.
@@ -3151,6 +3174,9 @@ class LoadManager:
                     charge_amps_max=new_tesla.charge_amps_max,
                     lumpy_first=getattr(
                         self.engine, "lumpy_first", self.lumpy_first
+                    ),
+                    ramp_aware=getattr(
+                        self.engine, "ramp_aware", self.ramp_aware
                     ),
                 )
 

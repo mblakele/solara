@@ -221,46 +221,215 @@ project-root
 │                          # Corpus: 405 decisions/65 quarters, 34 under 60 s,
 │                          # 109/165 sheds overshot (max 222 Wh), 50/84 plug sheds
 │                          # reversed (median 136 s).
+│                          # `--guards` adds the suppression census — every
+│                          # mechanism that only *declines* work is invisible to
+│                          # a loop that watches actions, so this counts what each
+│                          # one withheld: jitter-guard declines
+│                          # (`reason=excessive_jitter` cycles, read from the
+│                          # diagnostics segment so a candidate's own reason
+│                          # cannot stand in) and the off+toggleable candidates in
+│                          # the same repr, banked-cover rescues, stop deferrals
+│                          # with their R distribution, ramp-rule fires and
+│                          # arithmetical reach (`R <= gap/P + cycle*(1+clamp)`;
+│                          # P built from constants.TESLA_CHARGE_AMPS_MIN_DEFAULT *
+│                          # TESLA_NOMINAL_VOLTAGE / 3600 and the clamp/cadence
+│                          # pinned by test against TeslaDecider
+│                          # .RAMP_TREND_CLAMP_FRACTION / LoadManagerConfig
+│                          # .config_interval_secs), and the committed settle
+│                          # window per cycle (commits = the change production
+│                          # never logs). A guarded-vs-unguarded quarter split
+│                          # rides alongside with the confound stated in the
+│                          # output: the guard fires *in* the churning-forecast
+│                          # quarters, so the split is correlation, not effect.
+│                          # Corpus: 1242 declines over 1989 declined cycles (all
+│                          # 1989 offering a load — availability is universal, so
+│                          # the report says so and leaves "did the decline
+│                          # withhold an action" to the replay), 767 rescues, 172
+│                          # deferrals (median R 382 s), 0 ramp fires / 14
+│                          # eligible, settle 30 s x 55299 / 15 s x 103 / 21 s x 4
+│                          # / 6 commits. Default output stays byte-identical.
 │                          # Run from the repo root:
 │                          #   uv run python tools/forecast_log_scoring.py bugs/*.log
 │                          #   uv run python tools/forecast_log_scoring.py bugs/*.log --estimator
 │                          #   uv run python tools/forecast_log_scoring.py bugs/*.log --turn-offs
+│                          #   uv run python tools/forecast_log_scoring.py corpus/*.log --guards
 │   └── estimator_replay.py  # Closed-loop replay: drives an estimator through
 │                          # production GapMinder.decide() against a counterfactual
 │                          # step-function meter, so the verdict is the quarter's
 │                          # miss + churn, not the open-loop forecast error the
 │                          # scorer reports. The model (Quarter/Replay/meter/
-│                          # rate_* variants) lives here; tests/test_estimator_replay.py
-│                          # is its spec. Only `rate_fn` differs between runs, and
-│                          # the estimator formulas are pinned equal to the scorer's
-│                          # estimate_prior_only/estimate_prior_blend.
-│                          # Ingestion is deliberately conservative (the meter models
-│                          # three plugs): quarters where the Tesla could draw
-│                          # (charging/amps/non-plug decision) OR where no cycle ever
-│                          # reported a Tesla state (tesla_state=None is an early exit,
-│                          # not an idle car; production now records the reason on
+│                          # rate_* variants/Policy) lives here;
+│                          # tests/test_estimator_replay.py is its spec. Two
+│                          # independent axes: the rate estimator (only `rate_fn`
+│                          # differs between runs, pinned equal to the scorer's
+│                          # estimate_prior_only/estimate_prior_blend) and the
+│                          # decision Policy, expressed *only* through production
+│                          # GapMinder constructor surface — `--turn-on-margin WH`
+│                          # `--turn-off-margin WH` `--lumpy-first` `--amp-floor`
+│                          # (the last rounds a Tesla reduction down instead of up;
+│                          # TeslaDecider.amp_floor, default off/ceil)
+│                          # `--dispatch-secs SECS` (price a *starting* load over one
+│                          # meter dispatch instead of the whole remaining window;
+│                          # GapMinder.dispatch_secs, default None/whole window)
+│                          # The meter has two actuator populations: plugs (ON/OFF,
+│                          # nameplate watts) and the car (TeslaSample steps of
+│                          # REPORTED amps, replaced by a policy set_amps/Tesla
+│                          # turn_off, priced at nominal_voltage() W/amp so one amp
+│                          # over R is 240*R/3600 Wh — the quantum behind the
+│                          # 2026-10-17 overshoots). plugged_in/at_home ride along
+│                          # from the log because production gates both charging
+│                          # directions on them, so an absent car is never charged.
+│                          # Ingestion stays conservative: quarters where no cycle
+│                          # ever reported a Tesla state are dropped
+│                          # (tesla_state=None is an early exit, not an idle car;
+│                          # production now records the reason on
 │                          # CycleDiagnostics.tesla_state_missing_reason, so newer logs
-│                          # need no inference — older ones still do) are dropped; so are quarters under
+│                          # need no inference — older ones still do); so are quarters under
 │                          # MIN_ANCHORS_PER_QUARTER, with an implausible fetch-line lag
 │                          # (LAG_MIN/MAX_SECS), or with no candidate dump to read the
 │                          # opening ON/OFF state from; repeated samples_used are
 │                          # deduped (production's tracker rejects repeats). Command
 │                          # times come from each anchor's own `wall_at` (per-quarter
 │                          # median lag), not a hand constant. `--variant NAME` (repeatable)
-│                          # `--date YYYY-MM-DD` `--worst N` `--trend-floor WH`.
-│                          # Corpus verdict (13 logs, 1029 clean quarters of 1294):
-│                          # status-quo 23.41 mean|miss| / 14.27 median / -4.87 mean /
-│                          # 2.07 actions/q / 0.90 reversals/q beats prior 27.71,
-│                          # prior-blend@60 26.26 and trend-gated 24.11 while every
-│                          # smoother roughly halves churn — the open-loop ranking
+│                          # `--date YYYY-MM-DD` `--worst N` `--trend-floor WH`
+│                          # `--regime {all,tesla,plug-only}` (default all; splits the
+│                          # report by which actuators were in play, since the plug-only
+│                          # half is the pre-car baseline reproduced exactly — the
+│                          # policy never commands a car that is not drawing). A Policy
+│                          # run reports itself: the header carries the margins, the
+│                          # lumpy-first flag and the dispatch horizon (whole window
+│                          # shipped, or the dispatch quantum in seconds). DecideContext
+│                          # always carries banked_wh (the
+│                          # quarter's accumulated raw energy, qh1.raw_wh); whether the
+│                          # derived gap signals ride along is the guard arm
+│                          # (`--guards {inert,churn,live}`, default inert). inert —
+│                          # every pinned verdict below — leaves
+│                          # gap_jitter_wh_per_s / gap_trend_wh_per_s dark, so the
+│                          # turn-on jitter guard, its banked-cover override and the
+│                          # ramp-aware Tesla stop never fire; both sides of a comparison
+│                          # are equally affected, but a Policy that suppresses actions
+│                          # (a margin) overlaps with the guard's job, so its numbers
+│                          # read as "outside the guard". live feeds one
+│                          # GapTrendTracker per quarter in production's own order
+│                          # (noise floor HYSTERESIS_WH/R, churn withheld past
+│                          # JITTER_MAX_REMAINING_SECS, churn to gap_jitter_wh_per_s
+│                          # unconditionally, the slope to gap_trend_wh_per_s when
+│                          # trusted); churn feeds only the jitter signal, which
+│                          # isolates the ramp rule (the trend field's only reader is
+│                          # _ramp_stop_now). Stated deviation: production's tracker sees
+│                          # the pending-effect-adjusted gap of the published
+│                          # prediction while the replay's gap reflects its own
+│                          # counterfactual meter, so signs and relative deltas are the
+│                          # result and absolute landings are the model's. Inert parity
+│                          # verified to the printed digit: plug-only 23.41, car-active
+│                          # 17.99 mean|miss|.
+│                          # Corpus verdict (13 logs, 1146 replayable of 1294 scored;
+│                          # 117 car-active carrying 1269 Tesla commands): status-quo
+│                          # beats every variant in BOTH regimes — plug-only 23.41
+│                          # mean|miss| / 14.27 median / -4.87 mean / 2.07 actions/q /
+│                          # 0.90 reversals/q vs prior 27.71, prior-blend@60 26.26,
+│                          # trend-gated 24.11; car-active 17.99 / 5.00 / +0.30 vs
+│                          # prior 31.99, prior-blend@60 19.31, trend-gated 24.15
+│                          # (churn 15.73 -> 9.65-11.97) — the open-loop ranking
 │                          # INVERTS closed-loop (the shipped window is ~2x worse
-│                          # open-loop). No estimator variant ships; Subtask 3 stays
-│                          # blocked. Nameplate watts stand in for measured draw and
-│                          # only the three plugs are modelled, so deltas are the
-│                          # result, not absolute landings.
+│                          # open-loop). The 2026-10-17 counter-example
+│                          # (prior-blend@60 6.88 vs status-quo 10.54 on its four
+│                          # car-active quarters) does not survive the corpus.
+│                          # No estimator variant ships; Subtask 3 stays blocked.
+│                          # Policy sweep verdict (closed loop, both regimes): the
+│                          # shipped zero-margin policy is best or tied on mean|miss|
+│                          # everywhere, so no margin and no ordering ships —
+│                          # plug-only 23.41 at 0 / 23.41 at 10 / 24.80 at 40 / 26.85
+│                          # at 60 (turn-on margin worse still: 25.64 at 10, 31.98 at
+│                          # 40), car-active 17.99 vs 19.62 at 10 and 39.48 at 40.
+│                          # The plug regime's -4.87 mean miss is real bias (a 60 Wh
+│                          # margin zeroes it) yet mean|miss| gets WORSE, i.e. the
+│                          # over-shedding hedges forecast variance and |miss| punishes
+│                          # removing it. lumpy_first fires but nets out (23.51 /
+│                          # 17.88). 2026-10-17 disagrees with the corpus again
+│                          # (turn-on margin 20: 4.78 vs 10.54 there, 23.40 vs 17.99 on
+│                          # the car corpus) — the one-log trap. The granularity cure
+│                          # must win without shedding less on average.
+│                          # Amp-floor verdict (`--amp-floor`, car-active only; the
+│                          # plug-only regime is bit-identical as it must be with no
+│                          # car commanded): it LOSES — car-active 19.34 mean|miss| vs
+│                          # 17.99 shipped, churn 19.30 vs 15.73 actions/q and
+│                          # reversals 5.67 vs 2.09; 2026-10-17 itself 11.55 vs 10.54.
+│                          # The floor's premise (close the residue on a later, finer
+│                          # step) is false: the quantum is R-scaled and R shrinks
+│                          # ~30 s/cycle, so an amp is 40.0 Wh at R=600 s and 38.0 Wh
+│                          # one cycle later, only falling below a 20 Wh gap at
+│                          # R < 300 s (two-thirds through the quarter). Declining the
+│                          # step just routes the deficit to the plugs (+3.5
+│                          # actions/q, +3.6 reversals/q ≈ one extra duty-cycle per
+│                          # declined step) and the worst quarter (287 Wh, not
+│                          # amp-quantum-driven) is untouched. The DURATION form is
+│                          # closed too: the meter quantizes the MINIMUM DISPATCH to
+│                          # the reporting window (~30 s, also the settle window), so
+│                          # a minimum-length dispatch is one full observation step and
+│                          # a scheduled restore would be open-loop exactly where the
+│                          # closed loop is blind — strictly worse than today, where the
+│                          # loop's re-decide IS the restore (2.09 reversals/quarter,
+│                          # median 136 s ≈ 4-5 dispatch windows). The dispatchable unit
+│                          # is power * quantization / 3600: 2.2 Wh per 260 W plug,
+│                          # 2.0 Wh per amp, 40.5 Wh per heater run — not the R-scaled
+│                          # 43.3 Wh production books for that plug at R=600 s. The
+│                          # booking is a belief about a duration the actuator is never
+│                          # asked to hold; whether that feeds the over-shedding is the
+│                          # remaining measurable question (plan §5.3).
+│                          # Dispatch-quantum verdict (`--dispatch-secs SECS`, that
+│                          # §5.3 question measured): the admissibility horizon is the
+│                          # one place the R-scaled belief forbids a real action — a
+│                          # starting load must fit the surplus with its whole-window
+│                          # cost (43.3 Wh for a 260 W plug at R=600 s), production's
+│                          # `loads_too_large` no-action reason (12-17% of worst-decile
+│                          # cycles). Admitting a load whose FIRST dispatch fits (the
+│                          # running debit and the pending-effect estimate stay
+│                          # window-priced) is a VARIANCE TRADE, not the resolution gain
+│                          # it looked like: plug-only 23.41 -> 19.29 at 60 s but 238
+│                          # quarters improve / 160 worsen (median delta 0.00, 61%
+│                          # untouched; the mean is five rescues of 100-268 Wh, the 400
+│                          # Wh surpluses the whole-window fit declines outright), while
+│                          # car-active regresses the other way (17.99 -> 24.66 at 60 s;
+│                          # 30 improve / 73 worsen, median +2.66; 2026-10-17 10.54 ->
+│                          # 23.84). All-regime only improves because 90% of the corpus
+│                          # is plug-only. Best value 60 s (the toggle debounce, not the
+│                          # meter's 30 s): 10 s is worst in both regimes (31.41 / 45.72),
+│                          # 300 s the coarsest that still helps the car side (17.10).
+│                          # So the whole-window fit test is a conservative prior about
+│                          # whether a small predicted surplus materializes — the same
+│                          # hedge, on the surplus side, the turn-off margin sweep found
+│                          # on the shed side. No ship.
+│                          # Nameplate watts stand in for measured draw, so deltas
+│                          # are the result, not absolute landings.
+│                          # Guard-arm verdict (`--guards live`, corpus, status-quo
+│                          # rate, churn-only and inert controls): the arm is live, not
+│                          # silent — 291 declines (0.28/q) + 809 rescues plug-only,
+│                          # 115 (0.98/q) + 645 car-active, vs the scorer census's 1242
+│                          # declines / 1294 q (0.96/q) and 767 rescues (0.59/q), the
+│                          # replay's churn 0.256 mean (max 31.57) Wh/s against the
+│                          # census's 0.13 (12.60), all same-order. live is worse than
+│                          # inert in both regimes (plug-only 23.63 vs 23.41, +0.21
+│                          # mean; car-active 20.42 vs 17.99, +2.42) but the bundle is
+│                          # what the attribution convicts: churn-only (the jitter guard
+│                          # and its override alone) is +0.21 plug-only and -0.88
+│                          # car-active — a wash, so the pre-registered deletion rule is
+│                          # not met and NOTHING is deleted; live minus churn-only is the
+│                          # ramp rule alone at +3.31 car-active, 4 changed quarters of
+│                          # 117 (8.6/corpus-month, above the ~1/month threshold), so the
+│                          # ramp rule's deletion condition does NOT fire either —
+│                          # contrary to the plan's expectation, and with the pre-emption
+│                          # sometimes hundreds of seconds (two quarters lost 183 and 222
+│                          # Wh to an early stop the deferral would not have taken).
+│                          # 2026-10-17 separately: 12.06 live vs 12.23 inert overall,
+│                          # 13.22 vs 14.37 on its car-active quarters, ramp 0 changed.
 │                          # Run from the repo root:
 │                          #   uv run python tools/estimator_replay.py bugs/*.log
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --variant prior
+│                          #   uv run python tools/estimator_replay.py corpus/*.log --regime tesla
+│                          #   uv run python tools/estimator_replay.py corpus/*.log --turn-off-margin 40
+│                          #   uv run python tools/estimator_replay.py corpus/*.log --dispatch-secs 60
+│                          #   uv run python tools/estimator_replay.py corpus/*.log --guards live
 │   └── divergence_audit.py  # Status-quo vs residual shed-watts audit over logs:
 │                          # per-anchor ON states (deduped candidates) + logged
 │                          # priorities, lumpy-first iff implicated and beyond
@@ -390,8 +559,16 @@ project-root
                            # Tesla stop reasons without savings, the reversal join's
                            # time window bounding quarter scope, per-quarter miss
                            # join, empty-summary zeros, CLI section + default-output
-                           # parity, multi-word device names), and that the tool runs
-                           # standalone; real-log
+                           # parity, multi-word device names), the suppression
+                           # census (guard-decline parsing scoped to the
+                           # diagnostics segment, candidate dedup and the
+                           # off+toggleable filter, banked overrides, defer
+                           # horizons, ramp fires and the band arithmetic pinned
+                           # against load_nbc/load_manager's own constants, the
+                           # settle trace's commits, the guarded/unguarded cohort
+                           # split, the availability caveat, empty-census text,
+                           # and CLI section + default-output parity), and that the
+                           # tool runs standalone; real-log
                            # assertions skip because bugs/ is gitignored);
                            # test_estimator_replay.py is the spec for
                            # tools/estimator_replay.py, Subtask 2 of the variance-reduction plan:
@@ -406,20 +583,57 @@ project-root
                            # window matching the scorer's, and the measured verdict — the flat
                            # prior cuts churn in both quarters but over-sheds the regime-change
                            # quarter, so its mean |miss| is worse (19.87 vs 15.19) and it must not
-                           # ship. Ingestion is covered on SYNTHETIC log text (no bugs/ needed):
-                           # the built quarter's anchors/actual/lag/events/opening state, the dedup
+                           # ship. Its Tesla leg is pinned the same way: one amp over R is
+                           # 240*(R−lag)/3600 Wh (the synthetic car quarter), the 2026-10-17 ceil
+                           # overshoot reproduced (2 A past a 76.5 Wh gap), an unplugged car never
+                           # commanded, history mode pinning the car too, the plug-only fixtures
+                           # never commanding one, and --regime splitting car-active from
+                           # plug-only. The policy axis (Policy: margins + lumpy_first,
+                           # built from GapMinder's constructor) is spec'd on synthetic
+                           # quarters where a coarse quantum makes the effect legible: the
+                           # default policy reproduces the shipped engine (flag-off parity
+                           # against the pinned verdicts), a turn-off margin as wide as the
+                           # 260 W plug's own 43.3 Wh declines the shed, the turn-on margin
+                           # leaves the surplus unspent, replay_all forwards the knobs, a
+                           # supplied banked_wh is what arms the lumpy-first gate (without
+                           # it the flag is a silent no-op), --amp-floor's step is the
+                           # deferred overshoot (a 20 Wh gap at R=600 s declined
+                           # instead of taken), --dispatch-secs admits a plug the shipped
+                           # fit test declines (21 Wh surplus at R=600 s) while the
+                           # pending-effect debit stays window-priced, and the CLI header
+                           # names the
+                           # policy it ran; and the guard arm (GUARD_MODES inert/churn/live
+                           # through --guards) is spec'd on a synthetic CHURNING quarter —
+                           # its gap alternating 40/5 Wh makes churn ~2.33 Wh/s, so the
+                           # guard declines on both cycles that reach the turn-on side and
+                           # the arm suppresses two commands the inert control issues —
+                           # with a banked-cover twin (banked_wh -49 → one rescue, steps
+                           # and landing identical to inert) and a spy on
+                           # GapMinder.decide pinning what the tracker handed each arm's
+                           # ctx (inert both fields None, churn the jitter signal and
+                           # still no trend, live both), plus the arm vocabulary, the
+                           # aggregate forwarding, the three-way report text and the CLI
+                           # parity (default output == --guards inert, block only when
+                           # non-inert). Ingestion is covered on SYNTHETIC log text (no bugs/ needed):
+                           # the built quarter's anchors/actual/lag/events/opening state, the amp
+                           # history in time order, the dedup
                            # of a repeated data point, the fetch-line-derived lag, and each drop
-                           # reason (charging Tesla, never-known Tesla state, too few anchors,
+                           # reason (never-known Tesla state, too few anchors,
                            # implausible lag, no candidate dump), plus the reporting layer
-                           # (summaries, comparisons, regression ranking), the freshness of the
-                           # variant map, and the CLI (table, --date, unknown variant, no
+                           # (summaries, comparisons, regression ranking, regime selection),
+                           # the freshness of the
+                           # variant map, and the CLI (table, --date, --regime, --turn-off-margin/
+                           # --lumpy-first header, unknown variant, no
                            # quarters); test_tou_page.py covers inclusive date
                            # ranges, DST days, detail rows/defaults and picker dates;
                            # test_app.py covers endpoint validation and range limits;
                            # test_gap_trend.py covers the gap-slope tracker (+ the churn /
                            # jitter EWMA, incl. the churn_ready readiness gate that
                            # withholds the quarter-opening extrapolation),
-                           # test_tesla_decider.py the ramp-aware stop rule,
+                           # test_tesla_decider.py the ramp-aware stop rule and the
+                           # reduction amp step (ceil by default, floored under
+                           # amp_floor: same quantum arithmetic, one-way tightening
+                           # pinned),
                            # test_tesla_ramp_replay.py the 2026-09-26 incident sequence,
                            # test_tesla_overshoot_replay.py the 2026-10-01 overshoot
                            # (status quo characterized; jitter-guard gate: |miss| < 10.7
@@ -457,7 +671,14 @@ project-root
                            # corpus quarters diverge, always sheds less);
                            # test_lumpy_first.py the Subtask-4 wiring (flag-off
                            # parity with history, flag-on c658/c817
-                           # prescriptions, config/env plumbing)
+                           # prescriptions, config/env plumbing);
+                           # test_dispatch_quantum.py the admissibility horizon
+                           # (GapMinder.dispatch_secs default None is the shipped
+                           # whole-window fit test; a dispatch quantum admits a
+                           # load whose first dispatch fits, keeps the
+                           # pending-effect debit window-priced, caps the horizon
+                           # at the remaining window, leaves the shed side and the
+                           # car untouched, and rejects a non-positive value)
 ├── templates/             # Jinja2 HTML templates (index, TOU, error pages);
                            # tou.html shares the index design system (app-bar,
                            # card, kv, data-table) with a single-change
@@ -684,9 +905,31 @@ project-root
   `make_tesla_stop()` — no other PendingEffect() call sites remain in load_nbc.py
 - Tesla amp logic lives in TeslaDecider (owned by GapMinder as `tesla_decider`):
   `decide_increase()` / `decide_reduce()` / `supports()` / `safe_defer_secs()`.
+  The reduction's amp step comes from `TeslaDecider.reduce_amps_for()`, which
+  ceils by default (covers the gap, may overshoot by up to one quantum:
+  `volts * R / 3600` Wh) and floors when `amp_floor=True`
+  (`TeslaDecider`/`GapMinder` constructor, default off — experimental, measured
+  by `tools/estimator_replay.py --amp-floor`; the closed-loop verdict is
+  negative: the residue cannot be closed later because the quantum only shrinks
+  with R. The increase direction already truncates via `int`, so the floor also
+  makes the two directions symmetric.)
   GapMinder keeps thin `_decide_tesla_*` delegates so existing call sites and tests
   keep working. Plug candidate collection is unified in
   `GapMinder._eligible_plugs(ctx, want_on)` (priority order baked in).
+- The turn-on fit test prices a *starting* load over `GapMinder._dispatch_horizon_secs(ctx)`:
+  the whole remaining window shipped (`dispatch_secs=None`), or one meter dispatch
+  when `dispatch_secs` is set (the meter's quantization window — the minimum dispatch
+  time — bounded by the remaining window). Only the admissibility changes; the running
+  debit and `estimated_current_wh` stay window-priced, and the shed side and the car's
+  amp legs are untouched by design (the unguarded turn-off path is deliberate; a
+  dispatched amp step saturates into an irreversible stop). Experimental, measured by
+  `tools/estimator_replay.py --dispatch-secs`; the closed-loop verdict is a wash — a
+  variance trade that nets out (plug-only improves, car-active regresses, median
+  quarter unmoved), so the whole-window fit test stands as a conservative prior about
+  whether a small predicted surplus materializes.
+- The constructor's opt-in policy knobs (`lumpy_first`, `amp_floor`, `dispatch_secs`)
+  are keyword-only on `GapMinder.__init__` (pylint's positional ceiling); the margin
+  and hysteresis knobs stay positional. Pinned by tests/test_gap_minder.py.
 - In run_cycle(), raw NBC predictions are adjusted with pending effect deltas via
   `estimated_current_wh()` before being passed to decide() — this accounts for
   actions already taken this quarter-hour without waiting for fresh API data

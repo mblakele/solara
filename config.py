@@ -343,6 +343,16 @@ class Config:
         return self._get_bool("LOAD_MANAGE_LUMPY_FIRST")
 
     @property
+    def ramp_aware(self) -> bool:
+        """Return True when the ramp-aware Tesla stop hastener is enabled.
+
+        Defaults to False (off): the defer rule still applies, but the
+        trend-based hastener that stops one cycle early on a rising deficit
+        is disabled unless explicitly enabled.
+        """
+        return self._get_bool("LOAD_MANAGER_RAMP_AWARE")
+
+    @property
     def vue_username(self) -> Optional[str]:
         """Return Emporia VUE username, or None if not configured."""
         val = self._get("VUE_USERNAME")

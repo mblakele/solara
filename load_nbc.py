@@ -185,11 +185,11 @@ class ParsedMetricsQH:
 class NBCPeriod:
     """A fixed-length quarter-hour period within an NBC cycle.
 
-    Each period is 900 seconds (15 minutes) long and is used to align
-    NBC predictions into hourly windows for load management decisions.
+    Each period is a quarter hour (``PERIOD_SECS``) long and is used to
+    align NBC predictions into hourly windows for load management decisions.
 
     Attributes:
-        PERIOD_SECS: Duration of each period in seconds (always 900).
+        PERIOD_SECS: Duration of each period in seconds.
     """
 
     PERIOD_SECS = 900
@@ -1421,9 +1421,9 @@ class StateTracker:
     ) -> bool:
         """Check asymmetric debounce: has enough time elapsed since last toggle?
 
-        Turn-on uses MIN_TOGGLE_ON_SECS (60 s) to prevent rapid cycling.
-        Turn-off uses MIN_TOGGLE_OFF_SECS (10 s) to allow fast recovery from
-        an over-commit without waiting out the full on-guard period.
+        Turn-on uses MIN_TOGGLE_ON_SECS to prevent rapid cycling; turn-off uses
+        MIN_TOGGLE_OFF_SECS to allow fast recovery from an over-commit without
+        waiting out the full on-guard period.
 
         Args:
             device_name: The device to check.
@@ -1659,17 +1659,55 @@ class TeslaDecider:
         self,
         charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT,
         charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
+        amp_floor: bool = False,
+        defer_stop: bool = True,
+        max_defer_secs: int | None = None,
+        ramp_aware: bool = False,
     ) -> None:
         """Initialize the decider.
 
         Args:
             charge_amps_min: Minimum Tesla charge amps before turning off
-                instead of reducing further. Defaults to 5.
+                instead of reducing further. Defaults to
+                ``TESLA_CHARGE_AMPS_MIN_DEFAULT``.
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
-                to 48, clamped to HARD_MAX_AMPS.
+                to ``TESLA_CHARGE_AMPS_MAX_DEFAULT``, clamped to
+                HARD_MAX_AMPS.
+            amp_floor: When True, round a reduction *down* to the amps the
+                gap can afford instead of up to the amps it might need (the
+                shipped ceil). Experimental: measured by
+                ``tools/estimator_replay.py --amp-floor``, not yet wired to
+                config. Defaults to False (shipped behaviour).
         """
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
+        self.amp_floor = amp_floor
+        self.defer_stop = defer_stop
+        self.max_defer_secs = (
+            max_defer_secs if max_defer_secs is not None else self.MAX_DEFER_SECS
+        )
+        self.ramp_aware = ramp_aware
+    def reduce_amps_for(self, reduce_wh: float, seconds_remaining: int) -> int:
+        """The amp step a reduction of ``reduce_wh`` over the window buys.
+
+        An amp step is indivisible and worth ``volts * R / 3600`` Wh (40 Wh
+        at R=600 s and 240 V), so a step size that closes a gap exactly
+        usually does not exist. ``ceil`` (shipped) takes the step that covers
+        the gap, overshooting by up to one quantum; ``amp_floor`` takes the
+        step the gap can afford and leaves the residue to a later cycle, when
+        the shrinking window has made the quantum smaller. The increase
+        direction already truncates (``int``), so the floor also makes the two
+        symmetric.
+
+        Args:
+            reduce_wh: Wh reduction needed (positive).
+            seconds_remaining: Seconds left in the quarter.
+
+        Returns:
+            Whole amps to remove, possibly 0 when the gap is under a quantum.
+        """
+        amps = StateTracker.wh_to_amps(reduce_wh, seconds_remaining)
+        return math.floor(amps) if self.amp_floor else math.ceil(amps)
 
     def supports(
         self, tesla: TeslaState | None, requires_home_check: bool
@@ -1710,7 +1748,7 @@ class TeslaDecider:
             Maximum defer window in seconds, capped at MAX_DEFER_SECS.
         """
         return int(
-            min(self.MAX_DEFER_SECS, remaining_reduction / (self.car_power_watts_5a / 3600))
+            min(self.max_defer_secs, remaining_reduction / (self.car_power_watts_5a / 3600))
         )
 
     def _ramp_stop_now(self, ctx: DecideContext, reduce_wh: float) -> bool:
@@ -1866,25 +1904,30 @@ class TeslaDecider:
             # based on the gap. At 5A the car draws useful energy — stopping it
             # removes all that draw. Defer if the quarter-hour has more time
             # remaining than the safe window (i.e., we have buffer to stop later).
-            safe_defer_secs = self.safe_defer_secs(reduce_wh)
-            if ctx.seconds_remaining > safe_defer_secs:
-                if self._ramp_stop_now(ctx, reduce_wh):
-                    logger.debug(
-                        "[_decide_tesla_reduce] ramp stop: t* within one "
-                        "cycle (seconds_remaining=%d, safe_defer=%ds, "
-                        "gap=%.1f Wh, trend=%.3f Wh/s)",
-                        ctx.seconds_remaining, safe_defer_secs,
-                        reduce_wh,
-                        ctx.gap_trend_wh_per_s,
-                    )
-                else:
-                    logger.debug(
-                        "[_decide_tesla_reduce] deferring stop: current_amps=%d, "
-                        "seconds_remaining=%d, safe_defer=%ds, gap=%.1f Wh",
-                        current_amps, ctx.seconds_remaining, safe_defer_secs,
-                        reduce_wh,
-                    )
-                    return None
+            if self.defer_stop:
+                safe_defer_secs = self.safe_defer_secs(reduce_wh)
+                if ctx.seconds_remaining > safe_defer_secs:
+                    if self.ramp_aware and self._ramp_stop_now(ctx, reduce_wh):
+                        logger.info(
+                            "[_decide_tesla_reduce] ramp stop: t* within one "
+                            "cycle (seconds_remaining=%d, safe_defer=%ds, "
+                            "gap=%.1f Wh, trend=%.3f Wh/s, ramp_aware=%s)",
+                            ctx.seconds_remaining, safe_defer_secs,
+                            reduce_wh,
+                            ctx.gap_trend_wh_per_s,
+                            self.ramp_aware,
+                        )
+                    else:
+                        logger.info(
+                            "[_decide_tesla_reduce] deferring stop: current_amps=%d, "
+                            "seconds_remaining=%d, safe_defer=%ds, gap=%.1f Wh, "
+                            "trend=%s, ramp_aware=%s",
+                            current_amps, ctx.seconds_remaining, safe_defer_secs,
+                            reduce_wh,
+                            ctx.gap_trend_wh_per_s,
+                            self.ramp_aware,
+                        )
+                        return None
             logger.info(
                 "action=turn_off device=tesla reason=amps_min_reached current_amps=%d",
                 current_amps,
@@ -1896,7 +1939,7 @@ class TeslaDecider:
             )
 
         # direct amp delta from energy over remaining window
-        reduce_amps = math.ceil(StateTracker.wh_to_amps(reduce_wh, ctx.seconds_remaining))
+        reduce_amps = self.reduce_amps_for(reduce_wh, ctx.seconds_remaining)
         new_amps = max(0, min(self.charge_amps_max, current_amps - reduce_amps))
         # When stop is not allowed, clamp to minimum amps instead of
         # returning None — a reduction to charge_amps_min is still useful.
@@ -1956,10 +1999,10 @@ class TeslaDecider:
 def jitter_swing_wh(jitter_wh_per_s: float, seconds_remaining: int) -> float:
     """Projected swing (Wh) a churn estimate claims over the rest of a quarter.
 
-    Churn is measured from 30-60 s cycle spacing with a 3-sample window, so
-    projecting it across the entire remaining quarter overstates the horizon
-    over which it means anything. The projection is therefore capped at
-    ``JITTER_HORIZON_SECS``.
+    Churn is measured from 30-60 s cycle spacing over ``GAP_TREND_WINDOW``
+    cycles, so projecting it across the entire remaining quarter overstates
+    the horizon over which it means anything. The projection is therefore
+    capped at ``JITTER_HORIZON_SECS``.
 
     This single helper is used by the guard predicate, by ``GapMinder.decide``'s
     ``gapminder_jitter_guard`` INFO line, and by the manager's
@@ -2066,17 +2109,24 @@ class GapMinder:
         charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT,
         turn_on_margin_wh: int | None = None,
         turn_off_margin_wh: int | None = None,
+        *,
         lumpy_first: bool = False,
+        amp_floor: bool = False,
+        dispatch_secs: int | None = None,
+        defer_stop: bool = True,
+        max_defer_secs: int | None = None,
+        ramp_aware: bool = False,
     ) -> None:
         """Initialize the GapMinder.
 
         Args:
             hysteresis_wh: Hysteresis threshold in Wh. When None, defaults to
-                DEFAULT_HYSTERESIS_WH (20, residential scale).
+                DEFAULT_HYSTERESIS_WH (the residential-scale fallback).
             charge_amps_min: Minimum Tesla charge amps before turning off
-                instead of reducing further. Defaults to 5.
+                instead of reducing further. Defaults to
+                ``TESLA_CHARGE_AMPS_MIN_DEFAULT``.
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
-                to 48.
+                to ``TESLA_CHARGE_AMPS_MAX_DEFAULT``.
             turn_on_margin_wh: Wh withheld from the turn-on budget only.
                 ``decide()`` passes ``gap - turn_on_margin_wh`` to
                 ``_decide_turn_on``. Defaults to 0 (aim at target); pass
@@ -2087,13 +2137,45 @@ class GapMinder:
                 ``_decide_turn_off``. Defaults to 0 (aim at target); pass
                 the hysteresis value to restore the old deadband-edge
                 behavior. ``None`` is treated as 0.
-            lumpy_first: When True, turn_off decides >=1000 W
-                (``LUMPY_PLUG_MIN_WATTS``) loads first when one dominates
+            lumpy_first: When True, turn_off decides loads of at least
+                ``LUMPY_PLUG_MIN_WATTS`` first when one dominates
                 the trailing rate and the deficit exceeds the smalls'
                 combined capacity, then budgets small plugs on the
                 residual. Defaults to False (status-quo binpack).
+            amp_floor: Forwarded to :class:`TeslaDecider` — round a reduction
+                down to the amps the gap can afford instead of up to the amps
+                it might need. Experimental; defaults to False.
+            dispatch_secs: The horizon a *starting* load is priced over, in
+                seconds — one dispatch, i.e. the meter's reporting
+                quantization window (~30 s), which is also the shortest a
+                command can be held before the loop's next decision. When
+                set, a load may start if its first dispatch fits the surplus
+                instead of requiring the whole remaining window to fit;
+                ``None`` (shipped) keeps the whole-window fit test. Only the
+                admissibility changes: the running debit and the
+                pending-effect estimate stay window-priced. Must be positive.
+            defer_stop: Forwarded to :class:`TeslaDecider` — whether to defer
+                stopping at minimum amps while a safe buffer remains (and
+                let the ramp rule hasten the stop on a rising deficit). When
+                False, stop immediately at minimum amps whenever a deficit
+                remains, relaxing the defer constraint and making the ramp
+                rule unreachable. Diagnostic only; measured by
+                ``tools/estimator_replay.py --defer``. Defaults to True
+                (shipped behaviour).
+
+        Raises:
+            ValueError: If ``dispatch_secs`` is not positive.
         """
-        # Residential default (20 Wh); the load manager passes an explicit
+        if dispatch_secs is not None and dispatch_secs <= 0:
+            raise ValueError(
+                f"dispatch_secs must be positive, got {dispatch_secs}"
+            )
+        if max_defer_secs is not None and max_defer_secs <= 0:
+            raise ValueError(
+                f"max_defer_secs must be positive, got {max_defer_secs}"
+            )
+        # Residential default (``DEFAULT_HYSTERESIS_WH``); the load manager
+        # passes an explicit
         # config-derived value (abs(target_wh) * 1/3) in production.
         self.HYSTERESIS_WH = hysteresis_wh if hysteresis_wh is not None else DEFAULT_HYSTERESIS_WH
         # Both directions aim at the target (margin 0).
@@ -2101,11 +2183,19 @@ class GapMinder:
         self.TURN_ON_MARGIN_WH = turn_on_margin_wh if turn_on_margin_wh is not None else 0
         self.TURN_OFF_MARGIN_WH = turn_off_margin_wh if turn_off_margin_wh is not None else 0
         self.lumpy_first = lumpy_first
+        self.dispatch_secs = dispatch_secs
+        self.defer_stop = defer_stop
+        self.max_defer_secs = max_defer_secs
+        self.ramp_aware = ramp_aware
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.tesla_decider = TeslaDecider(
             charge_amps_min=charge_amps_min,
             charge_amps_max=charge_amps_max,
+            amp_floor=amp_floor,
+            defer_stop=defer_stop,
+            max_defer_secs=max_defer_secs,
+            ramp_aware=ramp_aware,
         )
         logger.info(
             "GapMinder: charge_amps_min=%d charge_amps_max=%d (config provided %d)",
@@ -2126,6 +2216,26 @@ class GapMinder:
             Maximum defer window in seconds, capped at MAX_DEFER_SECS.
         """
         return self.tesla_decider.safe_defer_secs(remaining_reduction)
+
+    def _dispatch_horizon_secs(self, ctx: DecideContext) -> int:
+        """Seconds a starting load is priced over.
+
+        Shipped (``dispatch_secs is None``): the whole remaining window, so
+        a load may only start if its *held* cost fits the surplus. With a
+        dispatch quantum, one dispatch — the meter's quantization window and
+        the loop's own decision cadence — so a load may start if its first
+        dispatch fits; the window only bounds it, since a command cannot
+        outlive the quarter.
+
+        Args:
+            ctx: Decision context (carries the remaining window).
+
+        Returns:
+            The pricing horizon in seconds (never negative).
+        """
+        if self.dispatch_secs is None:
+            return ctx.seconds_remaining
+        return min(self.dispatch_secs, ctx.seconds_remaining)
 
     def _eligible_plugs(
         self, ctx: DecideContext, want_on: bool
@@ -2408,6 +2518,9 @@ class GapMinder:
 
         for _, name, plug in candidates:
             capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
+            start_wh = StateTracker.watts_to_wh(
+                plug.power_watts, self._dispatch_horizon_secs(ctx)
+            )
             if capacity_cap_wh is not None and capacity > capacity_cap_wh:
                 logger.debug(
                     "[_decide_turn_on] %s: uncovered "
@@ -2417,13 +2530,14 @@ class GapMinder:
                     capacity_cap_wh,
                 )
                 continue
-            if capacity <= remaining_gap:
+            if start_wh <= remaining_gap:
                 logger.debug(
                     "[_decide_turn_on] %s: turning on "
-                    "(capacity=%.1f Wh fits in gap %.1f Wh)",
+                    "(first dispatch=%.1f Wh fits in gap %.1f Wh, held=%.1f Wh)",
                     name,
-                    capacity,
+                    start_wh,
                     remaining_gap,
+                    capacity,
                 )
                 logger.info(
                     "action=turn_on device=%s capacity=%.1f gap=%.1f priority=%d",

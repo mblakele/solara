@@ -941,6 +941,26 @@ def test_parse_cycle_states_reports_tesla_charging_and_amps() -> None:
     (snapshot,) = fls.parse_cycle_states(text)
     assert snapshot.tesla_charging is True
     assert snapshot.tesla_amps == pytest.approx(12.0)
+    assert snapshot.tesla_plugged_in is True
+    assert snapshot.tesla_at_home is True
+
+
+def test_parse_cycle_states_reports_an_absent_car_as_unplugged() -> None:
+    """``plugged_in`` is what stops the replay commanding a car that is away.
+
+    Both directions of production's Tesla decision are gated on it, so a
+    snapshot that dropped the flag would let the counterfactual meter charge
+    a vehicle that is not there.
+    """
+    text = _state_cycle_line(
+        "2026-10-14 23:16:40",
+        _state_candidate("jackery", True, True),
+        tesla="{'is_charging': False, 'current_amps': 0, 'plugged_in': False, "
+        "'at_home': True}",
+    )
+    (snapshot,) = fls.parse_cycle_states(text)
+    assert snapshot.tesla_plugged_in is False
+    assert snapshot.tesla_at_home is True
 
 
 def test_parse_cycle_states_tesla_absent_is_unknown_not_idle() -> None:
@@ -955,6 +975,8 @@ def test_parse_cycle_states_tesla_absent_is_unknown_not_idle() -> None:
     (snapshot,) = fls.parse_cycle_states(text)
     assert snapshot.tesla_charging is None
     assert snapshot.tesla_amps is None
+    assert snapshot.tesla_plugged_in is None
+    assert snapshot.tesla_at_home is None
 
 
 def test_parse_cycle_states_skips_lines_without_a_diagnostics_segment() -> None:
@@ -1805,3 +1827,415 @@ def test_real_log_turn_off_decisions_parse() -> None:
     assert summary.decision_count == len(decisions)
     assert summary.quarter_count >= 1
     assert "turn-off decisions:" in fls.format_turn_offs(summary)
+
+
+# ── suppression census (--guards) ────────────────────────────────────
+#
+# Every mechanism that *declines* to act is invisible to a closed loop that
+# only observes actions. These tests pin the log-side census: what each guard
+# suppressed, how reachable its trigger was, and the confound that makes the
+# guarded-vs-unguarded comparison non-causal.
+
+
+def _plug_candidate(
+    name: str, desired: bool, toggleable: bool = True, power: float = 260.0
+) -> str:
+    """One ``CandidateDetail`` entry, in production field order."""
+    return (
+        f"CandidateDetail(device_type='plug', name='{name}', power_watts={power}, "
+        f"capacity_wh={power * 0.125}, can_toggle={toggleable}, "
+        f"desired_state={desired}, actual_state={desired}, state_available=None, "
+        f"is_charging=None, current_amps=None, plugged_in=None, at_home=None, "
+        f"reason=None, error=None)"
+    )
+
+
+def _cycle_result(
+    stamp: str,
+    *,
+    reason: str | None = None,
+    candidates: tuple[str, ...] = (),
+    settle: int = 30,
+    quant: int = 30,
+    gap: float = 13.5,
+    repeat_candidates: bool = False,
+) -> str:
+    """A cycle-result DEBUG line carrying the fields the census reads.
+
+    ``repeat_candidates`` reproduces production's shape, where the repr
+    carries the candidate list in two segments.
+    """
+    cands = ", ".join(candidates)
+    top = f"candidates=[{cands}], " if repeat_candidates else ""
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [DEBUG] app "
+        f"Load management cycle result: CycleResult({top}status='ok', qh='QH1', "
+        "predicted_wh=-22.5, adjusted_wh=-22.5, target_wh=-9, current_wh=None, "
+        f"estimated_wh=None, actions=[], diagnostics=CycleDiagnostics(gap_wh={gap}, "
+        "hysteresis_wh=3, seconds_remaining=449, "
+        "data_point_at=datetime.datetime(2026, 10, 10, 8, 22, 31, "
+        "tzinfo=<DstTzInfo 'America/Los_Angeles' PDT-1 day, 17:00:00 DST>), "
+        f"reason={reason!r}, pending_effects_count=0, "
+        f"plugs_configured=['jackery', 'ecoflow'], candidates=[{cands}], "
+        f"quantization_seconds={quant}, settle_window_secs={settle}, "
+        "quantization_offset=1, quantization_confidence=0.99))"
+    )
+
+
+def _defer(stamp: str, remaining: int, gap: float, safe: int) -> str:
+    """The DEBUG line for a stop the defer rule declined to take."""
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [DEBUG] load_nbc "
+        f"[_decide_tesla_reduce] deferring stop: current_amps=5, "
+        f"seconds_remaining={remaining}, safe_defer={safe}s, gap={gap:.1f} Wh"
+    )
+
+
+def _ramp_stop(stamp: str, remaining: int, gap: float, trend: float) -> str:
+    """The DEBUG line for a stop the ramp rule pulled into this cycle."""
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [DEBUG] load_nbc "
+        f"[_decide_tesla_reduce] ramp stop: t* within one cycle "
+        f"(seconds_remaining={remaining}, safe_defer=120s, gap={gap:.1f} Wh, "
+        f"trend={trend:.3f} Wh/s)"
+    )
+
+
+def _override(stamp: str, gap: float, banked: float, cover: float, R: int) -> str:
+    """The INFO line for a banked-cover rescue of a guarded turn-on."""
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [INFO] load_nbc "
+        f"gapminder_banked_override gap={gap:.1f} banked={banked:.1f} "
+        f"cover={cover:.1f} jitter=0.5275 swing=79.1 R={R} "
+        f"[banked_wh={banked} cover_wh={cover} event=gapminder_banked_override "
+        f"gap_wh={gap} jitter_wh_per_s=0.5275498 seconds_remaining={R} "
+        "swing_wh=79.13248]"
+    )
+
+
+def test_parse_guarded_declines_counts_available_turn_ons() -> None:
+    """A declined cycle reports how many turn-ons were actually on offer."""
+    text = "\n".join(
+        [
+            _cycle_result(
+                "21:44:58",
+                reason="excessive_jitter",
+                candidates=(
+                    _plug_candidate("jackery", True),
+                    _plug_candidate("ecoflow", False),
+                    _plug_candidate("sentinel", False, toggleable=False),
+                ),
+            ),
+            _cycle_result(
+                "21:45:28", reason="no_eligible", candidates=(_plug_candidate("ecoflow", False),)
+            ),
+        ]
+    )
+    declines = fls.parse_guarded_declines(text, source="x.log")
+    assert len(declines) == 1
+    # jackery is already ON and sentinel is not toggleable: only ecoflow counts.
+    assert declines[0].available_candidates == 1
+    assert declines[0].quarter_start is not None
+    assert declines[0].quarter_start.minute % 15 == 0
+
+
+def test_parse_guarded_declines_dedupes_a_repeated_candidate_list() -> None:
+    """The repr repeats the candidate list; each plug counts once."""
+    text = _cycle_result(
+        "21:44:58",
+        reason="excessive_jitter",
+        candidates=(_plug_candidate("ecoflow", False), _plug_candidate("water heater", False, power=4857.0)),
+        repeat_candidates=True,
+    )
+    declines = fls.parse_guarded_declines(text, source="x.log")
+    assert declines[0].available_candidates == 2
+
+
+def test_parse_guarded_declines_ignores_other_reasons() -> None:
+    """Only the guard's own reason is a decline; a cycle with none is not."""
+    text = "\n".join(
+        [
+            _cycle_result("21:44:58", reason=None),
+            _cycle_result("21:45:28", reason="loads_too_large"),
+        ]
+    )
+    assert fls.parse_guarded_declines(text, source="x.log") == []
+
+
+def test_parse_defer_entries_and_ramp_stops_split_the_same_branch() -> None:
+    """A deferral is a declined stop; a ramp stop is one that was taken."""
+    text = "\n".join(
+        [
+            _defer("21:44:58", 790, 22.0, 66),
+            _defer("21:45:28", 756, 18.0, 53),
+            _ramp_stop("21:46:00", 149, 45.1, 0.250),
+        ]
+    )
+    defers = fls.parse_defer_entries(text, source="x.log")
+    assert [(d.seconds_remaining, d.gap_wh, d.safe_defer_secs) for d in defers] == [
+        (790, 22.0, 66),
+        (756, 18.0, 53),
+    ]
+    assert len(fls.parse_ramp_stops(text, source="x.log")) == 1
+
+
+def test_parse_banked_overrides_and_settle_window_trace() -> None:
+    """Rescues are counted, and the settle window keeps its cycle order."""
+    text = "\n".join(
+        [
+            _override("21:44:58", 13.5, -19.2, 13.2, 449),
+            _override("21:45:28", 12.4, -19.3, 13.3, 419),
+            _cycle_result("21:46:00", settle=30),
+            _cycle_result("21:46:30", settle=15),
+            _cycle_result("21:47:00", settle=15),
+        ]
+    )
+    assert len(fls.parse_banked_overrides(text, source="x.log")) == 2
+    trace = fls.parse_settle_windows(text, source="x.log")
+    assert trace.windows == (30, 15, 15)
+    assert trace.commits == ((30, 15),)
+
+
+def test_ramp_band_is_the_window_the_rule_can_fire_in() -> None:
+    """The band is the arithmetical reach of ``t* <= cycle_secs``."""
+    # t* = (P*R - gap) / (P + trend), trend clamped at P/2, so firing needs
+    # P*R - gap <= cycle * 1.5*P, i.e. R <= gap/P + 45 s.
+    assert fls.ramp_band_remaining_secs(30.0) == pytest.approx(135.0)
+    assert fls.ramp_band_remaining_secs(0.0) == pytest.approx(45.0)
+
+
+def test_summarize_suppressions_rolls_up_every_counter() -> None:
+    """One summary carries the guard, the deferral, the ramp rule and settle."""
+    text = "\n".join(
+        [
+            _cycle_result(
+                "21:44:58",
+                reason="excessive_jitter",
+                candidates=(_plug_candidate("ecoflow", False),),
+            ),
+            _cycle_result("21:45:28", reason="excessive_jitter"),
+            _override("21:45:58", 13.5, -19.2, 13.2, 449),
+            _defer("21:46:00", 100, 30.0, 90),
+            _defer("21:47:00", 700, 20.0, 60),
+            _ramp_stop("21:48:00", 149, 45.1, 0.250),
+            _cycle_result("21:48:30", settle=30),
+            _cycle_result("21:49:00", settle=15),
+        ]
+    )
+    census = fls.summarize_suppressions(
+        declines=fls.parse_guarded_declines(text, source="x.log"),
+        overrides=fls.parse_banked_overrides(text, source="x.log"),
+        defers=fls.parse_defer_entries(text, source="x.log"),
+        ramp_fires=fls.parse_ramp_stops(text, source="x.log"),
+        settle_windows=[fls.parse_settle_windows(text, source="x.log")],
+    )
+    assert census.declined_cycles == 2
+    assert census.declined_with_candidate == 1
+    assert census.rescues == 1
+    assert census.deferrals == 2
+    assert census.median_defer_secs == 400
+    assert census.max_defer_secs == 700
+    assert census.ramp_fires == 1
+    # R=100 lies inside 3*30+45=135 s; R=700 lies far outside 3*20+45=105 s.
+    assert census.ramp_eligible == 1
+    assert census.settle_cycles == ((30, 3), (15, 1))
+    assert census.settle_commits == 1
+
+
+def test_summarize_suppressions_counts_declines_from_guard_events() -> None:
+    """Fires and declined cycles are different counts and are kept apart."""
+    text = "\n".join(
+        [
+            _cycle_result("21:44:58", reason="excessive_jitter"),
+            _cycle_result("21:45:28", reason="excessive_jitter"),
+            _cycle_result("21:45:58", reason=None),
+        ]
+    )
+    census = fls.summarize_suppressions(
+        guard_events=fls.parse_guard_events(text, source="x.log"),
+        declines=fls.parse_guarded_declines(text, source="x.log"),
+    )
+    assert census.declines == 0
+    assert census.declined_cycles == 2
+
+
+def test_summarize_suppressions_splits_guarded_and_unguarded_quarters() -> None:
+    """The comparison reports both sides, so the confound is visible."""
+    guilty = datetime(2026, 10, 17, 21, 30, tzinfo=timezone.utc)
+    calm = datetime(2026, 10, 17, 22, 0, tzinfo=timezone.utc)
+    quarters = [
+        fls.QuarterSummary(
+            source="x.log",
+            quarter_start=guilty,
+            anchor_count=2,
+            actual_wh=11.0,
+            max_abs_error=20.0,
+            mean_signed_error=-10.0,
+            target_wh=-9.0,
+            guard_firings=3,
+        ),
+        fls.QuarterSummary(
+            source="x.log",
+            quarter_start=calm,
+            anchor_count=2,
+            actual_wh=-8.0,
+            max_abs_error=2.0,
+            mean_signed_error=1.0,
+            target_wh=-9.0,
+            guard_firings=0,
+        ),
+    ]
+    anchors = [
+        ForecastAnchor(
+            source="x.log",
+            quarter_start=guilty,
+            data_point_at=guilty,
+            remaining_secs=300,
+            samples_used=10,
+            prediction_values=10,
+            raw_wh=0.0,
+            prediction_w=1.0,
+            predicted_wh=25.0,
+            actual_wh=11.0,
+        ),
+        ForecastAnchor(
+            source="x.log",
+            quarter_start=guilty,
+            data_point_at=guilty,
+            remaining_secs=200,
+            samples_used=10,
+            prediction_values=10,
+            raw_wh=0.0,
+            prediction_w=1.0,
+            predicted_wh=21.0,
+            actual_wh=11.0,
+        ),
+        ForecastAnchor(
+            source="x.log",
+            quarter_start=calm,
+            data_point_at=calm,
+            remaining_secs=300,
+            samples_used=10,
+            prediction_values=10,
+            raw_wh=0.0,
+            prediction_w=1.0,
+            predicted_wh=-7.0,
+            actual_wh=-8.0,
+        ),
+    ]
+    census = fls.summarize_suppressions(quarters=quarters, anchors=anchors)
+    assert (census.guarded.quarters, census.unguarded.quarters) == (1, 1)
+    assert census.guarded.mean_abs_miss_wh == pytest.approx(20.0)
+    assert census.unguarded.mean_abs_miss_wh == pytest.approx(1.0)
+    assert census.guarded.mean_abs_error_wh == pytest.approx(12.0)
+    assert census.unguarded.mean_abs_error_wh == pytest.approx(1.0)
+
+
+def test_format_suppressions_reports_every_section() -> None:
+    """Every mechanism gets a line, and the confound is stated, not implied."""
+    text = "\n".join(
+        [
+            _cycle_result(
+                "21:44:58", reason="excessive_jitter", candidates=(_plug_candidate("ecoflow", False),)
+            ),
+            _override("21:45:00", 13.5, -19.2, 13.2, 449),
+            _defer("21:46:00", 100, 30.0, 90),
+            _ramp_stop("21:47:00", 149, 45.1, 0.250),
+            _cycle_result("21:48:00", settle=30),
+            _cycle_result("21:49:00", settle=15),
+        ]
+    )
+    body = fls.format_suppressions(
+        fls.summarize_suppressions(
+            declines=fls.parse_guarded_declines(text, source="x.log"),
+            overrides=fls.parse_banked_overrides(text, source="x.log"),
+            defers=fls.parse_defer_entries(text, source="x.log"),
+            ramp_fires=fls.parse_ramp_stops(text, source="x.log"),
+            settle_windows=[fls.parse_settle_windows(text, source="x.log")],
+        )
+    )
+    assert "jitter guard" in body
+    assert "declined cycle" in body
+    assert "rescue" in body
+    assert "deferral" in body
+    assert "ramp rule" in body
+    assert "eligible" in body
+    assert "settle window" in body
+    assert "confound" in body
+    # Every declined cycle here offered a load, so the census says outright
+    # that availability is universal and cannot convict the guard.
+    assert "not what the decline withheld" in body
+
+
+def test_availability_note_flags_a_decline_with_nothing_to_turn_on() -> None:
+    """A decline with no candidate at all is called out, not generalized."""
+    text = _cycle_result("21:44:58", reason="excessive_jitter")
+    body = fls.format_suppressions(
+        fls.summarize_suppressions(
+            declines=fls.parse_guarded_declines(text, source="x.log")
+        )
+    )
+    assert "some declined cycles had nothing to turn on" in body
+
+
+def test_format_suppressions_without_data_says_so() -> None:
+    """An empty census prints a reason, not an empty table."""
+    body = fls.format_suppressions(fls.summarize_suppressions())
+    assert "no suppression" in body
+    assert "quarter" not in body
+
+
+def test_cli_guards_flag_adds_a_section_and_default_omits_it(tmp_path, capsys) -> None:
+    """``--guards`` is opt-in; the shipped report is unchanged."""
+    log = tmp_path / "guards.log"
+    log.write_text(
+        _fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q2=-9.0)
+        + "\n"
+        + _fetch(1800, -100.0, 0.05, -55.0, 500, 1300, complete_q2=-9.0)
+        + "\n"
+        + _cycle_result(
+            "21:44:58", reason="excessive_jitter", candidates=(_plug_candidate("ecoflow", False),)
+        )
+    )
+    assert fls.main([str(log)]) == 0
+    default_out = capsys.readouterr().out
+    assert "suppression census" not in default_out
+
+    assert fls.main([str(log), "--guards"]) == 0
+    guards_out = capsys.readouterr().out
+    assert "suppression census" in guards_out
+    assert default_out.strip() in guards_out
+
+
+def test_ramp_band_constants_track_production(monkeypatch) -> None:
+    """The band arithmetic mirrors load_nbc's own constants, never a copy."""
+    from load_nbc import TeslaDecider
+
+    from load_manager import LoadManagerConfig
+
+    monkeypatch.setenv("TESLA_NOMINAL_VOLTAGE", "240")
+    assert fls.RAMP_BAND_CLAMP_FRACTION == TeslaDecider.RAMP_TREND_CLAMP_FRACTION
+    assert fls.RAMP_BAND_DRAW_WH_PER_S == pytest.approx(
+        TeslaDecider().car_power_watts_5a / 3600
+    )
+    assert fls.RAMP_BAND_CYCLE_SECS == LoadManagerConfig().config_interval_secs
+
+
+@_NEEDS_REAL_LOG
+def test_real_log_suppression_census_is_self_consistent() -> None:
+    """A real jitter log parses into a coherent census."""
+    text = _OVERSHOOT.read_text(errors="replace")
+    census = fls.summarize_suppressions(
+        guard_events=fls.parse_guard_events(text, source="x.log"),
+        declines=fls.parse_guarded_declines(text, source="x.log"),
+        overrides=fls.parse_banked_overrides(text, source="x.log"),
+        defers=fls.parse_defer_entries(text, source="x.log"),
+        ramp_fires=fls.parse_ramp_stops(text, source="x.log"),
+        settle_windows=[fls.parse_settle_windows(text, source="x.log")],
+    )
+    assert census.declined_with_candidate <= census.declined_cycles
+    assert census.ramp_eligible <= census.deferrals
+    assert sum(count for _, count in census.settle_cycles) == len(
+        fls.parse_settle_windows(text, source="x.log").windows
+    )
+    assert "suppression census" in fls.format_suppressions(census)
