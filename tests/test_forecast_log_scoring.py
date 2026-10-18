@@ -50,15 +50,21 @@ def _nbc(
     used: int,
     complete: bool = False,
     complete_q2: float | None = None,
+    complete_q3: float | None = None,
 ) -> str:
-    """An ``nbc_set`` line for one fetch."""
+    """An ``nbc_set`` line for one fetch.
+
+    ``complete_q2``/``complete_q3`` set the raw totals of the completed
+    quarters the same fetch reports alongside the incomplete QH1, which is
+    where a prior-quarter rate comes from.
+    """
     parts = [
         f"qh1=NBCQuarter(complete={complete}, raw_wh={raw_wh!r}, wh=0, "
         f"prediction_values=30, prediction_w={prediction_w!r}, "
         f"predicted_wh={predicted_wh!r}, remaining_seconds={remaining}, "
         f"samples_used={used})"
     ]
-    for name, val in (("qh2", complete_q2), ("qh3", None)):
+    for name, val in (("qh2", complete_q2), ("qh3", complete_q3)):
         raw = "None" if val is None else repr(val)
         parts.append(
             f"{name}=NBCQuarter(complete=True, raw_wh={raw}, wh=0.0"
@@ -80,10 +86,14 @@ def _fetch(
     data_start: str = START,
     complete: bool = False,
     complete_q2: float | None = None,
+    complete_q3: float | None = None,
 ) -> str:
     """One fetch: the nbc_set line, then its data_start line (real order)."""
     return (
-        _nbc(total, raw_wh, prediction_w, predicted_wh, remaining, used, complete, complete_q2)
+        _nbc(
+            total, raw_wh, prediction_w, predicted_wh, remaining, used,
+            complete, complete_q2, complete_q3,
+        )
         + "\n"
         + f"[2026-10-01 20:40:34 +0000] [980472] [DEBUG] app create_metrics "
         f"result: devices=1, data_start={data_start}+00:00, "
@@ -850,6 +860,117 @@ def test_format_report_jitter_guard_line() -> None:
     assert "production churn mean" in text
 
 
+# ── per-cycle dispatch state (plug desired/actual, Tesla flags) ─────
+
+
+def _state_candidate(
+    name: str,
+    desired: bool | None,
+    actual: bool | None,
+    kind: str = "plug",
+    power: str = "260.0",
+) -> str:
+    """One CandidateDetail entry with desired and actual set independently."""
+    return (
+        f"CandidateDetail(device_type='{kind}', name='{name}', "
+        f"power_watts={power}, capacity_wh=21.6, can_toggle=True, "
+        f"desired_state={desired}, actual_state={actual})"
+    )
+
+
+def _state_cycle_line(
+    stamp: str,
+    candidates: str,
+    data_point: str | None = _LA_DP_US,
+    tesla: str = "None",
+) -> str:
+    """A cycle-result line carrying plug candidates and a Tesla state dict."""
+    dp_s = "None" if data_point is None else data_point
+    return (
+        f"[{stamp} +0000] [980472] [DEBUG] app Load management cycle result: "
+        f"CycleResult(status='ok', qh='QH1', predicted_wh=-1.0, adjusted_wh=-1.0, "
+        f"target_wh=-9, actions=[], diagnostics=CycleDiagnostics(gap_wh=7.7, "
+        f"hysteresis_wh=3, seconds_remaining=269, data_point_at={dp_s}, "
+        f"reason='ok', pending_effects_count=0, tesla_configured=True, "
+        f"tesla_state={tesla}, candidates=[{candidates}])"
+    )
+
+
+def test_parse_cycle_states_reads_desired_and_actual_separately() -> None:
+    """The two fields disagree while a command is still unconfirmed.
+
+    The replay seeds its meter from the *actual* state, so a parser that
+    collapsed the two would silently mis-model every pending quarter.
+    """
+    text = _state_cycle_line(
+        "2026-10-14 23:16:40",
+        ", ".join(
+            [
+                _state_candidate("water heater", False, True),
+                _state_candidate("ecoflow", True, False),
+                _state_candidate("tesla", None, None, kind="tesla", power="None"),
+            ]
+        ),
+    )
+    (snapshot,) = fls.parse_cycle_states(text, source="s.log")
+    assert snapshot.plugs == (
+        ("water heater", False, True),
+        ("ecoflow", True, False),
+    )
+    assert snapshot.source == "s.log"
+
+
+def test_parse_cycle_states_attributes_quarter_and_wall_time() -> None:
+    """Quarter comes from the diagnostics data point, not the line prefix."""
+    text = _state_cycle_line(
+        "2026-10-01 20:16:41", _state_candidate("jackery", True, True)
+    )
+    (snapshot,) = fls.parse_cycle_states(text)
+    assert snapshot.quarter_start == datetime(2026, 10, 1, 20, 30, tzinfo=timezone.utc)
+    assert snapshot.at == datetime(2026, 10, 1, 20, 16, 41, tzinfo=timezone.utc)
+
+
+def test_parse_cycle_states_reports_tesla_charging_and_amps() -> None:
+    """A Tesla state dict yields both flags, whatever the key order."""
+    text = _state_cycle_line(
+        "2026-10-14 23:16:40",
+        _state_candidate("jackery", True, True),
+        tesla="{'current_amps': 12, 'is_charging': True, 'plugged_in': True, "
+        "'at_home': True}",
+    )
+    (snapshot,) = fls.parse_cycle_states(text)
+    assert snapshot.tesla_charging is True
+    assert snapshot.tesla_amps == pytest.approx(12.0)
+
+
+def test_parse_cycle_states_tesla_absent_is_unknown_not_idle() -> None:
+    """An early-exit cycle logs no Tesla state; that is not a quiet car.
+
+    Tesla stays ``configured`` in these cycles, so ``None`` cannot be read
+    as "not charging" — the replay drops the quarter instead.
+    """
+    text = _state_cycle_line(
+        "2026-10-14 23:16:40", _state_candidate("jackery", True, True)
+    )
+    (snapshot,) = fls.parse_cycle_states(text)
+    assert snapshot.tesla_charging is None
+    assert snapshot.tesla_amps is None
+
+
+def test_parse_cycle_states_skips_lines_without_a_diagnostics_segment() -> None:
+    """Action lines and other reprs are not cycle states."""
+    text = "\n".join(
+        [
+            "[2026-10-14 23:16:40 +0000] [1] [INFO] load_nbc action=turn_off "
+            "device=jackery savings=60.0 gap=60.0 priority=100",
+            _state_cycle_line(
+                "2026-10-14 23:16:41", _state_candidate("jackery", True, True)
+            ),
+        ]
+    )
+    assert len(fls.parse_cycle_states(text)) == 1
+
+
 # ── pinned against production evidence ──────────────────────────────
 
 
@@ -999,3 +1120,688 @@ def test_residual_report_exposes_sigma_and_plug_survival() -> None:
     assert report.residual_coverage(1.0) == pytest.approx(0.0)
     assert report.residual_coverage(10.0) == pytest.approx(1.0)
     assert report.plug_survival(1.0) == pytest.approx(1.0)
+
+
+# ── pass E: estimator variants ───────────────────────────────────────
+#
+# Production's forecast is left alone. These variants exist so the corpus
+# can be re-scored offline against alternatives, which is the only way to
+# size the "is the trailing window the noise source?" question (see
+# .opencode/plans/forecast-variance-reduction.md, subtask 1). The prior
+# rate is the median realized rate of the completed quarters the *same
+# fetch* reports next to the incomplete QH1 — information production
+# already holds when it decides.
+
+from tools.forecast_log_scoring import (  # noqa: E402
+    DEFAULT_PRIOR_WEIGHTS_SECS,
+    ESTIMATOR_NAMES,
+    TREND_GATE_NOISE_FLOOR_WH,
+    estimate_prior_blend,
+    estimate_prior_only,
+    estimate_series,
+    format_estimators,
+    score_estimators,
+)
+
+
+def _est_anchor(
+    offset: int,
+    remaining: int,
+    raw_wh: float,
+    prediction_w: float,
+    predicted_wh: float,
+    actual_wh: float | None,
+    prior_rate: float | None = None,
+    quarter: datetime | None = None,
+) -> ForecastAnchor:
+    """An anchor with an explicit data point and prior-quarter rate."""
+    start = quarter or _Q
+    return ForecastAnchor(
+        source="unit.log",
+        quarter_start=start,
+        data_point_at=start + timedelta(seconds=offset),
+        remaining_secs=remaining,
+        prediction_values=30,
+        samples_used=offset + 1,
+        raw_wh=raw_wh,
+        prediction_w=prediction_w,
+        predicted_wh=predicted_wh,
+        actual_wh=actual_wh,
+        wall_at=start,
+        prior_rate=prior_rate,
+    )
+
+
+def test_prior_rate_from_completed_qh2() -> None:
+    """The completed neighbours in the same fetch supply the prior rate."""
+    got = _parse(_fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q2=-9.0))
+    assert got[0].prior_rate == pytest.approx(-9.0 / 900.0)
+
+
+def test_prior_rate_is_median_of_completed_quarters() -> None:
+    """Two completed neighbours collapse to their median rate."""
+    got = _parse(
+        _fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q2=-9.0, complete_q3=-27.0)
+    )
+    assert got[0].prior_rate == pytest.approx(-18.0 / 900.0)
+
+
+def test_prior_rate_none_without_completed_quarter() -> None:
+    """A fetch that reports no completed neighbour has no prior."""
+    got = _parse(_fetch(500, -50.0, 0.1, -10.0, 400, 500))
+    assert got[0].prior_rate is None
+
+
+def test_prior_rate_ignores_unknown_completed_totals() -> None:
+    """A completed quarter with no raw_wh cannot contribute a rate.
+
+    The API sometimes sets the complete flag without a total; treating
+    that as a zero-rate quarter would drag the median toward zero.
+    """
+    got = _parse(_fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q3=-27.0))
+    assert got[0].prior_rate == pytest.approx(-27.0 / 900.0)
+
+
+def test_estimate_prior_only_extrapolates_the_prior_rate() -> None:
+    """prior = raw_wh + R * prior_rate, with no window term at all."""
+    anchor = _est_anchor(400, 400, -50.0, 0.1, -10.0, -9.0, prior_rate=-0.01)
+    assert estimate_prior_only(anchor) == pytest.approx(-50.0 + 400 * -0.01)
+
+
+def test_estimate_prior_only_falls_back_to_the_window() -> None:
+    """No prior available -> the shipped forecast stands in, so n is shared."""
+    anchor = _est_anchor(400, 400, -50.0, 0.1, -10.0, -9.0, prior_rate=None)
+    assert estimate_prior_only(anchor) == pytest.approx(anchor.predicted_wh)
+
+
+def test_estimate_prior_blend_weights_follow_sample_counts() -> None:
+    """blend rate = (n * window + m * prior) / (n + m) with n = 30 samples."""
+    anchor = _est_anchor(400, 400, -50.0, 0.10, -10.0, -9.0, prior_rate=-0.01)
+    expected_rate = (30 * 0.10 + 120 * -0.01) / 150
+    assert estimate_prior_blend(anchor, 120) == pytest.approx(
+        -50.0 + 400 * expected_rate
+    )
+
+
+def test_estimate_prior_blend_falls_back_to_the_window() -> None:
+    """Without a prior the blend is the shipped forecast, not a shifted one."""
+    anchor = _est_anchor(400, 400, -50.0, 0.10, -10.0, -9.0, prior_rate=None)
+    assert estimate_prior_blend(anchor, 300) == pytest.approx(anchor.predicted_wh)
+
+
+def test_estimator_names_cover_the_planned_sweep() -> None:
+    """Every planned variant is registered, blends included."""
+    assert "status-quo" in ESTIMATOR_NAMES
+    assert "prior" in ESTIMATOR_NAMES
+    assert "trend-gated" in ESTIMATOR_NAMES
+    for weight in DEFAULT_PRIOR_WEIGHTS_SECS:
+        assert f"prior-blend@{weight}" in ESTIMATOR_NAMES
+
+
+def test_estimate_series_is_aligned_and_finite() -> None:
+    """Every variant predicts one finite value per anchor, in order."""
+    anchors = [
+        _est_anchor(30, 870, -5.0, 0.1, 82.0, -9.0, prior_rate=-0.01),
+        _est_anchor(60, 840, -20.0, -0.2, -188.0, -9.0, prior_rate=-0.01),
+        _est_anchor(90, 810, -30.0, 0.05, 10.5, -9.0, prior_rate=None),
+    ]
+    for name in ESTIMATOR_NAMES:
+        series = estimate_series(anchors, name)
+        assert len(series) == len(anchors)
+        assert all(isinstance(v, float) for v in series)
+        assert all(v == v and abs(v) < 1e9 for v in series)
+
+
+def test_estimate_series_rejects_unknown_variant() -> None:
+    with pytest.raises(ValueError):
+        estimate_series([], "no-such-estimator")
+
+
+def test_trend_gated_prefers_the_window_once_the_trend_is_trusted() -> None:
+    """A trusted ramp keeps the responsive window; before that, the prior."""
+    anchors = [
+        _est_anchor(30, 870, 10.0, 0.1, 10.0, -9.0, prior_rate=-0.01),
+        _est_anchor(60, 840, 20.0, 0.1, 20.0, -9.0, prior_rate=-0.01),
+        _est_anchor(90, 810, 40.0, 0.1, 40.0, -9.0, prior_rate=-0.01),
+    ]
+    series = estimate_series(anchors, "trend-gated", trend_floor_wh=0.0)
+    assert series[0] == pytest.approx(10.0 + 870 * -0.01)
+    assert series[1] == pytest.approx(20.0 + 840 * -0.01)
+    assert series[2] == pytest.approx(40.0)  # slope confirmed -> window
+
+
+def test_trend_gated_falls_back_when_nothing_is_trusted() -> None:
+    """An unreachable noise floor leaves the prior rate in charge throughout."""
+    anchors = [
+        _est_anchor(30, 870, 10.0, 0.1, 10.0, -9.0, prior_rate=-0.01),
+        _est_anchor(60, 840, 20.0, 0.1, 20.0, -9.0, prior_rate=-0.01),
+        _est_anchor(90, 810, 40.0, 0.1, 40.0, -9.0, prior_rate=-0.01),
+    ]
+    series = estimate_series(anchors, "trend-gated", trend_floor_wh=1e9)
+    assert series == pytest.approx([10.0 + 870 * -0.01, 20.0 + 840 * -0.01,
+                                    40.0 + 810 * -0.01])
+
+
+def test_trend_gated_does_not_leak_across_quarters() -> None:
+    """Each quarter's tracker starts empty, so no ramp carries over."""
+    other = _Q + timedelta(minutes=15)
+    anchors = [
+        _est_anchor(30, 870, 10.0, 0.1, 10.0, -9.0, prior_rate=-0.01),
+        _est_anchor(60, 840, 20.0, 0.1, 20.0, -9.0, prior_rate=-0.01),
+        _est_anchor(90, 810, 40.0, 0.1, 40.0, -9.0, prior_rate=-0.01),
+        _est_anchor(30, 870, 100.0, 0.1, 100.0, -9.0, prior_rate=-0.01, quarter=other),
+    ]
+    series = estimate_series(anchors, "trend-gated", trend_floor_wh=0.0)
+    assert series[3] == pytest.approx(100.0 + 870 * -0.01)
+
+
+def test_score_estimators_uses_one_shared_anchor_set() -> None:
+    """Rows are comparable: same scored anchors, same count, per variant."""
+    anchors = [
+        _est_anchor(400, 400, -50.0, 0.1, -10.0, -9.0, prior_rate=-0.01),
+        _est_anchor(300, 500, -50.0, 0.1, 0.0, -9.0, prior_rate=-0.01),
+        _est_anchor(200, 600, -50.0, 0.1, 10.0, None, prior_rate=-0.01),
+    ]
+    summaries = score_estimators(anchors)
+    assert [s.name for s in summaries] == list(ESTIMATOR_NAMES)
+    assert all(s.count == 2 for s in summaries)
+    status, prior = summaries[0], summaries[1]
+    assert status.mean_abs_error == pytest.approx((1.0 + 9.0) / 2)
+    assert prior.mean_abs_error == pytest.approx((45.0 + 46.0) / 2)
+    assert prior.max_abs_error == pytest.approx(46.0)
+    assert status.sigma_rate == pytest.approx(stddev([-1.0 / 400, 9.0 / 500]))
+
+
+def test_score_estimators_buckets_rate_sigma_by_horizon() -> None:
+    """Per-R sigma_rate exposes where a variant wins (the opening buckets)."""
+    anchors = [
+        _est_anchor(30, 870, 10.0, 0.1, 10.0, -9.0, prior_rate=-0.01),
+        _est_anchor(60, 840, 20.0, 0.1, 20.0, 5.0, prior_rate=-0.01),
+    ]
+    prior = score_estimators(anchors, names=("prior",))[0]
+    buckets = {b.label: b for b in prior.buckets if b.count}
+    assert list(buckets) == ["360-900"]
+    assert buckets["360-900"].count == 2
+    assert buckets["360-900"].sigma_rate == pytest.approx(
+        stddev([(10.0 + 870 * -0.01 + 9.0) / 870,
+                (20.0 + 840 * -0.01 - 5.0) / 840])
+    )
+
+
+def test_format_estimators_lists_every_variant_and_metric() -> None:
+    """The table has to name the variants and their error scale."""
+    anchors = [
+        _est_anchor(400, 400, -50.0, 0.1, -10.0, -9.0, prior_rate=-0.01),
+        _est_anchor(300, 500, -50.0, 0.1, 0.0, -9.0, prior_rate=-0.01),
+    ]
+    text = format_estimators(
+        score_estimators(anchors), trend_floor_wh=TREND_GATE_NOISE_FLOOR_WH
+    )
+    for name in ESTIMATOR_NAMES:
+        assert name in text
+    assert "mean|e|" in text
+    assert "by R bucket" in text
+    assert f"{TREND_GATE_NOISE_FLOOR_WH:.1f}" in text
+
+
+def test_cli_estimator_variants_do_not_change_default_output(tmp_path, capsys) -> None:
+    """The shipped report is untouched: variants only appear on request."""
+    log = tmp_path / "estimator.log"
+    log.write_text(
+        _fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q2=-9.0)
+        + "\n"
+        + _fetch(1800, -100.0, 0.05, -55.0, 500, 1300, complete_q2=-9.0)
+    )
+    assert fls.main([str(log)]) == 0
+    default_out = capsys.readouterr().out
+    assert "estimator" not in default_out.lower()
+
+    assert fls.main([str(log), "--estimator"]) == 0
+    variant_out = capsys.readouterr().out
+    assert "status-quo" in variant_out
+    assert "prior-blend@120" in variant_out
+    assert default_out.strip() in variant_out
+
+
+def test_cli_estimator_flag_accepts_a_variant_list(tmp_path, capsys) -> None:
+    """``--estimator=prior`` restricts the table to the named variants."""
+    log = tmp_path / "estimator.log"
+    log.write_text(
+        _fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q2=-9.0)
+        + "\n"
+        + _fetch(1800, -100.0, 0.05, -55.0, 500, 1300, complete_q2=-9.0)
+    )
+    assert fls.main([str(log), "--estimator=prior", "--trend-floor=3"]) == 0
+    out = capsys.readouterr().out
+    assert "prior" in out
+    assert "trend-gated" not in out
+    assert "3.0" in out
+
+
+def test_cli_rejects_an_unknown_flag(tmp_path, capsys) -> None:
+    """A mistyped flag is an error, not a silently skipped path."""
+    log = tmp_path / "estimator.log"
+    log.write_text(
+        _fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q2=-9.0)
+        + "\n"
+        + _fetch(1800, -100.0, 0.05, -55.0, 500, 1300, complete_q2=-9.0)
+    )
+    assert fls.main([str(log), "--bogus"]) == 1
+    captured = capsys.readouterr()
+    assert "bogus" in captured.err
+    assert "scored anchors" not in captured.out
+
+
+@_NEEDS_REAL_LOG
+def test_real_log_estimator_table_reports_every_variant() -> None:
+    """On a real log every variant scores the same anchors."""
+    anchors = parse_log(_OVERSHOOT.read_text(errors="replace"), source="x")
+    summaries = score_estimators(anchors)
+    counts = {s.count for s in summaries}
+    assert len(counts) == 1
+    assert counts.pop() >= 10
+    assert "status-quo" in format_estimators(summaries)
+
+
+# ── turn-off path data collection ────────────────────────────────────
+#
+# Production already logs every entry into the unguarded turn-off path:
+# the decision (horizon + gap), each shed it books, and the plug turn-ons
+# that later undo it. These helpers emit the same shapes so the parsers
+# are pinned without a real log present.
+
+_LOGDATE = "2026-10-17"
+
+
+def _off_entry(stamp: str, gap: float, remaining: int) -> str:
+    """A ``[_decide_turn_off]`` entry line: one decision's horizon and gap."""
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [DEBUG] load_nbc "
+        f"[_decide_turn_off] gap={gap:.1f} Wh, seconds_remaining={remaining}"
+    )
+
+
+def _plug_off(
+    stamp: str, device: str, savings: float, gap: float, priority: int = 50
+) -> str:
+    """A plug shed INFO line, with its logfmt extra suffix."""
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [INFO] load_nbc "
+        f"action=turn_off device={device} savings={savings:.1f} gap={gap:.1f} "
+        f"priority={priority} [action_type=turn_off device={device} event=action "
+        f"priority={priority} remaining_gap_wh={gap} savings_wh={savings}]"
+    )
+
+
+def _tesla_amps(
+    stamp: str, current: int, target: int, savings: float, before: float, after: float
+) -> str:
+    """The DEBUG line for a partial Tesla amps-only reduction."""
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [DEBUG] load_nbc "
+        f"[_decide_turn_off] Tesla amps {current} → {target}, savings={savings:.1f} Wh, "
+        f"remaining {before:.1f} → {after:.1f} Wh"
+    )
+
+
+def _tesla_stop(stamp: str, reason: str, remaining: float | None = None) -> str:
+    """A Tesla stop INFO line; only the deficit variant logs a remainder."""
+    tail = "" if remaining is None else f" remaining={remaining:.1f}"
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [INFO] load_nbc "
+        f"action=turn_off device=tesla reason={reason}{tail}"
+    )
+
+
+def _plug_on(
+    stamp: str, device: str, capacity: float, gap: float, priority: int = 100
+) -> str:
+    """A plug turn-on INFO line, the signal a shed was undone."""
+    return (
+        f"[{_LOGDATE} {stamp} +0000] [3224] [INFO] load_nbc "
+        f"action=turn_on device={device} capacity={capacity:.1f} gap={gap:.1f} "
+        f"priority={priority} [action_type=turn_on capacity_wh={capacity} "
+        f"device={device} event=action priority={priority} remaining_gap_wh={gap}]"
+    )
+
+
+def test_parse_turn_offs_attaches_same_second_actions_to_their_decision() -> None:
+    """The entry line owns every shed logged in its own second."""
+    text = "\n".join(
+        [
+            _off_entry("21:44:58", 5.8, 4),
+            _tesla_amps("21:44:58", 10, 5, 1.3, 5.8, 4.5),
+            _plug_off("21:44:58", "ecoflow", 0.3, 4.5, priority=50),
+            _plug_off("21:44:58", "jackery", 0.3, 4.2, priority=100),
+        ]
+    )
+    decisions = fls.parse_turn_offs(text, source="x.log")
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.gap_wh == pytest.approx(5.8)
+    assert decision.seconds_remaining == 4
+    assert [a.kind for a in decision.actions] == ["tesla_amps", "plug", "plug"]
+    assert [a.device_name for a in decision.actions] == ["tesla", "ecoflow", "jackery"]
+    assert [a.priority for a in decision.actions] == [None, 50, 100]
+
+
+def test_parse_turn_offs_skips_actions_without_a_decision_line() -> None:
+    """A shed with no entry line is skipped, never guessed into a quarter."""
+    text = _plug_off("21:44:58", "ecoflow", 0.3, 4.5)
+    assert fls.parse_turn_offs(text, source="x.log") == []
+
+
+def test_parse_turn_offs_handles_a_device_name_with_spaces() -> None:
+    """``water heater`` is a plug name, so ``device=`` cannot be ``\\S+``."""
+    text = "\n".join(
+        [
+            _off_entry("21:44:58", 22.9, 536),
+            _plug_off("21:44:58", "water heater", 35.7, 22.9, priority=60),
+        ]
+    )
+    decision = fls.parse_turn_offs(text, source="x.log")[0]
+    assert [a.device_name for a in decision.actions] == ["water heater"]
+    assert decision.shed_wh == pytest.approx(35.7)
+
+
+def test_parse_turn_ons_handles_a_device_name_with_spaces() -> None:
+    """The reversal join needs the same tolerance as the shed side."""
+    records = fls.parse_turn_ons(
+        _plug_on("21:45:59", "water heater", 61.0, 103.8, priority=60), source="x"
+    )
+    assert [(r.device_name, r.capacity_wh) for r in records] == [
+        ("water heater", pytest.approx(61.0))
+    ]
+
+
+def test_parse_turn_offs_does_not_attach_other_seconds() -> None:
+    """Only the entry's own second is attached; a later second is not."""
+    text = "\n".join(
+        [_off_entry("21:44:58", 5.8, 4), _plug_off("21:45:59", "jackery", 61.0, 51.7)]
+    )
+    decisions = fls.parse_turn_offs(text, source="x.log")
+    assert len(decisions) == 1
+    assert decisions[0].actions == ()
+    assert fls.parse_turn_ons(text, source="x.log") == []
+
+
+def test_turn_off_decision_quarter_is_its_wall_quarter() -> None:
+    """Wall time is exact: decide() only runs inside the current quarter."""
+    decisions = fls.parse_turn_offs(_off_entry("21:44:58", 5.8, 4), source="x.log")
+    assert decisions[0].quarter_start == datetime(
+        2026, 10, 17, 21, 30, tzinfo=timezone.utc
+    )
+
+
+def test_turn_off_decision_rolls_up_shed_residual_and_overshoot() -> None:
+    """Shed sums, the uncovered remainder, and per-action overshoot."""
+    text = "\n".join(
+        [
+            _off_entry("21:44:58", 5.8, 4),
+            _tesla_amps("21:44:58", 10, 5, 1.3, 5.8, 4.5),
+            _plug_off("21:44:58", "ecoflow", 0.3, 4.5),
+            _plug_off("21:44:58", "jackery", 0.3, 4.2),
+        ]
+    )
+    decision = fls.parse_turn_offs(text, source="x.log")[0]
+    assert decision.shed_wh == pytest.approx(1.9)
+    assert decision.residual_gap_wh == pytest.approx(3.9)
+    assert [a.overshoot_wh for a in decision.actions] == pytest.approx(
+        [-4.5, -4.2, -3.9]
+    )
+
+
+def test_turn_off_decision_reports_overshoot_when_a_shed_exceeds_the_gap() -> None:
+    """A shed larger than what was still needed is a positive overshoot."""
+    text = "\n".join(
+        [_off_entry("22:15:59", 51.7, 872), _plug_off("22:15:59", "ecoflow", 61.0, 51.7)]
+    )
+    decision = fls.parse_turn_offs(text, source="x.log")[0]
+    assert decision.residual_gap_wh == 0.0
+    assert decision.actions[0].overshoot_wh == pytest.approx(9.3)
+
+
+def test_tesla_stop_action_carries_its_reason_and_no_savings() -> None:
+    """Every Tesla stop variant is collected; none logs a booked saving."""
+    text = "\n".join(
+        [
+            _off_entry("22:58:03", 49.7, 300),
+            _tesla_stop("22:58:03", "amps_min_reached"),
+            _tesla_stop("22:58:03", "deficit", 49.7),
+        ]
+    )
+    decision = fls.parse_turn_offs(text, source="x.log")[0]
+    assert [a.kind for a in decision.actions] == ["tesla_stop", "tesla_stop"]
+    assert [a.reason for a in decision.actions] == ["amps_min_reached", "deficit"]
+    assert all(a.savings_wh is None for a in decision.actions)
+    assert all(a.overshoot_wh is None for a in decision.actions)
+
+
+def test_parse_turn_ons_reads_each_device_and_time() -> None:
+    """Turn-ons are parsed for the reversal join only."""
+    text = "\n".join(
+        [
+            _plug_on("21:45:59", "jackery", 61.0, 103.8),
+            _plug_on("22:20:33", "ecoflow", 41.1, 45.8),
+        ]
+    )
+    records = fls.parse_turn_ons(text, source="x.log")
+    assert [(r.device_name, r.capacity_wh) for r in records] == [
+        ("jackery", pytest.approx(61.0)),
+        ("ecoflow", pytest.approx(41.1)),
+    ]
+    assert records[0].at == datetime(2026, 10, 17, 21, 45, 59, tzinfo=timezone.utc)
+
+
+def test_find_reversals_pairs_a_shed_with_its_later_turn_on() -> None:
+    """A shed undone by a turn-on a minute later, across the QH boundary."""
+    off = fls.parse_turn_offs(
+        "\n".join(
+            [_off_entry("21:44:58", 0.6, 4), _plug_off("21:44:58", "jackery", 0.3, 0.6)]
+        ),
+        source="x.log",
+    )
+    ons = fls.parse_turn_ons(_plug_on("21:45:59", "jackery", 61.0, 103.8), source="x")
+    reversals = fls.find_reversals(off, ons)
+    assert len(reversals) == 1
+    assert reversals[0].device_name == "jackery"
+    assert reversals[0].delay_secs == pytest.approx(61.0)
+    # Counted on the shed's own quarter, even though the turn-on is in the next.
+    assert reversals[0].quarter_start == datetime(
+        2026, 10, 17, 21, 30, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.parametrize(
+    ("stamp", "device"),
+    [
+        ("21:30:00", "jackery"),  # before the shed
+        ("22:01:00", "jackery"),  # same plug, outside the reversal window
+        ("21:45:59", "ecoflow"),  # right time, other plug
+    ],
+)
+def test_find_reversals_ignores_non_matching_turn_ons(stamp: str, device: str) -> None:
+    """Only a later, same-device turn-on inside the window undoes a shed."""
+    off = fls.parse_turn_offs(
+        "\n".join(
+            [_off_entry("21:44:58", 0.6, 4), _plug_off("21:44:58", "jackery", 0.3, 0.6)]
+        ),
+        source="x.log",
+    )
+    ons = fls.parse_turn_ons(_plug_on(stamp, device, 61.0, 10.0), source="x")
+    assert fls.find_reversals(off, ons) == []
+
+
+def test_summarize_turn_offs_counts_medians_and_rollups() -> None:
+    """The summary's counts, medians, and short-horizon/uncovered splits."""
+    text = "\n".join(
+        [
+            _off_entry("21:36:07", 22.9, 536),
+            _tesla_amps("21:36:07", 6, 5, 35.7, 22.9, -12.8),
+            _off_entry("21:44:58", 5.8, 4),
+            _plug_off("21:44:58", "ecoflow", 0.3, 4.5),
+            _plug_off("21:44:58", "jackery", 0.3, 4.2),
+            _off_entry("22:15:59", 51.7, 872),
+            _plug_off("22:15:59", "ecoflow", 61.0, 51.7),
+        ]
+    )
+    summary = fls.summarize_turn_offs(fls.parse_turn_offs(text, source="x.log"))
+    assert summary.decision_count == 3
+    assert summary.quarter_count == 2
+    assert summary.plug_off_count == 3
+    assert summary.tesla_amp_count == 1
+    assert summary.tesla_stop_count == 0
+    assert summary.action_count == 4
+    assert summary.shed_total_wh == pytest.approx(97.3)
+    assert summary.median_shed_wh == pytest.approx(0.3)
+    assert summary.median_remaining_secs == pytest.approx(536.0)
+    assert summary.short_horizon_count == 1
+    assert summary.short_horizon_secs == fls.TURN_OFF_SHORT_HORIZON_SECS
+    assert summary.uncovered_count == 1
+    assert summary.median_residual_wh == pytest.approx(5.2)
+    assert summary.overshoot_count == 2
+    assert summary.max_overshoot_wh == pytest.approx(12.8)
+
+
+def test_summarize_turn_offs_joins_the_quarter_miss() -> None:
+    """A turn-off quarter carries the completed quarter's actual and miss."""
+    decisions = fls.parse_turn_offs(
+        "\n".join([_off_entry("21:44:58", 5.8, 4), _plug_off("21:44:58", "jackery", 0.3, 4.5)]),
+        source="x.log",
+    )
+    quarters = [
+        fls.QuarterSummary(
+            source="x.log",
+            quarter_start=datetime(2026, 10, 17, 21, 30, tzinfo=timezone.utc),
+            anchor_count=3,
+            actual_wh=-2.84,
+            max_abs_error=4.0,
+            mean_signed_error=0.5,
+            target_wh=-9.0,
+            guard_firings=0,
+        )
+    ]
+    summary = fls.summarize_turn_offs(decisions, quarters=quarters)
+    row = summary.quarters[0]
+    assert row.decision_count == 1
+    assert row.plug_off_count == 1
+    assert row.shed_wh == pytest.approx(0.3)
+    assert row.actual_wh == pytest.approx(-2.84)
+    assert row.target_wh == pytest.approx(-9.0)
+    assert row.miss_wh == pytest.approx(6.16)
+    assert row.min_remaining_secs == 4
+
+
+def test_summarize_turn_offs_counts_reversals_per_quarter() -> None:
+    """Reversals are counted on the quarter whose shed they undid."""
+    text = "\n".join(
+        [
+            _off_entry("21:44:58", 5.8, 4),
+            _plug_off("21:44:58", "jackery", 0.3, 4.5),
+            _plug_on("21:45:59", "jackery", 61.0, 103.8),
+        ]
+    )
+    summary = fls.summarize_turn_offs(
+        fls.parse_turn_offs(text, source="x.log"),
+        fls.parse_turn_ons(text, source="x.log"),
+    )
+    assert summary.reversal_count == 1
+    assert summary.median_reversal_secs == pytest.approx(61.0)
+    assert summary.quarters[0].reversal_count == 1
+
+
+def test_summarize_turn_offs_empty_is_all_zeros() -> None:
+    """A log with no turn-off path lines summarizes to zeros, not a crash."""
+    summary = fls.summarize_turn_offs([])
+    assert summary.decision_count == 0
+    assert summary.quarter_count == 0
+    assert summary.shed_total_wh == 0.0
+    assert summary.median_shed_wh == 0.0
+    assert summary.median_residual_wh == 0.0
+    assert summary.reversals == ()
+    assert summary.median_reversal_secs is None
+
+
+def test_format_turn_offs_reports_every_section() -> None:
+    """The text report names shed, horizon, coverage, overshoot, reversals."""
+    text = "\n".join(
+        [
+            _off_entry("21:44:58", 5.8, 4),
+            _plug_off("21:44:58", "jackery", 0.3, 5.8),
+            _plug_on("21:45:59", "jackery", 61.0, 103.8),
+        ]
+    )
+    body = fls.format_turn_offs(
+        fls.summarize_turn_offs(
+            fls.parse_turn_offs(text, source="x.log"),
+            fls.parse_turn_ons(text, source="x.log"),
+        )
+    )
+    assert "turn-off decisions: 1 across 1 quarter" in body
+    assert "plug 1, Tesla amps 0, Tesla stops 0" in body
+    assert "shed:" in body
+    assert "horizon:" in body
+    assert "uncovered" in body
+    assert "overshoot" in body
+    assert "reversal" in body
+    assert "2026-10-17 21:30" in body
+    assert "n/a" in body  # no completed quarter joined
+
+
+def test_format_turn_offs_without_decisions_says_so() -> None:
+    """An empty summary prints a reason, not an empty table."""
+    body = fls.format_turn_offs(fls.summarize_turn_offs([]))
+    assert "no turn-off decisions" in body
+    assert "quarter" not in body
+
+
+def test_cli_turn_offs_flag_adds_a_section_and_default_omits_it(
+    tmp_path, capsys
+) -> None:
+    """``--turn-offs`` is opt-in; the shipped report is unchanged."""
+    log = tmp_path / "turnoffs.log"
+    log.write_text(
+        _fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q2=-9.0)
+        + "\n"
+        + _fetch(1800, -100.0, 0.05, -55.0, 500, 1300, complete_q2=-9.0)
+        + "\n"
+        + "\n".join(
+            [_off_entry("21:44:58", 5.8, 4), _plug_off("21:44:58", "jackery", 0.3, 5.8)]
+        )
+    )
+    assert fls.main([str(log)]) == 0
+    default_out = capsys.readouterr().out
+    assert "turn-off decisions" not in default_out
+
+    assert fls.main([str(log), "--turn-offs"]) == 0
+    turn_off_out = capsys.readouterr().out
+    assert "turn-off decisions: 1 across 1 quarter" in turn_off_out
+    assert default_out.strip() in turn_off_out
+
+
+def test_cli_turn_offs_section_prints_without_scored_anchors(
+    tmp_path, capsys
+) -> None:
+    """Turn-off data is still collected on a log with no completed total."""
+    log = tmp_path / "turnoffs-only.log"
+    log.write_text(
+        "\n".join([_off_entry("21:44:58", 5.8, 4), _plug_off("21:44:58", "jackery", 0.3, 5.8)])
+    )
+    assert fls.main([str(log), "--turn-offs"]) == 1
+    out = capsys.readouterr().out
+    assert "no scored anchors" in out
+    assert "turn-off decisions: 1 across 1 quarter" in out
+
+
+@_NEEDS_REAL_LOG
+def test_real_log_turn_off_decisions_parse() -> None:
+    """A real log's turn-off decisions parse with quarters attached."""
+    decisions = fls.parse_turn_offs(
+        _OVERSHOOT.read_text(errors="replace"), source="x.log"
+    )
+    assert decisions
+    assert all(d.quarter_start.minute % 15 == 0 for d in decisions)
+    summary = fls.summarize_turn_offs(decisions)
+    assert summary.decision_count == len(decisions)
+    assert summary.quarter_count >= 1
+    assert "turn-off decisions:" in fls.format_turn_offs(summary)

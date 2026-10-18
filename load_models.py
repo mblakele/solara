@@ -495,7 +495,15 @@ class CycleDiagnostics:
         pending_effects_count: Number of pending effects at cycle time.
         tesla_configured: Whether Tesla integration is enabled.
         tesla_state: Current Tesla state snapshot (dict from
-            _tesla_state_to_dict), or None.
+            _tesla_state_to_dict), or None. None alone does not mean
+            "not charging" — see tesla_state_missing_reason.
+        tesla_state_missing_reason: Why tesla_state is None, whenever it
+            is: "not_reached" when the cycle exited before the Tesla
+            async phase ran (status is not ok/dry-run, so nobody read
+            the car), "unavailable" when that phase ran and produced no
+            state (Tesla configured but offline / no telemetry yet, as
+            tesla_error would confirm), or None when a state is present
+            or Tesla is not configured.
         tesla_error: Error message from Tesla API, or None.
         tesla_login_url: OAuth login URL if Tesla auth is required,
             or None.
@@ -531,6 +539,7 @@ class CycleDiagnostics:
     pending_effects_count: int | None = None
     tesla_configured: bool | None = None
     tesla_state: dict[str, Any] | None = None
+    tesla_state_missing_reason: str | None = None
     tesla_error: str | None = None
     tesla_login_url: str | None = None
     plugs_configured: list[str] | None = None
@@ -567,6 +576,7 @@ class CycleDiagnostics:
             "pending_effects_count": self.pending_effects_count,
             "tesla_configured": self.tesla_configured,
             "tesla_state": self.tesla_state,
+            "tesla_state_missing_reason": self.tesla_state_missing_reason,
             "tesla_error": self.tesla_error,
             "tesla_login_url": self.tesla_login_url,
             "plugs_configured": self.plugs_configured,

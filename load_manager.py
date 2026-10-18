@@ -725,6 +725,8 @@ class LoadManager:
                 seconds_remaining=ctx.seconds_remaining,
                 data_point_at=ctx.data_point_at,
                 pending_effects_count=0,
+                tesla_state=ctx.tesla_state,
+                tesla_fetched=True,
                 sentinel_names=list(self.sentinel_names),
                 sentinel_on=True,
             )
@@ -820,6 +822,7 @@ class LoadManager:
                 data_point_at=ctx.data_point_at,
                 pending_effects_count=len(self.state.pending_effects),
                 tesla_state=ctx.tesla_state,
+                tesla_fetched=True,
                 tesla_error=ctx.tesla_error,
                 tesla_login_url=ctx.tesla_login_url,
                 sentinel_names=list(self.sentinel_names),
@@ -874,6 +877,9 @@ class LoadManager:
                 candidates=candidate_details,
                 tesla_configured=tesla_configured,
                 tesla_state=_tesla_state_to_dict(ctx.tesla_state),
+                tesla_state_missing_reason=self._tesla_state_missing_reason(
+                    ctx.tesla_state, fetched=True
+                ),
                 tesla_error=ctx.tesla_error,
                 tesla_login_url=ctx.tesla_login_url,
                 plugs_configured=list(self.plugs.keys()),
@@ -1451,6 +1457,32 @@ class LoadManager:
         time_range = self.tesla_config.time_range if self.tesla_config else None
         return self._is_device_in_time_range(now, time_range)
 
+    def _tesla_state_missing_reason(
+        self, tesla_state: TeslaState | None, *, fetched: bool
+    ) -> str | None:
+        """Explain a missing Tesla state, or return None when none is missing.
+
+        ``tesla_state=None`` alone cannot be read as "not charging": a cycle
+        that exits before the Tesla async phase never queried the car, while
+        a full cycle that ran the phase and still has no state found it
+        configured but unavailable (offline / no telemetry yet — the path
+        that deliberately keeps a grey off dashboard entry). Recording which
+        one happened keeps that meaning in the log instead of leaving it to
+        be inferred from the cycle status.
+
+        Args:
+            tesla_state: Tesla state the cycle has, or None.
+            fetched: Whether the Tesla async phase ran this cycle.
+
+        Returns:
+            "not_reached" before the phase, "unavailable" when it ran and
+            produced no state, or None when a state is present or Tesla is
+            not configured.
+        """
+        if self.tesla_ctrl is None or tesla_state is not None:
+            return None
+        return "unavailable" if fetched else "not_reached"
+
     def _early_exit(
         self,
         ctx: CycleContext,
@@ -1468,6 +1500,7 @@ class LoadManager:
         pending_effects_count: int | None = None,
         candidates: list[CandidateDetail] | None = None,
         tesla_state: TeslaState | None = None,
+        tesla_fetched: bool = False,
         tesla_error: str | None = None,
         tesla_login_url: str | None = None,
         sentinel_names: list[str] | None = None,
@@ -1496,6 +1529,8 @@ class LoadManager:
             pending_effects_count: Pending effects at exit time, if known.
             candidates: Candidate device details, if computed.
             tesla_state: Tesla state snapshot, if available.
+            tesla_fetched: Whether the Tesla async phase already ran, so a
+                missing state means "unavailable" ("not_reached" otherwise).
             tesla_error: Tesla error message, if any.
             tesla_login_url: Tesla OAuth URL, if re-auth is needed.
             sentinel_names: Sentinel plug names, if relevant.
@@ -1524,6 +1559,9 @@ class LoadManager:
                 pending_effects_count=pending_effects_count,
                 tesla_configured=self.tesla_ctrl is not None,
                 tesla_state=_tesla_state_to_dict(tesla_state),
+                tesla_state_missing_reason=self._tesla_state_missing_reason(
+                    tesla_state, fetched=tesla_fetched
+                ),
                 tesla_error=tesla_error,
                 tesla_login_url=tesla_login_url,
                 plugs_configured=list(self.plugs.keys()),

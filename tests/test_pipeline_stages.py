@@ -10,7 +10,13 @@ import pytest
 
 from load_controllers import RealTeslaController, TeslaController
 from load_manager import LoadManager, LoadManagerConfig
-from load_models import AsyncPhaseResult, CycleContext, PendingEffect, TeslaAuthError
+from load_models import (
+    AsyncPhaseResult,
+    CycleContext,
+    PendingEffect,
+    TeslaAuthError,
+    TeslaState,
+)
 from load_nbc import NBCFetchResult
 
 
@@ -1683,3 +1689,131 @@ class TestSinglePlugPollPerCycle:
         result = mgr.run_cycle()
         assert result.status in ("ok", "dry-run")
         assert counts == {"water_heater": 1, "pool_pump": 1}
+
+
+class TestTeslaStateMissingReason:
+    """A missing Tesla state says *why* it is missing.
+
+    ``tesla_configured=True, tesla_state=None`` is ambiguous on its own: the
+    cycle may have exited before the Tesla async phase ran (nobody looked at
+    the car), or that phase ran and produced no state because the car is
+    offline or has not telemetered yet. Production distinguishes the two
+    internally; recording which one happened keeps a log reader — and the
+    offline replay tooling — from having to infer it from ``status``.
+    """
+
+    @staticmethod
+    def _commit_ready_ctx(ctx: CycleContext, gap_wh: float) -> None:
+        """Populate the fields _stage_commit needs to reach its hysteresis exit."""
+        ctx.sentinel_on = False
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = gap_wh
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        ctx.seconds_remaining = 450
+        ctx.data_point_at = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+
+    @staticmethod
+    def _build_ready_ctx(ctx: CycleContext) -> None:
+        """Populate the fields _stage_build_result needs."""
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = -100.0
+        ctx.seconds_remaining = 450
+        ctx.now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+
+    def test_pre_fetch_exit_is_not_reached(self, lm: LoadManager, ctx: CycleContext):
+        """Exiting before the async phase never queried the car."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        with patch.object(lm.nbc_reader, "get_current_qh", return_value=None):
+            result = lm._stage_nbc_fetch(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state_missing_reason == "not_reached"
+
+    def test_exit_without_tesla_configured_has_no_reason(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """With no Tesla configured there is nothing to explain."""
+        assert lm.tesla_ctrl is None
+        with patch.object(lm.nbc_reader, "get_current_qh", return_value=None):
+            result = lm._stage_nbc_fetch(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state_missing_reason is None
+
+    def test_commit_exit_without_a_state_is_unavailable(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """After the async phase ran, no state means configured but unavailable."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._commit_ready_ctx(ctx, gap_wh=0.0)
+        ctx.tesla_state = None
+        result = lm._stage_commit(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state_missing_reason == "unavailable"
+
+    def test_commit_exit_with_a_state_has_no_reason(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A state that is present needs no explanation."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._commit_ready_ctx(ctx, gap_wh=0.0)
+        ctx.tesla_state = TeslaState(
+            is_charging=False, current_amps=0, plugged_in=True, at_home=True
+        )
+        result = lm._stage_commit(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state is not None
+        assert result.diagnostics.tesla_state_missing_reason is None
+
+    def test_sentinel_exit_keeps_the_known_state(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A post-async early exit reports the state it actually read."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._commit_ready_ctx(ctx, gap_wh=-100.0)
+        ctx.sentinel_on = True
+        ctx.tesla_state = TeslaState(
+            is_charging=True, current_amps=12, plugged_in=True, at_home=True
+        )
+        result = lm._stage_commit(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state is not None
+        assert result.diagnostics.tesla_state_missing_reason is None
+
+    def test_build_result_reports_unavailable_without_a_state(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """The full path ran the async phase, so None means unavailable."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._build_ready_ctx(ctx)
+        ctx.tesla_state = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state_missing_reason == "unavailable"
+
+    def test_build_result_with_a_state_has_no_reason(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A full-path cycle with a state is self-describing already."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._build_ready_ctx(ctx)
+        ctx.tesla_state = TeslaState(
+            is_charging=True, current_amps=12, plugged_in=True, at_home=True
+        )
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state is not None
+        assert result.diagnostics.tesla_state_missing_reason is None

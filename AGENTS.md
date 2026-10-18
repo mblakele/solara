@@ -145,6 +145,9 @@ This is a flat-layout Python project. All source files live at the project root 
 project-root
 ├── tools/                 # Offline-only analysis tools. No production module
 │                          # imports anything in here; they read log text and report.
+│                          # (estimator_replay.py additionally re-runs production
+│                          # decision classes — it is still never imported by
+│                          # production, and still writes nothing back.)
 │                          # Linted and type-checked (`uv run pylint *.py tools/*.py`,
 │                          # mypy `files` includes `tools/*.py`), but not shipped in
 │                          # the gunicorn/Flask runtime path.
@@ -176,8 +179,88 @@ project-root
 │                          # the residual series (net-of-ON rate error,
 │                          # sigma_residual, 260 W survival — residual never
 │                          # beat raw sigma on corpus/, so no margin ships).
+│                          # `--estimator[=NAME,...]` additionally *scores*
+│                          # alternative forecast rates over the same anchors
+│                          # (status-quo trailing window; prior = median rate of
+│                          # the completed qh2..qh4 the same fetch reports, with
+│                          # the shipped forecast as fallback so every row shares
+│                          # one anchor set; prior-blend@M = (n*w + M*p)/(n+M);
+│                          # trend-gated = the window only while GapTrendTracker
+│                          # trusts a trend, mirroring _stage_compute_gap's
+│                          # HYSTERESIS_WH/R floor, override with --trend-floor).
+│                          # Report: per-variant mean|e|/p80/max/optimistic/
+│                          # sigma_rate plus a sigma_rate-by-R-bucket matrix.
+│                          # Corpus verdict (760 anchors, floor 3): prior 12.60
+│                          # mean|e| vs status-quo 29.71, and at R 360-900 s
+│                          # sigma_rate 0.0270 vs 0.1268 — but ramp quarters
+│                          # regress (2026-10-01: 22.7 -> 57.5), so this measures,
+│                          # it does not ship (ForecastAnchor.prior_rate).
+│                          # Default output is unchanged without the flag.
+│                          # `--turn-offs` adds the turn-off path collection:
+│                          # every entry into the unguarded `_decide_turn_off`
+│                          # (horizon R, gap, each shed booked: plug
+│                          # `action=turn_off`, Tesla amp reduce, Tesla stop; the
+│                          # raw logfmt values, joined to the decision by its
+│                          # line-prefix second), reported as shed totals, median
+│                          # horizon, short-horizon count
+│                          # (TURN_OFF_SHORT_HORIZON_SECS=60), gap coverage with
+│                          # the per-action overshoot (savings − remaining gap),
+│                          # reversals (a plug turned back on within
+│                          # TURN_OFF_REVERSAL_WINDOW_SECS=900 s of the shed —
+│                          # time-based, not quarter-scoped, because the clearest
+│                          # case crosses the QH boundary), and a per-quarter table
+│                          # joining the completed actual/target/miss. Data
+│                          # collection only: the unguarded path is a documented
+│                          # design decision and is not re-executed or changed.
+│                          # Plug device names can contain spaces ("water heater"),
+│                          # so the name pattern is `(.+?)` — a `\S+` silently drops
+│                          # every shed by a multi-word plug (caught by
+│                          # tests/test_estimator_replay.py, which needs the whole
+│                          # event set; the dropped heater sheds moved the corpus by
+│                          # 5 sheds / 4.9 kWh / 150 Wh of overshoot).
+│                          # Corpus: 405 decisions/65 quarters, 34 under 60 s,
+│                          # 109/165 sheds overshot (max 222 Wh), 50/84 plug sheds
+│                          # reversed (median 136 s).
 │                          # Run from the repo root:
 │                          #   uv run python tools/forecast_log_scoring.py bugs/*.log
+│                          #   uv run python tools/forecast_log_scoring.py bugs/*.log --estimator
+│                          #   uv run python tools/forecast_log_scoring.py bugs/*.log --turn-offs
+│   └── estimator_replay.py  # Closed-loop replay: drives an estimator through
+│                          # production GapMinder.decide() against a counterfactual
+│                          # step-function meter, so the verdict is the quarter's
+│                          # miss + churn, not the open-loop forecast error the
+│                          # scorer reports. The model (Quarter/Replay/meter/
+│                          # rate_* variants) lives here; tests/test_estimator_replay.py
+│                          # is its spec. Only `rate_fn` differs between runs, and
+│                          # the estimator formulas are pinned equal to the scorer's
+│                          # estimate_prior_only/estimate_prior_blend.
+│                          # Ingestion is deliberately conservative (the meter models
+│                          # three plugs): quarters where the Tesla could draw
+│                          # (charging/amps/non-plug decision) OR where no cycle ever
+│                          # reported a Tesla state (tesla_state=None is an early exit,
+│                          # not an idle car; production now records the reason on
+│                          # CycleDiagnostics.tesla_state_missing_reason, so newer logs
+│                          # need no inference — older ones still do) are dropped; so are quarters under
+│                          # MIN_ANCHORS_PER_QUARTER, with an implausible fetch-line lag
+│                          # (LAG_MIN/MAX_SECS), or with no candidate dump to read the
+│                          # opening ON/OFF state from; repeated samples_used are
+│                          # deduped (production's tracker rejects repeats). Command
+│                          # times come from each anchor's own `wall_at` (per-quarter
+│                          # median lag), not a hand constant. `--variant NAME` (repeatable)
+│                          # `--date YYYY-MM-DD` `--worst N` `--trend-floor WH`.
+│                          # Corpus verdict (13 logs, 1029 clean quarters of 1294):
+│                          # status-quo 23.41 mean|miss| / 14.27 median / -4.87 mean /
+│                          # 2.07 actions/q / 0.90 reversals/q beats prior 27.71,
+│                          # prior-blend@60 26.26 and trend-gated 24.11 while every
+│                          # smoother roughly halves churn — the open-loop ranking
+│                          # INVERTS closed-loop (the shipped window is ~2x worse
+│                          # open-loop). No estimator variant ships; Subtask 3 stays
+│                          # blocked. Nameplate watts stand in for measured draw and
+│                          # only the three plugs are modelled, so deltas are the
+│                          # result, not absolute landings.
+│                          # Run from the repo root:
+│                          #   uv run python tools/estimator_replay.py bugs/*.log
+│                          #   uv run python tools/estimator_replay.py corpus/*.log --variant prior
 │   └── divergence_audit.py  # Status-quo vs residual shed-watts audit over logs:
 │                          # per-anchor ON states (deduped candidates) + logged
 │                          # priorities, lumpy-first iff implicated and beyond
@@ -238,11 +321,15 @@ project-root
                             # fleet_telemetry_config_create)
  ├── load_manager.py       # OAuth handling, pipeline stages (_stage_*), load-shedding management,
                              # _last_tesla_at_home preserves at_home across telemetry snapshots,
+                             # _tesla_state_missing_reason() explains tesla_state=None
+                             # (post-async sites in _stage_commit/_stage_build_result pass
+                             # tesla_fetched=True; _early_exit defaults to "not_reached"),
                              # data-health Telegram alerts (_check_data_health_alerts:
                              # fatal fetch errors + 300 s stale/no-data, once per QH each,
                              # bypassing the devices whitelist)
  ├── load_models.py        # Shared data models (CycleContext (stage-4 gap_jitter_wh_per_s),
-                            # CycleResult, CycleDiagnostics (gap_jitter_wh_per_s + to_dict),
+                            # CycleResult, CycleDiagnostics (gap_jitter_wh_per_s,
+                            # tesla_state_missing_reason + to_dict),
                             # AsyncPhaseResult, PendingEffect,
                             # TeslaChargeState, TeslaDriveState, TeslaLocation, TeslaCallbackPayload,
                             # TeslaEvent, TeslaEventKind, TeslaVehicleTelemetry,
@@ -292,9 +379,41 @@ project-root
                            # churn_coverage — guard/cycle-result parsing incl. the
                            # segment-scoping traps (action data_point_at before,
                            # candidate reason after diagnostics), target/miss/guard
-                           # joins, and that the tool runs standalone; real-log
+                           # joins, the estimator variants (prior rate from the same
+                           # fetch's completed neighbours incl. the missing-total and
+                           # no-prior fallbacks, blend weights, trend gate trust/
+                           # fallback/quarter isolation, shared anchor set, bucket
+                           # sigma matrix, CLI table + default-output parity and
+                           # unknown-flag rejection), and the turn-off path collection
+                           # (decision entry ↔ same-second shed attachment incl. the
+                           # orphan-shed skip, per-action overshoot/residual roll-ups,
+                           # Tesla stop reasons without savings, the reversal join's
+                           # time window bounding quarter scope, per-quarter miss
+                           # join, empty-summary zeros, CLI section + default-output
+                           # parity, multi-word device names), and that the tool runs
+                           # standalone; real-log
                            # assertions skip because bugs/ is gitignored);
-                           # test_tou_page.py covers inclusive date
+                           # test_estimator_replay.py is the spec for
+                           # tools/estimator_replay.py, Subtask 2 of the variance-reduction plan:
+                           # a closed loop over the two plug-only quarters (anchors + plug events
+                           # as CHECKED-IN fixtures — the verdict must not depend on gitignored
+                           # bugs/ — with a skipif-guarded drift test re-parsing the logs through
+                           # the tool's own ingest_log), a step-function meter (opening plug state
+                           # per quarter via Quarter.initial_on, defaulting to the all-on the two
+                           # fixtures happen to open with), history mode landing on the logged
+                           # actual, the status-quo rate reproducing production's own opening shed,
+                           # the replay's rates equal to the scorer's estimators, the reversal
+                           # window matching the scorer's, and the measured verdict — the flat
+                           # prior cuts churn in both quarters but over-sheds the regime-change
+                           # quarter, so its mean |miss| is worse (19.87 vs 15.19) and it must not
+                           # ship. Ingestion is covered on SYNTHETIC log text (no bugs/ needed):
+                           # the built quarter's anchors/actual/lag/events/opening state, the dedup
+                           # of a repeated data point, the fetch-line-derived lag, and each drop
+                           # reason (charging Tesla, never-known Tesla state, too few anchors,
+                           # implausible lag, no candidate dump), plus the reporting layer
+                           # (summaries, comparisons, regression ranking), the freshness of the
+                           # variant map, and the CLI (table, --date, unknown variant, no
+                           # quarters); test_tou_page.py covers inclusive date
                            # ranges, DST days, detail rows/defaults and picker dates;
                            # test_app.py covers endpoint validation and range limits;
                            # test_gap_trend.py covers the gap-slope tracker (+ the churn /
@@ -896,6 +1015,14 @@ Ensure that file is present and sourced before running.
 
 **Write tests for all new functionality.** A PR with new behavior but no new
   tests is incomplete (see the Test-First protocol above).
+- **Never depend on `bugs/` or `corpus/`**: neither is tracked by git, so a
+  fresh clone has no logs and anything that reads them silently skips. A test
+  whose *verdict* needs log data must carry that data inline as a checked-in
+  fixture (the precedent: `A_ANCHORS` in `tests/test_residual_feedback_replay.py`,
+  `QUARTER_A_ANCHORS` in `tests/test_estimator_replay.py`) and treat the log as
+  an optional `skipif`-guarded drift check that fails if the fixture goes stale.
+  Behavioural tests should be driven by synthetic log text. The corpus is
+  measurement-only: it can inform a decision, never gate one.
 - **Always guard against pollution from `devices.json` and `.env` files** The local `.env` (read lazily by the `config` module) may conflict with your test. Consider that and guard against it. Use deferred config in app code, and monkeypatch.setenv in pytest fixtures.
 ```
 # ❌ Evaluated at import — hard to mock

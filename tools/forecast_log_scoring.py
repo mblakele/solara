@@ -26,15 +26,33 @@ deliberately left unchanged: see
 ``.opencode/plans/forecast-uncertainty-action-band.md`` §4 for the candidates
 already evaluated and rejected.
 
+``--estimator`` additionally *scores* alternative forecast rates over the
+same anchors — the shipped trailing window, the prior completed quarter's
+rate, blends of the two, and a trend-gated mix — so an estimator change can
+be judged from the corpus before any production edit
+(``.opencode/plans/forecast-variance-reduction.md``). The default output is
+unchanged.
+
+``--turn-offs`` adds the turn-off path collection: every entry into the
+unguarded ``GapMinder._decide_turn_off`` (horizon, gap, each shed it booked,
+whether the gap was covered, whether a shed overshot it, and whether a plug
+was turned back on in the same quarter) beside the quarter it produced.
+That path has no minimum-horizon floor and no overshoot cap by design, so
+the data is collected before any guard is considered. Also opt-in; the
+default output is unchanged.
+
 Run from the repo root::
 
     uv run python tools/forecast_log_scoring.py bugs/*.log
+    uv run python tools/forecast_log_scoring.py bugs/*.log --estimator
+    uv run python tools/forecast_log_scoring.py bugs/*.log --turn-offs
 """
 
 from __future__ import annotations
 
 import math
 import re
+import statistics
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -43,6 +61,7 @@ from typing import Iterable, Iterator, Sequence, TypeVar
 
 import pytz
 
+
 # Solara is a flat-layout project: production modules sit beside this one,
 # not inside a package. Running this file directly puts tools/ (not the repo
 # root) on sys.path, so the root has to be added back before importing util.
@@ -50,9 +69,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# Flat-layout script: both local imports must follow the _ROOT sys.path
+# Flat-layout script: every local import must follow the _ROOT sys.path
 # bootstrap above, so they deliberately sit below module-level code (flake8
 # E402 and pylint wrong-import-position are the same complaint).
+from constants import DEFAULT_HYSTERESIS_WH  # noqa: E402 # pylint: disable=wrong-import-position
 from gap_trend import GapTrendTracker  # noqa: E402 # pylint: disable=wrong-import-position
 from util import QH_PERIOD_SECONDS, floor_to_qh # noqa: E402 # pylint: disable=wrong-import-position
 
@@ -117,6 +137,15 @@ class ForecastAnchor:
     predicted_wh: float
     actual_wh: float | None
     wall_at: datetime | None = None
+    prior_rate: float | None = None
+    """Median realized rate (Wh/s) of the completed quarters the same fetch
+    reports beside this incomplete one; None when it reports none.
+
+    This is information production already holds at decision time — the
+    completed ``qh2..qh4`` entries come from the same payload as the
+    incomplete QH1 — and it is the alternative to the trailing window the
+    estimator sweep scores (``.opencode/plans/forecast-variance-reduction.md``).
+    """
 
     @property
     def horizon_ratio(self) -> float:
@@ -296,6 +325,7 @@ def parse_log(text: str, source: str = "<log>") -> list[ForecastAnchor]:
 def _to_anchor(
     quarter: _Quarter, start: datetime, source: str,
     wall_at: datetime | None = None,
+    prior_rate: float | None = None,
 ) -> ForecastAnchor | None:
     """Build an anchor from a QH1 entry, or None if any field is missing."""
     if (
@@ -322,7 +352,30 @@ def _to_anchor(
         predicted_wh=quarter.predicted_wh,
         actual_wh=None,
         wall_at=wall_at,
+        prior_rate=prior_rate,
     )
+
+
+def _prior_rate(quarters: Sequence[_Quarter]) -> float | None:
+    """Median realized rate of a record's completed neighbouring quarters.
+
+    The incomplete QH1 is index 1 and is skipped: its total is the *current*
+    quarter's outcome, not a prior one. Completed entries with no ``raw_wh``
+    (the API sometimes reports the flag without the total) contribute
+    nothing rather than a zero.
+
+    Args:
+        quarters: The quarters reported by one ``nbc_set`` record.
+
+    Returns:
+        The median rate in Wh/s, or None when no completed total is present.
+    """
+    rates = [
+        quarter.raw_wh / QH_PERIOD_SECONDS
+        for quarter in quarters
+        if quarter.complete and quarter.index != 1 and quarter.raw_wh is not None
+    ]
+    return statistics.median(rates) if rates else None
 
 
 def _collect(
@@ -335,13 +388,16 @@ def _collect(
     wall_at: datetime | None = None,
 ) -> None:
     """File one parsed ``nbc_set`` record under its resolved data_start."""
+    prior_rate = _prior_rate(quarters)
     for quarter in quarters:
         start = _quarter_start(data_start, cache_len, quarter.index)
         if quarter.complete:
             if quarter.raw_wh is not None:
                 actuals[start] = quarter.raw_wh
             continue
-        anchor = _to_anchor(quarter, start, source, wall_at=wall_at)
+        anchor = _to_anchor(
+            quarter, start, source, wall_at=wall_at, prior_rate=prior_rate
+        )
         if anchor is not None:
             anchors.append(anchor)
 
@@ -524,6 +580,113 @@ def parse_cycles(text: str, source: str = "<log>") -> list[CycleRecord]:
             )
         )
     return records
+
+
+@dataclass(frozen=True)
+class CycleStateSnapshot:
+    """The dispatch-relevant state one cycle-result line reports.
+
+    :func:`parse_cycles` reads a cycle-result repr only for its decision
+    context. The replay needs the other half of the same repr: whether
+    each plug candidate is *actually* running (the meter it integrates is
+    physical, not desired), and whether the Tesla could be drawing (a
+    quarter the car charged in is outside a plugs-only meter's scope).
+
+    Attributes:
+        source: Log the line came from.
+        at: The line's prefix timestamp in UTC, or None when absent.
+        quarter_start: Quarter of the diagnostics ``data_point_at``, or
+            None when it cannot be parsed.
+        plugs: ``(name, desired, actual)`` per plug candidate, in log
+            order. Tesla candidates carry no plug state and are omitted.
+        tesla_charging: Whether the cycle reported the Tesla charging, or
+            None when the diagnostics logged no Tesla state at all (the
+            cycle exited before the async phase — unknown, never "idle").
+        tesla_amps: The Tesla's reported amps, or None when unknown.
+    """
+
+    source: str
+    at: datetime | None
+    quarter_start: datetime | None
+    plugs: tuple[tuple[str, bool | None, bool | None], ...]
+    tesla_charging: bool | None = None
+    tesla_amps: float | None = None
+
+
+def _flag(value: str) -> bool | None:
+    """``"True"``/``"False"``/``"None"`` as a tri-state bool."""
+    if value == "None":
+        return None
+    return value == "True"
+
+
+def parse_cycle_states(text: str, source: str = "<log>") -> list[CycleStateSnapshot]:
+    """Extract per-cycle plug and Tesla state from one log's text.
+
+    Reads the same ``Load management cycle result: CycleResult(...)`` reprs
+    as :func:`parse_cycles`, scoped to the
+    ``diagnostics=CycleDiagnostics(...)`` segment so the pending effects'
+    own ``data_point_at`` and the candidates' own Tesla fields cannot leak
+    in. ``tesla_state=None`` (Tesla still configured, no state read — so
+    the cycle either exited before the async phase or found the car
+    unavailable) is reported as unknown rather than defaulted to idle.
+
+    Args:
+        text: Full log contents.
+        source: Identifier recorded on each snapshot (usually the filename).
+
+    Returns:
+        Snapshots in log order. Lines without a diagnostics segment are
+        skipped.
+    """
+    snapshots: list[CycleStateSnapshot] = []
+    for line in text.splitlines():
+        if "CycleResult(" not in line:
+            continue
+        diags = line.find(_CYCLE_DIAGS)
+        if diags < 0:
+            continue
+        segment = line[diags:]
+        tesla_chunk = ""
+        marker = segment.find(_TESLA_STATE_MARKER)
+        if marker >= 0:
+            tesla_chunk = segment[marker:]
+        charging = _TESLA_CHARGING_RE.search(tesla_chunk)
+        amps = _TESLA_AMPS_RE.search(tesla_chunk)
+        snapshots.append(
+            CycleStateSnapshot(
+                source=source,
+                at=_line_timestamp(line),
+                quarter_start=_cycle_quarter(segment),
+                plugs=tuple(
+                    (name, _flag(desired), _flag(actual))
+                    for name, desired, actual in _CANDIDATE_STATE_RE.findall(segment)
+                ),
+                tesla_charging=(
+                    None if charging is None else charging.group(1) == "True"
+                ),
+                tesla_amps=None if amps is None else float(amps.group(1)),
+            )
+        )
+    return snapshots
+
+
+# The same candidate entry, extended to the trailing ``actual_state``: the
+# replay models the meter from what the controller reported, which differs
+# from the wanted state while a command is unconfirmed. Tesla entries are
+# dropped here — they carry no plug state.
+_CANDIDATE_STATE_RE = re.compile(
+    r"CandidateDetail\(device_type='plug', name='([^']*)', "
+    r"power_watts=[\d.eE+-]+,.*?"
+    r"desired_state=(True|False|None), actual_state=(True|False|None)"
+)
+
+# ``tesla_state={'is_charging': False, 'current_amps': 0, ...}``. The quoted
+# keys are what separate the dict from a tesla CandidateDetail's own
+# ``is_charging=None`` fields, so no dict-boundary parse is needed.
+_TESLA_STATE_MARKER = "tesla_state={"
+_TESLA_CHARGING_RE = re.compile(r"'is_charging':\s*(True|False)")
+_TESLA_AMPS_RE = re.compile(r"'current_amps':\s*(-?\d+(?:\.\d+)?)")
 
 
 # Matches one candidate entry in production field order, e.g.
@@ -776,6 +939,331 @@ def churn_uncertainty_wh(remaining_secs: float, churn_rate: float, k: float) -> 
         Half-width of the band, in Wh.
     """
     return k * churn_rate * remaining_secs
+
+
+# ── estimator variants ───────────────────────────────────────────────
+#
+# The forecast production ships (``util.compute_nbc_quarter``) is
+# deliberately left unchanged here. These variants only *score*
+# alternatives over the same anchors, so the question "is the trailing
+# window the noise source?" can be answered from the corpus before any
+# production change is considered
+# (``.opencode/plans/forecast-variance-reduction.md``, subtask 1).
+# Every variant predicts the same quantity as the shipped forecast —
+# ``raw_wh + remaining_secs * rate`` — and differs only in the rate.
+
+DEFAULT_PRIOR_WEIGHTS_SECS: tuple[int, ...] = (60, 120, 300)
+"""Blend weights, in seconds of prior-quarter equivalent.
+
+The blend is ``(n * window_rate + m * prior_rate) / (n + m)`` with
+``m`` in these units: ``m = n`` (30) is an even split, ``m = 300`` leaves
+the trailing window ~9% of the weight.
+"""
+
+TREND_GATE_NOISE_FLOOR_WH: float = float(DEFAULT_HYSTERESIS_WH)
+"""Minimum gap slope (Wh) the trend gate trusts, matching production's method.
+
+Production passes ``engine.HYSTERESIS_WH / seconds_remaining`` to
+``GapTrendTracker.update`` (``load_manager._stage_compute_gap``), and
+``engine.HYSTERESIS_WH`` is the deployment's ``|target_wh| / 3`` — 3 Wh
+for this corpus, not the 20 Wh residential default. Override with
+``--trend-floor`` when the corpus was run at another scale.
+"""
+
+ESTIMATOR_NAMES: tuple[str, ...] = (
+    "status-quo",
+    "prior",
+) + tuple(
+    f"prior-blend@{weight}" for weight in DEFAULT_PRIOR_WEIGHTS_SECS
+) + (
+    "trend-gated",
+)
+"""Every scorable variant, in report order."""
+
+
+def estimate_prior_only(anchor: ForecastAnchor) -> float:
+    """Predict the quarter total from the prior quarters' rate alone.
+
+    Args:
+        anchor: The forecast anchor.
+
+    Returns:
+        ``raw_wh + remaining_secs * prior_rate``, or the shipped forecast
+        when the fetch reported no completed neighbour (so every variant
+        scores an identical anchor set).
+    """
+    if anchor.prior_rate is None:
+        return anchor.predicted_wh
+    return anchor.raw_wh + anchor.remaining_secs * anchor.prior_rate
+
+
+def estimate_prior_blend(anchor: ForecastAnchor, prior_weight_secs: float) -> float:
+    """Predict the quarter total from a weighted window/prior rate.
+
+    Args:
+        anchor: The forecast anchor.
+        prior_weight_secs: Weight given to the prior rate, in seconds of
+            window-equivalent samples (``m`` in the formula).
+
+    Returns:
+        ``raw_wh + remaining_secs * rate`` with
+        ``rate = (n * prediction_w + m * prior_rate) / (n + m)`` and
+        ``n = prediction_values``. Falls back to the shipped forecast
+        without a prior rate, or when the weights degenerate.
+    """
+    if anchor.prior_rate is None:
+        return anchor.predicted_wh
+    samples = float(anchor.prediction_values)
+    weight = float(prior_weight_secs)
+    if samples + weight <= 0.0:
+        return estimate_prior_only(anchor)
+    rate = (samples * anchor.prediction_w + weight * anchor.prior_rate) / (
+        samples + weight
+    )
+    return anchor.raw_wh + anchor.remaining_secs * rate
+
+
+def _blend_weight(name: str) -> float:
+    """Parse the weight out of ``prior-blend@<secs>``."""
+    return float(name.split("@", 1)[1])
+
+
+def _trend_gated_series(
+    anchors: Sequence[ForecastAnchor], noise_floor_wh: float
+) -> list[float]:
+    """Keep the trailing window only while ``GapTrendTracker`` trusts a trend.
+
+    Mirrors ``_stage_compute_gap``: one ``update`` per anchor in log order,
+    keyed by quarter, with ``predicted_wh`` standing in for the gap (a
+    constant offset and a sign flip both leave slopes unchanged) and the
+    trust floor ``noise_floor_wh / remaining_secs``. Where the trend is
+    trusted the responsive window is the better estimator (a genuine
+    regime change); everywhere else the prior quarter's rate is.
+
+    Args:
+        anchors: Anchors in log order.
+        noise_floor_wh: Trust floor in Wh, divided by ``remaining_secs``.
+
+    Returns:
+        One predicted total per anchor, aligned by index.
+    """
+    values: list[float] = []
+    trackers: dict[_QuarterKey, GapTrendTracker] = {}
+    for anchor in anchors:
+        key = (anchor.source, anchor.quarter_start)
+        tracker = trackers.get(key)
+        if tracker is None:
+            tracker = GapTrendTracker()
+            trackers[key] = tracker
+        floor = (
+            noise_floor_wh / anchor.remaining_secs if anchor.remaining_secs else 0.0
+        )
+        _, trusted = tracker.update(
+            anchor.data_point_at, anchor.predicted_wh, noise_floor=floor
+        )
+        values.append(anchor.predicted_wh if trusted else estimate_prior_only(anchor))
+    return values
+
+
+def estimate_series(
+    anchors: Sequence[ForecastAnchor],
+    name: str,
+    *,
+    trend_floor_wh: float = TREND_GATE_NOISE_FLOOR_WH,
+) -> list[float]:
+    """Predict every anchor with one named variant.
+
+    Args:
+        anchors: Anchors in log order (scored or not; the trend-gated
+            variant needs the full series to build its history).
+        name: A variant from :data:`ESTIMATOR_NAMES`.
+        trend_floor_wh: Trust floor for the trend gate.
+
+    Returns:
+        One predicted quarter total per anchor, aligned by index.
+
+    Raises:
+        ValueError: If ``name`` is not a registered variant.
+    """
+    if name == "status-quo":
+        return [anchor.predicted_wh for anchor in anchors]
+    if name == "prior":
+        return [estimate_prior_only(anchor) for anchor in anchors]
+    if name.startswith("prior-blend@"):
+        weight = _blend_weight(name)
+        return [estimate_prior_blend(anchor, weight) for anchor in anchors]
+    if name == "trend-gated":
+        return _trend_gated_series(anchors, trend_floor_wh)
+    raise ValueError(f"unknown estimator variant: {name}")
+
+
+@dataclass(frozen=True)
+class EstimatorBucket:
+    """One variant's rate-error spread inside a ``remaining_seconds`` range."""
+
+    low_secs: int
+    high_secs: int
+    count: int
+    sigma_rate: float | None
+
+    @property
+    def label(self) -> str:
+        """Human-readable range, e.g. ``120-179``."""
+        return f"{self.low_secs}-{self.high_secs - 1}"
+
+
+@dataclass(frozen=True)
+class EstimatorSummary:
+    """One estimator variant scored over the anchors that have a total.
+
+    ``sigma_rate`` is the spread of ``error / remaining_secs`` — the same
+    statistic the main report uses, and the one a band ``k * sigma * R``
+    consumes, so a variant's number is directly comparable with
+    ``ForecastReport.sigma_rate``.
+    """
+
+    name: str
+    count: int
+    mean_abs_error: float
+    p80_abs_error: float
+    max_abs_error: float
+    optimistic_count: int
+    optimistic_fraction: float
+    sigma_rate: float
+    buckets: tuple[EstimatorBucket, ...]
+
+
+def _estimator_bucket(
+    errors: Sequence[float], horizons: Sequence[int], low: int, high: int
+) -> EstimatorBucket:
+    """Rate-error spread for the anchors whose horizon falls in ``[low, high)``."""
+    rates = [
+        error / horizon
+        for error, horizon in zip(errors, horizons)
+        if low <= horizon < high and horizon > 0
+    ]
+    return EstimatorBucket(
+        low_secs=low,
+        high_secs=high,
+        count=sum(1 for horizon in horizons if low <= horizon < high),
+        sigma_rate=stddev(rates) if len(rates) > 1 else None,
+    )
+
+
+def _estimator_summary(
+    name: str,
+    errors: Sequence[float],
+    horizons: Sequence[int],
+    bucket_edges: Sequence[int],
+) -> EstimatorSummary:
+    """Roll one variant's errors up into its report row."""
+    if not errors:
+        return EstimatorSummary(name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, ())
+    rate_errors = [
+        error / horizon for error, horizon in zip(errors, horizons) if horizon > 0
+    ]
+    optimistic = sum(1 for error in errors if error < 0)
+    return EstimatorSummary(
+        name=name,
+        count=len(errors),
+        mean_abs_error=sum(abs(e) for e in errors) / len(errors),
+        p80_abs_error=percentile([abs(e) for e in errors], 0.8),
+        max_abs_error=max(abs(e) for e in errors),
+        optimistic_count=optimistic,
+        optimistic_fraction=optimistic / len(errors),
+        sigma_rate=stddev(rate_errors) if len(rate_errors) > 1 else 0.0,
+        buckets=tuple(
+            _estimator_bucket(errors, horizons, low, high)
+            for low, high in zip(bucket_edges, bucket_edges[1:])
+        ),
+    )
+
+
+def score_estimators(
+    anchors: Sequence[ForecastAnchor],
+    names: Sequence[str] = ESTIMATOR_NAMES,
+    trend_floor_wh: float = TREND_GATE_NOISE_FLOOR_WH,
+    bucket_edges: Sequence[int] = BUCKET_EDGES,
+) -> tuple[EstimatorSummary, ...]:
+    """Score each named variant over the same set of scored anchors.
+
+    Anchors without a known quarter total are excluded from every row, and
+    variants missing a prior rate fall back to the shipped forecast, so
+    the rows stay comparable anchor-for-anchor. The trend-gated variant
+    still sees the full series (its tracker history must not lose the
+    anchors at a log's tail).
+
+    Args:
+        anchors: Parsed anchors in log order.
+        names: Variants to score.
+        trend_floor_wh: Trust floor for the trend gate.
+        bucket_edges: Ascending ``remaining_seconds`` boundaries.
+
+    Returns:
+        One summary per name, in the order given.
+    """
+    all_anchors = list(anchors)
+    keep = [
+        index
+        for index, anchor in enumerate(all_anchors)
+        if anchor.actual_wh is not None
+    ]
+    horizons = [all_anchors[index].remaining_secs for index in keep]
+    summaries: list[EstimatorSummary] = []
+    for name in names:
+        series = estimate_series(all_anchors, name, trend_floor_wh=trend_floor_wh)
+        errors: list[float] = []
+        for index in keep:
+            actual = all_anchors[index].actual_wh
+            if actual is not None:
+                errors.append(series[index] - actual)
+        summaries.append(_estimator_summary(name, errors, horizons, bucket_edges))
+    return tuple(summaries)
+
+
+def format_estimators(
+    summaries: Sequence[EstimatorSummary],
+    trend_floor_wh: float = TREND_GATE_NOISE_FLOOR_WH,
+) -> str:
+    """Render the variant comparison as plain text tables.
+
+    Args:
+        summaries: Rows from :func:`score_estimators`.
+        trend_floor_wh: Trust floor that produced the trend-gated row, so
+            the number is reproducible from the output.
+
+    Returns:
+        The comparison table plus a per-``R``-bucket ``sigma_rate`` matrix,
+        which is where the differences between variants show up.
+    """
+    if not summaries:
+        return "no estimator variants requested"
+    lines = [
+        f"estimator variants ({summaries[0].count} scored anchors)",
+        f"trend gate: trust floor {trend_floor_wh:.1f} Wh (--trend-floor)",
+        f"{'variant':>18} {'n':>5} {'mean|e|':>9} {'p80|e|':>8} {'max|e|':>9} "
+        f"{'optimistic':>11} {'sigma_rate':>11}",
+    ]
+    for summary in summaries:
+        lines.append(
+            f"{summary.name:>18} {summary.count:>5} {summary.mean_abs_error:>9.2f} "
+            f"{summary.p80_abs_error:>8.2f} {summary.max_abs_error:>9.2f} "
+            f"{summary.optimistic_fraction:>10.0%} {summary.sigma_rate:>11.4f}"
+        )
+    labels = [bucket.label for bucket in summaries[0].buckets]
+    lines += [
+        "",
+        f"sigma_rate by R bucket (Wh/s): {' '.join(labels)}",
+        f"{'variant':>18} " + " ".join(f"{label:>9}" for label in labels),
+    ]
+    for summary in summaries:
+        cells = " ".join(
+            f"{bucket.sigma_rate:>9.4f}" if bucket.sigma_rate is not None
+            else f"{'n/a':>9}"
+            for bucket in summary.buckets
+        )
+        lines.append(f"{summary.name:>18} {cells}")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -1324,6 +1812,519 @@ def format_report(report: ForecastReport) -> str:
     return "\n".join(lines)
 
 
+# ── turn-off path collection ─────────────────────────────────────────
+#
+# The unguarded turn-off path (``GapMinder._decide_turn_off``) is a design
+# decision, not an oversight: no minimum-horizon floor and no overshoot cap.
+# Revisiting it needs data, and production already logs all of it — one
+# entry line per decision (horizon + gap), one line per shed it books, and
+# the plug turn-ons that later undo a shed. This section reads those lines.
+
+TURN_OFF_SHORT_HORIZON_SECS: int = 60
+"""A turn-off decided with less than this much quarter left counts as short.
+
+Shedding that late books almost nothing (a 260 W plug is worth
+``260 * R / 3600`` Wh, so 4.3 Wh at the floor) while still flipping
+actuator state into the next quarter — the behavior a floor would
+prevent, and the reason this number is collected.
+"""
+
+TURN_OFF_REVERSAL_WINDOW_SECS: int = 900
+"""A turn-on within this long of a plug shed counts as undoing that shed.
+
+One quarter-hour. Long enough to catch the boundary case — a shed with
+four seconds left is undone by the next cycle, which is in the *following*
+quarter — and short enough that a turn-on driven by genuinely new
+conditions is not counted as churn.
+"""
+
+_TURN_OFF_ENTRY_RE = re.compile(
+    r"\[_decide_turn_off\] gap=(-?[\d.]+) Wh, seconds_remaining=(\d+)"
+)
+_TURN_OFF_PLUG_RE = re.compile(
+    r"action=turn_off device=(.+?) savings=(-?[\d.]+) gap=(-?[\d.]+) priority=(\d+)"
+)
+_TURN_OFF_TESLA_AMPS_RE = re.compile(
+    r"\[_decide_turn_off\] Tesla amps (\d+) → (\d+), savings=(-?[\d.]+) Wh, "
+    r"remaining (-?[\d.]+) → (-?[\d.]+) Wh"
+)
+_TURN_OFF_TESLA_STOP_RE = re.compile(r"action=turn_off device=tesla reason=(\S+)")
+_TURN_OFF_TESLA_STOP_REMAIN_RE = re.compile(r"reason=deficit remaining=(-?[\d.]+)")
+_TURN_ON_PLUG_RE = re.compile(
+    r"action=turn_on device=(.+?) capacity=(-?[\d.]+) gap=(-?[\d.]+) priority=(\d+)"
+)
+
+
+@dataclass(frozen=True)
+class TurnOffAction:
+    """One shed booked by the turn-off path, as production logged it.
+
+    Attributes:
+        device_name: Plug name, or ``"tesla"`` for either Tesla leg.
+        kind: ``"plug"``, ``"tesla_amps"`` (partial amp reduction), or
+            ``"tesla_stop"`` (charging stopped).
+        savings_wh: Energy the shed booked for the rest of the quarter, or
+            None for a stop (production logs no saving for one).
+        remaining_gap_wh: The gap still to cover *before* this shed, or None
+            when the line does not log it.
+        current_amps: Amps before a Tesla amp reduction.
+        target_amps: Amps after a Tesla amp reduction.
+        priority: The plug's configured priority (shed order).
+        reason: Why a Tesla stop fired (e.g. ``deficit``).
+    """
+
+    device_name: str
+    kind: str
+    savings_wh: float | None
+    remaining_gap_wh: float | None
+    current_amps: int | None = None
+    target_amps: int | None = None
+    priority: int | None = None
+    reason: str | None = None
+
+    @property
+    def overshoot_wh(self) -> float | None:
+        """Energy shed beyond what was still needed (Wh; >0 = overshoot).
+
+        Returns:
+            ``savings_wh - remaining_gap_wh``, or None when either is
+            unlogged.
+        """
+        if self.savings_wh is None or self.remaining_gap_wh is None:
+            return None
+        return self.savings_wh - self.remaining_gap_wh
+
+
+@dataclass(frozen=True)
+class TurnOffDecision:
+    """One entry into the turn-off path, plus every shed it booked."""
+
+    source: str
+    at: datetime
+    gap_wh: float
+    seconds_remaining: int
+    actions: tuple[TurnOffAction, ...]
+
+    @property
+    def quarter_start(self) -> datetime:
+        """Quarter the decision belonged to.
+
+        Wall time is exact here, as for :class:`GuardEvent`: the pipeline's
+        ``previous_qh`` check exits before ``decide()``, so a decision can
+        only be taken while ``data_point_at`` lies in the current
+        wall-clock quarter.
+        """
+        return floor_to_qh(self.at)
+
+    @property
+    def shed_wh(self) -> float:
+        """Total energy the decision booked (Wh)."""
+        return sum(a.savings_wh or 0.0 for a in self.actions)
+
+    @property
+    def residual_gap_wh(self) -> float:
+        """Gap still uncovered after the decision (Wh; 0.0 = covered).
+
+        Tesla stops log no saving, so a decision that stopped charging
+        without an amp reduction reports the amp leg's remainder only.
+        """
+        return max(0.0, self.gap_wh - self.shed_wh)
+
+
+@dataclass(frozen=True)
+class TurnOnRecord:
+    """One plug turn-on production decided, needed to spot a reversal."""
+
+    at: datetime
+    device_name: str
+    capacity_wh: float
+
+
+@dataclass(frozen=True)
+class Reversal:
+    """A plug shed that production turned back on soon afterwards."""
+
+    source: str
+    device_name: str
+    quarter_start: datetime
+    off_at: datetime
+    on_at: datetime
+
+    @property
+    def delay_secs(self) -> float:
+        """How long the plug stayed off before coming back (seconds)."""
+        return (self.on_at - self.off_at).total_seconds()
+
+
+@dataclass(frozen=True)
+class TurnOffQuarter:
+    """One quarter's turn-off activity beside the total it produced."""
+
+    source: str
+    quarter_start: datetime
+    decision_count: int
+    plug_off_count: int
+    shed_wh: float
+    min_remaining_secs: int
+    reversal_count: int
+    actual_wh: float | None
+    target_wh: float | None
+
+    @property
+    def miss_wh(self) -> float | None:
+        """``actual - target`` for the turn-off quarter, or None if unknown."""
+        if self.actual_wh is None or self.target_wh is None:
+            return None
+        return self.actual_wh - self.target_wh
+
+
+@dataclass(frozen=True)
+class TurnOffSummary:
+    """What the corpus says about the unguarded turn-off path.
+
+    The coverage pair is scoped to the decisions that could not cover their
+    gap: ``uncovered_count`` counts those, and ``median_residual_wh`` is
+    their median remainder (0.0 when every decision covered its gap), so a
+    zero median reads as "the path kept up", not "the gap was tiny". The
+    overshoot pair is scoped to the sheds that logged a saving — the
+    plug/Tesla-amp legs, which the path books against the gap it still had.
+    """
+
+    decision_count: int
+    quarter_count: int
+    plug_off_count: int
+    tesla_amp_count: int
+    tesla_stop_count: int
+    shed_total_wh: float
+    median_shed_wh: float
+    median_remaining_secs: float
+    short_horizon_count: int
+    short_horizon_secs: int
+    uncovered_count: int
+    median_residual_wh: float
+    overshoot_count: int
+    max_overshoot_wh: float
+    reversals: tuple[Reversal, ...]
+    quarters: tuple[TurnOffQuarter, ...]
+
+    @property
+    def action_count(self) -> int:
+        """Sheds of every kind the path booked."""
+        return self.plug_off_count + self.tesla_amp_count + self.tesla_stop_count
+
+    @property
+    def reversal_count(self) -> int:
+        """Plug sheds a later same-quarter turn-on undid."""
+        return len(self.reversals)
+
+    @property
+    def median_reversal_secs(self) -> float | None:
+        """Median seconds between a shed and the turn-on that undid it."""
+        if not self.reversals:
+            return None
+        return percentile([r.delay_secs for r in self.reversals], 0.5)
+
+
+def _turn_off_action(line: str) -> TurnOffAction | None:
+    """Parse one shed, or None when the line is not a turn-off action."""
+    plug = _TURN_OFF_PLUG_RE.search(line)
+    if plug is not None:
+        return TurnOffAction(
+            device_name=plug.group(1),
+            kind="plug",
+            savings_wh=float(plug.group(2)),
+            remaining_gap_wh=float(plug.group(3)),
+            priority=int(plug.group(4)),
+        )
+    amps = _TURN_OFF_TESLA_AMPS_RE.search(line)
+    if amps is not None:
+        # ``remaining before → after``; the before value is the budget the
+        # shed drew on (the after value is before - savings, logged for
+        # readers only).
+        return TurnOffAction(
+            device_name="tesla",
+            kind="tesla_amps",
+            savings_wh=float(amps.group(3)),
+            remaining_gap_wh=float(amps.group(4)),
+            current_amps=int(amps.group(1)),
+            target_amps=int(amps.group(2)),
+        )
+    stop = _TURN_OFF_TESLA_STOP_RE.search(line)
+    if stop is not None:
+        remain = _TURN_OFF_TESLA_STOP_REMAIN_RE.search(line)
+        return TurnOffAction(
+            device_name="tesla",
+            kind="tesla_stop",
+            savings_wh=None,
+            remaining_gap_wh=None if remain is None else float(remain.group(1)),
+            reason=stop.group(1),
+        )
+    return None
+
+
+def parse_turn_offs(text: str, source: str = "<log>") -> list[TurnOffDecision]:
+    """Extract every entry into GapMinder's turn-off path.
+
+    Production logs one ``[_decide_turn_off] gap=... seconds_remaining=...``
+    line per decision, then one line per shed it books: an INFO
+    ``action=turn_off device=<plug> savings=... gap=... priority=...``, a
+    DEBUG Tesla ``amps A → B`` reduction, or an INFO Tesla stop. All of a
+    cycle's lines share the line-prefix second, which is how the sheds are
+    attached to their decision.
+
+    Args:
+        text: Full log contents.
+        source: Identifier recorded on each decision.
+
+    Returns:
+        Decisions in log order. A shed whose decision line is missing
+        (logs written before it shipped) is skipped rather than guessed
+        into a quarter; a decision with no completed total still reports
+        its own horizon and gap.
+    """
+    entries: list[tuple[datetime, float, int]] = []
+    seen: set[datetime] = set()
+    sheds: dict[datetime, list[TurnOffAction]] = {}
+    for line in text.splitlines():
+        stamp = _line_timestamp(line)
+        if stamp is None:
+            continue
+        entry = _TURN_OFF_ENTRY_RE.search(line)
+        if entry is not None:
+            if stamp in seen:  # two cycles in one second: first sighting wins
+                continue
+            seen.add(stamp)
+            entries.append((stamp, float(entry.group(1)), int(entry.group(2))))
+            continue
+        action = _turn_off_action(line)
+        if action is not None:
+            sheds.setdefault(stamp, []).append(action)
+    return [
+        TurnOffDecision(
+            source=source,
+            at=at,
+            gap_wh=gap,
+            seconds_remaining=remaining,
+            actions=tuple(sheds.get(at, ())),
+        )
+        for at, gap, remaining in entries
+    ]
+
+
+def parse_turn_ons(text: str, source: str = "<log>") -> list[TurnOnRecord]:
+    """Extract plug turn-ons, the signal that a shed was undone.
+
+    Only decided turn-ons (``action=turn_on``) are collected: a plug that
+    merely reports ON after a dashboard reconciliation is not production
+    reversing its own shed.
+
+    Args:
+        text: Full log contents.
+        source: Identifier (unused beyond symmetry with the other parsers).
+
+    Returns:
+        Turn-ons in log order; lines without a parseable timestamp are
+        skipped rather than guessed.
+    """
+    _ = source
+    records: list[TurnOnRecord] = []
+    for line in text.splitlines():
+        match = _TURN_ON_PLUG_RE.search(line)
+        if match is None:
+            continue
+        stamp = _line_timestamp(line)
+        if stamp is None:
+            continue
+        records.append(
+            TurnOnRecord(
+                at=stamp,
+                device_name=match.group(1),
+                capacity_wh=float(match.group(2)),
+            )
+        )
+    return records
+
+
+def find_reversals(
+    decisions: Sequence[TurnOffDecision],
+    turn_ons: Sequence[TurnOnRecord],
+) -> list[Reversal]:
+    """Pair each plug shed with the turn-on that undid it.
+
+    A reversal is a *decided* turn-on of the same plug within
+    :data:`TURN_OFF_REVERSAL_WINDOW_SECS` of the shed — production
+    changing its mind about a shed it had just booked, which is what
+    shedding on a noisy forecast costs when the Wh nets out anyway. The
+    window is measured from the shed, not from the quarter, because the
+    clearest case crosses the boundary: a shed with seconds left is undone
+    by the next cycle, which lands in the following quarter.
+
+    Args:
+        decisions: Parsed turn-off decisions.
+        turn_ons: Parsed turn-ons.
+
+    Returns:
+        Reversals in decision-then-time order.
+    """
+    ordered = sorted(turn_ons, key=lambda record: record.at)
+    reversals: list[Reversal] = []
+    for decision in decisions:
+        quarter = decision.quarter_start
+        for action in decision.actions:
+            if action.kind != "plug":
+                continue
+            undo = next(
+                (
+                    record
+                    for record in ordered
+                    if record.device_name == action.device_name
+                    and decision.at < record.at
+                    and record.at - decision.at
+                    <= timedelta(seconds=TURN_OFF_REVERSAL_WINDOW_SECS)
+                ),
+                None,
+            )
+            if undo is not None:
+                reversals.append(
+                    Reversal(
+                        source=decision.source,
+                        device_name=action.device_name,
+                        quarter_start=quarter,
+                        off_at=decision.at,
+                        on_at=undo.at,
+                    )
+                )
+    return reversals
+
+
+def summarize_turn_offs(
+    decisions: Sequence[TurnOffDecision],
+    turn_ons: Sequence[TurnOnRecord] = (),
+    quarters: Sequence[QuarterSummary] = (),
+) -> TurnOffSummary:
+    """Roll the turn-off path's decisions into the collection report.
+
+    Args:
+        decisions: Parsed decisions, in any order.
+        turn_ons: Parsed turn-ons, for the reversal join (optional).
+        quarters: Per-quarter roll-ups from :func:`summarize`, joined by
+            ``(source, quarter_start)`` for each turn-off quarter's
+            completed total (optional).
+
+    Returns:
+        The summary; all zeros for a log with no turn-off path lines.
+    """
+    reversals = find_reversals(decisions, turn_ons)
+    actions = [action for decision in decisions for action in decision.actions]
+    savings = [a.savings_wh for a in actions if a.savings_wh is not None]
+    overshoots = [o for o in (a.overshoot_wh for a in actions) if o is not None]
+    residuals = [d.residual_gap_wh for d in decisions]
+    uncovered = [r for r in residuals if r > 1e-9]
+
+    by_quarter: dict[_QuarterKey, list[TurnOffDecision]] = {}
+    for decision in decisions:
+        by_quarter.setdefault(
+            (decision.source, decision.quarter_start), []
+        ).append(decision)
+    completed = {(q.source, q.quarter_start): q for q in quarters}
+    reversal_counts: dict[_QuarterKey, int] = {}
+    for reversal in reversals:
+        key = (reversal.source, reversal.quarter_start)
+        reversal_counts[key] = reversal_counts.get(key, 0) + 1
+
+    rows: list[TurnOffQuarter] = []
+    for key in sorted(by_quarter, key=lambda quarter_key: quarter_key[1]):
+        items = by_quarter[key]
+        row_actions = [a for d in items for a in d.actions]
+        known = completed.get(key)
+        rows.append(
+            TurnOffQuarter(
+                source=key[0],
+                quarter_start=key[1],
+                decision_count=len(items),
+                plug_off_count=sum(1 for a in row_actions if a.kind == "plug"),
+                shed_wh=sum(a.savings_wh or 0.0 for a in row_actions),
+                min_remaining_secs=min(d.seconds_remaining for d in items),
+                reversal_count=reversal_counts.get(key, 0),
+                actual_wh=None if known is None else known.actual_wh,
+                target_wh=None if known is None else known.target_wh,
+            )
+        )
+
+    return TurnOffSummary(
+        decision_count=len(decisions),
+        quarter_count=len(by_quarter),
+        plug_off_count=sum(1 for a in actions if a.kind == "plug"),
+        tesla_amp_count=sum(1 for a in actions if a.kind == "tesla_amps"),
+        tesla_stop_count=sum(1 for a in actions if a.kind == "tesla_stop"),
+        shed_total_wh=sum(savings),
+        median_shed_wh=percentile(savings, 0.5) if savings else 0.0,
+        median_remaining_secs=(
+            percentile([float(d.seconds_remaining) for d in decisions], 0.5)
+            if decisions
+            else 0.0
+        ),
+        short_horizon_count=sum(
+            1 for d in decisions if d.seconds_remaining < TURN_OFF_SHORT_HORIZON_SECS
+        ),
+        short_horizon_secs=TURN_OFF_SHORT_HORIZON_SECS,
+        uncovered_count=len(uncovered),
+        median_residual_wh=percentile(uncovered, 0.5) if uncovered else 0.0,
+        overshoot_count=sum(1 for o in overshoots if o > 1e-9),
+        max_overshoot_wh=max([0.0, *overshoots]),
+        reversals=tuple(reversals),
+        quarters=tuple(rows),
+    )
+
+
+def format_turn_offs(summary: TurnOffSummary) -> str:
+    """Render the turn-off collection report as plain text tables."""
+    if summary.decision_count == 0:
+        return (
+            "no turn-off decisions: no [_decide_turn_off] gap= line was found "
+            "in the logs"
+        )
+    sheds = summary.plug_off_count + summary.tesla_amp_count
+    median_delay = (
+        f" (median {summary.median_reversal_secs:.0f} s later)"
+        if summary.median_reversal_secs is not None
+        else ""
+    )
+    lines = [
+        f"turn-off decisions: {summary.decision_count} across "
+        f"{summary.quarter_count} quarter(s)  (plug {summary.plug_off_count}, "
+        f"Tesla amps {summary.tesla_amp_count}, Tesla stops "
+        f"{summary.tesla_stop_count})",
+        f"shed: total {summary.shed_total_wh:.2f} Wh, median "
+        f"{summary.median_shed_wh:.2f} Wh per shed ({sheds} with a logged saving)",
+        f"horizon: median R {summary.median_remaining_secs:.0f} s, "
+        f"{summary.short_horizon_count}/{summary.decision_count} decisions under "
+        f"{summary.short_horizon_secs} s",
+        f"coverage: {summary.uncovered_count}/{summary.decision_count} decisions "
+        f"left the gap uncovered (median residual "
+        f"{summary.median_residual_wh:.2f} Wh among those)",
+        f"overshoot: {summary.overshoot_count}/{sheds} sheds exceeded the "
+        f"remaining gap (max {summary.max_overshoot_wh:.2f} Wh)",
+        f"reversals: {summary.reversal_count}/{summary.plug_off_count} plug sheds "
+        f"undone by a later turn-on within {TURN_OFF_REVERSAL_WINDOW_SECS} s"
+        f"{median_delay}",
+        "",
+        f"{'quarter':<22} {'decisions':>9} {'plug-offs':>9} {'shed Wh':>8} "
+        f"{'min R':>6} {'reversals':>9} {'actual':>8} {'target':>7} {'miss':>8}",
+    ]
+    for row in summary.quarters:
+        actual = f"{row.actual_wh:.2f}" if row.actual_wh is not None else "n/a"
+        target = f"{row.target_wh:.1f}" if row.target_wh is not None else "n/a"
+        miss = f"{row.miss_wh:+.2f}" if row.miss_wh is not None else "n/a"
+        lines.append(
+            f"{row.quarter_start.strftime('%Y-%m-%d %H:%M'):<22} "
+            f"{row.decision_count:>9} {row.plug_off_count:>9} {row.shed_wh:>8.2f} "
+            f"{row.min_remaining_secs:>6} {row.reversal_count:>9} {actual:>8} "
+            f"{target:>7} {miss:>8}"
+        )
+    return "\n".join(lines)
+
+
 def _iter_log_texts(paths: Sequence[Path]) -> Iterator[tuple[Path, str]]:
     """Yield ``(path, text)`` for each readable log, skipping the rest.
 
@@ -1339,21 +2340,94 @@ def _iter_log_texts(paths: Sequence[Path]) -> Iterator[tuple[Path, str]]:
         yield path, text
 
 
+_ESTIMATOR_FLAG = "--estimator"
+_TREND_FLOOR_FLAG = "--trend-floor"
+_TURN_OFFS_FLAG = "--turn-offs"
+_USAGE = (
+    "usage: forecast_log_scoring.py [LOG ...] "
+    "[--estimator[=NAME,...]] [--trend-floor=WH] [--turn-offs]"
+)
+
+
+def _parse_cli(
+    args: Sequence[str],
+) -> tuple[list[Path], tuple[str, ...] | None, float, bool]:
+    """Split argv into log paths, requested variants, and the flags.
+
+    Args:
+        args: Raw argv entries — log paths and ``--flag[=value]`` pairs.
+            With no paths, every ``*.log`` under ``bugs/`` is used.
+
+    Returns:
+        ``(paths, names, trend_floor_wh, turn_offs)``. ``names`` is None
+        when ``--estimator`` was not given (the shipped report only), else
+        the variants to compare. ``turn_offs`` asks for the turn-off path
+        collection report.
+
+    Raises:
+        ValueError: On an unknown flag, an unknown variant name, or a
+            non-numeric trend floor.
+    """
+    paths: list[Path] = []
+    names: tuple[str, ...] | None = None
+    trend_floor = TREND_GATE_NOISE_FLOOR_WH
+    turn_offs = False
+    for arg in args:
+        if arg == _ESTIMATOR_FLAG:
+            names = ESTIMATOR_NAMES
+        elif arg.startswith(_ESTIMATOR_FLAG + "="):
+            requested = tuple(
+                name.strip()
+                for name in arg.split("=", 1)[1].split(",")
+                if name.strip()
+            )
+            unknown = [name for name in requested if name not in ESTIMATOR_NAMES]
+            if unknown:
+                raise ValueError(
+                    f"unknown estimator variant(s): {', '.join(unknown)}"
+                )
+            names = requested
+        elif arg.startswith(_TREND_FLOOR_FLAG + "="):
+            trend_floor = float(arg.split("=", 1)[1])
+        elif arg == _TURN_OFFS_FLAG:
+            turn_offs = True
+        elif arg.startswith("-"):
+            raise ValueError(f"unknown flag: {arg}")
+        else:
+            paths.append(Path(arg))
+    if not paths:
+        paths = sorted(Path("bugs").glob("*.log"))
+    return paths, names, trend_floor, turn_offs
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Print the forecast-error report for the given log paths.
 
     Args:
-        argv: Log file paths. Defaults to every ``*.log`` under ``bugs/``.
+        argv: Log paths, plus optional ``--estimator[=NAME,...]`` (score
+            the named forecast variants and print the comparison),
+            ``--trend-floor=WH`` (trust floor for the trend-gated
+            variant), and ``--turn-offs`` (add the turn-off path
+            collection report). Defaults to every ``*.log`` under
+            ``bugs/``.
 
     Returns:
-        Process exit status: 0 on success, 1 if a log cannot be read.
+        Process exit status: 0 on success, 1 if a log cannot be read or an
+        argument is rejected.
     """
     args = list(sys.argv[1:] if argv is None else argv)
-    paths = [Path(a) for a in args] if args else sorted((Path("bugs")).glob("*.log"))
+    try:
+        paths, names, trend_floor, turn_offs = _parse_cli(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
+        return 1
     anchors: list[ForecastAnchor] = []
     on_watts: list[float | None] = []
     cycles: list[CycleRecord] = []
     guards: list[GuardEvent] = []
+    decisions: list[TurnOffDecision] = []
+    turn_ons: list[TurnOnRecord] = []
     for path, text in _iter_log_texts(paths):
         path_anchors = parse_log(text, source=path.name)
         on_watts.extend(
@@ -1364,9 +2438,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         anchors.extend(path_anchors)
         cycles.extend(parse_cycles(text, source=path.name))
         guards.extend(parse_guard_events(text, source=path.name))
+        if turn_offs:
+            decisions.extend(parse_turn_offs(text, source=path.name))
+            turn_ons.extend(parse_turn_ons(text, source=path.name))
     report = summarize(anchors, cycles=cycles, guards=guards, on_watts=on_watts)
     print(f"scanned {len(paths)} log(s)\n")
     print(format_report(report))
+    if names is not None:
+        print()
+        print(
+            format_estimators(
+                score_estimators(
+                    anchors, names=names, trend_floor_wh=trend_floor
+                ),
+                trend_floor_wh=trend_floor,
+            )
+        )
+    if turn_offs:
+        print()
+        print(
+            format_turn_offs(
+                summarize_turn_offs(decisions, turn_ons, report.quarters)
+            )
+        )
     return 0 if report.anchor_count else 1
 
 
