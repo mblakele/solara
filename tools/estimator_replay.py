@@ -119,6 +119,38 @@ refresh, not this change: at both K=0 and K=1 the ramp rule fires 0 times
 (``live == churn`` exactly) and the bundle is net *better* car-active
 (16.96 vs 17.91 inert) while still costing plug-only 0.21 Wh.
 
+Scorecard shape (2026-10-19 snapshot; method stated so it can be
+re-derived): the mean |miss| every verdict below quotes is measured over
+*all* replayable quarters, and roughly 45% of those are night quarters the
+loop has nothing to do in. Classify a quarter by whether any of its cycles
+ever saw a surplus (``min(anchor.predicted_wh) <= 0``): 515 of 1,152 are
+negative, 514 of those fall in the 18:00-07:59 local window (``qh_start`` is
+UTC, the site is UTC-7), and their miss is the house's own baseline load —
+the -9 Wh target is unreachable there without a battery, so no decision
+change can move them. Restricting the population to the leverable 637 raises
+every candidate's mean |miss| and reverses no ordering (status-quo plug-only
+23.36 -> 31.63; the estimator variants, margins and rate windows all keep
+their places). Car-active has no night quarters at all — 117 of 117 are
+leverable — so that regime's verdicts were never diluted. Read the levels as
+diluted by 6-14 Wh, the comparisons as unaffected.
+
+Two-axis note (same snapshot, leverable quarters only): |miss| is symmetric,
+but its two sides are not two names for one error. Status-quo plug-only
+splits 3.53 Wh/quarter import-side against -28.10 export-side — ~89% of the
+error is surplus the loop never absorbed, and that axis is invariant across
+every candidate measured (-26.94 to -28.21; the only one that moves it,
+``--rate-window-quanta 2``, buys -1.16 Wh there for +0.42 Wh of imports and
+a car-active regression). Every candidate that improves the import axis does
+it by absorbing less — declining a turn-on or an amp increase leaves load
+off, which is fewer imports and more leftover export (car-active guard arm:
+8.74 -> 4.13 Wh/quarter imports against -9.17 -> -12.83 exports). The
+measured knobs therefore trade one axis for the other, and a symmetric mean
+|miss| scores each trade as a wash — which is why the margins and the
+guard-prune never cleared their bars. The exchange rate between the two axes
+is a price ratio (imported vs exported Wh); the decision path has no price,
+time-of-use or export-credit term anywhere, and none is planned from this
+measurement.
+
 Corpus verdict (13 logs, Oct 4-17 2026, 1,146 replayable quarters of 1,294
 scored, of which 117 car-active): the shipped trailing window beats every
 smoother variant closed-loop in *both* regimes, inverting the open-loop

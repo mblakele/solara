@@ -125,6 +125,17 @@ sample. A single `bugs/<file>.log` is a case study, not a population.
   `now >= data_point_at`), so production exits before the suppression is
   consulted." State which kind of claim you are making, and do not delete on the
   measurement kind alone.
+- **`mean |miss|` is diluted by night quarters, and it is symmetric.** On the
+  2026-10-19 corpus ~45% of replayable quarters (515 of 1,152) never had a
+  cycle with a surplus (`min(anchor.predicted_wh) > 0`) — 514 of them in the
+  18:00–07:59 local window, since `qh_start` is UTC and the site is UTC−7 — so
+  their miss is the house's baseline load against an unreachable target.
+  Restricting to the leverable quarters moves the *level* (plug-only 23.36 →
+  31.63 Wh) and no *ranking*; car-active was never diluted (117 of 117
+  leverable). And the miss has two sides that trade: plug-only error is ~89%
+  export-side and that side is invariant across every candidate measured,
+  while import-side improvements come from absorbing less. State which
+  population and which axis a figure is on before ranking candidates with it.
 - **Corpus brittleness.** The corpus grows and logs get re-fetched; counts,
   per-log rows, and even the newest quarter's inclusion drift between runs. Any
   figure is a *snapshot of a moment*. Do not treat a figure as a baseline, and

@@ -355,6 +355,30 @@ project-root
 │                          # at both K (0 ramp fires) and the bundle is net
 │                          # better car-active (16.96 vs 17.91 inert) while
 │                          # costing plug-only +0.21.
+│                          # Scorecard shape (2026-10-19): ~45% of the
+│                          # replayable quarters are night quarters the loop
+│                          # has nothing to do in — no cycle ever saw a
+│                          # surplus (`min(anchor.predicted_wh) > 0`), so the
+│                          # -9 Wh target is unreachable without a battery and
+│                          # the miss is the house's baseline load. 514 of the
+│                          # 515 fall in the 18:00-07:59 local window
+│                          # (`qh_start` is UTC). Restricting to the leverable
+│                          # 637 raises every candidate's mean |miss| by 6-14
+│                          # Wh (plug-only 23.36 -> 31.63) and reverses no
+│                          # ordering; car-active was never diluted (117/117
+│                          # leverable — the car only ran on surplus). Two-axis
+│                          # split over leverable quarters: plug-only error is
+│                          # ~89% export-side (-28.10 Wh/q against +3.53) and
+│                          # that axis is invariant across every candidate
+│                          # (-26.94..-28.21); improving imports means
+│                          # absorbing less (car-active guard arm 8.74 -> 4.13
+│                          # Wh/q imports at -9.17 -> -12.83 exports), so each
+│                          # knob trades one axis for the other and a symmetric
+│                          # |miss| scores each trade a wash — why the margins
+│                          # and the guard-prune never cleared their bars. The
+│                          # exchange rate is a price ratio (imported vs
+│                          # exported Wh); no price/TOU/credit term exists in
+│                          # the decision path, and none is planned from this.
 │                          # Corpus verdict (13 logs, 1146 replayable of 1294 scored;
 │                          # 117 car-active carrying 1269 Tesla commands): status-quo
 │                          # beats every variant in BOTH regimes — plug-only 23.41

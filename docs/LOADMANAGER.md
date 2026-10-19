@@ -119,6 +119,35 @@ of excess solar unabsorbed rather than driving net usage to exactly zero.
 Set it closer to 0 to absorb more solar, or more negative (e.g., -100)
 to be conservative and leave more surplus on the grid.
 
+### What the target is, and what it is not
+
+`target_wh` is a **control setpoint, not the objective**. It is a flat Wh
+number: nothing in the decision path knows a price, a time-of-use period, or
+an export credit (`gap = target_wh - predicted_wh`). It stands in for the
+real objective — imports cost money, self-consumed generation does not —
+at the resolution the engine can act on. Two consequences matter when
+reading any accuracy figure:
+
+- **Quarters with no lever.** When no cycle of a quarter ever sees a surplus
+  (the prediction stays positive — empirically the 18:00–07:59 local window),
+  the target is unreachable without a battery and the loop can only shed.
+  The miss there is the house's baseline load, not a control failure. On the
+  2026-10-19 corpus 515 of 1,152 replayable quarters are such quarters, so
+  any `mean |miss|` quoted over all quarters is diluted by them. Restricting
+  to quarters with a lever changes the level (plug-only 23.4 → 31.6 Wh) but
+  no ranking among the measured candidates, and car-active quarters are
+  never diluted (all are surplus quarters — the car only ever ran on surplus).
+- **The miss has two sides, and the loop's effort lands on the smaller one.**
+  Over leverable quarters the plug-only miss is ~89% export-side (leftover
+  surplus the loop never absorbed, about −28 Wh/quarter) against ~3.5
+  Wh/quarter import-side, and the export side is invariant across every
+  candidate measured. Candidates that cut imports cut them by absorbing
+  less, which moves error to the export side. Weighing that trade correctly
+  needs a price ratio between imported and exported Wh; the engine has none,
+  so it treats the two sides as equal. That is a deliberate simplification,
+  not an oversight, and it is the first thing to revisit if site rates are
+  ever fed in.
+
 ## Hysteresis
 
 Production `hysteresis_wh = int(abs(target_wh) / 3)` (`load_manager.py`,
