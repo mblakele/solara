@@ -202,9 +202,79 @@ deliberate: the hastener fired 0 times across the corpus (172 deferrals, 14
 eligible) and only the `2026-09-26` incident benefits, so the default keeps
 the reluctance-to-stop stance and leaves the incident fix one env var away.
 The defer rule itself is load-bearing and stays (car-active closed-loop mean
-|miss| 17.99 on vs 25.90 off), while the buffer value is not (30–180 s spans
-17.90–18.17). Plug
+|miss| 17.91 on vs 25.90 off), while the buffer value is not (30–180 s spans
+17.96–17.89). Plug
 decisions are intentionally out of scope (Phase I: Tesla stop only).
+
+### The defer deadline is sized in observation windows
+
+`seconds_remaining > safe_defer_secs` asks only whether the buffer outlasts
+the quarter; it never asks whether the *next observation* can arrive before
+the deadline. `bugs/2026-10-18-tesla-stop-overshoot.log` shows the gap: at
+`R=89 s` against a 24 Wh gap the rule deferred (`safe_defer = 72 s`) and the
+next decision landed at `R=60 s`, where the remaining 20 Wh of shed could no
+longer close the 31.8 Wh deficit.
+
+`TeslaDecider.defer_lookahead_quanta` (keyword-only, **default `1` = shipped
+2026-10-19**) withholds K whole observation windows from the deadline, so a
+defer always leaves room for the next observation to be acted on. The window
+comes from `DecideContext.observability_secs` — the quantisation quantum,
+which production fills with the resolved prediction/settle window
+(`StateTracker.effective_settle_secs`) and the replay with each quarter's
+median data-point spacing — and never from a literal 30 s: `None` (window
+unknown) leaves the lookahead inert rather than guessing. It is configured by
+`LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA` (read leniently: a malformed value falls
+back to the default instead of refusing to start the load manager), and `0`
+restores the pre-2026-10-19 static rule. This is the same rule as the ramp
+hastener's eligibility band with the trend gate opened
+(`R ≤ gap/P + c·(1 + r/P)` at `r = 0`, `c = K·Q`), which is why it partially
+subsumes that rule.
+
+**Why it ships as a soundness fix, not as a mean win.** A deferral whose
+deadline sits inside the next observation window cannot be observed through —
+the promise "I can stop later if needed" is one the loop cannot keep. That is
+exactly the incident: at `R=119 s` the deadline was 107 s, one 30 s window
+away, so the static rule deferred, the next decision arrived at `R=60 s`, and
+the quarter finished +10.81 Wh over the −9 Wh target; taking the stop at
+`R=119 s` sheds 39.7 Wh instead of 20.0 Wh and lands the quarter at −8.86 Wh.
+Stopping earlier strictly *lowers* consumption — that was verified, not
+assumed: in the replay's regressing quarter the landing falls from −5.81 to
+−27.13 Wh, and the |miss| rise there is purely the overshoot past the target.
+
+The overshoot against the engine's *claimed* gap is bounded at one quantum
+(`R ≤ gap/P + Q` ⟺ `P·R ≤ gap + P·Q`); against the *realized* quarter it is
+whatever the forecast got wrong, which no stop rule can bound. Closed-loop on
+the corpus that shows up as a wash: car-active mean |miss| 17.99 → 17.91,
+3 quarters better / 4 worse (median delta 0.00), signed miss +0.30 → −0.42;
+plug-only is bit-identical (23.36 — the knob is Tesla-only). All 7
+improvements at K=2 came from under-shed quarters and all 5 regressions from
+near-target or already-over-shed ones: the rule converts under-shedding into
+over-shedding, and |miss| punishes both. K=2 (17.68) is better still but the
+sweep is non-monotone (18.21 at K=3) and 2 is not the stated rule, so `1`
+ships. `--ramp-aware` changes no number at any K on this corpus.
+
+**The incident is characterized, not replayed.** An earlier reading —
+"the log regresses under its own fix" (5.91 → 10.89) — was a replay-model
+artifact. The replay derives its prediction from its own counterfactual meter
+(`cf.raw_wh`), and for that quarter the counterfactual diverges from the
+log's raw energy all quarter (up to 8 Wh), carries no anchor at the decisive
+R=60 s cycle (19 anchors, median spacing 45 s, while production cycled that
+deferral burst every 8–13 s), and lands 7.62 Wh from the logged actual. The
+replay is the arbiter for corpus-wide comparisons; for a single incident the
+log's own trace is the evidence, and it supports the rule.
+
+**Baseline note.** Corpus figures quoted elsewhere in this document that name
+a car-active baseline (the estimator variants, the margin sweeps, the rate
+windows, the guard arm) are snapshots measured with the pre-ship static defer
+rule. Under the shipped one-window rule the car-active baseline is 17.91
+instead of 17.99 and plug-only is bit-identical (23.36). Re-measured
+2026-10-19 on one snapshot, no ordering reverses: the estimator variants still
+lose in both regimes, the shipped zero-margin policy still wins or ties, the
+defer rule is still load-bearing (17.91 vs 25.90 with `defer off`), and no
+rate window still helps both regimes. The guard arm's car-active leg is the
+one reading that moved — live is now net *better* than inert (16.96 vs 17.91)
+with `live == churn` exactly and 0 ramp fires — and that is the corpus
+refresh, not this change.
 
 **Two sign conventions, deliberately:**
 

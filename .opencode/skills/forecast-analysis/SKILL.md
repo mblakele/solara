@@ -76,6 +76,7 @@ uv run python tools/estimator_replay.py corpus/*.log --regime tesla
 uv run python tools/estimator_replay.py corpus/*.log --turn-off-margin 40
 uv run python tools/estimator_replay.py corpus/*.log --guards live
 uv run python tools/estimator_replay.py corpus/*.log --rate-window-quanta 2,3,4,all
+uv run python tools/estimator_replay.py corpus/*.log --defer-lookahead-quanta 0
 
 # 4. counterfactual
 uv run python tools/settle_window_counterfactual.py corpus/*.log
@@ -130,7 +131,10 @@ sample. A single `bugs/<file>.log` is a case study, not a population.
   re-run before citing.
 - **The one-log trap.** A single incident log can invert a corpus ranking (a
   change that wins on the corpus can lose on one dramatic day, and vice versa).
-  Report the one log *separately*; never decide *on* it.
+  Report the one log *separately*; never decide *on* it. And when the incident's
+  own log *regresses* under the fix designed for it, say so plainly: the incident
+  is then **characterized, not replayed** — the replay's meter did not reproduce
+  the production trace, so no quarter in the model can confirm the story.
 - **Nameplate vs measured draw.** Plug power uses configured nameplate watts, so
   replay *absolute landings are the model's*; the *deltas* are the result.
 - **Replay fidelity.** The replay's meter is a counterfactual step-function and
@@ -149,7 +153,25 @@ sample. A single `bugs/<file>.log` is a case study, not a population.
   zero-order hold) and a sub-quantum window is degenerate. Frame any window or
   estimator-horizon sweep in quanta — the replay's `--rate-window-quanta` is the
   closed-loop form of that sweep (it re-averages the rate only; `raw_wh` and the
-  cadence stay fixed).
+  cadence stay fixed). The defer deadline is the quantum's second consumer: a
+  *time* rule that must leave room for the next observation should buy whole
+  windows, sized from the resolved window (`DecideContext.observability_secs`,
+  filled from `state.effective_settle_secs` in production and from each quarter's
+  median data-point spacing in the replay), never from a literal 30 s — and it
+  must fall back to shipped behaviour when the window is unknown rather than
+  guess. That rule **shipped at K=1 on 2026-10-19**
+  (`LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA`) as a soundness fix priced as a wash
+  (car-active 17.99 → 17.91, plug-only bit-identical); `--defer-lookahead-quanta 0`
+  reproduces the pre-ship baseline the older verdicts were measured against.
+- **Stopping earlier cannot raise consumption — but |miss| is not monotone in
+  consumption.** A change that only removes car draw lowers the landing, so a
+  "regression" in |miss| means the quarter *overshot* the target, not that more
+  energy was used. Check the signed miss and the landing before calling such a
+  change harmful (the 2026-10-18 verdict was misread this way once: consumption
+  fell −5.81 → −27.13 Wh while |miss| rose, and the log's own trace favours the
+  rule). Also check that the replay's counterfactual actually reproduces the
+  incident (`cf.raw_wh` vs the log's `raw_wh`, the decisive cycle's presence in
+  the anchor set) before quoting its verdict as evidence about that incident.
 - **Constant metadata.** `ParsedMetricsQH.qh_name` is the literal `"QH1"` on both
   sides of comparisons, so any QH-boundary clause keyed on it is dead in
   production. Verify a "QH expiry" is live before crediting it.

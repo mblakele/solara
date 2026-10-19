@@ -1,5 +1,7 @@
 """Tests for PendingEffect factories and TeslaDecider (from GapMinder)."""
 
+import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -232,3 +234,109 @@ class TestRampAwareStop:
         ctx = _min_amps_ctx(149)
         assert TeslaDecider(defer_stop=False).decide_reduce(ctx, 45.1) is not None
         assert TeslaDecider(defer_stop=True).decide_reduce(ctx, 45.1) is None
+
+
+class TestDeferQuantumLookahead:
+    """A defer must be covered by at least one observation window.
+
+    bugs/2026-10-18-tesla-stop-overshoot.log: at ``R=89 s`` against a 24.0 Wh
+    gap the static rule deferred (``safe_defer = 24 / 0.3333 = 72 s``) and the
+    next decision landed at ``R=60 s`` — past the point where the shed could
+    still close the gap. A defer whose deadline is closer than one
+    quantisation window is not a defer: the next observation cannot arrive in
+    time to act on it. The lookahead is counted in windows, never in literal
+    seconds, so it tracks the deployment's real quantum.
+    """
+
+    GAP_WH = 24.0
+    """Gap whose static safe-defer window is exactly 72 s."""
+
+    WINDOW = 30
+    """Observability window (one quantisation quantum)."""
+
+    def _ctx(self, seconds_remaining, window=WINDOW):
+        """A min-amps context carrying the observability window."""
+        return replace(_min_amps_ctx(seconds_remaining), observability_secs=window)
+
+    def test_static_rule_defers_the_incident_cycle(self):
+        """Control: with the lookahead off the incident cycle still defers."""
+        assert (
+            TeslaDecider(defer_lookahead_quanta=0).decide_reduce(
+                self._ctx(89), self.GAP_WH
+            )
+            is None
+        )
+
+    def test_shipped_rule_stops_the_incident_cycle(self):
+        """Default construction stops it: 89 < 72 + one 30 s window."""
+        action = TeslaDecider().decide_reduce(self._ctx(89), self.GAP_WH)
+        assert action is not None
+        assert action.action == "turn_off"
+
+    def test_one_quantum_lookahead_stops_the_incident_cycle(self):
+        """R=89, safe_defer=72 + one 30 s window → stop (89 < 102)."""
+        action = TeslaDecider(defer_lookahead_quanta=1).decide_reduce(
+            self._ctx(89), self.GAP_WH
+        )
+        assert action is not None
+        assert action.device_name == "tesla"
+        assert action.action == "turn_off"
+
+    def test_deadline_equal_to_one_window_still_stops(self):
+        """The test is strict (>) so R == safe_defer + window stops."""
+        action = TeslaDecider(defer_lookahead_quanta=1).decide_reduce(
+            self._ctx(102), self.GAP_WH
+        )
+        assert action is not None
+
+    def test_one_second_past_the_deadline_defers(self):
+        """R=103 leaves more than one window: still a real defer."""
+        assert (
+            TeslaDecider(defer_lookahead_quanta=1).decide_reduce(
+                self._ctx(103), self.GAP_WH
+            )
+            is None
+        )
+
+    def test_without_an_observability_window_the_lookahead_is_inert(self):
+        """Unknown quantum falls back to shipped behaviour, never guesses."""
+        assert (
+            TeslaDecider(defer_lookahead_quanta=1).decide_reduce(
+                self._ctx(89, window=None), self.GAP_WH
+            )
+            is None
+        )
+
+    def test_two_quanta_extend_the_deadline(self):
+        """quanta=2 buys 60 s: R=132 stops, R=133 defers."""
+        decider = TeslaDecider(defer_lookahead_quanta=2)
+        assert decider.decide_reduce(self._ctx(132), self.GAP_WH) is not None
+        assert decider.decide_reduce(self._ctx(133), self.GAP_WH) is None
+
+    def test_deferral_log_names_the_lookahead(self, caplog):
+        """A deferral reports the window it weighed, appended last."""
+        caplog.set_level(logging.INFO, logger="load_nbc")
+        assert (
+            TeslaDecider(defer_lookahead_quanta=1).decide_reduce(
+                self._ctx(103), self.GAP_WH
+            )
+            is None
+        )
+        assert "safe_defer=72s, gap=24.0 Wh" in caplog.text
+        assert "defer_lookahead=30s" in caplog.text
+
+    def test_static_log_reports_zero_lookahead(self, caplog):
+        """The knob-off line keeps the parser-visible fields adjacent."""
+        caplog.set_level(logging.INFO, logger="load_nbc")
+        decider = TeslaDecider(defer_lookahead_quanta=0)
+        assert decider.decide_reduce(self._ctx(89), self.GAP_WH) is None
+        assert "safe_defer=72s, gap=24.0 Wh" in caplog.text
+        assert "defer_lookahead=0s" in caplog.text
+
+    def test_gapminder_forwards_the_knob(self):
+        """The engine's opt-in knob reaches the decider it owns."""
+        assert GapMinder(defer_lookahead_quanta=2).tesla_decider.defer_lookahead_quanta == 2
+
+    def test_gapminder_default_is_shipped(self):
+        """Default construction ships the one-window rule."""
+        assert GapMinder().tesla_decider.defer_lookahead_quanta == 1

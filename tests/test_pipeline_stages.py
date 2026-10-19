@@ -1816,3 +1816,36 @@ class TestTeslaStateMissingReason:
         assert result.diagnostics is not None
         assert result.diagnostics.tesla_state is not None
         assert result.diagnostics.tesla_state_missing_reason is None
+
+
+def test_decide_actions_passes_the_quantisation_window(lm: LoadManager) -> None:
+    """The defer lookahead's granularity comes from the resolved window.
+
+    A rule that buys "one observation window" must be told what the window
+    is; production resolves it from quantisation and hands it to the engine
+    rather than letting the decider assume 30 s.
+    """
+    lm.state.apply_prediction_window(60)
+    lm.state.apply_prediction_window(60)
+    assert lm.state.effective_settle_secs == 60
+
+    seen = []
+    real_decide = lm.engine.decide
+
+    def spy(*, ctx, predicted_wh, target_wh):
+        seen.append(ctx)
+        return real_decide(ctx=ctx, predicted_wh=predicted_wh, target_wh=target_wh)
+
+    lm.engine.decide = spy  # type: ignore[method-assign]
+    lm._decide_actions(
+        lm.plugs,
+        None,
+        -100.0,
+        datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        300,
+        True,
+        None,
+    )
+
+    assert seen, "engine.decide was never called"
+    assert seen[0].observability_secs == 60

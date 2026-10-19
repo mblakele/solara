@@ -549,6 +549,8 @@ def test_ingest_log_builds_a_replayable_quarter() -> None:
     assert [a.samples_used for a in quarter.anchors] == [60, 120, 180, 240, 300]
     assert quarter.anchors[0].prior_rate == pytest.approx(-8.7 / 900)
     assert quarter.decide_lag == pytest.approx(8.0)
+    # The log's own observation window: the 60 s data-point spacing.
+    assert quarter.observability_secs == 60
     assert quarter.events == ((45.0, "water heater", False),)
     assert quarter.initial_on == dict.fromkeys(er.POWERS, True)
 
@@ -963,7 +965,7 @@ def test_policy_defaults_are_the_shipped_engine() -> None:
     assert engine.lumpy_first is False
     assert er.Policy().label == (
         "turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
-        "defer on, defer cap 120 s, ramp-aware off"
+        "defer on, defer cap 120 s, defer lookahead 1q, ramp-aware off"
     )
 
 
@@ -1055,6 +1057,123 @@ def test_replay_all_forwards_the_policy() -> None:
     )
     assert shipped[quarter.qh_start].actions == 1
     assert withheld[quarter.qh_start].actions == 0
+
+
+# ── the defer lookahead (stop deadline, in observation windows) ──────
+#
+# The static defer rule asks only whether the safe buffer outlasts the
+# remaining quarter; it never asks whether the *next observation* can arrive
+# before the deadline. bugs/2026-10-18-tesla-stop-overshoot.log: at R=89 s
+# against a 24 Wh gap the rule deferred (safe_defer=72 s) and the next
+# decision landed at R=60 s — too late to close the gap. The lookahead buys
+# whole observation windows, sized from the log's own data-point spacing, so
+# it follows the deployment's quantum instead of assuming 30 s.
+
+
+def _defer_quarter(window_secs: int = 30, last_remaining_secs: int = 89) -> er.Quarter:
+    """Two min-amps anchors one ``window_secs`` apart, 24 Wh short.
+
+    ``predicted_wh=15.0`` against the -9 Wh target is a 24 Wh deficit, whose
+    static safe-defer window is ``24 / (1200/3600) = 72 s``. The shipped rule
+    defers whenever more than 72 s remain, even when the next data point
+    lands past the point where the shed could still close the gap. Every plug
+    is off, so the car is the only actuator and the landing is exactly the
+    car's own deviation.
+    """
+    def anchor(samples_used: int) -> fls.ForecastAnchor:
+        return fls.ForecastAnchor(
+            source="defer-synth",
+            quarter_start=_SYNTH_Q,
+            data_point_at=_SYNTH_Q + timedelta(seconds=samples_used),
+            remaining_secs=900 - samples_used,
+            samples_used=samples_used,
+            prediction_values=30,
+            raw_wh=15.0,
+            prediction_w=0.0,
+            predicted_wh=15.0,
+            actual_wh=0.0,
+            wall_at=None,
+            prior_rate=0.0,
+        )
+
+    last_used = 900 - last_remaining_secs
+    return er.Quarter(
+        name="defer-synth",
+        qh_start=_SYNTH_Q,
+        actual_wh=0.0,
+        decide_lag=8.0,
+        anchors=(anchor(last_used - window_secs), anchor(last_used)),
+        events=(),
+        initial_on=dict.fromkeys(er.POWERS, False),
+        tesla_samples=(
+            er.TeslaSample(
+                t=float(last_used), amps=5.0, plugged_in=True, at_home=True
+            ),
+        ),
+        car_active=True,
+        observability_secs=window_secs,
+    )
+
+
+def test_defer_lookahead_stops_one_window_earlier() -> None:
+    """The shipped rule stops the 89 s cycle; ``0`` restores the static rule.
+
+    The stop lands one decision lag after the second data point (``811 + 8``),
+    so it removes the car's 1200 W for the 81 s left in the quarter.
+    """
+    quarter = _defer_quarter()
+    shipped = er.replay(quarter, er.rate_status_quo)
+    static = er.replay(
+        quarter, er.rate_status_quo, policy=er.Policy(defer_lookahead_quanta=0)
+    )
+    assert static.actions == ()
+    assert static.landing_wh == pytest.approx(0.0)
+    assert shipped.actions == (("tesla", "turn_off"),)
+    assert shipped.landing_wh == pytest.approx(-1200.0 * (900 - 811 - 8) / 3600.0)
+
+
+def test_defer_lookahead_without_a_window_is_inert() -> None:
+    """A quarter whose spacing is unknown falls back to the shipped rule."""
+    quarter = _defer_quarter()
+    blind = dataclasses.replace(quarter, observability_secs=None)
+    ahead = er.replay(
+        blind, er.rate_status_quo, policy=er.Policy(defer_lookahead_quanta=1)
+    )
+    assert ahead.actions == ()
+
+
+def test_defer_lookahead_scales_with_the_quarters_window() -> None:
+    """The lookahead counts the log's own windows, not a literal 30 s.
+
+    The same shape 60 s apart, with ``R = 160 s`` at the last data point:
+    one 60 s window leaves the deadline at ``72 + 60 = 132 s`` (still a
+    defer), two windows put it at 192 s and the stop lands now.
+    """
+    quarter = _defer_quarter(window_secs=60, last_remaining_secs=160)
+    one = er.replay(
+        quarter, er.rate_status_quo, policy=er.Policy(defer_lookahead_quanta=1)
+    )
+    two = er.replay(
+        quarter, er.rate_status_quo, policy=er.Policy(defer_lookahead_quanta=2)
+    )
+    assert one.actions == ()
+    assert two.actions == (("tesla", "turn_off"),)
+
+
+def test_policy_label_names_the_lookahead() -> None:
+    """The header always says which defer-lookahead the run used."""
+    assert er.Policy().label.endswith(
+        "defer lookahead 1q, ramp-aware off"
+    )
+    assert "defer lookahead 0q, ramp-aware off" in er.Policy(
+        defer_lookahead_quanta=0
+    ).label
+
+
+def test_policy_defaults_to_the_shipped_lookahead() -> None:
+    """The shipped policy is one observation window (2026-10-19)."""
+    assert er.Policy().defer_lookahead_quanta == 1
+    assert er.Policy().engine().tesla_decider.defer_lookahead_quanta == 1
 
 
 # ── the rate-window axis (trailing horizon, in quanta) ───────────────
@@ -1334,12 +1453,20 @@ def test_main_reports_the_policy_it_ran(tmp_path: Path, capsys) -> None:
     assert er.main([str(log), "--turn-off-margin", "40"]) == 0
     assert (
         "policy: turn-on margin 0 Wh, turn-off margin 40 Wh, lumpy-first off, "
-        "defer on, defer cap 120 s, ramp-aware off" in capsys.readouterr().out
+        "defer on, defer cap 120 s, defer lookahead 1q, ramp-aware off"
+        in capsys.readouterr().out
     )
     assert er.main([str(log), "--lumpy-first"]) == 0
     assert (
         "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first on, "
-        "defer on, defer cap 120 s, ramp-aware off" in capsys.readouterr().out
+        "defer on, defer cap 120 s, defer lookahead 1q, ramp-aware off"
+        in capsys.readouterr().out
+    )
+    assert er.main([str(log), "--defer-lookahead-quanta", "3"]) == 0
+    assert (
+        "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
+        "defer on, defer cap 120 s, defer lookahead 3q, ramp-aware off"
+        in capsys.readouterr().out
     )
 
 

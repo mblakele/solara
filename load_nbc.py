@@ -1468,6 +1468,13 @@ class DecideContext:
             own cycle-to-cycle swing.
         cycle_secs: Decision cadence in seconds. The ramp rule stops now
             when the exact-hit stop time falls within one cycle.
+        observability_secs: Quantisation window in seconds — how long the
+            meter holds one reported power before a materially new
+            observation exists. Production passes the resolved
+            prediction/settle window. The defer rule buys one of these so a
+            defer is never shorter than the time the next observation needs
+            to arrive (``TeslaDecider.defer_lookahead_quanta``); None leaves
+            the lookahead inert rather than guessing a granularity.
         banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``,
             negative = net export), or None when unknown. Lets a plug
             turn-on proceed despite jitter when the bank covers its full
@@ -1486,6 +1493,7 @@ class DecideContext:
     gap_jitter_wh_per_s: float | None = None
     cycle_secs: int = 30
     banked_wh: float | None = None
+    observability_secs: int | None = None
 
 
 def make_plug_effect(
@@ -1614,6 +1622,7 @@ class TeslaDecider:
         defer_stop: bool = True,
         max_defer_secs: int | None = None,
         ramp_aware: bool = False,
+        defer_lookahead_quanta: int = 1,
     ) -> None:
         """Initialize the decider.
 
@@ -1624,10 +1633,25 @@ class TeslaDecider:
             charge_amps_max: Maximum Tesla charge amps to command. Defaults
                 to ``TESLA_CHARGE_AMPS_MAX_DEFAULT``, clamped to
                 HARD_MAX_AMPS.
+            defer_stop: Whether to defer stopping at minimum amps while a
+                safe buffer remains. Defaults to True (shipped).
+            max_defer_secs: Cap on the safe defer window. Defaults to
+                ``MAX_DEFER_SECS``.
+            ramp_aware: Whether a trusted rising deficit may hasten the stop.
+                Defaults to False (shipped).
+            defer_lookahead_quanta: Quantisation windows added to the safe
+                defer window, so a defer always leaves at least that much
+                room for the next observation to arrive. Counted in windows
+                rather than seconds so it tracks the deployment's quantum;
+                ``1`` (shipped) stops instead of deferring whenever the
+                deadline sits inside the next window, and ``0`` restores the
+                pre-2026-10-19 static rule. Needs
+                ``DecideContext.observability_secs`` to have any effect.
         """
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.defer_stop = defer_stop
+        self.defer_lookahead_quanta = defer_lookahead_quanta
         self.max_defer_secs = (
             max_defer_secs if max_defer_secs is not None else self.MAX_DEFER_SECS
         )
@@ -1694,6 +1718,28 @@ class TeslaDecider:
         return int(
             min(self.max_defer_secs, remaining_reduction / (self.car_power_watts_5a / 3600))
         )
+
+    def defer_lookahead_secs(self, ctx: DecideContext) -> int:
+        """Seconds of quantisation lookahead added to the safe defer window.
+
+        A defer is only real if the next observation can arrive before the
+        deadline. With a 24 Wh gap the static window is 72 s, so an 89 s
+        remainder "defers" — yet the next cycle lands at 60 s and the shed
+        can no longer close the gap
+        (``bugs/2026-10-18-tesla-stop-overshoot.log``). The lookahead counts
+        windows rather than seconds so it follows the deployment's actual
+        quantum instead of assuming 30 s.
+
+        Args:
+            ctx: Decision context carrying the observability window.
+
+        Returns:
+            Lookahead in seconds, or 0 when the knob is off or the window is
+            unknown (never guess a granularity).
+        """
+        if self.defer_lookahead_quanta <= 0 or ctx.observability_secs is None:
+            return 0
+        return self.defer_lookahead_quanta * ctx.observability_secs
 
     def _ramp_stop_now(self, ctx: DecideContext, reduce_wh: float) -> bool:
         """Return True when a rising deficit pulls the stop into this cycle.
@@ -1850,26 +1896,30 @@ class TeslaDecider:
             # remaining than the safe window (i.e., we have buffer to stop later).
             if self.defer_stop:
                 safe_defer_secs = self.safe_defer_secs(reduce_wh)
-                if ctx.seconds_remaining > safe_defer_secs:
+                lookahead_secs = self.defer_lookahead_secs(ctx)
+                if ctx.seconds_remaining > safe_defer_secs + lookahead_secs:
                     if self.ramp_aware and self._ramp_stop_now(ctx, reduce_wh):
                         logger.info(
                             "[_decide_tesla_reduce] ramp stop: t* within one "
                             "cycle (seconds_remaining=%d, safe_defer=%ds, "
-                            "gap=%.1f Wh, trend=%.3f Wh/s, ramp_aware=%s)",
+                            "gap=%.1f Wh, trend=%.3f Wh/s, ramp_aware=%s, "
+                            "defer_lookahead=%ds)",
                             ctx.seconds_remaining, safe_defer_secs,
                             reduce_wh,
                             ctx.gap_trend_wh_per_s,
                             self.ramp_aware,
+                            lookahead_secs,
                         )
                     else:
                         logger.info(
                             "[_decide_tesla_reduce] deferring stop: current_amps=%d, "
                             "seconds_remaining=%d, safe_defer=%ds, gap=%.1f Wh, "
-                            "trend=%s, ramp_aware=%s",
+                            "trend=%s, ramp_aware=%s, defer_lookahead=%ds",
                             current_amps, ctx.seconds_remaining, safe_defer_secs,
                             reduce_wh,
                             ctx.gap_trend_wh_per_s,
                             self.ramp_aware,
+                            lookahead_secs,
                         )
                         return None
             logger.info(
@@ -2052,6 +2102,7 @@ class GapMinder:
         defer_stop: bool = True,
         max_defer_secs: int | None = None,
         ramp_aware: bool = False,
+        defer_lookahead_quanta: int = 1,
     ) -> None:
         """Initialize the GapMinder.
 
@@ -2086,6 +2137,18 @@ class GapMinder:
                 rule unreachable. Diagnostic only; measured by
                 ``tools/estimator_replay.py --defer``. Defaults to True
                 (shipped behaviour).
+            max_defer_secs: Forwarded to :class:`TeslaDecider` — cap on the
+                safe defer window. None keeps ``TeslaDecider.MAX_DEFER_SECS``.
+            ramp_aware: Forwarded to :class:`TeslaDecider` — whether a
+                trusted rising deficit may hasten the stop. Defaults to False
+                (shipped).
+            defer_lookahead_quanta: Forwarded to :class:`TeslaDecider` —
+                quantisation windows added to the safe defer window so a
+                defer always leaves room for the next observation to arrive,
+                scaled by ``DecideContext.observability_secs``. ``1``
+                (shipped) stops instead of deferring whenever the deadline
+                sits inside the next window; ``0`` restores the pre-2026-10-19
+                static defer rule.
 
         Raises:
             ValueError: If ``max_defer_secs`` is not positive.
@@ -2106,6 +2169,7 @@ class GapMinder:
         self.defer_stop = defer_stop
         self.max_defer_secs = max_defer_secs
         self.ramp_aware = ramp_aware
+        self.defer_lookahead_quanta = defer_lookahead_quanta
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.tesla_decider = TeslaDecider(
@@ -2114,6 +2178,7 @@ class GapMinder:
             defer_stop=defer_stop,
             max_defer_secs=max_defer_secs,
             ramp_aware=ramp_aware,
+            defer_lookahead_quanta=defer_lookahead_quanta,
         )
         logger.info(
             "GapMinder: charge_amps_min=%d charge_amps_max=%d (config provided %d)",

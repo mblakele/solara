@@ -149,6 +149,25 @@ window spanning a quarter-hour boundary), so the tracker clears history
 instead of trusting it. Real production deltas are 30-60 s, because half
 the cycles exit early on ``waiting_for_fresh_data``."""
 
+DEFER_LOOKAHEAD_QUANTA_DEFAULT: int = 1
+"""Observation windows the Tesla stop's safe defer deadline must clear.
+
+Shipped 2026-10-19. A defer is only real if the next observation can still
+arrive before the deadline; with this at 1 a defer is refused whenever the
+deadline sits inside the next window, so the stop is taken now instead
+(``bugs/2026-10-18-tesla-stop-overshoot.log``: deferred at R=89 s against a
+72 s deadline, next decision at R=60 s, quarter finished +10.81 Wh over
+target). Counted in windows, never seconds: the window is
+``DecideContext.observability_secs`` (the resolved prediction/settle
+window), so a deployment whose meter quantises differently sizes the rule
+correctly. ``0`` restores the pre-2026-10-19 static rule.
+
+Corpus snapshot (``uv run python tools/estimator_replay.py corpus/*.log``):
+car-active mean |miss| 17.99 -> 17.91, 3 quarters better / 4 worse, plug-only
+bit-identical. A wash, shipped for the soundness property documented in
+``docs/LOADMANAGER.md``, not for the mean.
+"""
+
 JITTER_GUARD_FRACTION: float = 2.0
 """Turn-on jitter guard: decline when ``churn * seconds_remaining`` reaches
 this multiple of the surplus gap it is claiming.

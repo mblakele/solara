@@ -28,10 +28,11 @@ trend-based hastener that pulls the stop one cycle earlier on a rising
 deficit; shipped off, production's ``LOAD_MANAGER_RAMP_AWARE``). A candidate
 that wins on this axis has a shipping path that is a flag, not a rewrite.
 
-Measured: the defer rule is load-bearing (car-active mean |miss| 17.99 on vs
-25.90 off — plug-only is bit-identical, since the policy never commands a car
-that is not drawing), but the specific buffer is not (30–180 s spans
-17.90–18.17). Folding the trend into ``safe_defer_secs`` (the plan's
+Measured (re-measured under the shipped policy, see the baseline note below):
+the defer rule is load-bearing (car-active mean |miss| 17.91 on vs 25.90 off —
+plug-only is bit-identical, since the policy never commands a car that is not
+drawing), but the specific buffer is not (30–180 s spans 17.96–17.89). Folding
+the trend into ``safe_defer_secs`` (the plan's
 ``G_eff = G₀ + r·min(R, cap)``) is *not* equivalent to the ramp rule and does
 not hasten the incident stop — the 120 s cap swallows the trend (c54 still
 defers) — so the ``t*`` hastener stands as the one trend-aware form.
@@ -104,6 +105,20 @@ Quarter ingestion is deliberately conservative:
 Nameplate watts stand in for measured draw, so absolute landings are model
 values; the deltas between runs are the result.
 
+Baseline note (2026-10-19): every "corpus verdict" below is the snapshot
+measured *before* the Tesla stop's defer lookahead shipped, i.e. with
+``--defer-lookahead-quanta 0`` (the static rule) as the policy every run
+defaulted to. The shipped policy is now ``1``. On one current snapshot the
+move is car-active 17.99 -> 17.91 mean |miss| and **bit-identical** plug-only
+(23.36), and re-measuring each verdict below against the shipped baseline
+reverses no ordering — the deltas and the "best or tied" claims stand (the
+absolute baselines quoted in the older paragraphs are one to two tenths of a
+Wh stale for car-active quarters only). The one thing that *did* move is the
+guard arm's "live is worse than inert" reading, and that is the corpus
+refresh, not this change: at both K=0 and K=1 the ramp rule fires 0 times
+(``live == churn`` exactly) and the bundle is net *better* car-active
+(16.96 vs 17.91 inert) while still costing plug-only 0.21 Wh.
+
 Corpus verdict (13 logs, Oct 4-17 2026, 1,146 replayable quarters of 1,294
 scored, of which 117 car-active): the shipped trailing window beats every
 smoother variant closed-loop in *both* regimes, inverting the open-loop
@@ -167,6 +182,66 @@ mean is a handful of 30-115 Wh rescues). Longer windows are monotone worse, and
 the one-log counter-example (2026-10-17) shows no window win either. The loop
 pays for the level's freshness, not its smoothness, so no window ships.
 
+The defer-lookahead axis (``--defer-lookahead-quanta``) prices the *stop
+deadline* rather than the rate. The static rule defers whenever the safe
+buffer outlasts the remaining quarter, without asking whether the next
+observation can arrive before the deadline; in
+``bugs/2026-10-18-tesla-stop-overshoot.log`` it deferred at R=89 s against a
+24 Wh gap (safe_defer = 72 s) and the next decision landed at R=60 s, 20 Wh
+shed where 39.7 Wh was still available. The knob withholds K whole
+observation windows from the defer window — the deployment's *own* window
+(``Quarter.observability_secs``, the median data-point spacing), never a
+literal 30 s.
+
+Shipped verdict (2026-10-19): **the rule ships at K=1**
+(``LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA``). A deferral whose deadline sits
+inside the next observation window is not a deferral — the engine cannot
+observe through it, so it takes the stop now. Ordered before the ship: this
+is a *soundness* fix priced as a wash, not a mean-|miss| win. Corpus
+snapshot (14 logs, 1152 replayable, 117 car-active): car-active mean |miss|
+17.99 -> 17.91, signed miss +0.30 -> -0.42, 3 quarters better / 4 worse;
+plug-only bit-identical (23.36, the knob is Tesla-only). The direction is
+legible in the changed quarters — all 7 improvements at K=2 came from
+under-shed quarters, all 5 regressions from near-target or already-over-shed
+ones — i.e. the rule converts under-shedding into over-shedding, and over-shed
+is what |miss| also punishes. The k-sweep is non-monotone (17.99 / 17.91 /
+17.68 / 18.21 at K=0..3): K=2 would win the mean but is not the stated rule,
+so it is not shipped.
+
+The incident itself is *not* the evidence for the rule, and the earlier
+"it regresses under its own fix" reading was a replay-model artifact: the
+replay derives its prediction from its own counterfactual meter
+(``cf.raw_wh``), and for that quarter the counterfactual diverges from the
+log's raw energy all quarter (up to 8 Wh), has no anchor at the decisive
+R=60 s cycle (19 anchors, median spacing 45 s, the one cycle
+``../AGENTS.md`` flags as the fidelity caveat), and lands 7.62 Wh from the
+logged actual. On the log's own trace the rule helps: the deferral series
+reports R=119/35.8 Wh/safe_defer=107 s (slack 12 s, under one 30 s window),
+so the stop is taken there and sheds 39.7 Wh instead of the 20.0 Wh the
+R=60 s stop removed — landing the quarter at -8.86 Wh against the -9 Wh
+target instead of +10.81. The earlier "5.91 -> 10.89" regression is the
+model, not the plant.
+
+Stopping earlier strictly lowers consumption (that was checked, not
+assumed): in the replay's regressing quarter the landing falls -5.81 ->
+-27.13 Wh. The |miss| rise is the *overshoot*, and overshoot is not bounded
+by the rule — ``R <= gap/P + Q`` is equivalent to ``P*R <= gap + P*Q``, so
+the shed overshoots the *claimed* gap by at most one quantum; against the
+*realized* quarter it overshoots by whatever the forecast got wrong. That
+residual is forecast churn, which no stop rule can bound. ``0`` restores the
+pre-2026-10-19 static rule; ``--ramp-aware`` changes no number at any K (the
+ramp rule fires 0 times on this corpus).
+
+Other corpus verdicts in this docstring were measured before the ship, under
+the static rule. Re-measured on one current snapshot, no ordering reverses:
+estimator variants still lose in both regimes (car-active status-quo 17.91 vs
+prior 31.42, prior-blend@60 19.03, trend-gated 23.87; plug-only 23.36 vs
+27.64 / 26.19 / 24.06), the shipped zero-margin policy still wins or ties
+(car-active 17.91 vs 19.35 at a 10 Wh turn-off margin, 39.48 at 40; plug-only
+23.36 vs 23.35 / 24.77 / 26.80), and the defer rule stays load-bearing
+(car-active 17.91 with it, 25.90 with ``--defer off``; the cap value is not —
+30/60/180 s span 17.96-17.89).
+
 Run from the repo root::
 
     uv run python tools/estimator_replay.py bugs/*.log
@@ -176,6 +251,7 @@ Run from the repo root::
     uv run python tools/estimator_replay.py corpus/*.log --turn-off-margin 40
     uv run python tools/estimator_replay.py corpus/*.log --guards live
     uv run python tools/estimator_replay.py corpus/*.log --rate-window-quanta 2,3,4,all
+    uv run python tools/estimator_replay.py corpus/*.log --defer-lookahead-quanta 0
 """
 
 from __future__ import annotations
@@ -326,6 +402,10 @@ class Quarter:
     replay — though neither is reproducible by the old model now that the car
     is commandable in every replayable quarter.
     """
+    observability_secs: int | None = None
+    """The quarter's own observation window: the median gap between its data
+    points. ``None`` when the spacing cannot be measured (a single anchor),
+    which leaves the defer lookahead inert rather than guessing a quantum."""
 
 
 @dataclass(frozen=True)
@@ -436,6 +516,13 @@ class Policy:
     ramp_aware: bool = False
     """Enable the ramp-aware Tesla stop hastener (shipped off). When on, a
     trusted rising deficit pulls the stop one cycle earlier."""
+    defer_lookahead_quanta: int = 1
+    """Observation windows added to the safe defer window (shipped 1, the
+    2026-10-19 rule). A defer whose deadline is closer than the next
+    observation cannot be acted on, so a defer is only taken when the
+    deadline still clears that many windows. ``0`` restores the pre-2026-10-19
+    static rule. Sized from each quarter's own data-point spacing
+    (``Quarter.observability_secs``), never from a literal 30 s."""
 
     @property
     def label(self) -> str:
@@ -446,6 +533,7 @@ class Policy:
             f"lumpy-first {'on' if self.lumpy_first else 'off'}, "
             f"defer {'on' if self.defer_stop else 'off'}, "
             f"defer cap {self.max_defer_secs if self.max_defer_secs is not None else 120} s, "
+            f"defer lookahead {self.defer_lookahead_quanta}q, "
             f"ramp-aware {'on' if self.ramp_aware else 'off'}"
         )
 
@@ -459,6 +547,7 @@ class Policy:
             defer_stop=self.defer_stop,
             max_defer_secs=self.max_defer_secs,
             ramp_aware=self.ramp_aware,
+            defer_lookahead_quanta=self.defer_lookahead_quanta,
         )
 
 
@@ -962,6 +1051,9 @@ def replay(
                 banked_wh=anchor.raw_wh,
                 gap_jitter_wh_per_s=signals.jitter_wh_per_s if signals else None,
                 gap_trend_wh_per_s=signals.trend_wh_per_s if signals else None,
+                # The quarter's own data-point spacing, so a defer lookahead
+                # counts real observation windows on this log.
+                observability_secs=quarter.observability_secs,
             ),
             predicted_wh=predicted_wh,
             target_wh=TARGET_WH,
@@ -1328,6 +1420,29 @@ def _quarter_lag(
     return lag
 
 
+def _observability_secs(anchors: Sequence[ForecastAnchor]) -> int | None:
+    """The quarter's own observation window, from its data-point spacing.
+
+    The rule that buys "one lookahead window" has to be told what the window
+    is. A log carries the quantisation only indirectly, in how far apart its
+    data points sit, so the median gap between successive anchors is the
+    deployment's own granularity — read off the evidence rather than assumed
+    to be the typical 30 s.
+
+    Args:
+        anchors: The quarter's anchors, in time order.
+
+    Returns:
+        Median data-point spacing in seconds, or None when fewer than two
+        distinct data points exist (spacing unmeasurable).
+    """
+    used = [anchor.samples_used for anchor in anchors]
+    gaps = [after - before for before, after in zip(used, used[1:]) if after > before]
+    if not gaps:
+        return None
+    return int(statistics.median(gaps))
+
+
 def ingest_log(path: Path, text: str) -> tuple[dict[datetime, Quarter], IngestStats]:
     """Turn one log's text into every quarter the meter model can replay.
 
@@ -1378,6 +1493,7 @@ def ingest_log(path: Path, text: str) -> tuple[dict[datetime, Quarter], IngestSt
                 initial_on=initial,
                 tesla_samples=samples,
                 car_active=quarter_start in active,
+                observability_secs=_observability_secs(anchors),
             )
             stats.clean += 1
             if samples:
@@ -1908,6 +2024,17 @@ def build_parser() -> argparse.ArgumentParser:
         "trusted rising deficit pulls the stop one cycle earlier",
     )
     parser.add_argument(
+        "--defer-lookahead-quanta",
+        type=int,
+        default=1,
+        metavar="K",
+        help="observation windows the Tesla stop's safe defer deadline must "
+        "still clear before a defer is taken (shipped 1). A defer whose "
+        "deadline is shorter than the next observation cannot be acted on; K "
+        "windows of each quarter's own data-point spacing are withheld from "
+        "it, and 0 restores the pre-2026-10-19 static rule",
+    )
+    parser.add_argument(
         "--guards",
         choices=GUARD_MODES,
         default="inert",
@@ -1988,6 +2115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         defer_stop=(args.defer == "on"),
         max_defer_secs=args.max_defer_secs,
         ramp_aware=args.ramp_aware,
+        defer_lookahead_quanta=args.defer_lookahead_quanta,
     )
     runs = {
         name: replay_all(

@@ -147,6 +147,11 @@ class LoadManagerConfig:
         ramp_aware: If True, enable the ramp-aware Tesla stop hastener that stops
             one cycle early on a rising deficit (defaults to LOAD_MANAGER_RAMP_AWARE,
             off). Tests may pass an engine instead.
+        defer_lookahead_quanta: Quantisation windows the Tesla stop's safe defer
+            window must still clear before a defer is taken (defaults to
+            LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA, shipped 1 — the deadline must
+            clear the next observation window). ``0`` restores the static rule.
+            Tests may pass an engine instead.
         config_interval_secs: Target interval between cycles in seconds (default 30).
     """
 
@@ -162,6 +167,7 @@ class LoadManagerConfig:
     dry_run: bool | None = None
     lumpy_first: bool | None = None
     ramp_aware: bool | None = None
+    defer_lookahead_quanta: int | None = None
     config_interval_secs: int = 30
     telegram_sender: TelegramSender | None = None
     clock: Any | None = None  # clock.Clock | None — forward ref, resolved at runtime
@@ -344,6 +350,11 @@ class LoadManager:
         if ramp_aware is None:
             ramp_aware = self._cfg.ramp_aware
         self.ramp_aware = ramp_aware
+
+        defer_lookahead_quanta = cfg.defer_lookahead_quanta
+        if defer_lookahead_quanta is None:
+            defer_lookahead_quanta = self._cfg.defer_lookahead_quanta
+        self.defer_lookahead_quanta = defer_lookahead_quanta
         if engine is not None:
             self.engine = engine
         else:
@@ -359,6 +370,7 @@ class LoadManager:
                 ),
                 lumpy_first=lumpy_first,
                 ramp_aware=ramp_aware,
+                defer_lookahead_quanta=defer_lookahead_quanta,
             )
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
@@ -2795,6 +2807,7 @@ class LoadManager:
             gap_jitter_wh_per_s=self._last_gap_jitter_wh_per_s,
             cycle_secs=self.config_interval_secs,
             banked_wh=banked_wh,
+            observability_secs=self.state.effective_settle_secs,
         )
         actions = self.engine.decide(
             ctx=decide_ctx,

@@ -132,6 +132,15 @@ Key capabilities:
   the stop one cycle earlier (`bugs/2026-09-26-tesla-stop-charging.log`). The
   default is off because the hastener fired 0 times across the corpus and only
   that incident benefits; the defer rule itself stays (see docs/LOADMANAGER.md)
+- `LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA` — Observation windows the Tesla stop's
+  safe defer deadline must still clear before a defer is taken (default: `1`).
+  A deferral whose deadline sits inside the next window cannot be observed
+  through, so the stop is taken now
+  (`bugs/2026-10-18-tesla-stop-overshoot.log`). Counted in windows, never
+  seconds: the window is the resolved prediction/settle window
+  (`DecideContext.observability_secs`). `0` restores the pre-2026-10-19 static
+  rule; a malformed value falls back to the default rather than refusing to
+  start (see docs/LOADMANAGER.md)
 - Telegram device whitelist comes from the `telegram.devices` section of `devices.json`
   (there is no env-var override; the old `LOAD_TELEGRAM_DEVICES` env var is gone).
   Example: `{"pool_pump": ["turn_on", "turn_off"], "jackery": ["turn_on"]}`
@@ -331,6 +340,21 @@ project-root
 │                          # result and absolute landings are the model's. Inert parity
 │                          # verified to the printed digit: plug-only 23.41, car-active
 │                          # 17.99 mean|miss|.
+│                          # Baseline note (2026-10-19): the corpus verdicts
+│                          # below are snapshots measured with the pre-ship
+│                          # static defer rule (--defer-lookahead-quanta 0). The
+│                          # shipped policy is now 1: car-active 17.99 -> 17.91,
+│                          # plug-only bit-identical (23.36). Re-measured on one
+│                          # current snapshot, no ordering below reverses
+│                          # (estimator variants still lose, the zero-margin
+│                          # policy still wins or ties, the defer rule is still
+│                          # load-bearing 17.91 vs 25.90 off, no rate window
+│                          # still helps both regimes). The guard-arm reading
+│                          # is the one that moved, and that is the corpus
+│                          # refresh, not this change: `live == churn` exactly
+│                          # at both K (0 ramp fires) and the bundle is net
+│                          # better car-active (16.96 vs 17.91 inert) while
+│                          # costing plug-only +0.21.
 │                          # Corpus verdict (13 logs, 1146 replayable of 1294 scored;
 │                          # 117 car-active carrying 1269 Tesla commands): status-quo
 │                          # beats every variant in BOTH regimes — plug-only 23.41
@@ -418,8 +442,9 @@ project-root
 │                          # 115 (0.98/q) + 645 car-active, vs the scorer census's 1242
 │                          # declines / 1294 q (0.96/q) and 767 rescues (0.59/q), the
 │                          # replay's churn 0.256 mean (max 31.57) Wh/s against the
-│                          # census's 0.13 (12.60), all same-order. live is worse than
-│                          # inert in both regimes (plug-only 23.63 vs 23.41, +0.21
+│                          # census's 0.13 (12.60), all same-order. live was worse
+│                          # than inert in both regimes on that snapshot
+│                          # (plug-only 23.63 vs 23.41, +0.21
 │                          # mean; car-active 20.42 vs 17.99, +2.42) but the bundle is
 │                          # what the attribution convicts: churn-only (the jitter guard
 │                          # and its override alone) is +0.21 plug-only and -0.88
@@ -431,6 +456,11 @@ project-root
 │                          # contrary to the plan's expectation, and with the pre-emption
 │                          # sometimes hundreds of seconds (two quarters lost 183 and 222
 │                          # Wh to an early stop the deferral would not have taken).
+│                          # Re-measured under the shipped policy the car-active leg
+│                          # flips to net BETTER (live 16.96 vs inert 17.91) with
+│                          # live == churn exactly and 0 ramp fires — the earlier
+│                          # +2.42 was a corpus-refresh artifact, so the bundle's
+│                          # deletion rule still does not fire, from the other side.
 │                          # 2026-10-17 separately: 12.06 live vs 12.23 inert overall,
 │                          # 13.22 vs 14.37 on its car-active quarters, ramp 0 changed.
 │                          # Rate-window verdict (`--rate-window-quanta`,
@@ -450,6 +480,56 @@ project-root
 │                          # Composed only when `--rate-window-quanta K|all` is
 │                          # given (K=1 is the shipped status-quo, always
 │                          # reported), so default output is byte-identical.
+│                          # Defer-lookahead verdict (`--defer-lookahead-quanta
+│                          # K`, closed loop, corpus, status-quo rate; snapshot):
+│                          # **SHIPPED at K=1 on 2026-10-19** as a SOUNDNESS fix,
+│                          # priced as a wash. The knob withholds K observation
+│                          # windows from the Tesla stop's safe defer window,
+│                          # sized from each quarter's OWN window
+│                          # (`Quarter.observability_secs`, the median data-point
+│                          # spacing — never a literal 30 s), so a defer never
+│                          # leaves less room than the next observation needs: a
+│                          # deferral the engine cannot observe through is not a
+│                          # deferral, so it takes the stop now. Corpus: car-active
+│                          # (117 quarters) 17.99 -> 17.91 mean |miss|, 3 quarters
+│                          # better / 4 worse, signed miss +0.30 -> -0.42;
+│                          # plug-only BIT-IDENTICAL (23.36, the knob is
+│                          # Tesla-only). At K=2 the mean is better still (17.68,
+│                          # 7 better / 5 worse, median delta 0.00) but the sweep is
+│                          # non-monotone (18.21 at K=3) and 2 is not the stated
+│                          # rule, so 1 ships. The direction is legible in the
+│                          # changed quarters: all improvements came from
+│                          # under-shed quarters, all regressions from near-target
+│                          # or already-over-shed ones — the rule converts
+│                          # under-shedding into over-shedding, which |miss| also
+│                          # punishes, so it is not a mean win.
+│                          # Stopping earlier strictly LOWERS consumption (checked,
+│                          # not assumed: the replay's regressing quarter lands
+│                          # -5.81 -> -27.13 Wh); the |miss| rise is overshoot, and
+│                          # overshoot against the *claimed* gap is bounded at one
+│                          # quantum (`R <= gap/P + Q` <=> `P*R <= gap + P*Q`) while
+│                          # overshoot against the *realized* quarter is the
+│                          # forecast's own churn, which no stop rule bounds.
+│                          # The incident is characterized, not replayed: the earlier
+│                          # "the log regresses under its own fix" (5.91 -> 10.89)
+│                          # was a replay-model artifact — the replay derives its
+│                          # prediction from its own counterfactual meter, which for
+│                          # that quarter diverges from the log's raw energy all
+│                          # quarter (up to 8 Wh), has NO anchor at the decisive
+│                          # R=60 s cycle (19 anchors, median spacing 45 s), and
+│                          # lands 7.62 Wh from the logged actual. On the log's own
+│                          # trace the rule helps: the deferral series reports
+│                          # R=119 / 35.8 Wh / safe_defer=107 s (slack 12 s, under
+│                          # one 30 s window), so the stop is taken there and sheds
+│                          # 39.7 Wh instead of the 20.0 Wh the R=60 s stop removed,
+│                          # landing the quarter at -8.86 Wh against the -9 Wh target
+│                          # instead of +10.81. `0` restores the pre-2026-10-19
+│                          # static rule (used for every older verdict in this tree).
+│                          # `DecideContext.observability_secs`
+│                          # (production: the resolved prediction/settle window)
+│                          # is the window plumbing this added, and it is the
+│                          # sanctioned way for any decision rule to size itself
+│                          # from the quantum instead of a hardcoded 30 s.
 │                          # Run from the repo root:
 │                          #   uv run python tools/estimator_replay.py bugs/*.log
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --variant prior
@@ -457,6 +537,7 @@ project-root
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --turn-off-margin 40
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --guards live
 │                          #   uv run python tools/estimator_replay.py corpus/*.log --rate-window-quanta 2,3,4,all
+│                          #   uv run python tools/estimator_replay.py corpus/*.log --defer-lookahead-quanta 0
 │   ├── settle_window_counterfactual.py  # Prices the *adaptive* prediction/
 │                          # settle window against a pinned one (Subtask 6 of
 │                          # the guard-observability plan). The window is the
@@ -535,7 +616,10 @@ project-root
                            # from per_second_sparkline to stay under pylint's local
                            # budget; behavior unchanged, covered by the chart tests)
 ├── config.py              # TeslaConfig/PlugConfig/VocolincConfig dataclasses,
-                           # load_tesla_config(), load_plug_configs(), Config.log_file, etc.
+                           # load_tesla_config(), load_plug_configs(), Config.log_file,
+                           # Config.defer_lookahead_quanta (read leniently — a
+                           # malformed LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA falls
+                           # back to the shipped default, never crashes startup), etc.
 ├── config_loader.py       # Config loading helpers (load_tesla_config,
                            # load_plugs_from_file, load_vocolinc_*) reading
                            # env via the Config class + devices.json
@@ -547,7 +631,9 @@ project-root
                            # JITTER_GUARD_FRACTION=2.0 turn-on jitter guard,
                            # JITTER_FLOOR_WH_PER_S=0.2 churn noise floor,
                            # JITTER_HORIZON_SECS=150 swing projection cap,
-                           # JITTER_MAX_REMAINING_SECS=600 churn readiness gate)
+                           # JITTER_MAX_REMAINING_SECS=600 churn readiness gate,
+                           # DEFER_LOOKAHEAD_QUANTA_DEFAULT=1 the shipped
+                           # Tesla defer-lookahead rule)
 ├── device_config.py       # devices.json loader and typed accessors (get_telegram_config,
                            # get_tesla_config, get_homekit_plugs, etc.)
 ├── energy_aggregator.py   # TOU (time-of-use) energy aggregation logic
@@ -576,7 +662,7 @@ project-root
                             # get_active_tesla_telemetry, FleetTelemetryProvisionConfig) plus
                             # shared fleet-telemetry parsing helpers (unwrap_telemetry_value,
                             # parse_charge_amps) used by mqtt_telemetry and load_controllers
- ├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider (incl. turn_on_jitter_guard_fires — JITTER_FLOOR_WH_PER_S noise floor and jitter_swing_wh()'s JITTER_HORIZON_SECS-capped swing, the one implementation shared by the predicate and every jitter log line; banked_cover_cap_wh banked-cover override letting covered plug turn-ons proceed despite jitter, Tesla never; the Tesla-stop trio defer_stop / max_defer_secs / ramp_aware — the safe-defer branch is skipped when defer_stop is False, max_defer_secs tunes the buffer cap, and the ramp hastener `_ramp_stop_now` is consulted only when ramp_aware, so the shipped default leaves the defer rule intact with no trend hastening; defer/ramp decisions log at INFO with safe_defer/seconds_remaining/gap/trend), PendingEffect factories
+ ├── load_nbc.py            # NBCReader, EffectStore, TeslaSettleTracker, StateTracker, GapMinder bin-packing + TeslaDecider (incl. turn_on_jitter_guard_fires — JITTER_FLOOR_WH_PER_S noise floor and jitter_swing_wh()'s JITTER_HORIZON_SECS-capped swing, the one implementation shared by the predicate and every jitter log line; banked_cover_cap_wh banked-cover override letting covered plug turn-ons proceed despite jitter, Tesla never; the Tesla-stop trio defer_stop / max_defer_secs / ramp_aware — the safe-defer branch is skipped when defer_stop is False, max_defer_secs tunes the buffer cap, and the ramp hastener `_ramp_stop_now` is consulted only when ramp_aware, so the shipped default leaves the defer rule intact with no trend hastening; defer_lookahead_quanta (shipped 1) adds that many DecideContext.observability_secs windows to the defer deadline so a defer never leaves less room than the next observation needs — the window is the resolved prediction/settle window (the quantisation quantum), never a literal 30 s; defer/ramp decisions log at INFO with safe_defer/seconds_remaining/gap/trend/defer_lookahead), PendingEffect factories
 ├── gap_trend.py           # GapTrendTracker: EWMA slope of the adjusted gap across cycles
 │                          # (keyed on data_point_at; quarter-hour identity derived via
 │                          # floor_to_qh because ParsedMetricsQH.qh_name is the constant
@@ -690,21 +776,35 @@ project-root
                            # the freshness of the
                            # variant map, and the CLI (table, --date, --regime, --turn-off-margin/
                            # --lumpy-first header, unknown variant, no
-                           # quarters); test_tou_page.py covers inclusive date
+                           # quarters), plus the defer quantum lookahead on synthetic
+                           # two-anchor quarters (the incident cycle stops with one
+                           # window and defers with zero, scaling with each quarter's
+                           # own spacing, inert without a window, the quarter carries
+                           # the spacing the ingest measured, and the label names the
+                           # knob only when it is on); test_tou_page.py covers inclusive date
                            # ranges, DST days, detail rows/defaults and picker dates;
                            # test_app.py covers endpoint validation and range limits;
                            # test_gap_trend.py covers the gap-slope tracker (+ the churn /
                            # jitter EWMA, incl. the churn_ready readiness gate that
                            # withholds the quarter-opening extrapolation),
-                           # test_tesla_decider.py the ramp-aware stop rule and the
+                           # test_tesla_decider.py the ramp-aware stop rule, the
                            # reduction amp step (a ceil that covers the gap, the shipped
-                           # rounding pinned),
+                           # rounding pinned), and the defer quantum lookahead
+                           # (TestDeferQuantumLookahead: the 2026-10-18 incident cycle
+                           # stops at one window, defers at zero, is inert without a
+                           # window, scales in quanta, and the log line reports it),
                            # test_tesla_ramp_replay.py the 2026-09-26 incident sequence
                            # (ramp_aware=True) plus a skipif-guarded drift check that
                            # the inline INCIDENT_POINTS gaps still match the log,
                            # test_ramp_aware.py the LOAD_MANAGER_RAMP_AWARE default-off
                            # stance (default defers on the c54 cycle, flag-on stops)
                            # and its LoadManagerConfig/env plumbing,
+                           # test_defer_lookahead_quanta.py the shipped one-window
+                           # defer lookahead (the 2026-10-19 rule): the default,
+                           # the incident cycle on both settings, "unknown window
+                           # stays inert", and the LOAD_MANAGER_DEFER_LOOKAHEAD_
+                           # QUANTA config/env plumbing incl. the malformed-value
+                           # fallback,
                            # test_tesla_overshoot_replay.py the 2026-10-01 overshoot
                            # (status quo characterized; jitter-guard gate: |miss| < 10.7
                            # toward target −9),
@@ -1004,16 +1104,45 @@ project-root
   2026-10-18 (verdict above); the whole-window fit stands as a conservative prior
   about whether a small predicted surplus materializes.
 - The constructor's opt-in policy knobs (`lumpy_first`, `defer_stop`,
-  `max_defer_secs`, `ramp_aware`) are keyword-only on `GapMinder.__init__`
+  `max_defer_secs`, `ramp_aware`, `defer_lookahead_quanta`) are keyword-only on
+  `GapMinder.__init__`
   (pylint's positional ceiling); the margin and hysteresis knobs stay positional.
   Pinned by tests/test_gap_minder.py. `defer_stop`/`max_defer_secs` are diagnostic-only
   (measured by `tools/estimator_replay.py --defer` / `--max-defer-secs`); `ramp_aware`
   is the production flag `LOAD_MANAGER_RAMP_AWARE` (default off), wired through
   `LoadManagerConfig.ramp_aware`. The defer rule is load-bearing (car-active closed-loop
-  mean |miss| 17.99 on vs 25.90 off); the buffer value is not (30–180 s spans 17.90–18.17);
+  mean |miss| 17.91 on vs 25.90 off); the buffer value is not (30–180 s spans 17.96–17.89);
   the trend-fold into `safe_defer_secs` is not equivalent to the `t*` hastener (the cap
   swallows it), so no second trend-aware form ships. Cover: tests/test_ramp_aware.py,
   tests/test_tesla_decider.py, tests/test_tesla_ramp_replay.py.
+- The defer deadline is sized in observation windows, not seconds:
+  `defer_lookahead_quanta` (keyword-only, **default 1 = shipped 2026-10-19**) adds
+  that many
+  `DecideContext.observability_secs` to `safe_defer_secs`, so a defer never
+  leaves less room than the next observation needs. `observability_secs` is the
+  quantisation window — production passes the resolved prediction/settle window
+  (`state.effective_settle_secs`) and the replay passes each quarter's median
+  data-point spacing — and `None` (unknown) leaves the lookahead inert rather
+  than guessing. Shipped as a soundness fix priced as a wash (car-active
+  17.99 → 17.91, 3 better / 4 worse, plug-only bit-identical; K=2's 17.68 is
+  better but non-monotone — 18.21 at K=3 — and is not the stated rule), wired
+  through `LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA` and
+  `LoadManagerConfig.defer_lookahead_quanta`; verdict in the tool tree above.
+  `0` restores the static rule and reproduces the older verdicts.
+  Cover: tests/test_defer_lookahead_quanta.py (the shipped rule, the env
+  plumbing, the malformed-value fallback), tests/test_tesla_decider.py
+  (`TestDeferQuantumLookahead`), tests/test_estimator_replay.py,
+  tests/test_pipeline_stages.py.
+- The other R-floor is `constants.MIN_SECONDS_TO_ACT` (21 s — itself a
+  hardcoded ≈0.7 × 30, the last quantum-shaped literal in the decision path).
+  It gates only the *energizing* directions (plug turn-on
+  `GapMinder._decide_turn_on`, Tesla amp increase
+  `TeslaDecider.decide_increase`) — never turn-off or the last-resort Tesla
+  stop, which are deliberately unguarded — so the defer lookahead does not
+  need to cover it: the two floors are independent consumers of "is there
+  enough room left". Whether `MIN_SECONDS_TO_ACT` should also be derived from
+  the quantum (it is too small for a 60 s meter and over-strict for a 15 s
+  one) is an unmeasured question, not a shipped change.
 - In run_cycle(), raw NBC predictions are adjusted with pending effect deltas via
   `estimated_current_wh()` before being passed to decide() — this accounts for
   actions already taken this quarter-hour without waiting for fresh API data
