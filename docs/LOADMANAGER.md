@@ -49,6 +49,11 @@ If actions were taken after the last data point, the system enters a
 | `LOAD_MANAGE_API_KEY` | *(empty, disabled)* | API key for manual trigger endpoint auth |
 | `LOAD_PLUG_CONTROLLER` | `stub` | `real` (aiohomekit) or `stub` (in-memory mock) |
 | `LOAD_TESLA_CONTROLLER` | `stub` | `real` (tesla-fleet-api) or `stub` (in-memory mock) |
+| `LOAD_NBC_DEVICE` | *(unset)* | Device name used for NBC predictions |
+| `LOAD_MANAGER_RAMP_AWARE` | `False` | Ramp-aware Tesla stop hastener (see below) |
+| `LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA` | `1` | Observation windows the stop deferral must clear |
+| `DEBUG` | `False` | Debug logging and the diagnostics section on the index page |
+| `TIMEZONE` | `America/Los_Angeles` | Device timezone for display and time ranges |
 
 ### Device Configuration (`devices.json`)
 
@@ -658,3 +663,31 @@ curl http://localhost:8000/api/v1/load/status
 - **GET** `/api/v1/tesla/auth/initiate` — Start OAuth flow, returns login URL
 - **GET** `/callback` — OAuth redirect handler (exchanges code for tokens)
 - **GET** `/api/v1/tesla/status` — Check authentication status and token expiry
+
+## Telegram notifications
+
+- `TelegramConfig` (`telegram_client.py`) — frozen config dataclass with
+  `bot_token` and `chat_id`.
+- `TelegramClient` (`telegram_client.py`) — async aiohttp client. Fire and
+  forget. Returns `bool`. Never raises.
+- `TelegramSender` (`telegram.py`) — high-level sender. Loads config from env
+  vars and `devices.json`.
+- `NotificationEvent` (`telegram.py`) — frozen dataclass for structured
+  notifications with `format_message()`.
+- `load_telegram_config()` (`telegram.py`) — loads config through the `Config`
+  lookup chain (env vars, then `.env`) first, then `devices.json`.
+- The device whitelist is the `telegram.devices` section of `devices.json`,
+  read in `LoadManager.__init__` / `reload_config()`. There is no env-var
+  override; the old `LOAD_TELEGRAM_DEVICES` variable is gone.
+- `validate_telegram_devices()` (`device_config.py`) — checks that
+  `telegram.devices` keys match plug names after every `_load()`. `"tesla"` is
+  accepted as a special name for stop-charging alerts.
+- **Whitelist gate.** A notification is sent only when a whitelist is
+  configured AND at least one action matches it. Without a whitelist, all
+  notifications are blocked.
+- Plug messages: `🟢 device → ON` / `🔘 device → OFF`.
+- A plug `turn_off` line appends today's ON-time since meter-local midnight:
+  `🔘 water heater (06:12 today)`. Format is `MM:SS` under an hour and
+  `H:MM:SS` above. Plugs only, never Tesla or `turn_on`.
+- Tesla messages: `🔌 Tesla charging stopped` / `⚡ Tesla charging started` /
+  `🔋 Tesla charge amps → N A`.
