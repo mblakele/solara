@@ -1,6 +1,6 @@
 """Incident replay: bugs/2026-10-01-tesla-overshoot.log, quarter 20:30-20:45.
 
-Characterizes the shipped turn-on behavior for the 2026-10-01 overshoot
+Characterizes the status-quo turn-on behavior for the 2026-10-01 overshoot
 (actual ``+1.739 Wh`` vs ``target_wh=-9``, miss ``+10.7``) by stepping the
 logged decision-time gaps through the production classes:
 ``GapTrendTracker`` + ``GapMinder.decide``.
@@ -121,7 +121,6 @@ class ReplayStep:
         current_amps: Tesla amps seen by the decision.
         seconds_remaining: Decision-time seconds left in the quarter.
         actions: Actions ``GapMinder.decide`` produced.
-        jitter_guard_fired: Whether the turn-on jitter guard declined.
     """
 
     cycle: str
@@ -131,7 +130,6 @@ class ReplayStep:
     current_amps: int
     seconds_remaining: int
     actions: tuple[PendingEffect, ...]
-    jitter_guard_fired: bool = False
 
 
 def _command_wall(seconds: int) -> datetime:
@@ -217,20 +215,13 @@ def _commands_from(steps: list[ReplayStep]) -> tuple[tuple[float, int], ...]:
     return tuple(commands)
 
 
-def _replay(plumb_jitter: bool = False) -> list[ReplayStep]:
+def _replay() -> list[ReplayStep]:
     """Run the incident sequence through the production decision path.
 
     Feeds each step's (counterfactually adjusted) gap to a fresh
     ``GapTrendTracker`` and calls ``GapMinder.decide`` exactly like
     ``_stage_compute_gap`` + the async phase do, tracking the replayed
     Tesla amp level so later steps see the variant's own state.
-
-    Args:
-        plumb_jitter: When True, pass the tracker's churn into the
-            DecideContext — production as shipped after the jitter guard
-            landed. When False (default), model production as it ran
-            during the incident: no jitter value existed, so the guard
-            is inapplicable and decisions reproduce the log.
 
     Returns:
         One ReplayStep per fixture step.
@@ -277,7 +268,6 @@ def _replay(plumb_jitter: bool = False) -> list[ReplayStep]:
             noise_floor=engine.HYSTERESIS_WH / step.seconds_remaining,
         )
         trend = rate if trusted else None
-        churn = tracker.churn_wh_per_s
         ctx = DecideContext(
             now=wall,
             seconds_remaining=step.seconds_remaining,
@@ -287,7 +277,6 @@ def _replay(plumb_jitter: bool = False) -> list[ReplayStep]:
                              plugged_in=True, at_home=True),
             data_point_at=step.data_point_at,
             gap_trend_wh_per_s=trend,
-            gap_jitter_wh_per_s=(churn if plumb_jitter else None),
             cycle_secs=30,
         )
         actions = engine.decide(
@@ -311,11 +300,6 @@ def _replay(plumb_jitter: bool = False) -> list[ReplayStep]:
                 current_amps=ctx.tesla.current_amps if ctx.tesla else 0,
                 seconds_remaining=step.seconds_remaining,
                 actions=tuple(actions),
-                jitter_guard_fired=engine.turn_on_jitter_guard_fires(
-                    gap,
-                    churn if plumb_jitter else None,
-                    step.seconds_remaining,
-                ),
             )
         )
     return results
@@ -399,25 +383,7 @@ def test_command_energy_model_matches_logged_wall_times() -> None:
     assert abs(_commands_wh(LOGGED_COMMANDS) - wall_energy) < 1.0
 
 
-def test_jitter_guarded_replay_beats_status_quo() -> None:
-    """Subtask-4 gate: the shipped guard must beat the logged miss.
-
-    With jitter plumbed (current production), the churn swing blocks the
-    c579 +1 A increase — the guard fires exactly where the incident
-    overshot — and the quarter lands toward the target instead of
-    +1.74. Acceptance: |landed - target| < 10.7 (the logged miss).
-    """
-    history = _replay()
-    guarded = _replay(plumb_jitter=True)
-
-    # The first increase (c575) happens before churn is measurable — the
-    # guard must only decline from the oscillation's measurable onset.
-    assert guarded[1].jitter_guard_fired is False
-    assert guarded[3].jitter_guard_fired is True
-    # c579's +1 A is the overshooting command; only the c575 +2 A remains.
-    assert _commands_from(guarded) == ((480.0, 209),)
-
-    miss_history = abs(_landed(_commands_from(history)) - TARGET_WH)
-    miss_guarded = abs(_landed(_commands_from(guarded)) - TARGET_WH)
-    assert miss_guarded < 10.7
-    assert miss_guarded < miss_history
+def test_status_quo_replay_reproduces_the_logged_commands() -> None:
+    """Without the removed guard, the replay reproduces the log's two increases."""
+    steps = _replay()
+    assert _commands_from(steps) == ((480.0, 209), (240.0, 111))

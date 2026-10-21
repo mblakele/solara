@@ -340,3 +340,60 @@ class TestDeferQuantumLookahead:
     def test_gapminder_default_is_shipped(self):
         """Default construction ships the one-window rule."""
         assert GapMinder().tesla_decider.defer_lookahead_quanta == 1
+
+
+class TestDeferHonoursTheGapDeadline:
+    """The stop deadline comes from the gap, not from a fixed buffer.
+
+    ``safe_defer = min(cap, gap / P)`` with ``P = 1200/3600 Wh/s`` puts the
+    stop at ``R = 3 * gap`` — the second at which a 5 A draw has consumed
+    exactly the gap. A 120 s cap overrode that deadline for every gap above
+    50 Wh, so the car ran to ``R = 150 s`` instead: the 2026-10-20 18:52
+    cycle deferred at ``R=479, gap=155.0`` (deadline 465 s), and letting the
+    car run to the cap cost about 105 Wh of avoidable draw
+    (``corpus/2026-10-20-0006b7dea172f40756dc9c0fd354ae5b.log``; the user's
+    hand stop landed that quarter 10.9 Wh from target). The cap now sits at
+    a whole window, so the gap deadline governs — and a gap the window can
+    never pay is stopped immediately rather than deferred to the edge.
+    """
+
+    def test_stop_fires_at_the_gap_deadline(self):
+        """R=479 against 155.0 Wh: 465 s + one 30 s window is due."""
+        ctx = replace(_min_amps_ctx(479), observability_secs=30)
+        action = TeslaDecider().decide_reduce(ctx, 155.0)
+        assert action is not None
+        assert action.device_name == "tesla"
+        assert action.action == "turn_off"
+
+    def test_the_cycle_before_the_deadline_still_defers(self):
+        """R=496 keeps one second of headroom over 465 s + 30 s."""
+        ctx = replace(_min_amps_ctx(496), observability_secs=30)
+        assert TeslaDecider().decide_reduce(ctx, 155.0) is None
+
+    def test_gap_the_window_cannot_pay_stops_now(self):
+        """R=686 against 345.5 Wh: no later stop can close it, so act now."""
+        action = TeslaDecider().decide_reduce(_min_amps_ctx(686), 345.5)
+        assert action is not None
+        assert action.action == "turn_off"
+
+    def test_2026_10_20_incident_cycle_still_defers(self):
+        """Parity with the one engine stop: R=119, gap=29.4, one window."""
+        ctx = replace(_min_amps_ctx(119), observability_secs=30)
+        assert TeslaDecider().decide_reduce(ctx, 29.4) is None
+        assert TeslaDecider().decide_reduce(
+            replace(_min_amps_ctx(110), observability_secs=30), 29.4
+        ) is not None
+
+    def test_safe_defer_is_gap_derived(self):
+        """155 Wh buys 465 s; 29.4 Wh keeps the log's 88 s truncation."""
+        decider = TeslaDecider()
+        assert decider.safe_defer_secs(155.0) == 465
+        assert decider.safe_defer_secs(29.4) == 88
+
+    def test_cap_is_a_whole_window(self):
+        """A gap beyond 300 Wh defers to nothing — the cap is the window."""
+        assert TeslaDecider().safe_defer_secs(400.0) == 900
+
+    def test_explicit_cap_still_reproduces_the_old_arm(self):
+        """The diagnostic knob keeps the pre-change deadline reachable."""
+        assert TeslaDecider(max_defer_secs=120).safe_defer_secs(155.0) == 120

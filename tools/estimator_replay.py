@@ -23,55 +23,56 @@ budget, the deliberate form of the hedge the loop currently gets by accident),
 ``--lumpy-first`` (production's ``LOAD_MANAGE_LUMPY_FIRST``). The Tesla-stop
 trio prices the *reluctance to stop charging*: ``--defer {on,off}`` (the defer rule
 itself; off stops the moment a deficit exists), ``--max-defer-secs`` (the safe
-buffer the defer rule requires, shipped 120 s) and ``--ramp-aware`` (the
-trend-based hastener that pulls the stop one cycle earlier on a rising
-deficit; shipped off, production's ``LOAD_MANAGER_RAMP_AWARE``). A candidate
-that wins on this axis has a shipping path that is a flag, not a rewrite.
+buffer the defer rule requires, shipped 900 s — a whole quarter-hour, so the
+gap deadline governs) and ``--ramp-aware`` (the trend-based hastener that
+pulls the stop one cycle earlier on a rising deficit; shipped off,
+production's ``LOAD_MANAGER_RAMP_AWARE``). A candidate that wins on this axis
+has a shipping path that is a flag, not a rewrite.
 
-Measured (re-measured under the shipped policy, see the baseline note below):
-the defer rule is load-bearing (car-active mean |miss| 17.91 on vs 25.90 off —
-plug-only is bit-identical, since the policy never commands a car that is not
-drawing), but the specific buffer is not (30–180 s spans 17.96–17.89). Folding
-the trend into ``safe_defer_secs`` (the plan's
-``G_eff = G₀ + r·min(R, cap)``) is *not* equivalent to the ramp rule and does
-not hasten the incident stop — the 120 s cap swallows the trend (c54 still
-defers) — so the ``t*`` hastener stands as the one trend-aware form.
+Measured (current corpus, 141 car-active quarters): the defer rule is
+load-bearing (mean |miss| 17.83 on vs 28.13 off; plug-only bit-identical,
+since the policy never commands a car that is not drawing), and the buffer
+cap is only a lever above the gap deadline it used to override: 30 s 20.08,
+120 s 19.63, 300 s 18.92, 900 s 17.83 (5 quarters better / 2 worse / 134
+unchanged at 120 → 900). A cap below a whole window cannot be the shipped
+value, because it holds the stop past the second the gap implies — the
+2026-10-20 18:52 cycle deferred at R=479 against a 155 Wh gap (465 s
+deadline). Folding the trend into ``safe_defer_secs`` (the plan's
+``G_eff = G₀ + r·min(R, cap)``) is *not* the ``t*`` predicate (a horizon
+comparison rather than an exact-hit estimate), so the ``t*`` hastener stands
+as the one trend-aware form.
 
 Fidelity note: ``DecideContext`` carries what the parsed anchors hold
 (``banked_wh``, the quarter's accumulated raw energy, so the lumpy-first
-gate's trailing-rate implication works). Whether the two *derived* gap
-signals ride along is the guard arm (``--guards``):
+gate's trailing-rate implication works). The one *derived* signal is the
+gap trend (``--guards``):
 
-* ``inert`` (the default) leaves ``gap_jitter_wh_per_s`` and
-  ``gap_trend_wh_per_s`` dark — the machine every number in this docstring
-  was measured on. The turn-on jitter guard, its banked-cover override and
-  the ramp-aware Tesla stop cannot fire, so a policy whose whole job is
-  suppressing actions (a margin) overlaps with the guard's job and its
-  numbers are read as "outside the guard".
+* ``inert`` (the default) leaves ``gap_trend_wh_per_s`` dark — the machine
+  every number in this docstring was measured on. The ramp-aware Tesla
+  stop cannot fire, so a policy whose whole job is suppressing actions (a
+  margin) overlaps with that rule and its numbers are read as "outside the
+  stop rule".
 * ``live`` feeds one :class:`GapTrendTracker` per quarter in production's
-  own order and inputs (``_stage_compute_gap``): this cycle's adjusted gap,
-  the ``HYSTERESIS_WH / seconds_remaining`` noise floor, churn withheld
-  until ``JITTER_MAX_REMAINING_SECS`` of the quarter has observed data, then
-  ``churn_wh_per_s`` handed to ``gap_jitter_wh_per_s`` unconditionally
-  (0.0 until measurable, exactly as production passes it) and the slope to
-  ``gap_trend_wh_per_s`` when the tracker trusts it. The same
+  own order and inputs (``_stage_compute_gap``): this cycle's adjusted gap
+  and the ``HYSTERESIS_WH / seconds_remaining`` noise floor, then the slope
+  to ``gap_trend_wh_per_s`` when the tracker trusts it. The same
   ``predicted_wh`` that the tracker's gap is derived from is the value
   ``decide()`` is handed. One deviation, stated rather than hidden:
   production's tracker sees the *published* prediction minus its own
   pending-effect deltas, while the replay's gap reflects the counterfactual
   meter — its actions are already realized in ``raw_cf``/``w_cf`` and it
-  tracks no pending effects — so the two churn series agree in shape, not
-  sample for sample. The live arm is therefore a different machine: its
-  absolute misses are read against the inert control the report runs
-  alongside it, never against the pinned verdicts above, which are inert by
-  construction.
-* ``churn`` feeds the jitter signal but *not* the trend. The turn-on guard
-  and the ramp rule read different context fields, so this is the control
-  that separates them: ``churn`` minus ``inert`` is the jitter guard's own
-  effect on the closed loop and ``live`` minus ``churn`` is the ramp rule's,
-  which is how the pre-registered deletion rule for the ramp rule (zero
-  production fires) gets a closed-loop half instead of an unattributable
-  bundle.
+  tracks no pending effects — so the two series agree in shape, not sample
+  for sample. The live arm is therefore a different machine: its absolute
+  misses are read against the inert control the report runs alongside it,
+  never against the pinned verdicts above, which are inert by construction.
+  ``live`` only changes a decision with ``--ramp-aware``; without it the two
+  arms are bit-identical.
+
+The turn-on jitter guard and its banked-cover override were removed
+2026-10-21: both the fixed-car and the plug-only corpus measured them net
+worse (car-active 10.34 inert vs 12.28, plug-only 24.87 vs 25.18). The
+offline scorer's ``--guards`` census still reads the old log lines for
+historical analysis; production no longer emits them.
 
 The meter has two actuator populations. The plugs are ON/OFF steps at
 nameplate watts. The car is a commanded-amps step: each cycle's *reported*
@@ -113,11 +114,10 @@ move is car-active 17.99 -> 17.91 mean |miss| and **bit-identical** plug-only
 (23.36), and re-measuring each verdict below against the shipped baseline
 reverses no ordering — the deltas and the "best or tied" claims stand (the
 absolute baselines quoted in the older paragraphs are one to two tenths of a
-Wh stale for car-active quarters only). The one thing that *did* move is the
-guard arm's "live is worse than inert" reading, and that is the corpus
-refresh, not this change: at both K=0 and K=1 the ramp rule fires 0 times
-(``live == churn`` exactly) and the bundle is net *better* car-active
-(16.96 vs 17.91 inert) while still costing plug-only 0.21 Wh.
+Wh stale for car-active quarters only). The guard-arm readings below
+predate the 2026-10-21 removal of the jitter guard and banked-cover
+override; only the ramp-aware stop's trend arm remains, and it is inert
+unless ``--ramp-aware`` is passed.
 
 Scorecard shape (2026-10-19 snapshot; method stated so it can be
 re-derived): the mean |miss| every verdict below quotes is measured over
@@ -264,15 +264,19 @@ residual is forecast churn, which no stop rule can bound. ``0`` restores the
 pre-2026-10-19 static rule; ``--ramp-aware`` changes no number at any K (the
 ramp rule fires 0 times on this corpus).
 
-Other corpus verdicts in this docstring were measured before the ship, under
-the static rule. Re-measured on one current snapshot, no ordering reverses:
-estimator variants still lose in both regimes (car-active status-quo 17.91 vs
-prior 31.42, prior-blend@60 19.03, trend-gated 23.87; plug-only 23.36 vs
-27.64 / 26.19 / 24.06), the shipped zero-margin policy still wins or ties
-(car-active 17.91 vs 19.35 at a 10 Wh turn-off margin, 39.48 at 40; plug-only
-23.36 vs 23.35 / 24.77 / 26.80), and the defer rule stays load-bearing
-(car-active 17.91 with it, 25.90 with ``--defer off``; the cap value is not —
-30/60/180 s span 17.96-17.89).
+Other corpus verdicts in this docstring were measured before the 2026-10-21
+fixed-car model, which follows the logged amp transitions instead of holding
+the opening amps. Re-measured on the current snapshot (141 car-active / 1199
+plug-only), no verdict ordering reverses: estimator variants still lose in
+both regimes (car-active status-quo 10.34 vs prior 19.15, prior-blend@60
+14.71, trend-gated 13.29; plug-only 24.87 vs 29.31 / 27.80 / 25.57), the
+shipped zero-margin policy still wins (car-active turn-on 10/20/40 =
+11.68/13.29/18.04, turn-off 10/20/40/60 = 12.26/17.18/31.02/50.15; every
+plug-only margin is worse), and the defer rule stays load-bearing (car-active
+10.34 with it, 18.12 with ``--defer off``; the cap now matters — 120 s 12.21,
+300 s 11.99, 900 s 10.34). The jitter guard and banked-cover override were
+net worse in both regimes (car-active 10.34 inert vs 12.28; plug-only 24.87
+vs 25.18) and were removed 2026-10-21. The ramp-aware stop stays.
 
 Run from the repo root::
 
@@ -284,6 +288,8 @@ Run from the repo root::
     uv run python tools/estimator_replay.py corpus/*.log --guards live
     uv run python tools/estimator_replay.py corpus/*.log --rate-window-quanta 2,3,4,all
     uv run python tools/estimator_replay.py corpus/*.log --defer-lookahead-quanta 0
+    uv run python tools/estimator_replay.py corpus/*.log --defer-cap-sweep 120,300,900
+    uv run python tools/estimator_replay.py corpus/*.log --trace-quarter 2026-10-20T22:15
 """
 
 from __future__ import annotations
@@ -292,8 +298,8 @@ import argparse
 import statistics
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -319,9 +325,6 @@ from forecast_log_scoring import (  # noqa: E402 # pylint: disable=wrong-import-
     parse_turn_offs,
     parse_turn_ons,
 )
-from constants import (  # noqa: E402 # pylint: disable=wrong-import-position
-    JITTER_MAX_REMAINING_SECS,
-)
 from gap_trend import GapTrendTracker  # noqa: E402 # pylint: disable=wrong-import-position
 from load_models import (  # noqa: E402 # pylint: disable=wrong-import-position
     DeviceState,
@@ -333,6 +336,7 @@ from load_nbc import (  # noqa: E402 # pylint: disable=wrong-import-position
     DecideContext,
     GapMinder,
     StateTracker,
+    TeslaDecider,
     nominal_voltage,
 )
 from util import floor_to_qh  # noqa: E402 # pylint: disable=wrong-import-position
@@ -349,15 +353,13 @@ PRIORITIES: dict[str, int] = {"ecoflow": 50, "water heater": 60, "jackery": 100}
 HYSTERESIS_WH = 3
 """Production's deadband at this site (|target_wh| / 3, integral)."""
 
-GUARD_MODES: tuple[str, ...] = ("inert", "churn", "live")
-"""The guard arms — which derived gap signals reach ``decide()``.
+GUARD_MODES: tuple[str, ...] = ("inert", "live")
+"""The derived-signal arms — whether the gap trend reaches ``decide()``.
 
-``inert`` leaves both dark (the historical harness), ``churn`` feeds only the
-jitter signal (the turn-on guard and its banked-cover override, with the ramp
-rule's trend still dark), and ``live`` feeds both, as production does. The
-jitter guard and the ramp rule read *different* context fields, so ``churn``
-is the control that isolates the ramp rule: ``live`` minus ``churn`` is its
-effect, and ``churn`` minus ``inert`` is the guard's own.
+``inert`` leaves ``gap_trend_wh_per_s`` dark (the historical harness);
+``live`` feeds one tracker per quarter, as production does, so the
+ramp-aware Tesla stop can fire when the policy enables it. Without
+``--ramp-aware`` the two arms are bit-identical.
 """
 
 DEFAULT_TREND_FLOOR_WH = 3.0
@@ -442,23 +444,39 @@ class Quarter:
 
 @dataclass(frozen=True)
 class GuardActivity:
-    """What the guard arm's suppressing mechanisms did over a run.
-
-    Counted with production's own public predicates (the guard's fire test
-    and the bank override's cap), not by diffing action lists, so the numbers
-    are the same events production logs as ``gapminder_jitter_guard`` and
-    ``gapminder_banked_override``. All zeroes in the inert arm by
-    construction: with no tracker there is no churn, no trend, and nothing
-    for either mechanism to act on.
+    """What the live arm's derived signal made reachable over a run.
 
     ``trusted_trend_cycles`` counts the cycles whose slope cleared the
     tracker's trust rule — the ramp-aware Tesla stop can only hasten inside
-    one of them, so it is that rule's reachability, not its firing.
+    one of them, so it is that rule's reachability, not its firing. Zero in
+    the inert arm by construction.
     """
 
-    declines: int = 0
-    rescues: int = 0
     trusted_trend_cycles: int = 0
+
+
+@dataclass(frozen=True)
+class TraceRow:
+    """One cycle of a traced replay, for incident analysis.
+
+    ``gap_wh`` uses the operator-facing NBC sign (``predicted - target``):
+    positive is a deficit to shed, the same sign the Tesla defer log lines
+    print. ``actions`` is what the engine decided at this cycle, before the
+    command lands ``decide_lag`` seconds later.
+    """
+
+    data_at: datetime
+    """The data point the cycle read (UTC)."""
+    remaining_secs: int
+    """Seconds left in the quarter at the data point."""
+    predicted_wh: float
+    """The replay's predicted total for the quarter, Wh."""
+    gap_wh: float
+    """``predicted_wh - target``; positive is a deficit."""
+    tesla_amps: int | None
+    """The counterfactual car's amps at the cycle, or None without a car."""
+    actions: tuple[tuple[str, str], ...]
+    """Decided ``(device, action)`` pairs, in engine order."""
 
 
 @dataclass(frozen=True)
@@ -468,6 +486,7 @@ class Replay:
     steps: tuple[tuple[tuple[float, str, str], ...], ...]
     landing_wh: float
     guard: GuardActivity = GuardActivity()
+    trace: tuple[TraceRow, ...] = ()
 
     @property
     def actions(self) -> tuple[tuple[str, str], ...]:
@@ -543,8 +562,9 @@ class Policy:
     (shipped). False stops immediately at minimum amps, relaxing the defer
     constraint and making the ramp rule unreachable."""
     max_defer_secs: int | None = None
-    """Cap on the safe defer window in seconds (shipped 120). None keeps
-    the shipped cap. Lower values stop sooner while a buffer remains."""
+    """Cap on the safe defer window in seconds. None keeps the shipped cap
+    (``TeslaDecider.MAX_DEFER_SECS``, one whole window, so the gap deadline
+    governs); lower values stop sooner while a buffer remains."""
     ramp_aware: bool = False
     """Enable the ramp-aware Tesla stop hastener (shipped off). When on, a
     trusted rising deficit pulls the stop one cycle earlier."""
@@ -559,12 +579,17 @@ class Policy:
     @property
     def label(self) -> str:
         """One self-describing line, for the report header."""
+        cap = (
+            self.max_defer_secs
+            if self.max_defer_secs is not None
+            else TeslaDecider.MAX_DEFER_SECS
+        )
         return (
             f"turn-on margin {self.turn_on_margin_wh:g} Wh, "
             f"turn-off margin {self.turn_off_margin_wh:g} Wh, "
             f"lumpy-first {'on' if self.lumpy_first else 'off'}, "
             f"defer {'on' if self.defer_stop else 'off'}, "
-            f"defer cap {self.max_defer_secs if self.max_defer_secs is not None else 120} s, "
+            f"defer cap {cap} s, "
             f"defer lookahead {self.defer_lookahead_quanta}q, "
             f"ramp-aware {'on' if self.ramp_aware else 'off'}"
         )
@@ -643,9 +668,9 @@ def _divergence_wh(
 def _amps_at(samples: Sequence[TeslaSample], t: float, initial: float) -> float:
     """Car amps in force at ``t``; ``initial`` covers the open.
 
-    ``initial`` is the quarter's opening amps (the first reported sample,
-    which is also the initial of both the history and the policy series —
-    they agree until the policy commands something).
+    ``initial`` is the quarter's opening amps. It covers the span before the
+    first recorded event of ``samples``; for the merged counterfactual series
+    that first event is the opening history transition.
     """
     amps = initial
     for sample in sorted(samples, key=lambda item: item.t):
@@ -696,25 +721,68 @@ def _tesla_sample_at(samples: Sequence[TeslaSample], t: float) -> TeslaSample:
     return chosen
 
 
+def _tesla_series(
+    history: Sequence[TeslaSample], commands: Sequence[TeslaSample]
+) -> tuple[TeslaSample, ...]:
+    """The logged amp series with the policy's commands overlaid.
+
+    The log contributes its *transitions* only. A repeated reported sample is
+    the same state read again, so it must not override a policy command that
+    landed between two readings — that is the telemetry-lag case (a stop at
+    22:26:03 followed by a stale 5 A sample at 22:27:03). A real logged
+    transition still wins: a manual stop or a charge restart is exogenous to
+    the policy, so the counterfactual cannot invent draw past it.
+
+    Args:
+        history: The quarter's reported samples, in time order.
+        commands: The policy's own amp steps, in command order.
+
+    Returns:
+        The merged step series, in time order.
+    """
+    events: dict[float, TeslaSample] = {}
+    previous_amps: float | None = None
+    for sample in sorted(history, key=lambda item: item.t):
+        if previous_amps is None or sample.amps != previous_amps:
+            events[sample.t] = sample
+            previous_amps = sample.amps
+    for sample in commands:
+        events[sample.t] = sample
+    return tuple(events[t] for t in sorted(events))
+
+
 def _counterfactual_tesla(
     quarter: Quarter, policy_tesla: Sequence[TeslaSample], t: float
 ) -> TeslaState | None:
     """The car as the policy has left it, or None when no car is modelled.
 
-    Amps come from the counterfactual series (the logged draw where the
-    policy has not commanded anything); ``plugged_in``/``at_home`` come from
-    the log, because production gates both directions on them.
+    Amps come from the merged series — the logged draw where the policy has
+    not commanded anything, the command where it has (see
+    :func:`_tesla_series`); ``plugged_in``/``at_home`` come from the log,
+    because production gates both directions on them.
     """
     if not quarter.tesla_samples:
         return None
     sample = _tesla_sample_at(quarter.tesla_samples, t)
-    amps = _amps_at(policy_tesla, t, quarter.tesla_samples[0].amps)
+    amps = _amps_at(
+        _tesla_series(quarter.tesla_samples, policy_tesla),
+        t,
+        quarter.tesla_samples[0].amps,
+    )
     return TeslaState(
         is_charging=amps > 0.0,
         current_amps=int(round(amps)),
         plugged_in=sample.plugged_in,
         at_home=sample.at_home,
     )
+
+
+def _tesla_amps_at(
+    quarter: Quarter, policy_tesla: Sequence[TeslaSample], t: float
+) -> int | None:
+    """The counterfactual car's amps at ``t``, or None without a car."""
+    state = _counterfactual_tesla(quarter, policy_tesla, t)
+    return state.current_amps if state is not None else None
 
 
 def _meter_divergence_wh(
@@ -728,12 +796,17 @@ def _meter_divergence_wh(
 
     The plugs (nameplate watts) and the car (commanded amps) are the meter's
     two actuator populations, and their divergences add: the car is where
-    most of a Tesla-heavy quarter's shed energy goes.
+    most of a Tesla-heavy quarter's shed energy goes. The car's
+    counterfactual side follows the logged transitions, so a manual stop the
+    policy did not cause is not booked as an action of its own.
     """
     open_amps = quarter.tesla_samples[0].amps if quarter.tesla_samples else 0.0
+    counterfactual = _tesla_series(quarter.tesla_samples, policy_tesla)
     return _divergence_wh(
         commands, quarter.events, t0, t1, quarter.initial_on
-    ) + _tesla_divergence_wh(policy_tesla, quarter.tesla_samples, t0, t1, open_amps)
+    ) + _tesla_divergence_wh(
+        counterfactual, quarter.tesla_samples, t0, t1, open_amps
+    )
 
 
 def _apply_actions(
@@ -766,43 +839,6 @@ def _apply_actions(
             commands.append(
                 (commanded_at, action.device_name, action.action == "turn_on")
             )
-
-
-def _guard_activity(
-    engine: GapMinder,
-    gap_wh: float,
-    jitter_wh_per_s: float | None,
-    seconds_remaining: int,
-    banked_wh: float,
-) -> GuardActivity:
-    """Count what the guard arm decided on one cycle, as production would.
-
-    ``decide()`` only reaches the turn-on side past the deadband, and the
-    guard only ever declines a *surplus* claim, so the same two gates are
-    applied here: a cycle that never got that far cannot be counted. A fire
-    the banked-cover override releases is a rescue, not a decline —
-    production's own split between its ``gapminder_jitter_guard`` and
-    ``gapminder_banked_override`` events.
-
-    Args:
-        engine: The constructed ``GapMinder`` (its hysteresis and predicates).
-        gap_wh: The cycle's adjusted gap, as ``decide()`` computes it.
-        jitter_wh_per_s: The tracker's churn signal (None in the inert arm).
-        seconds_remaining: Seconds left in the quarter.
-        banked_wh: The quarter's accumulated raw energy, as ``ctx.banked_wh``.
-
-    Returns:
-        This cycle's activity: a decline, a rescue, or nothing.
-    """
-    if abs(gap_wh) <= engine.HYSTERESIS_WH or gap_wh <= 0:
-        return GuardActivity()
-    if not engine.turn_on_jitter_guard_fires(
-        gap_wh, jitter_wh_per_s, seconds_remaining
-    ):
-        return GuardActivity()
-    if engine.banked_cover_cap_wh(banked_wh, TARGET_WH) is None:
-        return GuardActivity(declines=1)
-    return GuardActivity(rescues=1)
 
 
 def _build_plugs() -> dict[str, PlugConfig]:
@@ -942,9 +978,8 @@ def _rate_window_secs(quanta: int | str | None, t_data: float) -> float | None:
 
 @dataclass(frozen=True)
 class _GuardSignals:
-    """One cycle's guard inputs, as the tracker measured them."""
+    """One cycle's derived inputs, as the tracker measured them."""
 
-    jitter_wh_per_s: float
     trend_wh_per_s: float | None
     activity: GuardActivity
 
@@ -960,9 +995,9 @@ def _cycle_guard_signals(
     """Feed this cycle's adjusted gap, then report what the tracker measured.
 
     Production's order in ``_stage_compute_gap``: the sample lands before
-    ``decide()`` reads the signals. The trend is only *fed* in the live arm —
-    the ramp rule reads that field, the jitter guard reads the other one —
-    but trust in it is a fact about the series and is reported either way.
+    ``decide()`` reads the signal. The trend is only *fed* to the decision in
+    the live arm, but trust in it is a fact about the series and is reported
+    either way.
     """
     noise_floor = (
         engine.HYSTERESIS_WH / anchor.remaining_secs
@@ -973,20 +1008,99 @@ def _cycle_guard_signals(
         data_point_at,
         gap_wh,
         noise_floor=noise_floor,
-        churn_ready=anchor.remaining_secs <= JITTER_MAX_REMAINING_SECS,
-    )
-    jitter = tracker.churn_wh_per_s
-    activity = _guard_activity(
-        engine, gap_wh, jitter, anchor.remaining_secs, anchor.raw_wh
     )
     return _GuardSignals(
-        jitter_wh_per_s=jitter,
         trend_wh_per_s=slope if (trusted and guards == "live") else None,
-        activity=GuardActivity(
-            declines=activity.declines,
-            rescues=activity.rescues,
-            trusted_trend_cycles=1 if trusted else 0,
+        activity=GuardActivity(trusted_trend_cycles=1 if trusted else 0),
+    )
+
+
+def _run_cycle(
+    quarter: Quarter,
+    anchor: ForecastAnchor,
+    *,
+    engine: GapMinder,
+    state: StateTracker,
+    plugs: dict[str, PlugConfig],
+    tracker: GapTrendTracker,
+    commands: list[tuple[float, str, bool]],
+    policy_tesla: list[TeslaSample],
+    rate_fn: RateFn,
+    rate_window_quanta: int | str,
+    guards: str,
+    trace: bool,
+    steps: list[tuple[tuple[float, str, str], ...]],
+    trace_rows: list[TraceRow],
+    activities: list[GuardActivity],
+) -> None:
+    """Take one cycle's decision and append its outcomes to the run.
+
+    Extracted from :func:`replay` so the loop stays one screen long and the
+    per-cycle context (counterfactual, guard signals, decision, command)
+    has a single home. The lists are appended in place; nothing is returned.
+    """
+    t_data = float(anchor.samples_used)
+    cf = _counterfactual(
+        quarter,
+        anchor,
+        commands,
+        policy_tesla,
+        _rate_window_secs(rate_window_quanta, t_data),
+    )
+    _sync_plug_states(state, quarter, commands, t_data)
+    predicted_wh = cf.raw_wh + rate_fn(cf.rate, anchor) * anchor.remaining_secs
+    signals: _GuardSignals | None = None
+    if guards != "inert":
+        # The gap the tracker is fed is production's own: the prediction
+        # minus the pending effects already taken, against the target.
+        # Only the arm that can act needs it.
+        signals = _cycle_guard_signals(
+            tracker,
+            engine,
+            anchor,
+            quarter.qh_start + timedelta(seconds=t_data),
+            TARGET_WH
+            - state.estimated_current_wh(predicted_wh, anchor.remaining_secs),
+            guards,
+        )
+        activities.append(signals.activity)
+    actions = engine.decide(
+        ctx=DecideContext(
+            now=quarter.qh_start + timedelta(seconds=t_data + quarter.decide_lag),
+            seconds_remaining=anchor.remaining_secs,
+            state=state,
+            plugs=plugs,
+            tesla=_counterfactual_tesla(quarter, policy_tesla, t_data),
+            data_point_at=quarter.qh_start + timedelta(seconds=t_data),
+            # The quarter's accumulated energy, as production passes it
+            # (qh1.raw_wh): the lumpy-first gate's trailing-rate
+            # implication.
+            banked_wh=anchor.raw_wh,
+            gap_trend_wh_per_s=signals.trend_wh_per_s if signals else None,
+            # The quarter's own data-point spacing, so a defer lookahead
+            # counts real observation windows on this log.
+            observability_secs=quarter.observability_secs,
         ),
+        predicted_wh=predicted_wh,
+        target_wh=TARGET_WH,
+    )
+    commanded_at = t_data + quarter.decide_lag
+    if trace:
+        trace_rows.append(
+            TraceRow(
+                data_at=quarter.qh_start + timedelta(seconds=t_data),
+                remaining_secs=anchor.remaining_secs,
+                predicted_wh=predicted_wh,
+                gap_wh=predicted_wh - TARGET_WH,
+                tesla_amps=_tesla_amps_at(quarter, policy_tesla, t_data),
+                actions=tuple(
+                    (action.device_name, action.action) for action in actions
+                ),
+            )
+        )
+    _apply_actions(quarter, commanded_at, actions, commands, policy_tesla)
+    steps.append(
+        tuple((commanded_at, action.device_name, action.action) for action in actions)
     )
 
 
@@ -998,6 +1112,7 @@ def replay(
     policy: Policy = Policy(),
     guards: str = "inert",
     rate_window_quanta: int | str = 1,
+    trace: bool = False,
 ) -> Replay:
     """Run one quarter closed-loop under ``rate_fn`` and ``policy``.
 
@@ -1008,16 +1123,18 @@ def replay(
             framing control); ``"policy"`` starts from the counterfactual
             meter state and lets production ``decide()`` issue commands.
         policy: The decision knobs the engine is constructed with.
-        guards: ``"inert"`` leaves the derived gap signals dark;
-            ``"churn"`` feeds the jitter signal only (the turn-on guard and
-            its override); ``"live"`` feeds both signals, as production
-            does, which also makes the ramp rule reachable. History mode
-            pins the logged events, so no arm can change it.
+        guards: ``"inert"`` leaves the gap trend dark; ``"live"`` feeds it
+            as production does, which makes the ramp rule reachable when the
+            policy enables ``ramp_aware``. History mode pins the logged
+            events, so no arm can change it.
         rate_window_quanta: Trailing window the counterfactual rate is
             averaged over, in windows of :data:`RATE_WINDOW_SECS` (``1`` =
             the shipped window; an integer ≥2 re-averages that many windows;
             ``"all"`` the whole elapsed quarter). Only the rate moves —
             ``raw_wh`` and the decision cadence are unchanged.
+        trace: Record one :class:`TraceRow` per cycle in
+            :attr:`Replay.trace`. Off by default; the rows are diagnostic
+            only and change no decision.
 
     Returns:
         The run's per-step actions, its landing Wh, and the guard arm's
@@ -1039,61 +1156,28 @@ def replay(
     policy_tesla: list[TeslaSample] = []
     steps: list[tuple[tuple[float, str, str], ...]] = []
     activities: list[GuardActivity] = []
+    trace_rows: list[TraceRow] = []
     for anchor in quarter.anchors:
-        t_data = float(anchor.samples_used)
         if mode == "history":
-            _pin_history(state, quarter, t_data)
+            _pin_history(state, quarter, float(anchor.samples_used))
             steps.append(())
             continue
-        cf = _counterfactual(
+        _run_cycle(
             quarter,
             anchor,
-            commands,
-            policy_tesla,
-            _rate_window_secs(rate_window_quanta, t_data),
-        )
-        _sync_plug_states(state, quarter, commands, t_data)
-        predicted_wh = cf.raw_wh + rate_fn(cf.rate, anchor) * anchor.remaining_secs
-        signals: _GuardSignals | None = None
-        if guards != "inert":
-            # The gap the tracker is fed is production's own: the prediction
-            # minus the pending effects already taken, against the target.
-            # Only the arm that can act needs it.
-            signals = _cycle_guard_signals(
-                tracker,
-                engine,
-                anchor,
-                quarter.qh_start + timedelta(seconds=t_data),
-                TARGET_WH
-                - state.estimated_current_wh(predicted_wh, anchor.remaining_secs),
-                guards,
-            )
-            activities.append(signals.activity)
-        actions = engine.decide(
-            ctx=DecideContext(
-                now=quarter.qh_start + timedelta(seconds=t_data + quarter.decide_lag),
-                seconds_remaining=anchor.remaining_secs,
-                state=state,
-                plugs=plugs,
-                tesla=_counterfactual_tesla(quarter, policy_tesla, t_data),
-                data_point_at=quarter.qh_start + timedelta(seconds=t_data),
-                # The quarter's accumulated energy, as production passes it
-                # (qh1.raw_wh): the lumpy-first gate's trailing-rate
-                # implication, and the banked-cover override's certain side.
-                banked_wh=anchor.raw_wh,
-                gap_jitter_wh_per_s=signals.jitter_wh_per_s if signals else None,
-                gap_trend_wh_per_s=signals.trend_wh_per_s if signals else None,
-                # The quarter's own data-point spacing, so a defer lookahead
-                # counts real observation windows on this log.
-                observability_secs=quarter.observability_secs,
-            ),
-            predicted_wh=predicted_wh,
-            target_wh=TARGET_WH,
-        )
-        commanded_at = t_data + quarter.decide_lag
-        _apply_actions(quarter, commanded_at, actions, commands, policy_tesla)
-        steps.append(
-            tuple((commanded_at, action.device_name, action.action) for action in actions)
+            engine=engine,
+            state=state,
+            plugs=plugs,
+            tracker=tracker,
+            commands=commands,
+            policy_tesla=policy_tesla,
+            rate_fn=rate_fn,
+            rate_window_quanta=rate_window_quanta,
+            guards=guards,
+            trace=trace,
+            steps=steps,
+            trace_rows=trace_rows,
+            activities=activities,
         )
     if mode == "history":
         return Replay(steps=tuple(steps), landing_wh=quarter.actual_wh)
@@ -1102,12 +1186,11 @@ def replay(
         landing_wh=quarter.actual_wh
         + _meter_divergence_wh(quarter, commands, policy_tesla, 0.0, QUARTER_SECS),
         guard=GuardActivity(
-            declines=sum(activity.declines for activity in activities),
-            rescues=sum(activity.rescues for activity in activities),
             trusted_trend_cycles=sum(
                 activity.trusted_trend_cycles for activity in activities
             ),
         ),
+        trace=tuple(trace_rows),
     )
 
 
@@ -1801,52 +1884,173 @@ def format_comparison(name: str, comparison: Comparison) -> str:
     )
 
 
+def format_trace(quarter: Quarter, run: Replay, policy: Policy) -> str:
+    """One quarter's per-cycle decisions, for incident analysis.
+
+    The rows are the replay's own context, not the log's: ``predicted`` is
+    what the counterfactual meter plus the rate produced, and ``gap`` is
+    ``predicted - target`` (positive is a deficit, the sign the Tesla defer
+    log lines print). ``amps`` is the counterfactual car, so it already
+    follows the logged transitions and the policy's commands.
+    """
+    lines = [
+        f"trace {quarter.qh_start:%Y-%m-%d %H:%M} UTC | {quarter.name} | "
+        f"{len(quarter.anchors)} anchor(s)",
+        f"  policy: {policy.label} | rate: status-quo",
+        f"  {'data':>8} {'R':>4} {'predicted':>10} {'gap':>8} "
+        f"{'amps':>5}  actions",
+    ]
+    for row in run.trace:
+        amps = "-" if row.tesla_amps is None else str(row.tesla_amps)
+        actions = (
+            ", ".join(f"{device} {action}" for device, action in row.actions) or "-"
+        )
+        lines.append(
+            f"  {row.data_at:%H:%M:%S} {row.remaining_secs:4d} "
+            f"{row.predicted_wh:10.2f} {row.gap_wh:8.2f} {amps:>5}  {actions}"
+        )
+    lines.append(
+        f"landing {run.landing_wh:.2f} Wh | actual {quarter.actual_wh:.2f} Wh | "
+        f"miss {run.landing_wh - TARGET_WH:+.2f} Wh"
+    )
+    return "\n".join(lines)
+
+
+def parse_defer_cap_sweep(spec: str) -> tuple[int, ...]:
+    """Parse ``--defer-cap-sweep``'s comma-separated second counts.
+
+    Args:
+        spec: Comma-separated positive integers, e.g. ``"120,300,900"``.
+
+    Returns:
+        The caps in input order, duplicates removed.
+
+    Raises:
+        ValueError: If a token is not a positive integer, or none is given.
+    """
+    caps: list[int] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            cap = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"defer cap must be a positive integer, got {token!r}"
+            ) from exc
+        if cap < 1:
+            raise ValueError(f"defer cap must be a positive integer, got {cap}")
+        if cap not in caps:
+            caps.append(cap)
+    if not caps:
+        raise ValueError("defer cap sweep needs at least one cap")
+    return tuple(caps)
+
+
+def parse_quarter_start(value: str) -> datetime:
+    """Parse ``--trace-quarter`` into the UTC quarter start it names.
+
+    Accepts ``YYYY-MM-DDTHH:MM`` or ``YYYY-MM-DD HH:MM``; a naive value is
+    read as UTC, matching the quarter table. A time inside a quarter snaps
+    down to that quarter's start.
+
+    Args:
+        value: The user's quarter selector.
+
+    Returns:
+        The quarter start in UTC.
+
+    Raises:
+        ValueError: If the text is not an ISO date or datetime.
+    """
+    text = value.strip().replace(" ", "T")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"trace quarter must be YYYY-MM-DDTHH:MM, got {value!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return floor_to_qh(parsed.astimezone(timezone.utc))
+
+
+def format_cap_sweep(
+    caps: Sequence[int],
+    quarters: Mapping[datetime, Quarter],
+    policy: Policy,
+    *,
+    guards: str = "inert",
+) -> str:
+    """The defer-cap sweep: one status-quo row per cap, paired to the first.
+
+    Each cap is the same policy with ``max_defer_secs`` replaced, so the
+    comparison isolates the stop deadline. The first cap is the reference;
+    later rows report their per-quarter |miss| changes against it.
+    """
+    runs = {
+        cap: replay_all(
+            quarters,
+            rate_status_quo,
+            policy=replace(policy, max_defer_secs=cap),
+            guards=guards,
+        )
+        for cap in caps
+    }
+    reference = runs[caps[0]]
+    lines = [
+        f"defer cap sweep (status-quo rate, {len(quarters)} quarter(s), "
+        f"guards {guards})",
+        f"  {'cap':>5} {'mean|miss|':>10} {'median':>8} {'mean':>8} "
+        f"{'act/q':>6} {'vs first B/W/S':>15} {'med delta':>10}",
+    ]
+    for cap in caps:
+        summary = summarize_variant(f"cap {cap}", runs[cap])
+        if cap == caps[0]:
+            paired = "-"
+            median = "-"
+        else:
+            comparison = compare_variants(reference, runs[cap])
+            paired = f"{comparison.better}/{comparison.worse}/{comparison.same}"
+            median = f"{comparison.median_delta_wh:+.2f}"
+        lines.append(
+            f"  {cap:>5} {summary.mean_abs_miss_wh:>10.2f} "
+            f"{summary.median_abs_miss_wh:>8.2f} {summary.mean_miss_wh:>+8.2f} "
+            f"{summary.mean_actions:>6.2f} {paired:>15} {median:>10}"
+        )
+    return "\n".join(lines)
+
+
 def format_guard_arm(
     live: Mapping[datetime, QuarterRun],
     *,
-    churn: Mapping[datetime, QuarterRun],
     inert: Mapping[datetime, QuarterRun],
     rate_name: str,
     worst: int = 0,
 ) -> str:
-    """The guard arm's verdict: what it did, against what controls.
+    """The live arm's verdict: what feeding the trend changed.
 
-    The paired comparison is what answers "did the guard withhold a real
-    action?" — production's candidate dump lists every configured plug, so an
-    *available* turn-on is near-universal and the log alone cannot tell a
-    withheld action from one that was never there. The counterfactual can: a
-    quarter the live arm left untouched while the inert arm commanded a load
-    is the guard's work, and it shows up as a changed-quarter.
-
-    The arm bundles three mechanisms, and the churn-only control splits them:
-    ``churn`` vs ``inert`` is the turn-on guard and its banked-cover override
-    (the ramp rule's trend stays dark there), ``live`` vs ``churn`` is the
-    ramp rule alone — the pre-registered rule for deleting it needs exactly
-    that number, since the production census (zero fires) only supplies half
-    a verdict.
+    The paired comparison answers "did the trend signal change a decision?"
+    A quarter the live arm left untouched while the inert arm commanded a
+    load is the signal's work, and it shows up as a changed-quarter. The
+    live arm only differs from inert when the policy enables the ramp-aware
+    stop; without ``--ramp-aware`` the comparison is a bit-identical control.
 
     Args:
         live: The status-quo rate's quarters under the live arm.
-        churn: The same, with the jitter signal fed and the trend dark.
-        inert: The same, with both signals dark (the shipped machine).
+        inert: The same, with the trend dark (the shipped machine).
         rate_name: The rate the arm was measured with (the report's base).
         worst: How many changed quarters to list (0 lists none).
 
     Returns:
         The block, ready to print.
     """
-    declines = sum(run.guard.declines for run in live.values())
-    rescues = sum(run.guard.rescues for run in live.values())
     trusted = sum(run.guard.trusted_trend_cycles for run in live.values())
     quarters = len(live)
     combined = compare_variants(inert, live)
-    guard_only = compare_variants(inert, churn)
-    ramp = compare_variants(churn, live)
     lines = [
-        f"guard arm: live ({rate_name} rate; churn-only and inert controls)",
-        f"  jitter guard: {declines} decline(s) over {quarters} quarter(s) "
-        f"({declines / quarters if quarters else 0.0:.2f}/quarter), "
-        f"{rescues} banked-cover rescue(s)",
+        f"guard arm: live ({rate_name} rate; inert control)",
         f"  trusted-trend cycles: {trusted} "
         "(the ramp-aware Tesla stop's gate, not its firing)",
         f"live vs inert |miss|: better {combined.better}, worse "
@@ -1855,18 +2059,11 @@ def format_guard_arm(
         f"  mean delta {combined.mean_delta_wh:+.2f} Wh, median "
         f"{combined.median_delta_wh:+.2f}, worst {combined.worst_delta_wh:+.2f}, "
         f"best {combined.best_delta_wh:+.2f}",
-        f"churn-only vs inert (the guard and its override, no ramp rule): "
-        f"mean delta {guard_only.mean_delta_wh:+.2f} Wh, better "
-        f"{guard_only.better}, worse {guard_only.worse}, changed "
-        f"{guard_only.changed}/{quarters}",
-        f"live vs churn-only (the ramp rule alone): mean delta "
-        f"{ramp.mean_delta_wh:+.2f} Wh, better {ramp.better}, worse "
-        f"{ramp.worse}, changed {ramp.changed}/{quarters}",
-        "  cross-check: the decline rate must land in the same order as the "
-        "scorer's `--guards` census over the same logs — a silent arm is a "
-        "fidelity bug, not a calm corpus",
+        "  note: the live arm only changes a decision with --ramp-aware; "
+        "without it live == inert. The jitter guard and banked-cover "
+        "override were removed 2026-10-21.",
     ]
-    if worst > 0:
+    if worst > 0 and combined.changed:
         lines.append(format_guard_quarters(live, inert=inert, limit=worst))
     return "\n".join(lines)
 
@@ -1879,9 +2076,9 @@ def format_guard_quarters(
 ) -> str:
     """The quarters the live arm actually moved, worst |miss| delta first.
 
-    Attribution for a wash: each row names the arms' action counts and what
-    the guard's own counters saw, so a moved quarter can be read back to the
-    mechanism rather than to the bundle.
+    Attribution for a wash: each row names the arms' action counts and the
+    trusted-trend count, so a moved quarter can be read back to the ramp
+    rule's gate.
     """
     moved = [
         (start, inert[start], run)
@@ -1896,7 +2093,6 @@ def format_guard_quarters(
             f"|miss| {abs(base.miss_wh):6.2f} -> {abs(run.miss_wh):6.2f}  "
             f"({run.miss_wh - base.miss_wh:+7.2f})  "
             f"actions {base.actions} -> {run.actions}  "
-            f"declines {run.guard.declines}, rescues {run.guard.rescues}, "
             f"trusted {run.guard.trusted_trend_cycles}"
         )
     return "\n".join(lines)
@@ -1926,7 +2122,9 @@ _USAGE = (
     "[--regime {all,tesla,plug-only}] [--turn-on-margin WH] "
     "[--turn-off-margin WH] [--lumpy-first] "
     "[--defer {on,off}] [--max-defer-secs SECS] "
-    "[--ramp-aware] [--guards {inert,churn,live}] "
+    "[--defer-lookahead-quanta K] [--defer-cap-sweep SECS,SECS] "
+    "[--trace-quarter YYYY-MM-DDTHH:MM] "
+    "[--ramp-aware] [--guards {inert,live}] "
     "[--rate-window-quanta K|all]"
 )
 
@@ -2046,8 +2244,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="SECS",
-        help="cap on the safe defer window in seconds (shipped 120); lower "
-        "values stop sooner while a buffer remains. None keeps the shipped cap",
+        help="cap on the safe defer window in seconds (shipped 900, one whole "
+        "window, so the gap deadline governs); lower values stop sooner while "
+        "a buffer remains. None keeps the shipped cap",
     )
     parser.add_argument(
         "--ramp-aware",
@@ -2070,12 +2269,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--guards",
         choices=GUARD_MODES,
         default="inert",
-        help="which guard arm the run measures: 'inert' (default) leaves the "
-        "derived gap signals dark, reproducing the published numbers; 'live' "
-        "feeds a per-quarter trend tracker so the jitter guard, its "
-        "banked-cover override and the ramp-aware Tesla stop can fire; "
-        "'churn' feeds only the jitter signal, the control that isolates the "
-        "ramp rule. Any non-inert arm prints the verdict against both controls",
+        help="which derived-signal arm the run measures: 'inert' (default) "
+        "leaves the gap trend dark, reproducing the published numbers; 'live' "
+        "feeds a per-quarter trend tracker so the ramp-aware Tesla stop can "
+        "fire when --ramp-aware is set. Without --ramp-aware the two arms are "
+        "bit-identical. Any non-inert arm prints the verdict against inert",
     )
     parser.add_argument(
         "--rate-window-quanta",
@@ -2087,7 +2285,108 @@ def build_parser() -> argparse.ArgumentParser:
         "'window@Kq'/'window@all' row measured against status-quo (K=1, "
         "always reported)",
     )
+    parser.add_argument(
+        "--defer-cap-sweep",
+        default="",
+        metavar="SECS,SECS",
+        help="run the status-quo rate at each comma-separated defer cap and "
+        "print one row per cap, paired against the first (e.g. "
+        "'120,300,900'); the rest of the policy comes from the other flags. "
+        "Default output is unchanged when absent",
+    )
+    parser.add_argument(
+        "--trace-quarter",
+        default=None,
+        metavar="YYYY-MM-DDTHH:MM",
+        help="print one quarter's per-cycle decisions (data time, R, "
+        "predicted Wh, gap, counterfactual car amps, actions) and its "
+        "landing, then exit; a naive value is UTC and a time inside a "
+        "quarter snaps down to that quarter",
+    )
     return parser
+
+
+def _report(
+    args: argparse.Namespace,
+    quarters: Mapping[datetime, Quarter],
+    stats: IngestStats,
+    *,
+    policy: Policy,
+    available: Mapping[str, RateFn],
+    display: Sequence[str],
+    window_quanta: Mapping[str, int | str],
+    cap_specs: Sequence[int],
+    logs: int,
+) -> int:
+    """Run and print the aggregate report plus any requested sweep sections.
+
+    Extracted from :func:`main` so the CLI setup (parse, ingest, filter,
+    policy) stays separate from the presentation. Returns the process exit
+    status, which is always 0 here: ``main`` has already rejected the empty
+    input.
+    """
+    names = list(dict.fromkeys([*display, "status-quo"]))
+    runs = {
+        name: replay_all(
+            quarters,
+            available.get(name, rate_status_quo),
+            policy=policy,
+            guards=args.guards,
+            rate_window_quanta=window_quanta.get(name, 1),
+        )
+        for name in names
+    }
+    base = runs["status-quo"]
+    summaries = [summarize_variant(name, runs[name]) for name in display]
+    comparisons = [
+        (name, compare_variants(base, runs[name]))
+        for name in display
+        if name != "status-quo"
+    ]
+    reference = next((name for name in display if name != "status-quo"), None)
+
+    print(format_stats(logs, stats))
+    print(f"  regime: {args.regime} ({len(quarters)} quarter(s))")
+    print(f"  policy: {policy.label}")
+    if window_quanta:
+        print(
+            f"  rate windows: {', '.join(window_quanta)} "
+            "vs status-quo (1q = shipped)"
+        )
+    if args.date:
+        print(f"  restricted to {args.date}: {len(quarters)} quarters")
+    print()
+    print(f"target Wh/quarter: {TARGET_WH:.1f}\n")
+    print(format_summaries(summaries))
+    for name, comparison in comparisons:
+        print()
+        print(format_comparison(name, comparison))
+    if reference is not None and args.worst > 0:
+        print()
+        print(
+            format_regressions(
+                reference,
+                rank_regressions(base, runs[reference], args.worst),
+            )
+        )
+    if cap_specs:
+        print()
+        print(format_cap_sweep(cap_specs, quarters, policy, guards=args.guards))
+    if args.guards != "inert":
+        # The control is the same logs, rate and policy — only the derived
+        # gap signal differs, so every delta is the arm's own work.
+        print()
+        print(
+            format_guard_arm(
+                replay_all(
+                    quarters, available["status-quo"], policy=policy, guards="live"
+                ),
+                inert=replay_all(quarters, available["status-quo"], policy=policy),
+                rate_name="status-quo",
+                worst=args.worst,
+            )
+        )
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2105,6 +2404,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         window_specs = parse_rate_windows(args.rate_window_quanta)
+        cap_specs = (
+            parse_defer_cap_sweep(args.defer_cap_sweep)
+            if args.defer_cap_sweep
+            else ()
+        )
+        trace_start = (
+            parse_quarter_start(args.trace_quarter) if args.trace_quarter else None
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         print(_USAGE, file=sys.stderr)
@@ -2139,7 +2446,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: no replayable quarters in {len(paths)} log(s)", file=sys.stderr)
         return 1
 
-    names = list(dict.fromkeys([*display, "status-quo"]))
     policy = Policy(
         turn_on_margin_wh=args.turn_on_margin,
         turn_off_margin_wh=args.turn_off_margin,
@@ -2149,67 +2455,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         ramp_aware=args.ramp_aware,
         defer_lookahead_quanta=args.defer_lookahead_quanta,
     )
-    runs = {
-        name: replay_all(
-            quarters,
-            available.get(name, rate_status_quo),
+    if trace_start is not None:
+        quarter = quarters.get(trace_start)
+        if quarter is None:
+            print(
+                f"error: no replayable quarter at "
+                f"{trace_start:%Y-%m-%d %H:%M} UTC",
+                file=sys.stderr,
+            )
+            return 1
+        run = replay(
+            quarter,
+            rate_status_quo,
             policy=policy,
             guards=args.guards,
-            rate_window_quanta=window_quanta.get(name, 1),
+            trace=True,
         )
-        for name in names
-    }
-    base = runs["status-quo"]
-    summaries = [summarize_variant(name, runs[name]) for name in display]
-    comparisons = [
-        (name, compare_variants(base, runs[name]))
-        for name in display
-        if name != "status-quo"
-    ]
-    reference = next((name for name in display if name != "status-quo"), None)
+        print(format_trace(quarter, run, policy))
+        return 0
 
-    print(format_stats(len(paths), stats))
-    print(f"  regime: {args.regime} ({len(quarters)} quarter(s))")
-    print(f"  policy: {policy.label}")
-    if window_quanta:
-        print(
-            f"  rate windows: {', '.join(window_quanta)} "
-            "vs status-quo (1q = shipped)"
-        )
-    if args.date:
-        print(f"  restricted to {args.date}: {len(quarters)} quarters")
-    print()
-    print(f"target Wh/quarter: {TARGET_WH:.1f}\n")
-    print(format_summaries(summaries))
-    for name, comparison in comparisons:
-        print()
-        print(format_comparison(name, comparison))
-    if reference is not None and args.worst > 0:
-        print()
-        print(
-            format_regressions(
-                reference,
-                rank_regressions(base, runs[reference], args.worst),
-            )
-        )
-    if args.guards != "inert":
-        # The controls are the same logs, rate and policy — only the derived
-        # gap signals differ, so every delta is the arm's own work.
-        print()
-        print(
-            format_guard_arm(
-                replay_all(
-                    quarters, available["status-quo"], policy=policy, guards="live"
-                ),
-                churn=replay_all(
-                    quarters, available["status-quo"], policy=policy, guards="churn"
-                ),
-                inert=replay_all(quarters, available["status-quo"], policy=policy),
-                rate_name="status-quo",
-                worst=args.worst,
-            )
-        )
-    return 0
+    return _report(
+        args,
+        quarters,
+        stats,
+        policy=policy,
+        available=available,
+        display=display,
+        window_quanta=window_quanta,
+        cap_specs=cap_specs,
+        logs=len(paths),
+    )
 
 
 if __name__ == "__main__":

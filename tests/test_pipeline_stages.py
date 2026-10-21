@@ -13,6 +13,7 @@ from load_manager import LoadManager, LoadManagerConfig
 from load_models import (
     AsyncPhaseResult,
     CycleContext,
+    CycleDiagnostics,
     PendingEffect,
     TeslaAuthError,
     TeslaState,
@@ -30,6 +31,12 @@ def ctx() -> CycleContext:
 def lm() -> LoadManager:
     """Default LoadManager with minimal config, no real controllers."""
     return LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
+
+
+def test_cycle_models_have_no_gap_jitter() -> None:
+    """The guard's churn diagnostic is gone from both cycle models."""
+    assert "gap_jitter_wh_per_s" not in CycleContext.__dataclass_fields__
+    assert "gap_jitter_wh_per_s" not in CycleDiagnostics.__dataclass_fields__
 
 
 class TestStageNBCFetch:
@@ -1390,64 +1397,6 @@ class TestStageComputeGapTrend:
         )
         assert ctx.gap_trend_wh_per_s is None
 
-    def test_jitter_plumbed_from_tracker(self, lm: LoadManager, ctx: CycleContext):
-        """compute_gap exposes the tracker churn as ctx.gap_jitter_wh_per_s.
-
-        0.0 after a cycle where churn is not yet measurable (one or two
-        samples); the live churn value once the slope pair exists. The
-        oscillating series below never confirms a trend, so jitter and
-        trend are visible at the same time — jitter is measurable exactly
-        where the trend is not.
-        """
-        lm.target_wh = -9
-        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        self._run_gap_cycle(lm, ctx, base, -30.0)  # gap 21, churn unmeasurable
-        assert ctx.gap_jitter_wh_per_s == 0.0
-        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -45.0)  # gap 36
-        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=90), -36.0)  # gap 27
-        assert ctx.gap_trend_wh_per_s is None
-        assert ctx.gap_jitter_wh_per_s == lm.gap_trend.churn_wh_per_s
-        assert ctx.gap_jitter_wh_per_s > 0.0
-
-    def test_compute_gap_gates_churn_on_remaining(
-        self, lm: LoadManager, ctx: CycleContext
-    ):
-        """Churn is withheld while more than JITTER_MAX_REMAINING_SECS remain.
-
-        Past 600 s of a quarter at least two thirds of the projection is
-        `prediction_w * seconds_remaining` extrapolation, so seeding the
-        churn EWMA there reported "excessive jitter" for five minutes
-        (bugs/2026-10-02-sunrise-marine-layer-jitter.log, cluster B).
-        The default 450 s window still measures churn as before.
-        """
-        lm.target_wh = -9
-        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        self._run_gap_cycle(lm, ctx, base, -30.0, seconds_remaining=750)
-        self._run_gap_cycle(
-            lm, ctx, base + timedelta(seconds=30), -45.0, seconds_remaining=720
-        )
-        self._run_gap_cycle(
-            lm, ctx, base + timedelta(seconds=60), -69.0, seconds_remaining=690
-        )
-        assert ctx.gap_trend_wh_per_s is not None  # trend is unaffected
-        assert ctx.gap_jitter_wh_per_s == 0.0
-
-    def test_jitter_debug_log_when_measurable(
-        self, lm: LoadManager, ctx: CycleContext, caplog
-    ):
-        """A DEBUG line carries churn/swing once measurable, none before."""
-        lm.target_wh = -9
-        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        with caplog.at_level(logging.DEBUG, logger="load_manager"):
-            self._run_gap_cycle(lm, ctx, base, -30.0)
-            assert not [r for r in caplog.records if "gap_jitter" in r.getMessage()]
-            self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -45.0)
-            self._run_gap_cycle(lm, ctx, base + timedelta(seconds=90), -36.0)
-        messages = [r.getMessage() for r in caplog.records if "gap_jitter" in r.getMessage()]
-        assert len(messages) == 1
-        assert "churn=" in messages[0]
-
-
 class TestBuildResultGapTrend:
     """CycleDiagnostics carry the gap trend into logs/JSON/SSE."""
 
@@ -1495,53 +1444,6 @@ class TestBuildResultGapTrend:
         assert result.diagnostics is not None
         assert result.diagnostics.gap_trend_wh_per_s is None
         assert result.diagnostics.to_dict()["gap_trend_wh_per_s"] is None
-
-    def test_build_result_includes_gap_jitter(
-        self, lm: LoadManager, ctx: CycleContext
-    ):
-        """After jitter-producing cycles, diagnostics expose the churn."""
-        lm.target_wh = -9
-        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        for i, predicted in enumerate([-30.0, -45.0, -36.0]):
-            ctx.qh_name = "QH1"
-            ctx.data_point_at = base + timedelta(seconds=(0, 30, 90)[i])
-            ctx.now_postfetch = ctx.data_point_at + timedelta(seconds=30)
-            ctx.predicted_wh = predicted
-            ctx.seconds_remaining = 450 - 30 * i
-            lm._stage_compute_gap(ctx)
-        ctx.actions = []
-        ctx.succeeded_effects = []
-        ctx.tesla_state = None
-        ctx.tesla_error = None
-        ctx.tesla_login_url = None
-        result = lm._stage_build_result(ctx)
-        assert result.diagnostics is not None
-        jitter = result.diagnostics.gap_jitter_wh_per_s
-        assert jitter is not None
-        assert jitter > 0.0
-        payload = result.diagnostics.to_dict()
-        assert payload["gap_jitter_wh_per_s"] == jitter
-
-    def test_build_result_jitter_none_before_first_compute_gap(
-        self, lm: LoadManager, ctx: CycleContext
-    ):
-        """Before any compute_gap the field is None — churn never measured."""
-        ctx.qh_name = "QH2"
-        ctx.predicted_wh = -500.0
-        ctx.adjusted_wh = -500.0
-        ctx.gap_wh = -100.0
-        ctx.seconds_remaining = 450
-        ctx.now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        ctx.actions = []
-        ctx.succeeded_effects = []
-        ctx.tesla_state = None
-        ctx.tesla_error = None
-        ctx.tesla_login_url = None
-        result = lm._stage_build_result(ctx)
-        assert result.diagnostics is not None
-        assert result.diagnostics.gap_jitter_wh_per_s is None
-        assert result.diagnostics.to_dict()["gap_jitter_wh_per_s"] is None
-
 
 class TestPendingCheckRefreshesPlugState:
     """_stage_pending_check() refreshes plug state even on early exit.

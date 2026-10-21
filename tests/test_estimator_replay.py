@@ -61,7 +61,6 @@ from typing import Sequence
 
 import pytest
 
-from constants import JITTER_FLOOR_WH_PER_S
 from tools import estimator_replay as er
 from tools import forecast_log_scoring as fls
 
@@ -888,6 +887,46 @@ def test_history_mode_lands_on_the_logged_actual_with_a_car() -> None:
     assert run.action_count == 0
 
 
+def test_replay_follows_a_logged_car_stop() -> None:
+    """The counterfactual follows the logged amps, not a frozen open.
+
+    A car that stops mid-quarter without a policy command must not keep
+    drawing. The old model held the opening 5 A for the whole quarter, so it
+    booked 5 A over the final 300 s the log says the car was off — 100 Wh of
+    energy that never happened. The anchor aims at the target, so no command
+    explains a difference: the landing is the car series alone.
+    """
+    quarter = dataclasses.replace(
+        _tesla_quarter(5.0, predicted_wh=-9.0, remaining_secs=300),
+        tesla_samples=(
+            er.TeslaSample(t=200.0, amps=5.0, plugged_in=True, at_home=True),
+            er.TeslaSample(t=600.0, amps=0.0, plugged_in=True, at_home=True),
+        ),
+    )
+    run = er.replay(quarter, er.rate_status_quo)
+    assert run.actions == ()
+    assert run.landing_wh == pytest.approx(0.0)
+
+
+def test_replay_trace_records_each_cycle() -> None:
+    """``trace=True`` reports the context and action of every anchor.
+
+    The trace is diagnostic only: it must not change the run. The first row
+    is the 11 Wh prediction against the -9 Wh target (a 20 Wh deficit), so
+    the car takes one amp, and the row names that decision before the
+    command lands.
+    """
+    quarter = _tesla_quarter(6.0, predicted_wh=11.0, remaining_secs=600)
+    run = er.replay(quarter, er.rate_status_quo, trace=True)
+    assert len(run.trace) == len(quarter.anchors)
+    row = run.trace[0]
+    assert row.remaining_secs == 600
+    assert row.gap_wh == pytest.approx(11.0 - er.TARGET_WH)
+    assert row.tesla_amps == 6
+    assert row.actions == (("tesla", "set_amps"),)
+    assert er.replay(quarter, er.rate_status_quo).trace == ()
+
+
 def test_plug_only_quarters_never_command_the_tesla(
     quarter_a: er.Quarter, quarter_b: er.Quarter
 ) -> None:
@@ -965,7 +1004,7 @@ def test_policy_defaults_are_the_shipped_engine() -> None:
     assert engine.lumpy_first is False
     assert er.Policy().label == (
         "turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
-        "defer on, defer cap 120 s, defer lookahead 1q, ramp-aware off"
+        "defer on, defer cap 900 s, defer lookahead 1q, ramp-aware off"
     )
 
 
@@ -1453,21 +1492,66 @@ def test_main_reports_the_policy_it_ran(tmp_path: Path, capsys) -> None:
     assert er.main([str(log), "--turn-off-margin", "40"]) == 0
     assert (
         "policy: turn-on margin 0 Wh, turn-off margin 40 Wh, lumpy-first off, "
-        "defer on, defer cap 120 s, defer lookahead 1q, ramp-aware off"
+        "defer on, defer cap 900 s, defer lookahead 1q, ramp-aware off"
         in capsys.readouterr().out
     )
     assert er.main([str(log), "--lumpy-first"]) == 0
     assert (
         "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first on, "
-        "defer on, defer cap 120 s, defer lookahead 1q, ramp-aware off"
+        "defer on, defer cap 900 s, defer lookahead 1q, ramp-aware off"
         in capsys.readouterr().out
     )
     assert er.main([str(log), "--defer-lookahead-quanta", "3"]) == 0
     assert (
         "policy: turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
-        "defer on, defer cap 120 s, defer lookahead 3q, ramp-aware off"
+        "defer on, defer cap 900 s, defer lookahead 3q, ramp-aware off"
         in capsys.readouterr().out
     )
+
+
+def test_main_traces_one_quarter(tmp_path: Path, capsys) -> None:
+    """``--trace-quarter`` prints the cycle rows and exits, not the table."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log), "--trace-quarter", "2026-10-01T20:30"]) == 0
+    out = capsys.readouterr().out
+    assert "trace 2026-10-01 20:30 UTC" in out
+    assert "actions" in out
+    assert "landing" in out and "miss" in out
+    assert "target Wh/quarter" not in out
+    assert er.main([str(log), "--trace-quarter", "2026-10-01T21:00"]) == 1
+    assert "no replayable quarter" in capsys.readouterr().err
+
+
+def test_main_sweeps_defer_caps(tmp_path: Path, capsys) -> None:
+    """``--defer-cap-sweep`` adds one paired row per cap and no default row."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log), "--defer-cap-sweep", "120,900"]) == 0
+    out = capsys.readouterr().out
+    assert "defer cap sweep" in out
+    assert "vs first B/W/S" in out
+    assert "120" in out and "900" in out
+    assert er.main([str(log)]) == 0
+    assert "defer cap sweep" not in capsys.readouterr().out
+
+
+def test_main_rejects_a_bad_defer_cap_sweep(tmp_path: Path, capsys) -> None:
+    """A malformed sweep is an error, not a silently empty section."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log), "--defer-cap-sweep", "wide"]) == 1
+    assert "defer cap" in capsys.readouterr().err
+    assert er.main([str(log), "--defer-cap-sweep", "0"]) == 1
+    assert "defer cap" in capsys.readouterr().err
+
+
+def test_main_rejects_an_unknown_trace_quarter(tmp_path: Path, capsys) -> None:
+    """A misspelled quarter names the UTC start it could not find."""
+    log = tmp_path / "synth.log"
+    log.write_text(_replayable_log())
+    assert er.main([str(log), "--trace-quarter", "nonsense"]) == 1
+    assert "trace quarter" in capsys.readouterr().err
 
 
 def test_main_restricts_to_one_date(tmp_path: Path, capsys) -> None:
@@ -1569,43 +1653,33 @@ def test_checked_in_fixtures_still_match_the_logs() -> None:
             assert got_event[0] == pytest.approx(want_event[0], abs=1.0)
 
 
-# ── the guard arm (Subtask 2) ────────────────────────────────────────
+# ── the derived-signal arm (Subtask 2) ───────────────────────────────
 #
-# Until now the replay modelled a machine production does not run: the
-# ``DecideContext`` it built omitted ``gap_jitter_wh_per_s`` and
-# ``gap_trend_wh_per_s``, so the turn-on jitter guard, its banked-cover
-# override and the ramp-aware Tesla stop could never fire. These tests pin the
-# fidelity wiring (one tracker per quarter, fed production's own order and
-# inputs), the inert arm's bit-parity with the published numbers, and the
-# decline/rescue split the report has to name.
+# The replay must feed production's own gap-trend signal when asked, so the
+# ramp-aware Tesla stop is reachable. The jitter guard and its banked-cover
+# override were removed 2026-10-21; the ``churn`` arm and its counters went
+# with them.
 
 
-def _churning_quarter(banked_wh: float = 20.0) -> er.Quarter:
-    """A quarter whose gap oscillates, so the tracker measures churn.
+def test_guard_modes_are_inert_and_live_only() -> None:
+    """The churn arm and the decline/rescue counters are gone."""
+    assert er.GUARD_MODES == ("inert", "live")
+    assert "declines" not in er.GuardActivity.__dataclass_fields__
+    assert "rescues" not in er.GuardActivity.__dataclass_fields__
 
-    Four anchors 30 s apart with the gap alternating 40 / 5 Wh. Two slopes of
-    opposite sign make churn ~2.33 Wh/s — an order above the guard's floor —
-    and the projected swing at that horizon swamps either claim, so the
-    guard fires on *both* cycles that reach the turn-on side (5 Wh is past
-    the 3 Wh deadband, so the second one is not swallowed by hysteresis).
-    The first two anchors decide nothing (the cheapest 260 W plug costs 43.3
-    Wh over 600 s, more than either surplus), which is what keeps the two
-    arms' gap series identical up to the first decline.
 
-    ``banked_wh`` is the quarter's accumulated energy: +20 Wh sits above the
-    bar the cover needs (no override, so the guard's fire is a decline),
-    while a deep export grants the cover and the fire becomes a rescue.
-    """
+def _ramping_quarter() -> er.Quarter:
+    """A quarter whose gap rises steadily, so the tracker trusts a trend."""
     anchors = []
-    for index, gap in enumerate((40.0, 5.0, 40.0, 5.0)):
+    for index, gap in enumerate((10.0, 20.0, 30.0, 40.0)):
         remaining = 600 - 30 * index
         predicted = er.TARGET_WH - gap
         anchors.append(
-            (900 - remaining, remaining, 30, banked_wh,
-             (predicted - banked_wh) / remaining, None)
+            (900 - remaining, remaining, 30, 20.0,
+             (predicted - 20.0) / remaining, None)
         )
     return _build_quarter(
-        "churn",
+        "ramp",
         "2026-10-16 12:00",
         8.0,
         11.0,
@@ -1616,50 +1690,16 @@ def _churning_quarter(banked_wh: float = 20.0) -> er.Quarter:
 
 
 def test_guard_arm_defaults_to_inert_and_is_bit_identical() -> None:
-    """The shipped arm is the default, and it carries no guard activity."""
-    quarter = _churning_quarter()
+    """The shipped arm is the default and carries no trend activity."""
+    quarter = _ramping_quarter()
     default = er.replay(quarter, er.rate_status_quo)
     inert = er.replay(quarter, er.rate_status_quo, guards="inert")
     assert default == inert
     assert inert.guard == er.GuardActivity()
 
 
-def test_live_guard_declines_a_churning_turn_on() -> None:
-    """With the tracker fed, the guard withholds the turn-ons it protects."""
-    quarter = _churning_quarter()
-    inert = er.replay(quarter, er.rate_status_quo)
-    live = er.replay(quarter, er.rate_status_quo, guards="live")
-    assert inert.guard.declines == 0
-    # Both cycles that claim a surplus are declined: the inert arm starts a
-    # plug into the first one and sheds it again one cycle later, so the arm
-    # suppresses two commands and lands back on the logged actual.
-    assert live.guard.declines == 2
-    assert inert.action_count == 2
-    assert live.action_count == 0
-    assert live.landing_wh != inert.landing_wh
-    # An oscillating gap is not a ramp: the trend stays untrusted, so the
-    # ramp rule had nothing to hasten here.
-    assert live.guard.trusted_trend_cycles == 0
-
-
-def test_live_guard_override_releases_a_covered_turn_on() -> None:
-    """A bank deep enough to cover the load is a rescue, not a decline.
-
-    The rescue happens at the first fire, so the rest of the quarter then
-    unfolds exactly as it does in the inert arm — including the shed that
-    follows, which the guard never touches (turning off is not guarded).
-    """
-    quarter = _churning_quarter(banked_wh=-49.0)
-    inert = er.replay(quarter, er.rate_status_quo)
-    live = er.replay(quarter, er.rate_status_quo, guards="live")
-    assert live.guard.declines == 0
-    assert live.guard.rescues == 1
-    assert live.steps == inert.steps
-    assert live.landing_wh == inert.landing_wh
-
-
-def test_live_arm_feeds_the_tracker_productions_own_signals() -> None:
-    """The ctx decide() reads carries the churn/trend the tracker measured."""
+def test_live_arm_feeds_the_trend_signal_only() -> None:
+    """The live ctx carries the trusted trend; the inert ctx stays dark."""
     seen: list[er.DecideContext] = []
     original = er.GapMinder.decide
 
@@ -1669,83 +1709,81 @@ def test_live_arm_feeds_the_tracker_productions_own_signals() -> None:
 
     er.GapMinder.decide = spy  # type: ignore[method-assign]
     try:
-        er.replay(_churning_quarter(), er.rate_status_quo, guards="live")
+        er.replay(_ramping_quarter(), er.rate_status_quo, guards="live")
         live_seen = list(seen)
         seen.clear()
-        er.replay(_churning_quarter(), er.rate_status_quo, guards="churn")
-        churn_seen = list(seen)
-        seen.clear()
-        er.replay(_churning_quarter(), er.rate_status_quo, guards="inert")
+        er.replay(_ramping_quarter(), er.rate_status_quo, guards="inert")
         inert_seen = list(seen)
     finally:
         er.GapMinder.decide = original  # type: ignore[method-assign]
-    # Two cycles of samples are not enough for churn; the third measures it.
-    assert live_seen[0].gap_jitter_wh_per_s == 0.0
-    assert live_seen[2].gap_jitter_wh_per_s > JITTER_FLOOR_WH_PER_S
-    assert all(ctx.gap_trend_wh_per_s is None for ctx in live_seen)
-    # The churn arm feeds the same jitter signal but not the ramp rule's
-    # trend — that separation is the whole point of the control.
-    assert [ctx.gap_jitter_wh_per_s for ctx in churn_seen] == [
-        ctx.gap_jitter_wh_per_s for ctx in live_seen
-    ]
-    assert all(ctx.gap_trend_wh_per_s is None for ctx in churn_seen)
-    # The inert arm leaves both dark, which is the old machine.
-    assert all(ctx.gap_jitter_wh_per_s is None for ctx in inert_seen)
+    assert live_seen
     assert all(ctx.gap_trend_wh_per_s is None for ctx in inert_seen)
+    assert any(ctx.gap_trend_wh_per_s is not None for ctx in live_seen)
+    assert not hasattr(live_seen[0], "gap_jitter_wh_per_s")
 
 
-def test_churn_arm_isolates_the_ramp_rule_signal() -> None:
-    """With no car to command, ``churn`` and ``live`` are the same machine.
-
-    That identity is what licenses reading their difference elsewhere as the
-    ramp rule's own effect rather than the bundle's.
-    """
-    quarter = _churning_quarter()
-    churn = er.replay(quarter, er.rate_status_quo, guards="churn")
+def test_live_arm_is_bit_identical_without_ramp_aware() -> None:
+    """The trend only changes a decision when --ramp-aware is set."""
+    quarter = _ramping_quarter()
+    inert = er.replay(quarter, er.rate_status_quo)
     live = er.replay(quarter, er.rate_status_quo, guards="live")
-    assert churn == live
-    assert churn.guard.declines > 0  # the guard is live in both
+    assert live.steps == inert.steps
+    assert live.landing_wh == inert.landing_wh
+    assert live.actions == inert.actions
+    assert live.guard.trusted_trend_cycles > inert.guard.trusted_trend_cycles
 
 
 def test_guard_arm_rejects_an_unknown_name() -> None:
     """A typo is an error, not a silent fallback to inert."""
     with pytest.raises(ValueError):
-        er.replay(_churning_quarter(), er.rate_status_quo, guards="sometimes")
+        er.replay(_ramping_quarter(), er.rate_status_quo, guards="sometimes")
 
 
 def test_replay_all_forwards_the_guard_arm() -> None:
     """The aggregate path carries the arm, not just the single quarter."""
-    quarter = _churning_quarter()
+    quarter = _ramping_quarter()
     quarters = {quarter.qh_start: quarter}
     inert = er.replay_all(quarters, er.rate_status_quo)
     live = er.replay_all(quarters, er.rate_status_quo, guards="live")
-    assert inert[quarter.qh_start].guard.declines == 0
-    assert live[quarter.qh_start].guard.declines == 2
+    assert inert[quarter.qh_start].guard.trusted_trend_cycles == 0
+    assert live[quarter.qh_start].guard.trusted_trend_cycles > 0
 
 
-def test_format_guard_arm_names_the_mechanisms_and_the_control() -> None:
-    """The verdict block says what fired, against which controls, where."""
-    quarter = _churning_quarter()
+def test_format_guard_arm_names_the_signal_and_the_control() -> None:
+    """The verdict block says what the trend did, against the inert control."""
+    quarter = _ramping_quarter()
     quarters = {quarter.qh_start: quarter}
     body = er.format_guard_arm(
         er.replay_all(quarters, er.rate_status_quo, guards="live"),
-        churn=er.replay_all(quarters, er.rate_status_quo, guards="churn"),
         inert=er.replay_all(quarters, er.rate_status_quo),
         rate_name="status-quo",
         worst=1,
     )
     assert "guard arm: live" in body
     assert "status-quo" in body
-    assert "jitter guard" in body
-    assert "decline" in body
-    assert "rescue" in body
     assert "trusted-trend" in body
     assert "live vs inert" in body
-    # The ramp rule gets its own line, and the changed quarters are listed.
-    assert "churn-only vs inert" in body
-    assert "live vs churn-only" in body
-    assert "quarters the arm moved" in body
-    assert "--guards" in body
+    # Without --ramp-aware the arms are identical, so there is no list to print.
+    assert "quarters the arm moved" not in body
+    assert "--ramp-aware" in body
+    assert "churn-only" not in body
+    assert "jitter guard and banked-cover override were removed" in body
+
+
+def test_format_guard_quarters_lists_only_moved_quarters() -> None:
+    """The attribution list names the trusted count and the arm's actions."""
+    start = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+    inert = {start: er.QuarterRun(miss_wh=-20.0, actions=1, reversals=0)}
+    live = {
+        start: er.QuarterRun(
+            miss_wh=-10.0, actions=2, reversals=0,
+            guard=er.GuardActivity(trusted_trend_cycles=3),
+        )
+    }
+    body = er.format_guard_quarters(live, inert=inert, limit=8)
+    assert "worst 8 of 1" in body
+    assert "actions 1 -> 2" in body
+    assert "trusted 3" in body
 
 
 def test_main_prints_the_guard_arm_only_for_live(tmp_path: Path, capsys) -> None:

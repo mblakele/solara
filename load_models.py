@@ -521,10 +521,6 @@ class CycleDiagnostics:
             or None when not resolved.
         gap_trend_wh_per_s: EWMA slope of the adjusted gap in Wh/s,
             or None when no sustained trend is confirmed.
-        gap_jitter_wh_per_s: EWMA of consecutive-slope churn (the
-            cycle-to-cycle swing of the gap estimate) in Wh/s; 0.0 when
-            measured but not yet measurable (fewer than three samples),
-            None before the first compute_gap.
     """
 
     gap_wh: float | None = None
@@ -551,7 +547,6 @@ class CycleDiagnostics:
     quantization_confidence: float | None = None
     settle_window_secs: int | None = None
     gap_trend_wh_per_s: float | None = None
-    gap_jitter_wh_per_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -592,7 +587,6 @@ class CycleDiagnostics:
             "quantization_confidence": self.quantization_confidence,
             "settle_window_secs": self.settle_window_secs,
             "gap_trend_wh_per_s": self.gap_trend_wh_per_s,
-            "gap_jitter_wh_per_s": self.gap_jitter_wh_per_s,
         }
 
 
@@ -870,8 +864,8 @@ class CycleContext:
         qh_name: Current quarter-hour identifier (QH1–QH4), or None.
         predicted_wh: Raw NBC prediction for the current QH, or None.
         banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``,
-            negative = net export), or None when unknown. Feeds the
-            banked-cover jitter override for plug turn-ons.
+            negative = net export), or None when unknown. The lumpy-first
+            gate uses it to derive the quarter's trailing rate.
         seconds_remaining: Seconds left in the current QH, or None.
         data_point_at: Timestamp of the most recent NBC data point, or None.
 
@@ -879,8 +873,6 @@ class CycleContext:
         adjusted_wh: Prediction adjusted by pending effects, or None.
         gap_wh: Predicted surplus (+) or deficit (-) in Wh, or None.
         gap_trend_wh_per_s: Sustained slope of the adjusted gap, or None.
-        gap_jitter_wh_per_s: Cycle-to-cycle churn of the gap estimate
-            (EWMA of |delta slope|), 0.0 when not yet measurable.
 
         # Stage 5 (async phase) outputs
         tesla_state: Current Tesla state, or None.
@@ -914,7 +906,6 @@ class CycleContext:
     adjusted_wh: float | None = None
     gap_wh: float | None = None
     gap_trend_wh_per_s: float | None = None
-    gap_jitter_wh_per_s: float | None = None
 
     # Stage 5 output
     tesla_state: TeslaState | None = None

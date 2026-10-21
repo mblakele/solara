@@ -12,13 +12,14 @@ decision outcome changed.) Name the log because logs are the input.
 
 It also reads what production logged about its own decisions — the DEBUG
 ``Load management cycle result: CycleResult(...)`` reprs (per-quarter
-target, reason, production churn) and the INFO ``gapminder_jitter_guard``
-events — and reports them alongside a churn band (``k * churn * R``,
-production's ``GapTrendTracker`` fed from the anchor series) as a second
-uncertainty model next to the sigma band. Logged decisions are reported,
-never re-executed. Offline churn uses raw ``predicted_wh`` (no
-pending-effect adjustment), so quarters containing actions make it a
-slight approximation of the value the guard consumed.
+target, reason, historical churn) and the INFO ``gapminder_jitter_guard``
+events in old logs — and reports them alongside a churn band (``k * churn
+* R``) as a second uncertainty model next to the sigma band. Production
+removed the churn EWMA on 2026-10-21, so the tool rebuilds it locally from
+the anchor series. Logged decisions are reported, never re-executed.
+Offline churn uses raw ``predicted_wh`` (no pending-effect adjustment), so
+quarters containing actions make it a slight approximation of the value
+the guard consumed.
 
 Everything here is read-only analysis over log text; no production module
 imports this. The forecast itself (``util.compute_nbc_quarter``) is
@@ -41,15 +42,16 @@ That path has no minimum-horizon floor and no overshoot cap by design, so
 the data is collected before any guard is considered. Also opt-in; the
 default output is unchanged.
 
-``--guards`` adds the suppression census: every mechanism that only
-*declines* work is invisible to a closed loop that watches actions, so this
-section counts what each one withheld and how reachable its trigger was —
-jitter-guard declines (and the loads that were on offer in the same cycle),
-banked-cover rescues, stop deferrals with their horizon distribution, the
-ramp rule's arithmetical reach, and the committed settle window. A guarded
-quarter is reported beside an unguarded one with the confound stated: the
-guard fires *in* the churning-forecast quarters, so the split is a
-correlation, never the guard's effect.
+``--guards`` adds the historical suppression census: every mechanism that
+only *declines* work is invisible to a closed loop that watches actions, so
+this section counts what each one withheld in the OLD logs and how reachable
+its trigger was — jitter-guard declines (and the loads that were on offer in
+the same cycle), banked-cover rescues, stop deferrals with their horizon
+distribution, the ramp rule's arithmetical reach, and the committed settle
+window. The jitter guard and banked-cover override were removed from
+production on 2026-10-21. A guarded quarter is reported beside an unguarded
+one with the confound stated: the guard fired *in* the churning-forecast
+quarters, so the split is a correlation, never the guard's effect.
 
 Run from the repo root::
 
@@ -65,6 +67,7 @@ import math
 import re
 import statistics
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -85,6 +88,10 @@ if str(_ROOT) not in sys.path:
 # E402 and pylint wrong-import-position are the same complaint).
 from constants import (  # noqa: E402 # pylint: disable=wrong-import-position
     DEFAULT_HYSTERESIS_WH,
+    GAP_TREND_EWMA_ALPHA,
+    GAP_TREND_MAX_SPAN_SECS,
+    GAP_TREND_MIN_SLOPES,
+    GAP_TREND_WINDOW,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
     TESLA_NOMINAL_VOLTAGE,
 )
@@ -913,20 +920,19 @@ def forecast_uncertainty_wh(remaining_secs: float, sigma_rate: float, k: float) 
 
 
 def churn_by_anchor(anchors: Sequence[ForecastAnchor]) -> list[float]:
-    """Production churn estimate for each anchor, in input order.
+    """Historical churn estimate for each anchor, in input order.
 
-    Each quarter's anchors are fed to ``gap_trend.GapTrendTracker`` the
-    way production feeds its cycles: one ``update(data_point_at, ...)``
-    per anchor in log order (repeated data points are rejected by the
-    tracker just as in production). Raw ``predicted_wh`` stands in for
-    the production gap ``target - adjusted``: the unknown target is
-    constant within the quarter, and both a constant offset and a sign
-    flip leave slopes - and therefore the EWMA of ``|Δslope|`` -
-    unchanged. ``noise_floor`` is left at 0 because churn is folded
-    before the trust checks, so the floor cannot change it. The
-    pending-effect adjustment is unavailable offline, so anchors
-    recorded after an action make this a slight approximation of the
-    value the guard consumed.
+    Production removed the turn-on guard's churn EWMA on 2026-10-21, but
+    this offline tool still scores the old logs. It therefore rebuilds the
+    same series locally: one sample per anchor in log order (repeated data
+    points are rejected), reset on quarter-hour rollover and on a data gap
+    over the tracker's max span, then an EWMA of ``|Δslope|`` once two
+    slopes exist. Raw ``predicted_wh`` stands in for the production gap
+    ``target - adjusted``: the unknown target is constant within the
+    quarter, and both a constant offset and a sign flip leave slopes - and
+    therefore the EWMA of ``|Δslope|`` - unchanged. The pending-effect
+    adjustment is unavailable offline, so anchors recorded after an action
+    make this a slight approximation of the value the guard consumed.
 
     Args:
         anchors: Anchors for the log; per-quarter input order (log
@@ -938,15 +944,49 @@ def churn_by_anchor(anchors: Sequence[ForecastAnchor]) -> list[float]:
         or after a data gap over the tracker's max span.
     """
     churns = [0.0] * len(anchors)
-    trackers: dict[_QuarterKey, GapTrendTracker] = {}
+    windows: dict[_QuarterKey, deque[tuple[datetime, float]]] = {}
+    qh_starts: dict[_QuarterKey, datetime] = {}
+    accumulators: dict[_QuarterKey, float | None] = {}
     for index, anchor in enumerate(anchors):
         key = (anchor.source, anchor.quarter_start)
-        tracker = trackers.get(key)
-        if tracker is None:
-            tracker = GapTrendTracker()
-            trackers[key] = tracker
-        tracker.update(anchor.data_point_at, anchor.predicted_wh)
-        churns[index] = tracker.churn_wh_per_s
+        window = windows.setdefault(
+            key, deque(maxlen=GAP_TREND_WINDOW)
+        )
+        qh_start = floor_to_qh(anchor.data_point_at)
+        if key in qh_starts and qh_start != qh_starts[key]:
+            window.clear()
+            accumulators[key] = None
+        qh_starts[key] = qh_start
+
+        if window:
+            prev_ts = window[-1][0]
+            if anchor.data_point_at <= prev_ts:
+                churns[index] = accumulators.get(key) or 0.0
+                continue
+            span = (anchor.data_point_at - prev_ts).total_seconds()
+            if span > GAP_TREND_MAX_SPAN_SECS:
+                window.clear()
+                accumulators[key] = None
+        window.append((anchor.data_point_at, anchor.predicted_wh))
+
+        if len(window) < GAP_TREND_MIN_SLOPES + 1:
+            churns[index] = accumulators.get(key) or 0.0
+            continue
+        recent = list(window)[-(GAP_TREND_MIN_SLOPES + 1):]
+        slopes = [
+            (cur_gap - prev_gap) / (cur_ts - prev_ts).total_seconds()
+            for (prev_ts, prev_gap), (cur_ts, cur_gap) in zip(recent, recent[1:])
+        ]
+        pair_churn = abs(slopes[-1] - slopes[-2])
+        prior = accumulators.get(key)
+        next_churn = (
+            pair_churn
+            if prior is None
+            else GAP_TREND_EWMA_ALPHA * pair_churn
+            + (1.0 - GAP_TREND_EWMA_ALPHA) * prior
+        )
+        accumulators[key] = next_churn
+        churns[index] = next_churn
     return churns
 
 
