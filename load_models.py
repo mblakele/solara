@@ -90,6 +90,14 @@ class AbstractTeslaController(ABC):
         """
 
     @abstractmethod
+    async def wake_vehicle(self) -> bool:
+        """Wake the vehicle so subsequent commands can land.
+
+        Returns:
+            True on success, False on failure.
+        """
+
+    @abstractmethod
     async def set_charge_amps(self, amps: int) -> bool:
         """Set charging amps within [min, max] range.
 
@@ -233,8 +241,6 @@ class PendingEffect:
         power_watts: Expected power impact of the action in Watts.
         direction: For Tesla "set_amps" actions, whether amps increased or
             decreased. Used by settle-window queries. None for plug effects.
-        suppress_action: The action type to suppress during the settle window
-            (e.g. "turn_off" after an amp increase). None for plug effects.
         qh_name: Quarter-hour name when the effect was created. Used for
             QH-boundary expiry in settle-window checks. None for plug effects.
     """
@@ -246,7 +252,6 @@ class PendingEffect:
     power_watts: float
     target_amps: int | None = None
     direction: Literal["increase", "decrease"] | None = None
-    suppress_action: Literal["turn_off", "turn_on"] | None = None
     qh_name: str | None = None
 
     def __post_init__(self) -> None:
@@ -470,6 +475,10 @@ CycleStatus = Literal[
 
 @dataclass(frozen=True)
 class CycleDiagnostics:
+    # Too many instance attributes (22/17): diagnostic snapshot carries one
+    # field per signal by design; new signals (e.g. gap_trend_wh_per_s)
+    # extend it rather than nesting.
+    # pylint: disable=too-many-instance-attributes
     """Diagnostic snapshot for one load management cycle.
 
     Attributes:
@@ -483,7 +492,15 @@ class CycleDiagnostics:
         pending_effects_count: Number of pending effects at cycle time.
         tesla_configured: Whether Tesla integration is enabled.
         tesla_state: Current Tesla state snapshot (dict from
-            _tesla_state_to_dict), or None.
+            _tesla_state_to_dict), or None. None alone does not mean
+            "not charging" — see tesla_state_missing_reason.
+        tesla_state_missing_reason: Why tesla_state is None, whenever it
+            is: "not_reached" when the cycle exited before the Tesla
+            async phase ran (status is not ok/dry-run, so nobody read
+            the car), "unavailable" when that phase ran and produced no
+            state (Tesla configured but offline / no telemetry yet, as
+            tesla_error would confirm), or None when a state is present
+            or Tesla is not configured.
         tesla_error: Error message from Tesla API, or None.
         tesla_login_url: OAuth login URL if Tesla auth is required,
             or None.
@@ -502,6 +519,8 @@ class CycleDiagnostics:
         settle_window_secs: Effective prediction/settle window used for
             decisions (derived from quantization with a minimum floor),
             or None when not resolved.
+        gap_trend_wh_per_s: EWMA slope of the adjusted gap in Wh/s,
+            or None when no sustained trend is confirmed.
     """
 
     gap_wh: float | None = None
@@ -513,6 +532,7 @@ class CycleDiagnostics:
     pending_effects_count: int | None = None
     tesla_configured: bool | None = None
     tesla_state: dict[str, Any] | None = None
+    tesla_state_missing_reason: str | None = None
     tesla_error: str | None = None
     tesla_login_url: str | None = None
     plugs_configured: list[str] | None = None
@@ -526,6 +546,7 @@ class CycleDiagnostics:
     quantization_offset: int | None = None
     quantization_confidence: float | None = None
     settle_window_secs: int | None = None
+    gap_trend_wh_per_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible dict.
@@ -547,6 +568,7 @@ class CycleDiagnostics:
             "pending_effects_count": self.pending_effects_count,
             "tesla_configured": self.tesla_configured,
             "tesla_state": self.tesla_state,
+            "tesla_state_missing_reason": self.tesla_state_missing_reason,
             "tesla_error": self.tesla_error,
             "tesla_login_url": self.tesla_login_url,
             "plugs_configured": self.plugs_configured,
@@ -564,6 +586,7 @@ class CycleDiagnostics:
             "quantization_offset": self.quantization_offset,
             "quantization_confidence": self.quantization_confidence,
             "settle_window_secs": self.settle_window_secs,
+            "gap_trend_wh_per_s": self.gap_trend_wh_per_s,
         }
 
 
@@ -824,6 +847,9 @@ class AsyncPhaseResult:
 
 @dataclass
 class CycleContext:
+    # Too many instance attributes (20/17): pipeline context accumulates one
+    # field per stage output by design (Direction A).
+    # pylint: disable=too-many-instance-attributes
     """Intermediate state carried through the run_cycle() pipeline stages.
 
     Stages read fields and write back new values. Not frozen to allow
@@ -837,12 +863,16 @@ class CycleContext:
         # Stage 2 (NBC fetch) outputs
         qh_name: Current quarter-hour identifier (QH1–QH4), or None.
         predicted_wh: Raw NBC prediction for the current QH, or None.
+        banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``,
+            negative = net export), or None when unknown. The lumpy-first
+            gate uses it to derive the quarter's trailing rate.
         seconds_remaining: Seconds left in the current QH, or None.
         data_point_at: Timestamp of the most recent NBC data point, or None.
 
         # Stage 4 (compute gap) outputs
         adjusted_wh: Prediction adjusted by pending effects, or None.
         gap_wh: Predicted surplus (+) or deficit (-) in Wh, or None.
+        gap_trend_wh_per_s: Sustained slope of the adjusted gap, or None.
 
         # Stage 5 (async phase) outputs
         tesla_state: Current Tesla state, or None.
@@ -852,6 +882,12 @@ class CycleContext:
         actions: All actions decided by this cycle (including dry-run).
         sentinel_on: True when a sentinel device was found on.
         timings: Wall-clock seconds per pipeline stage, populated during run_cycle().
+
+        # Stage 3 (pending check) outputs
+        plug_pre_sync_done: Whether the pre-gate plug poll already ran.
+        plug_pre_sync_external: External flips found by the pre-gate poll,
+            already queued for Telegram. The async phase reuses the fresh
+            state instead of re-polling controllers.
     """
 
     # Input
@@ -861,6 +897,7 @@ class CycleContext:
     # Stage 2 output
     qh_name: str | None = None
     predicted_wh: float | None = None
+    banked_wh: float | None = None
     seconds_remaining: int | None = None
     data_point_at: datetime | None = None
     now_postfetch: datetime | None = None
@@ -868,6 +905,7 @@ class CycleContext:
     # Stage 4 output
     adjusted_wh: float | None = None
     gap_wh: float | None = None
+    gap_trend_wh_per_s: float | None = None
 
     # Stage 5 output
     tesla_state: TeslaState | None = None
@@ -876,6 +914,10 @@ class CycleContext:
     succeeded_effects: list[PendingEffect] = field(default_factory=list)
     actions: list[PendingEffect] = field(default_factory=list)
     sentinel_on: bool = False
+
+    # Stage 3 output: pre-gate plug poll reused by Stage 5.
+    plug_pre_sync_done: bool = False
+    plug_pre_sync_external: list[PendingEffect] = field(default_factory=list)
 
     # Timing
     timings: dict[str, float] = field(default_factory=dict)

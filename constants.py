@@ -122,6 +122,53 @@ reliable NBC prediction.  Below this threshold the pipeline returns
 ``no_incomplete_qh`` with a short sleep hint instead of acting on a
 wildly extrapolated single-sample prediction."""
 
+# ── Gap trend (ramp-aware Tesla stop) ────────────────────────────────
+
+GAP_TREND_WINDOW: int = 3
+"""Number of recent (data_point_at, gap) samples retained for slope
+estimation.  Three samples yield two consecutive slopes, the minimum
+needed to confirm a sustained ramp before acting on it."""
+
+GAP_TREND_EWMA_ALPHA: float = 0.3
+"""Weight of the most recent slope in the exponentially weighted moving
+average over the window.  Dampens single-cycle spikes while tracking
+sustained ramps such as sunset."""
+
+GAP_TREND_MIN_SLOPES: int = 2
+"""Slopes required before a gap trend is trusted. A single slope (two
+samples) is never enough — clouds and meter jitter flip the sign within
+one cycle. Zero slopes are neutral and neither confirm nor break."""
+
+GAP_TREND_MAX_SPAN_SECS: int = 120
+"""Largest ``data_point_at`` delta the gap tracker will slope across.
+
+Real production deltas are 30-60 s, because half the cycles exit early on
+``waiting_for_fresh_data``. A longer delta means the feed stalled, and a
+slope drawn across it would mix regimes (a long stall, or a window spanning
+a quarter-hour boundary) rather than measure a ramp, so the tracker clears
+history instead of trusting it. Not tied to ``TeslaDecider.MAX_DEFER_SECS``
+(one whole window since 2026-10-20): a useful slope is bounded by the feed's
+own cadence, not by the stop decision's horizon."""
+
+DEFER_LOOKAHEAD_QUANTA_DEFAULT: int = 1
+"""Observation windows the Tesla stop's safe defer deadline must clear.
+
+Shipped 2026-10-19. A defer is only real if the next observation can still
+arrive before the deadline; with this at 1 a defer is refused whenever the
+deadline sits inside the next window, so the stop is taken now instead
+(``bugs/2026-10-18-tesla-stop-overshoot.log``: deferred at R=89 s against a
+72 s deadline, next decision at R=60 s, quarter finished +10.81 Wh over
+target). Counted in windows, never seconds: the window is
+``DecideContext.observability_secs`` (the resolved prediction/settle
+window), so a deployment whose meter quantises differently sizes the rule
+correctly. ``0`` restores the pre-2026-10-19 static rule.
+
+Corpus snapshot (``uv run python tools/estimator_replay.py corpus/*.log``):
+car-active mean |miss| 17.99 -> 17.91, 3 quarters better / 4 worse, plug-only
+bit-identical. A wash, shipped for the soundness property documented in
+``docs/LOADMANAGER.md``, not for the mean.
+"""
+
 # ── Fetch drift observability ────────────────────────────────────────
 
 DRIFT_REJECTION_ALERT_AFTER: int = 5
@@ -173,3 +220,13 @@ started external session against poll cost during long ghost periods."""
 
 TESLA_HOME_RADIUS_M_DEFAULT: float = 500.0
 """Default radius in metres around home used for at-home detection."""
+
+LUMPY_PLUG_MIN_WATTS: float = 1000.0
+"""Minimum rating for lumpy-first candidacy in turn_off decisions.
+
+Below this a plug is always a fine-tuning knob budgeted on the residual;
+at or above it (the 4857 W water heater in practice) the load can dominate
+the trailing NBC rate, so the residual policy may decide it first. Sized
+by the divergence audit (``tools/divergence_audit.py``): an order of
+magnitude above the fine-tuning scale (hysteresis 3 Wh, gaps of tens of
+Wh), which is what makes the quantum lumpy."""

@@ -1,5 +1,6 @@
 """Tests for GapMinder decision logic."""
 
+import logging
 from datetime import datetime, timedelta, timezone
 import pytest
 
@@ -7,6 +8,14 @@ from load_models import PlugConfig, DeviceState, TeslaState
 from load_nbc import DecideContext, GapMinder, StateTracker
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
+
+
+def test_jitter_guard_and_banked_cover_are_removed():
+    """The guard and its banked-cover override are gone (2026-10-21)."""
+    engine = GapMinder()
+    assert not hasattr(engine, "turn_on_jitter_guard_fires")
+    assert not hasattr(engine, "banked_cover_cap_wh")
+    assert "gap_jitter_wh_per_s" not in DecideContext.__dataclass_fields__
 
 
 # --- Excess solar (turn on) tests ---
@@ -1222,8 +1231,11 @@ def test_safe_defer_secs_calculates_correctly():
     """Unit test for _safe_defer_secs helper method."""
     engine = GapMinder()
 
-    # gap=40 Wh → 40*3=120 → capped at MAX_DEFER_SECS=120
+    # gap=40 Wh → 40*3=120 (under the 900 s cap)
     assert engine._safe_defer_secs(40) == 120
+
+    # gap=400 Wh → 1200 s → capped at MAX_DEFER_SECS=900, a whole window
+    assert engine._safe_defer_secs(400) == 900
 
     # gap=10 Wh → 10*3=30
     assert engine._safe_defer_secs(10) == 30
@@ -1235,12 +1247,13 @@ def test_safe_defer_secs_calculates_correctly():
     assert engine._safe_defer_secs(1) == 3
 
 
-def test_decide_tesla_reduce_at_5a_defers_with_large_gap():
+def test_decide_tesla_reduce_at_5a_stops_with_large_gap():
     """Tesla at 5A, seconds_remaining=300, turn_off path, gap=-1000 Wh.
 
-    Safe window = min(120, 997*3) = 120 → defer (120 < 300).
-    Step 1 returns None (stop not allowed at min amps). Step 3 delegates
-    to _decide_tesla_reduce which defers (secs_remaining > safe_defer).
+    Safe window = min(900, 997*3) = 900 → stop (300 < 900). A gap the
+    remaining window cannot pay out is not deferrable: waiting only books
+    more draw. Step 1 returns None (stop not allowed at min amps). Step 3
+    delegates to _decide_tesla_reduce which stops.
     """
     engine = GapMinder(hysteresis_wh=3)
     state = StateTracker()
@@ -1265,8 +1278,10 @@ def test_decide_tesla_reduce_at_5a_defers_with_large_gap():
     )
 
     # Step 3 delegates to _decide_tesla_reduce with stop_allowed=True,
-    # which defers because secs_remaining=300 > safe_defer=120.
-    assert len(actions) == 0
+    # which stops because secs_remaining=300 < safe_defer=900.
+    assert len(actions) == 1
+    assert actions[0].device_name == "tesla"
+    assert actions[0].action == "turn_off"
 
 
 def test_decide_tesla_reduce_at_5a_stops_with_tight_gap():
@@ -1398,12 +1413,14 @@ def test_decide_tesla_reduce_at_5a_defers_when_time_longer_than_safe_window():
     assert len(actions) == 0
 
 
-def test_decide_turn_off_defers_at_min_amps_with_buffer():
-    """Tesla at 5A (minimum), large gap, lots of QH time remaining.
+def test_decide_turn_off_stops_at_min_amps_when_gap_exceeds_window():
+    """Tesla at 5A (minimum), gap larger than the quarter can pay out.
 
     Step 1 returns None (amps-only, stop not allowed). Step 3 delegates
     to _decide_tesla_reduce with stop_allowed=True. Safe defer window
-    = min(120, 342.5*3) = 120. secs_remaining=686 > 120 → defers.
+    = min(900, 342.5*3) = 900. secs_remaining=686 < 900 → stops now:
+    the car's remaining draw cannot consume the gap, so deferring only
+    books more of it.
 
     Matches the scenario from bugs/2026-06-08-tesla-stop.log:
     - predicted_wh=336.5, target_wh=-9.0  → gap=-345.5 → turn_off path
@@ -1434,15 +1451,18 @@ def test_decide_turn_off_defers_at_min_amps_with_buffer():
     )
 
     # Step 3 delegates to _decide_tesla_reduce(stop_allowed=True).
-    # safe_defer=120 < secs_remaining=686 → defers, no action.
-    assert len(actions) == 0
+    # safe_defer=900 > secs_remaining=686 → stops.
+    assert len(actions) == 1
+    assert actions[0].device_name == "tesla"
+    assert actions[0].action == "turn_off"
 
 
 def test_decide_tesla_reduce_below_5a_defers_with_enough_time():
     """Tesla at 4A (edge case), seconds_remaining=200, turn_off path.
 
-    Same defer logic applies (current_amps <= 5).
-    Safe window = min(120, 997*3) = 120 → defer (120 < 200).
+    Same defer logic applies (current_amps <= 5). With a 60 Wh gap the
+    safe window is min(900, 60*3) = 180 → defer (180 < 200): there is
+    still time for the car to consume the gap and stop on target.
     Step 3 delegates to _decide_tesla_reduce which defers.
     """
     engine = GapMinder(hysteresis_wh=3)
@@ -1463,11 +1483,11 @@ def test_decide_tesla_reduce_below_5a_defers_with_enough_time():
             plugs=plugs,
             tesla=tesla,
         ),
-        predicted_wh=500.0,
-        target_wh=-500.0,
+        predicted_wh=10.0,
+        target_wh=-50.0,
     )
 
-    # Step 3 delegates; safe_defer=120 < 200 → defers.
+    # Step 3 delegates; safe_defer=180 < 200 → defers.
     assert len(actions) == 0
 
 
@@ -1706,3 +1726,27 @@ def test_data_point_at_propagated_to_effects():
 
     assert len(actions) == 1
     assert actions[0].data_point_at == dp_at
+
+
+# --- Constructor API ---
+
+
+@pytest.mark.parametrize(
+    "knob",
+    [
+        {"lumpy_first": True},
+        {"defer_stop": False},
+        {"max_defer_secs": 60},
+        {"ramp_aware": True},
+    ],
+)
+def test_policy_knobs_are_keyword_only(knob):
+    """The opt-in policy knobs cannot be passed positionally.
+
+    They sit past pylint's ``max-positional-arguments`` ceiling, so a silent
+    positional shift would drop a knob into the wrong slot. Keyword-only turns
+    that into a TypeError at the call site.
+    """
+    positional = [None, 5, 48, 0, 0, *knob.values()]
+    with pytest.raises(TypeError):
+        GapMinder(*positional)

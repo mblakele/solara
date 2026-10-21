@@ -247,6 +247,21 @@ class TestCycleResultSerialization:
         assert d["quantization_seconds"] is None
         assert d["settle_window_secs"] is None
 
+    def test_diagnostics_to_dict_carries_tesla_missing_reason(self) -> None:
+        from load_models import CycleDiagnostics
+
+        diag = CycleDiagnostics(
+            gap_wh=-1.0,
+            hysteresis_wh=50,
+            reason="ok",
+            tesla_configured=True,
+            tesla_state_missing_reason="unavailable",
+        )
+        assert diag.to_dict()["tesla_state_missing_reason"] == "unavailable"
+        # Defaults to None, so the key is additive for every existing payload.
+        plain = CycleDiagnostics(gap_wh=-1.0, hysteresis_wh=50, reason="ok")
+        assert plain.to_dict()["tesla_state_missing_reason"] is None
+
     def test_result_to_dict_nests_dicts_not_dataclasses(self) -> None:
         import json
 

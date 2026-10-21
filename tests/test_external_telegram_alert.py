@@ -75,7 +75,7 @@ def test_external_turn_off_queues_alert_with_runtime() -> None:
     with patch.object(mgr, "_decide_actions", return_value=[]):
         asyncio.run(mgr._cycle_async_phase_body(
             9500.0, -10000.0, now, 600, False,
-            qh_name="QH1", data_point_at=now,
+            data_point_at=now,
         ))
 
     assert len(mgr._pending_notifications) == 1
@@ -97,7 +97,7 @@ def test_external_turn_on_queues_alert_without_runtime() -> None:
     with patch.object(mgr, "_decide_actions", return_value=[]):
         asyncio.run(mgr._cycle_async_phase_body(
             9500.0, -10000.0, now, 600, False,
-            qh_name="QH1", data_point_at=now,
+            data_point_at=now,
         ))
 
     assert len(mgr._pending_notifications) == 1
@@ -120,7 +120,7 @@ def test_external_flip_no_alert_without_whitelist() -> None:
     with patch.object(mgr, "_decide_actions", return_value=[]):
         asyncio.run(mgr._cycle_async_phase_body(
             9500.0, -10000.0, now, 600, False,
-            qh_name="QH1", data_point_at=now,
+            data_point_at=now,
         ))
 
     assert mgr._pending_notifications == []
@@ -139,7 +139,7 @@ def test_external_flip_no_alert_in_dry_run() -> None:
     with patch.object(mgr, "_decide_actions", return_value=[]):
         asyncio.run(mgr._cycle_async_phase_body(
             9500.0, -10000.0, now, 600, True,
-            qh_name="QH1", data_point_at=now,
+            data_point_at=now,
         ))
 
     assert mgr._pending_notifications == []

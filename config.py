@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import device_config
+from constants import DEFER_LOOKAHEAD_QUANTA_DEFAULT as _DEFER_LOOKAHEAD_QUANTA_DEFAULT
 
 
 logger = logging.getLogger(__name__)
@@ -336,6 +337,59 @@ class Config:
     def dry_run(self) -> bool:
         """Return True when load management is in dry-run mode."""
         return self._get_bool("LOAD_MANAGE_DRY_RUN")
+
+    @property
+    def lumpy_first(self) -> bool:
+        """Return True when turn_off decides lumpy loads first on residual."""
+        return self._get_bool("LOAD_MANAGE_LUMPY_FIRST")
+
+    @property
+    def ramp_aware(self) -> bool:
+        """Return True when the ramp-aware Tesla stop hastener is enabled.
+
+        Defaults to False (off): the defer rule still applies, but the
+        trend-based hastener that stops one cycle early on a rising deficit
+        is disabled unless explicitly enabled.
+        """
+        return self._get_bool("LOAD_MANAGER_RAMP_AWARE")
+
+    @property
+    def defer_lookahead_quanta(self) -> int:
+        """Return the quantisation windows added to the Tesla safe defer window.
+
+        Defaults to 1 (shipped, 2026-10-19): a stop is only deferred while
+        the next observation can still arrive before the safe-defer deadline,
+        so the deadline must clear the next window. ``0`` restores the static
+        rule (defer on the deadline test alone); larger values withhold more
+        defers. The window itself is the resolved prediction/settle window
+        (``DecideContext.observability_secs``), never a literal 30 s.
+
+        Read leniently, like ``TESLA_NOMINAL_VOLTAGE``: a malformed value is
+        an operator typo in an optimization knob, not a reason to refuse to
+        start the load manager, so it falls back to the shipped default.
+
+        Returns:
+            Whole observation windows (never negative).
+        """
+        raw = self._get("LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA")
+        if raw is None:
+            return _DEFER_LOOKAHEAD_QUANTA_DEFAULT
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA=%r — using default %d",
+                raw, _DEFER_LOOKAHEAD_QUANTA_DEFAULT,
+            )
+            return _DEFER_LOOKAHEAD_QUANTA_DEFAULT
+        if value < 0:
+            logger.warning(
+                "Negative LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA=%r — using 0 "
+                "(the pre-2026-10-19 static defer rule)",
+                raw,
+            )
+            return 0
+        return value
 
     @property
     def vue_username(self) -> Optional[str]:

@@ -1766,3 +1766,48 @@ def test_incomplete_telemetry_unseeded_location_falls_back_to_rest_not_charging(
     assert result_state.at_home is True
     assert result_err is None
     assert result_url is None
+
+
+@patch("config._lookup")
+def test_no_action_reason_without_candidates(mock_config):
+    """A cycle with no eligible loads reports no_candidates."""
+    mock_config.return_value = "America/Los_Angeles"
+
+    plugs = {
+        "heater": PlugConfig(
+            name="heater",
+            accessory_id="h1",
+            power_watts=2000.0,
+            priority=10,
+        ),
+    }
+    plug_ctrl = PlugController(plugs)
+
+    mgr = LoadManager(LoadManagerConfig(
+        metrics_fetch=lambda: _make_metrics_with_wh("main_panel", -2000.0),
+        plug_ctrl=plug_ctrl,
+        tesla_ctrl=None,
+        target_wh=-500,
+        nbc_device="main_panel",
+        enabled=True,
+        dry_run=False,
+    ))
+
+    tz = pytz.timezone("America/Los_Angeles")
+    fake_now = tz.localize(datetime(2025, 6, 15, 12, 0, 0)).astimezone(timezone.utc)
+
+    with patch("load_manager.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.timezone = timezone
+        mock_dt.timedelta = timedelta
+        reason = mgr._determine_no_action_reason(
+            results=[],
+            gap_wh=1000.0,
+            now=fake_now,
+            seconds_remaining=600,
+            tesla_state=None,
+            tesla_configured=False,
+            tesla_error=None,
+        )
+
+    assert reason == "no_candidates"

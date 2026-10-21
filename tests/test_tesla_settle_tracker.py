@@ -23,7 +23,6 @@ def _settle_effect(
         power_watts=0,
         target_amps=20,
         direction=direction,  # type: ignore[arg-type]
-        suppress_action="turn_off",  # type: ignore[arg-type]
         qh_name=qh_name,
     )
 
@@ -77,21 +76,18 @@ def test_inflight_two_zeroes_clear_command():
     assert tracker.last_commanded_amps is None
 
 
-def test_is_settling_matches_get_active():
-    """is_settling is True exactly when get_active returns an effect."""
+def test_is_settling_tracks_effects():
+    """is_settling is False with no effect and True while one is in window."""
     tracker = _tracker()
     assert tracker.is_settling(FIXED_NOW) is False
-    assert tracker.get_active(FIXED_NOW) is None
     tracker.effects.add(_settle_effect(age_secs=10))
     assert tracker.is_settling(FIXED_NOW) is True
-    assert tracker.get_active(FIXED_NOW) is not None
 
 
 def test_settle_expires_across_qh():
     """A settle effect from another QH is expired."""
     tracker = _tracker()
     tracker.effects.add(_settle_effect(age_secs=10, qh_name="QH2"))
-    assert tracker.get_active(FIXED_NOW, current_qh="QH1") is None
     assert tracker.is_settling(FIXED_NOW, current_qh="QH1") is False
 
 

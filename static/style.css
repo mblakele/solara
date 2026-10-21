@@ -211,6 +211,11 @@ button.app-bar__link {
   max-width: 14em;
 }
 
+/* Abnormal forecast-period labels (the "⚠ " prefix): red text. */
+.forecast__period--warn {
+  color: var(--color-warn);
+}
+
 .forecast__value {
   font-size: clamp(3.6rem, 15vw, 5.4rem);
   font-weight: 700;

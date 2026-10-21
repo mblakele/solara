@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, time, timedelta, timezone
 from unittest.mock import patch
 
@@ -9,7 +10,14 @@ import pytest
 
 from load_controllers import RealTeslaController, TeslaController
 from load_manager import LoadManager, LoadManagerConfig
-from load_models import AsyncPhaseResult, CycleContext, PendingEffect, TeslaAuthError
+from load_models import (
+    AsyncPhaseResult,
+    CycleContext,
+    CycleDiagnostics,
+    PendingEffect,
+    TeslaAuthError,
+    TeslaState,
+)
 from load_nbc import NBCFetchResult
 
 
@@ -23,6 +31,12 @@ def ctx() -> CycleContext:
 def lm() -> LoadManager:
     """Default LoadManager with minimal config, no real controllers."""
     return LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
+
+
+def test_cycle_models_have_no_gap_jitter() -> None:
+    """The guard's churn diagnostic is gone from both cycle models."""
+    assert "gap_jitter_wh_per_s" not in CycleContext.__dataclass_fields__
+    assert "gap_jitter_wh_per_s" not in CycleDiagnostics.__dataclass_fields__
 
 
 class TestStageNBCFetch:
@@ -536,7 +550,6 @@ class TestStageAsyncPhase:
                 now=now,
                 seconds_remaining=450,
                 dry_run=True,
-                qh_name="QH2",
                 data_point_at=now,
             )
 
@@ -1277,3 +1290,464 @@ class TestAuthErrorFromInitTeslaState:
         ))
 
         lm_with_successful_tesla._queue_auth_error_notification.assert_not_called()  # type: ignore[attr-defined]
+
+class TestStageComputeGapTrend:
+    """_stage_compute_gap() feeds the gap-trend tracker (ramp awareness).
+
+    Trend is computed on the adjusted gap (pending-effect corrected) keyed
+    on data_point_at, so waiting/stale cycles never fabricate a slope and
+    our own plug toggles never chase themselves.
+    """
+
+    def _run_gap_cycle(
+        self,
+        lm: LoadManager,
+        ctx: CycleContext,
+        data_point: datetime,
+        predicted_wh: float,
+        seconds_remaining: int = 450,
+        qh_name: str = "QH1",
+    ) -> None:
+        ctx.qh_name = qh_name
+        ctx.data_point_at = data_point
+        ctx.now_postfetch = data_point + timedelta(seconds=30)
+        ctx.predicted_wh = predicted_wh
+        ctx.seconds_remaining = seconds_remaining
+        lm._stage_compute_gap(ctx)
+
+    def test_trend_none_until_three_cycles(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """ctx.gap_trend_wh_per_s is None until two slopes confirm."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        assert ctx.gap_trend_wh_per_s is None
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -37.5)
+        assert ctx.gap_trend_wh_per_s is None
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=60), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        assert abs(ctx.gap_trend_wh_per_s - 0.25) < 1e-9
+
+    def test_repeated_data_point_ignored(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A repeated data_point_at (stale fetch) never crashes or trends."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base, -37.5)
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_qh_change_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A real quarter-hour boundary discards the previous QH's ramp.
+
+        The crossing step is kept within the span guard's limit so this
+        exercises the quarter-hour reset specifically, not the span guard.
+        """
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 14, 30, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=10), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=20), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=31), -52.5, qh_name="QH2"
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_hour_boundary_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Crossing the hour (a new QH1) also resets — the production bug.
+
+        ctx.qh_name is the literal "QH1" either side of the hour boundary,
+        so only a timestamp-derived identity can catch this.
+        """
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 14, 40, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=5), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=10), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm, ctx, base + timedelta(seconds=21), -52.5, qh_name="QH1"
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+    def test_long_data_gap_resets_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A data-point gap past the span limit clears history."""
+        from constants import GAP_TREND_MAX_SPAN_SECS
+
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 1, 0, tzinfo=timezone.utc)
+        self._run_gap_cycle(lm, ctx, base, -30.0)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=30), -37.5)
+        self._run_gap_cycle(lm, ctx, base + timedelta(seconds=60), -45.0)
+        assert ctx.gap_trend_wh_per_s is not None
+        self._run_gap_cycle(
+            lm,
+            ctx,
+            base + timedelta(seconds=60 + GAP_TREND_MAX_SPAN_SECS + 1),
+            -52.5,
+        )
+        assert ctx.gap_trend_wh_per_s is None
+
+class TestBuildResultGapTrend:
+    """CycleDiagnostics carry the gap trend into logs/JSON/SSE."""
+
+    def test_build_result_includes_gap_trend(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """After trending cycles, build_result diagnostics expose the rate."""
+        lm.target_wh = -9
+        base = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        for i, predicted in enumerate([-30.0, -37.5, -45.0]):
+            ctx.qh_name = "QH1"
+            ctx.data_point_at = base + timedelta(seconds=30 * i)
+            ctx.now_postfetch = base + timedelta(seconds=30 * i + 30)
+            ctx.predicted_wh = predicted
+            ctx.seconds_remaining = 450 - 30 * i
+            lm._stage_compute_gap(ctx)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.gap_trend_wh_per_s is not None
+        assert abs(result.diagnostics.gap_trend_wh_per_s - 0.25) < 1e-9
+        payload = result.diagnostics.to_dict()
+        assert abs(payload["gap_trend_wh_per_s"] - 0.25) < 1e-9
+
+    def test_build_result_trend_none_when_flat(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """Without a confirmed trend the field is None (not zero)."""
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = -100.0
+        ctx.seconds_remaining = 450
+        ctx.now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_state = None
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.gap_trend_wh_per_s is None
+        assert result.diagnostics.to_dict()["gap_trend_wh_per_s"] is None
+
+class TestPendingCheckRefreshesPlugState:
+    """_stage_pending_check() refreshes plug state even on early exit.
+
+    Regression for bugs/2026-10-03-plug-status-delay.log: Tesla
+    external-charge (and other pending-check gates) blocked the only
+    plug poll, so the dashboard kept showing sentinel + water heater
+    ON for ~4 min after they turned OFF. Decisions must stay gated,
+    but display state must go fresh.
+    """
+
+    def test_external_flip_visible_despite_tesla_gate(self) -> None:
+        """Plug flips are reconciled even when Tesla gate early-exits."""
+        from clock import FakeClock
+        from load_controllers import PlugController, TeslaController
+        from load_models import DeviceState, PlugConfig
+
+        now = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        data_point = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        plugs = {
+            "sentinel": PlugConfig(
+                name="sentinel", accessory_id="s1",
+                power_watts=10.0, priority=1,
+            ),
+            "water heater": PlugConfig(
+                name="water heater", accessory_id="w1",
+                power_watts=4857.0, priority=10,
+            ),
+        }
+        plug_ctrl = PlugController(plugs)
+        # Physical reality: both turned OFF (e.g. around Tesla start).
+        plug_ctrl._state["sentinel"] = False
+        plug_ctrl._state["water heater"] = False
+        mgr = LoadManager(LoadManagerConfig(
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=TeslaController(None),  # type: ignore[arg-type]
+            target_wh=-9,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=False,
+            clock=FakeClock(now),
+        ))
+        # Stale tracker: still thinks both are ON.
+        for name in ("sentinel", "water heater"):
+            mgr.state.devices[name] = DeviceState(
+                name=name, desired_state=True, actual_state=True,
+            )
+        local_ctx = CycleContext(now=now)
+        local_ctx.data_point_at = data_point
+        local_ctx.now_postfetch = now
+        local_ctx.seconds_remaining = 450
+        local_ctx.predicted_wh = -223.0
+        mgr.state.pending_effects.clear()
+        assert mgr.state.last_commanded_amps is None
+        with (
+            patch("load_manager.get_field_update_at", return_value=now),
+            patch(
+                "load_manager.get_telemetry_snapshot",
+                return_value={"ChargeAmps": 24, "ChargeState": "Charging"},
+            ),
+        ):
+            result = mgr._stage_pending_check(local_ctx)
+        # Gate still blocks decisions.
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.reason == "external_tesla_charge"
+        # But dashboard state is fresh.
+        assert mgr.state.devices["sentinel"].actual_state is False
+        assert mgr.state.devices["sentinel"].desired_state is False
+        assert mgr.state.devices["water heater"].actual_state is False
+        assert mgr.state.devices["water heater"].desired_state is False
+        by_name = {c.name: c for c in (result.candidates or [])}
+        assert by_name["sentinel"].actual_state is False
+        assert by_name["water heater"].actual_state is False
+
+
+class TestSinglePlugPollPerCycle:
+    """Full cycles poll each plug controller exactly once.
+
+    The pre-gate dashboard sync must be reused by the async phase,
+    not repeated — Vocolinc cloud calls are not free.
+    """
+
+    def test_run_cycle_polls_each_plug_once(self) -> None:
+        """A full run_cycle issues one get_state per plug, not two."""
+        import asyncio
+
+        from clock import FakeClock
+        from load_controllers import PlugController
+        from load_models import PlugConfig
+        from tests.helpers import _make_metrics_with_wh
+        from energy_cache import EnergyCache
+
+        now = datetime(2025, 6, 1, 12, 7, 30, tzinfo=timezone.utc)
+        plugs = {
+            "water_heater": PlugConfig(
+                name="water_heater", accessory_id="abc123",
+                power_watts=4500.0, priority=20,
+            ),
+            "pool_pump": PlugConfig(
+                name="pool_pump", accessory_id="xyz789",
+                power_watts=1500.0, priority=10,
+            ),
+        }
+        plug_ctrl = PlugController(plugs)
+        metrics_data = _make_metrics_with_wh("main_panel", -6000.0)
+
+        def metrics_fetch():
+            return metrics_data
+
+        sample_value = -6000.0 / 900_000.0
+        qh_minute = (now.minute // 15) * 15
+        data_start = now.replace(
+            minute=qh_minute, second=0, microsecond=0
+        ) - timedelta(minutes=15)
+        sample_count = int((now - data_start).total_seconds())
+        energy_cache = EnergyCache(ttl_seconds=30)
+        with energy_cache._lock:
+            energy_cache.samples = [sample_value] * sample_count
+            energy_cache.data_start = data_start
+            energy_cache.last_sample_at = now - timedelta(seconds=1)
+            energy_cache.sample_count = sample_count
+            energy_cache.last_fetch_at = now
+            energy_cache._set_data_field(data_lag_secs=0.0)
+        mgr = LoadManager(LoadManagerConfig(
+            metrics_fetch=metrics_fetch,
+            energy_cache=energy_cache,
+            plug_ctrl=plug_ctrl,
+            tesla_ctrl=None,
+            target_wh=-500,
+            nbc_device="main_panel",
+            enabled=True,
+            dry_run=False,
+            clock=FakeClock(now),
+        ))
+        counts: dict[str, int] = {"water_heater": 0, "pool_pump": 0}
+        orig_get_state = plug_ctrl.get_state
+
+        async def counting_get_state(name: str):
+            counts[name] = counts.get(name, 0) + 1
+            return await orig_get_state(name)
+
+        plug_ctrl.get_state = counting_get_state  # type: ignore[method-assign]
+        result = mgr.run_cycle()
+        assert result.status in ("ok", "dry-run")
+        assert counts == {"water_heater": 1, "pool_pump": 1}
+
+
+class TestTeslaStateMissingReason:
+    """A missing Tesla state says *why* it is missing.
+
+    ``tesla_configured=True, tesla_state=None`` is ambiguous on its own: the
+    cycle may have exited before the Tesla async phase ran (nobody looked at
+    the car), or that phase ran and produced no state because the car is
+    offline or has not telemetered yet. Production distinguishes the two
+    internally; recording which one happened keeps a log reader — and the
+    offline replay tooling — from having to infer it from ``status``.
+    """
+
+    @staticmethod
+    def _commit_ready_ctx(ctx: CycleContext, gap_wh: float) -> None:
+        """Populate the fields _stage_commit needs to reach its hysteresis exit."""
+        ctx.sentinel_on = False
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = gap_wh
+        ctx.now_postfetch = datetime(2025, 6, 1, 12, 0, 30, tzinfo=timezone.utc)
+        ctx.seconds_remaining = 450
+        ctx.data_point_at = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+
+    @staticmethod
+    def _build_ready_ctx(ctx: CycleContext) -> None:
+        """Populate the fields _stage_build_result needs."""
+        ctx.qh_name = "QH2"
+        ctx.predicted_wh = -500.0
+        ctx.adjusted_wh = -500.0
+        ctx.gap_wh = -100.0
+        ctx.seconds_remaining = 450
+        ctx.now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ctx.actions = []
+        ctx.succeeded_effects = []
+        ctx.tesla_error = None
+        ctx.tesla_login_url = None
+
+    def test_pre_fetch_exit_is_not_reached(self, lm: LoadManager, ctx: CycleContext):
+        """Exiting before the async phase never queried the car."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        with patch.object(lm.nbc_reader, "get_current_qh", return_value=None):
+            result = lm._stage_nbc_fetch(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state_missing_reason == "not_reached"
+
+    def test_exit_without_tesla_configured_has_no_reason(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """With no Tesla configured there is nothing to explain."""
+        assert lm.tesla_ctrl is None
+        with patch.object(lm.nbc_reader, "get_current_qh", return_value=None):
+            result = lm._stage_nbc_fetch(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state_missing_reason is None
+
+    def test_commit_exit_without_a_state_is_unavailable(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """After the async phase ran, no state means configured but unavailable."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._commit_ready_ctx(ctx, gap_wh=0.0)
+        ctx.tesla_state = None
+        result = lm._stage_commit(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state_missing_reason == "unavailable"
+
+    def test_commit_exit_with_a_state_has_no_reason(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A state that is present needs no explanation."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._commit_ready_ctx(ctx, gap_wh=0.0)
+        ctx.tesla_state = TeslaState(
+            is_charging=False, current_amps=0, plugged_in=True, at_home=True
+        )
+        result = lm._stage_commit(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state is not None
+        assert result.diagnostics.tesla_state_missing_reason is None
+
+    def test_sentinel_exit_keeps_the_known_state(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A post-async early exit reports the state it actually read."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._commit_ready_ctx(ctx, gap_wh=-100.0)
+        ctx.sentinel_on = True
+        ctx.tesla_state = TeslaState(
+            is_charging=True, current_amps=12, plugged_in=True, at_home=True
+        )
+        result = lm._stage_commit(ctx)
+        assert result is not None
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state is not None
+        assert result.diagnostics.tesla_state_missing_reason is None
+
+    def test_build_result_reports_unavailable_without_a_state(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """The full path ran the async phase, so None means unavailable."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._build_ready_ctx(ctx)
+        ctx.tesla_state = None
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state_missing_reason == "unavailable"
+
+    def test_build_result_with_a_state_has_no_reason(
+        self, lm: LoadManager, ctx: CycleContext
+    ):
+        """A full-path cycle with a state is self-describing already."""
+        lm.tesla_ctrl = TeslaController(None)  # type: ignore[arg-type]
+        self._build_ready_ctx(ctx)
+        ctx.tesla_state = TeslaState(
+            is_charging=True, current_amps=12, plugged_in=True, at_home=True
+        )
+        result = lm._stage_build_result(ctx)
+        assert result.diagnostics is not None
+        assert result.diagnostics.tesla_state is not None
+        assert result.diagnostics.tesla_state_missing_reason is None
+
+
+def test_decide_actions_passes_the_quantisation_window(lm: LoadManager) -> None:
+    """The defer lookahead's granularity comes from the resolved window.
+
+    A rule that buys "one observation window" must be told what the window
+    is; production resolves it from quantisation and hands it to the engine
+    rather than letting the decider assume 30 s.
+    """
+    lm.state.apply_prediction_window(60)
+    lm.state.apply_prediction_window(60)
+    assert lm.state.effective_settle_secs == 60
+
+    seen = []
+    real_decide = lm.engine.decide
+
+    def spy(*, ctx, predicted_wh, target_wh):
+        seen.append(ctx)
+        return real_decide(ctx=ctx, predicted_wh=predicted_wh, target_wh=target_wh)
+
+    lm.engine.decide = spy  # type: ignore[method-assign]
+    lm._decide_actions(
+        lm.plugs,
+        None,
+        -100.0,
+        datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        300,
+        True,
+        None,
+    )
+
+    assert seen, "engine.decide was never called"
+    assert seen[0].observability_secs == 60

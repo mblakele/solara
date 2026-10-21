@@ -1076,6 +1076,7 @@ class EnergyCache:
         return {
             "qh_name": "QH1",
             "predicted_wh": predicted_wh,
+            "raw_wh": qh1_data.raw_wh,
             "seconds_remaining": seconds_remaining,
             "data_start": data_start,
             "samples_used": qh1_data.samples_used,

@@ -17,4 +17,5 @@ devices*.json
 pyvenv.cfg
 solara.log
 solara.log.*
+*.log
 tesla/

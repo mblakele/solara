@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, time, timezone
 import itertools
 import logging
+import math
 import sys
 import threading
 import time as _time_mod
@@ -102,6 +103,8 @@ from quantization import usable_window
 
 from energy_cache import EnergyCache
 
+from gap_trend import GapTrendTracker
+
 from metrics import DriftAlert, drain_drift_alerts
 
 from telegram import (
@@ -137,6 +140,16 @@ class LoadManagerConfig:
         enabled: Whether load management is active. Accepts True/False, or a time range tuple.
             Defaults to LOAD_MANAGE_ENABLED env var parsed via _parse_load_manage_enabled.
         dry_run: If True, log actions without executing them (defaults to LOAD_MANAGE_DRY_RUN).
+        lumpy_first: If True, turn_off decides lumpy loads first on the residual
+            (defaults to LOAD_MANAGE_LUMPY_FIRST, off). Tests may pass an engine instead.
+        ramp_aware: If True, enable the ramp-aware Tesla stop hastener that stops
+            one cycle early on a rising deficit (defaults to LOAD_MANAGER_RAMP_AWARE,
+            off). Tests may pass an engine instead.
+        defer_lookahead_quanta: Quantisation windows the Tesla stop's safe defer
+            window must still clear before a defer is taken (defaults to
+            LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA, shipped 1 — the deadline must
+            clear the next observation window). ``0`` restores the static rule.
+            Tests may pass an engine instead.
         config_interval_secs: Target interval between cycles in seconds (default 30).
     """
 
@@ -150,6 +163,9 @@ class LoadManagerConfig:
     nbc_device: str | None = None
     enabled: bool | tuple[Any, Any] | None = None  # type: ignore[type-arg]
     dry_run: bool | None = None
+    lumpy_first: bool | None = None
+    ramp_aware: bool | None = None
+    defer_lookahead_quanta: int | None = None
     config_interval_secs: int = 30
     telegram_sender: TelegramSender | None = None
     clock: Any | None = None  # clock.Clock | None — forward ref, resolved at runtime
@@ -200,6 +216,19 @@ def _not_charging_state(*, at_home: bool) -> TeslaState:
         plugged_in=False,
         at_home=at_home,
     )
+
+
+def _sleep_hint_at_iso(ctx: CycleContext) -> str:
+    """Default wake timestamp for an exit that does not supply one.
+
+    Args:
+        ctx: Current pipeline context.
+
+    Returns:
+        ISO-8601 ``now_postfetch`` when the fetch ran, else ``now``.
+    """
+    base = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
+    return base.isoformat()
 
 
 def _write_fleet_telemetry_dotfile(dotfile_path: Any) -> None:
@@ -310,6 +339,20 @@ class LoadManager:
         hysteresis_wh = int(abs(target_wh) / 3)
         self.tesla_config = load_tesla_config(config=self._cfg)
         tesla_config = self.tesla_config
+        lumpy_first = cfg.lumpy_first
+        if lumpy_first is None:
+            lumpy_first = self._cfg.lumpy_first
+        self.lumpy_first = lumpy_first
+
+        ramp_aware = cfg.ramp_aware
+        if ramp_aware is None:
+            ramp_aware = self._cfg.ramp_aware
+        self.ramp_aware = ramp_aware
+
+        defer_lookahead_quanta = cfg.defer_lookahead_quanta
+        if defer_lookahead_quanta is None:
+            defer_lookahead_quanta = self._cfg.defer_lookahead_quanta
+        self.defer_lookahead_quanta = defer_lookahead_quanta
         if engine is not None:
             self.engine = engine
         else:
@@ -323,10 +366,18 @@ class LoadManager:
                     tesla_config.charge_amps_max
                     if tesla_config else TESLA_CHARGE_AMPS_MAX_DEFAULT
                 ),
+                lumpy_first=lumpy_first,
+                ramp_aware=ramp_aware,
+                defer_lookahead_quanta=defer_lookahead_quanta,
             )
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
         )
+        # Ramp awareness: EWMA slope of the adjusted gap across cycles,
+        # fed in _stage_compute_gap and exposed in diagnostics. The last
+        # trusted rate (or None) is kept for early-exit result payloads.
+        self.gap_trend = GapTrendTracker()
+        self._last_gap_trend_wh_per_s: float | None = None
         # Tracks the last known at_home value from Location telemetry snapshots.
         # Preserved when Location is absent so the requires_home_check gate in
         # GapMinder doesn't incorrectly block Tesla decisions.
@@ -345,11 +396,13 @@ class LoadManager:
         # Used to select a shorter sleep hint so the next cycle retries quickly.
         self._vehicle_offline_this_cycle: bool = False
         # Data-health alerting (bugs/2026-09-16-metrics.VueAuthenticationError):
-        # per-QH throttles for fatal-fetch and stale/no-data Telegram alerts.
+        # per-QH throttles for fatal-fetch, stale-meter and pipeline-stall
+        # Telegram alerts (pipeline split: bugs/2026-10-13-stale-data-369s).
         # _boot_at anchors the empty-cache age when no data point exists yet.
         self._boot_at: datetime = self._clock.now()
         self._last_fetch_fatal_alert_qh: datetime | None = None
         self._last_stale_alert_qh: datetime | None = None
+        self._last_pipeline_alert_qh: datetime | None = None
         # Out-of-range ON alerts: per-device QH throttle so a forgotten
         # manual ON pages once per quarter-hour, not every 30 s cycle.
         self._last_out_of_range_alert_qh: dict[str, datetime] = {}
@@ -474,8 +527,8 @@ class LoadManager:
         above ``MIN_QUANTIZATION_WINDOW_SECS``, returns
         ``quantization_seconds``.  Shorter periods are almost always
         detection artifacts (e.g. the flat-data N=2 case), so they fall
-        back to ``DEFAULT_PREDICTION_WINDOW_SECS`` (30 seconds, the
-        classic default pre-quantization prediction window).
+        back to ``DEFAULT_PREDICTION_WINDOW_SECS`` (the classic
+        pre-quantization prediction window).
 
         Safe to call before ``nbc_reader`` is initialized (returns default), and
         when ``nbc_reader`` is replaced with a mock that doesn't expose
@@ -525,6 +578,18 @@ class LoadManager:
             "quantization_offset": quantization_offset,
             "quantization_confidence": quantization_confidence,
             "settle_window_secs": self.state.effective_settle_secs,
+        }
+
+    def _gap_trend_diagnostics(self) -> dict[str, Any]:
+        """Most recent gap-trend rate for cycle diagnostics.
+
+        Returns:
+            Dict with ``gap_trend_wh_per_s`` (None when no sustained
+            trend is confirmed). Early-exit paths report the last
+            compute_gap value.
+        """
+        return {
+            "gap_trend_wh_per_s": self._last_gap_trend_wh_per_s,
         }
 
     def is_enabled_at(self, now: datetime) -> bool:
@@ -596,6 +661,7 @@ class LoadManager:
             )
         ctx.qh_name = qh_result.qh_name
         ctx.predicted_wh = qh_result.predicted_wh
+        ctx.banked_wh = qh_result.raw_wh
         ctx.seconds_remaining = qh_result.seconds_remaining
         ctx.data_point_at = qh_result.data_point_at
         fetch_end = _time_mod.perf_counter()
@@ -629,6 +695,20 @@ class LoadManager:
         gap_wh = self.target_wh - adjusted_wh
         ctx.adjusted_wh = adjusted_wh
         ctx.gap_wh = gap_wh
+        # Feed the trend tracker on the pending-effect-corrected gap so the
+        # slope never chases our own actions. Keyed on data_point_at: stale
+        # or repeated fetches are ignored inside the tracker, which also
+        # resets itself on quarter-hour rollover and over-long data gaps.
+        noise_floor = (
+            self.engine.HYSTERESIS_WH / seconds_remaining
+            if seconds_remaining > 0
+            else 0.0
+        )
+        rate, trusted = self.gap_trend.update(
+            data_point_at, gap_wh, noise_floor=noise_floor,
+        )
+        ctx.gap_trend_wh_per_s = rate if trusted else None
+        self._last_gap_trend_wh_per_s = ctx.gap_trend_wh_per_s
 
     def _stage_commit(self, ctx: CycleContext) -> CycleResult | None:
         """Stage 6: Sentinel check, commit effects, Tesla tracking, hysteresis.
@@ -649,6 +729,8 @@ class LoadManager:
                 seconds_remaining=ctx.seconds_remaining,
                 data_point_at=ctx.data_point_at,
                 pending_effects_count=0,
+                tesla_state=ctx.tesla_state,
+                tesla_fetched=True,
                 sentinel_names=list(self.sentinel_names),
                 sentinel_on=True,
             )
@@ -659,13 +741,23 @@ class LoadManager:
         for effect in ctx.succeeded_effects:
             if effect.device_name == "tesla" and effect.action == "set_amps":
                 prev_amps = self.state.last_commanded_amps
+                if (
+                    prev_amps is None
+                    and ctx.tesla_state is not None
+                    and ctx.tesla_state.current_amps is not None
+                ):
+                    # Expired/orphaned command (bugs/2026-10-08-tesla-chargeamps.log
+                    # c38): the tracker correctly holds None while the car is
+                    # actually at N A. Classify direction from live amps so a
+                    # 7->5 cut is a decrease (suppress turn_on), not an
+                    # increase.
+                    prev_amps = ctx.tesla_state.current_amps
                 new_amps = effect.target_amps
                 self.state.record_tesla_amp_command(new_amps)
                 if new_amps is not None and (
                     prev_amps is None or new_amps > prev_amps
                 ):
                     effect.direction = "increase"
-                    effect.suppress_action = "turn_off"
                     effect.qh_name = ctx.qh_name
                     logger.debug(
                         "Tesla amp increase recorded: %s → %d A "
@@ -679,7 +771,6 @@ class LoadManager:
                     and new_amps < prev_amps
                 ):
                     effect.direction = "decrease"
-                    effect.suppress_action = "turn_on"
                     effect.qh_name = ctx.qh_name
                     logger.debug(
                         "Tesla amp decrease recorded: %s → %d A "
@@ -733,6 +824,7 @@ class LoadManager:
                 data_point_at=ctx.data_point_at,
                 pending_effects_count=len(self.state.pending_effects),
                 tesla_state=ctx.tesla_state,
+                tesla_fetched=True,
                 tesla_error=ctx.tesla_error,
                 tesla_login_url=ctx.tesla_login_url,
                 sentinel_names=list(self.sentinel_names),
@@ -787,6 +879,9 @@ class LoadManager:
                 candidates=candidate_details,
                 tesla_configured=tesla_configured,
                 tesla_state=_tesla_state_to_dict(ctx.tesla_state),
+                tesla_state_missing_reason=self._tesla_state_missing_reason(
+                    ctx.tesla_state, fetched=True
+                ),
                 tesla_error=ctx.tesla_error,
                 tesla_login_url=ctx.tesla_login_url,
                 plugs_configured=list(self.plugs.keys()),
@@ -796,6 +891,7 @@ class LoadManager:
                 active_tesla_telemetry=active_telemetry,
                 tesla_command_offline=self._vehicle_offline_this_cycle,
                 **self._quantization_diagnostics(),
+                **self._gap_trend_diagnostics(),
             ),
             sleep_hint=(
                 DEFAULT_SLEEP_HINT_SECS
@@ -820,7 +916,6 @@ class LoadManager:
         adjusted_wh = ctx.adjusted_wh
         now_postfetch = ctx.now_postfetch
         seconds_remaining = ctx.seconds_remaining
-        qh_name = ctx.qh_name
         data_point_at = ctx.data_point_at
         assert gap_wh is not None
         assert adjusted_wh is not None
@@ -832,10 +927,17 @@ class LoadManager:
 
         if self.telegram_sender is not None:
             self.telegram_sender.reset_session()
+        pre_synced = (
+            list(ctx.plug_pre_sync_external)
+            if ctx.plug_pre_sync_done
+            else None
+        )
         res = asyncio.run(
             self._cycle_async_phase(
                 gap_wh, adjusted_wh, now_postfetch, seconds_remaining,
-                self.dry_run, qh_name, data_point_at=data_point_at,
+                self.dry_run, data_point_at=data_point_at,
+                pre_synced_external=pre_synced,
+                banked_wh=ctx.banked_wh,
             )
         )
         ctx.tesla_state = res.tesla_state
@@ -902,6 +1004,44 @@ class LoadManager:
         else:
             return
         self.state.sync_tesla_device_state(_not_charging_state(at_home=at_home))
+
+    def _sync_plugs_for_dashboard(self, ctx: CycleContext) -> None:
+        """Poll plug controllers so early exits still show fresh state.
+
+        The async phase reuses this poll instead of re-polling (see
+        ``plug_pre_sync_done`` on CycleContext), so each cycle issues
+        one controller round-trip per plug. This refresh reuses the
+        full ``_sync_plug_states`` reconcile (desired/actual update,
+        synthetic pending effects for NBC math, runtime books).
+        External flips observed here are alerted immediately with the
+        raw prediction since an early exit has no corrected gap yet;
+        the async phase must not re-queue them.
+
+        Args:
+            ctx: Current pipeline context (provides predicted_wh and
+                timestamps for the alert fallback; carries the
+                pre-sync result to Stage 5).
+        """
+        try:
+            external = asyncio.run(self._sync_plug_states())
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("Pre-gate plug sync failed", exc_info=True)
+            return
+        ctx.plug_pre_sync_done = True
+        ctx.plug_pre_sync_external = list(external)
+        if not external:
+            return
+        predicted_wh = ctx.predicted_wh
+        if predicted_wh is None:
+            predicted_wh = float(self.target_wh)
+        now = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
+        self._queue_surplus_notification(
+            actions=external,
+            predicted_wh=predicted_wh,
+            target_wh=self.target_wh,
+            dry_run=self.dry_run,
+            now=now,
+        )
 
     def _commanded_charge_echo(
         self, snapshot: dict[str, Any],
@@ -1042,7 +1182,6 @@ class LoadManager:
             < TESLA_ARBITRATION_COOLDOWN_SECS
         ):
             return None
-        self._last_rest_arbitration_at = now
         logger.debug(
             "tesla REST arbitration: polling charge_state for "
             "uncorroborated amps=%d",
@@ -1050,10 +1189,20 @@ class LoadManager:
         )
         rest_state = await self.tesla_ctrl._init_from_rest(snapshot=None)  # noqa: SLF001
         if rest_state is not None and rest_state.is_charging:
+            self._last_rest_arbitration_at = now
             self._last_rest_arbitration_charging = True
             self._last_tesla_at_home = rest_state.at_home
             return rest_state
-        self._last_rest_arbitration_charging = False
+        if rest_state is not None:
+            # Definitive idle answer: latch the cooldown so ghost periods
+            # don't poll-storm.
+            self._last_rest_arbitration_at = now
+            self._last_rest_arbitration_charging = False
+            return None
+        # Transport failure (408 offline, timeouts — bugs/2026-10-08-tesla-ghost.log
+        # c95): not an answer. Leave the timestamp and verdict untouched so the
+        # next cycle retries instead of serving a latched idle for 5 minutes
+        # while the car is actually charging.
         return None
 
     def _stage_pending_check(
@@ -1062,13 +1211,17 @@ class LoadManager:
         """Stage 3: Check whether NBC data is stale or pending effects
         are not yet reflected in the prediction.
 
-        Refreshes the dashboard Tesla entry from live telemetry first so
-        early exits don't leave a stale charging display behind, then
+        Refreshes the dashboard Tesla entry from live telemetry and the
+        plug entries from their controllers first so early exits don't
+        leave a stale display behind (bugs/2026-10-03-plug-status-delay.log
+        showed sentinel + water heater stuck ON for ~4 min while
+        external_tesla_charge gates blocked the only plug poll), then
         runs the gates. When force=True, bypasses all checks and returns
         None immediately. Otherwise returns a CycleResult for early-exit
         conditions or None to continue the pipeline.
         """
         self._refresh_tesla_display_from_telemetry()
+        self._sync_plugs_for_dashboard(ctx)
         if ctx.force:
             return None
 
@@ -1302,6 +1455,32 @@ class LoadManager:
         time_range = self.tesla_config.time_range if self.tesla_config else None
         return self._is_device_in_time_range(now, time_range)
 
+    def _tesla_state_missing_reason(
+        self, tesla_state: TeslaState | None, *, fetched: bool
+    ) -> str | None:
+        """Explain a missing Tesla state, or return None when none is missing.
+
+        ``tesla_state=None`` alone cannot be read as "not charging": a cycle
+        that exits before the Tesla async phase never queried the car, while
+        a full cycle that ran the phase and still has no state found it
+        configured but unavailable (offline / no telemetry yet — the path
+        that deliberately keeps a grey off dashboard entry). Recording which
+        one happened keeps that meaning in the log instead of leaving it to
+        be inferred from the cycle status.
+
+        Args:
+            tesla_state: Tesla state the cycle has, or None.
+            fetched: Whether the Tesla async phase ran this cycle.
+
+        Returns:
+            "not_reached" before the phase, "unavailable" when it ran and
+            produced no state, or None when a state is present or Tesla is
+            not configured.
+        """
+        if self.tesla_ctrl is None or tesla_state is not None:
+            return None
+        return "unavailable" if fetched else "not_reached"
+
     def _early_exit(
         self,
         ctx: CycleContext,
@@ -1319,6 +1498,7 @@ class LoadManager:
         pending_effects_count: int | None = None,
         candidates: list[CandidateDetail] | None = None,
         tesla_state: TeslaState | None = None,
+        tesla_fetched: bool = False,
         tesla_error: str | None = None,
         tesla_login_url: str | None = None,
         sentinel_names: list[str] | None = None,
@@ -1347,6 +1527,8 @@ class LoadManager:
             pending_effects_count: Pending effects at exit time, if known.
             candidates: Candidate device details, if computed.
             tesla_state: Tesla state snapshot, if available.
+            tesla_fetched: Whether the Tesla async phase already ran, so a
+                missing state means "unavailable" ("not_reached" otherwise).
             tesla_error: Tesla error message, if any.
             tesla_login_url: Tesla OAuth URL, if re-auth is needed.
             sentinel_names: Sentinel plug names, if relevant.
@@ -1357,8 +1539,7 @@ class LoadManager:
             CycleResult with diagnostics attached.
         """
         if sleep_hint_at is None:
-            base = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
-            sleep_hint_at = base.isoformat()
+            sleep_hint_at = _sleep_hint_at_iso(ctx)
         return CycleResult(
             status=status,
             qh=qh,
@@ -1375,6 +1556,9 @@ class LoadManager:
                 pending_effects_count=pending_effects_count,
                 tesla_configured=self.tesla_ctrl is not None,
                 tesla_state=_tesla_state_to_dict(tesla_state),
+                tesla_state_missing_reason=self._tesla_state_missing_reason(
+                    tesla_state, fetched=tesla_fetched
+                ),
                 tesla_error=tesla_error,
                 tesla_login_url=tesla_login_url,
                 plugs_configured=list(self.plugs.keys()),
@@ -1382,6 +1566,7 @@ class LoadManager:
                 sentinel_names=sentinel_names,
                 sentinel_on=sentinel_on,
                 **self._quantization_diagnostics(),
+                **self._gap_trend_diagnostics(),
             ),
             sleep_hint=sleep_hint,
             sleep_hint_at=sleep_hint_at,
@@ -2222,14 +2407,17 @@ class LoadManager:
         now: datetime,
         reason: str,
     ) -> None:
-        """Alert when data age exceeds the threshold, at most once per QH.
+        """Alert when meter-data age exceeds the threshold, at most once per QH.
 
-        Age is wall-clock ``now - data_point_at``; when no data point has
-        ever been seen (boot-empty cache) age is measured from manager
-        start instead.
+        Age is wall-clock ``now - data_point_at`` measured from the
+        EnergyCache's most recent meter sample (``last_sample_at``); when
+        no sample has ever been fetched (boot-empty cache) age is measured
+        from manager start instead. This is strictly about the meter feed —
+        pipeline stalls with a fresh meter page via
+        :meth:`_check_pipeline_stall_alert` instead.
 
         Args:
-            data_point_at: Most recent NBC data point, or None when empty.
+            data_point_at: Most recent meter sample, or None when empty.
             now: Current wall-clock time for age math and the QH key.
             reason: Short tag included in the alert text (e.g.
                 ``stale_data`` or ``no_data``).
@@ -2251,19 +2439,98 @@ class LoadManager:
             )
         else:
             message = (
-                f"Solara data stale: last data point {age_secs:.0f}s old "
+                f"Solara data stale: last meter data {age_secs:.0f}s old "
                 f"(reason={reason})"
             )
         self._queue_stale_data_notification(message)
 
+    def _queue_pipeline_notification(self, message: str) -> None:
+        """Queue a Telegram alert for a stalled decision pipeline.
+
+        Same bypass rules as :meth:`_queue_stale_data_notification`:
+        whitelist and dry-run do not apply.
+
+        Args:
+            message: Human-readable stall text (already includes ages).
+        """
+        if self.telegram_sender is None:
+            logger.info(
+                "Pipeline-stall notification skipped: sender not configured",
+            )
+            return
+        if not self.telegram_sender.is_configured:
+            logger.info(
+                "Pipeline-stall notification skipped: sender not configured "
+                "(is_configured=False)",
+            )
+            return
+        now = self._clock.now()
+        event = build_error_notification(message, now=now)
+        self._pending_notifications.append(event)
+        logger.error("Pipeline-stall notification queued: %s", message)
+
+    def _check_pipeline_stall_alert(
+        self,
+        pipe_point_at: datetime | None,
+        meter_age_secs: float | None,
+        now: datetime,
+        reason: str,
+    ) -> None:
+        """Alert when no usable prediction exists, at most once per QH.
+
+        Fires only when the meter feed itself is fresh (the caller gates
+        on meter age): the Emporia data is arriving but the pipeline has
+        not produced a decision-grade point — e.g. QH-boundary
+        ``insufficient_samples`` or a long ``waiting_for_fresh_data``
+        stall. The message reports both ages so the page cannot be read
+        as meter staleness.
+
+        Args:
+            pipe_point_at: Last decision-grade data point, or None when
+                no decision has ever been made (then the meter alert
+                owns the page, not this one).
+            meter_age_secs: Age of the most recent meter sample, or None
+                when unknown.
+            now: Current wall-clock time for age math and the QH key.
+            reason: Short tag included in the alert text (e.g.
+                ``no_incomplete_qh``).
+        """
+        if pipe_point_at is None:
+            return
+        pipe_age_secs = (now - pipe_point_at).total_seconds()
+        if pipe_age_secs <= DATA_STALE_ALERT_THRESHOLD_SECS:
+            return
+        qh = floor_to_qh(now)
+        if self._last_pipeline_alert_qh == qh:
+            return
+        self._last_pipeline_alert_qh = qh
+        meter_txt = (
+            f"{meter_age_secs:.0f}s old" if meter_age_secs is not None
+            else "unknown age"
+        )
+        message = (
+            f"Solara prediction stalled: no usable prediction for "
+            f"{pipe_age_secs:.0f}s (last decision point "
+            f"{pipe_age_secs:.0f}s old, meter data {meter_txt}, "
+            f"reason={reason})"
+        )
+        self._queue_pipeline_notification(message)
+
     def _check_data_health_alerts(self, ctx: CycleContext) -> None:
-        """Run both data-health alert checks for the current cycle.
+        """Run data-health alert checks for the current cycle.
 
         Called by ``run_cycle()`` right after the NBC fetch stage (on both
         the success and early-exit paths) so a swallowed fetch exception
-        still pages: the fatal check reads the shared EnergyCache's stored
-        fetch error, and the stale check ages ``ctx.data_point_at``
-        (falling back to the last known data point for fetch misses).
+        still pages. Meter health is measured from the shared
+        EnergyCache's most recent sample (``last_sample_at``, falling back
+        to ``last_fetch_at``), never from the pipeline's last acted-on
+        point: a fresh fetch with ``insufficient_samples`` at a QH
+        boundary must not page as stale data
+        (bugs/2026-10-13-stale-data-369s-alert.log). A stalled pipeline
+        with a fresh meter pages separately via
+        :meth:`_check_pipeline_stall_alert` so the two failure modes stay
+        distinguishable; a stale meter suppresses the pipeline page to
+        avoid a double alert for one outage.
 
         Args:
             ctx: Current pipeline context.
@@ -2271,15 +2538,30 @@ class LoadManager:
         ec = getattr(self.nbc_reader, "energy_cache", None)
         err = getattr(ec, "last_fetch_error", None) if ec is not None else None
         self._check_fetch_fatal_alert(err, ctx.now)
-        data_point_at = ctx.data_point_at
-        reason = "stale_data"
-        if data_point_at is None:
-            data_point_at = self.state.last_data_point_at
-            reason = "no_incomplete_qh"
-            if data_point_at is None:
-                reason = "no_data"
         now_ref = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
-        self._check_stale_data_alert(data_point_at, now_ref, reason)
+        meter_point = None
+        if ec is not None:
+            meter_point = ec.last_sample_at
+            if meter_point is None:
+                meter_point = ec.last_fetch_at
+        if meter_point is not None:
+            self._check_stale_data_alert(meter_point, now_ref, "stale_data")
+            meter_age_secs: float | None = (
+                now_ref - meter_point
+            ).total_seconds()
+        else:
+            self._check_stale_data_alert(None, now_ref, "no_data")
+            meter_age_secs = None
+        if ctx.data_point_at is None:
+            pipe_point = self.state.last_data_point_at
+            if (
+                pipe_point is not None
+                and meter_age_secs is not None
+                and meter_age_secs <= DATA_STALE_ALERT_THRESHOLD_SECS
+            ):
+                self._check_pipeline_stall_alert(
+                    pipe_point, meter_age_secs, now_ref, "no_incomplete_qh"
+                )
 
     def _send_pending_notifications_sync(self) -> None:
         """Flush all queued Telegram notifications synchronously.
@@ -2379,83 +2661,6 @@ class LoadManager:
         )
         return corrected_adjusted_wh, corrected_gap_wh
 
-    def _suppressed_by_settle(
-        self,
-        corrected_gap_wh: float,
-        now: datetime,
-        qh_name: str | None,
-        data_point_at: datetime | None,
-    ) -> bool:
-        """Return True when a Tesla settle window suppresses this decision.
-
-        After a Tesla amp increase the NBC prediction needs a few cycles to
-        absorb the new load — the Emporia API data lags behind wall-clock time
-        by ~60 s, so some of the fetch history is still at the old amp level.
-        Combined with solar variability this can produce a large apparent
-        deficit on the very first post-confirmation cycle, triggering an
-        unwarranted cascade of plug shutoffs and Tesla stop.
-
-        Similarly, after an amp decrease the prediction still includes the
-        now-removed load, producing a large apparent surplus that would
-        trigger re-enabling loads that were just turned off (bounce-back).
-
-        Suppression applies while the relevant settle window is active AND
-        the apparent gap is below ``TESLA_SETTLE_SUPPRESS_WH``. Large
-        genuine gaps (e.g. new QH, clouds) still fire immediately; the
-        QH-name check auto-expires the window on a QH transition.
-
-        Args:
-            corrected_gap_wh: Gap after Tesla in-flight correction.
-            now: Current wall-clock time.
-            qh_name: Current QH name for QH-boundary expiry.
-            data_point_at: Current NBC data-point-at timestamp.
-
-        Returns:
-            True when the decision should be suppressed.
-        """
-        # ── Post-increase: suppress turn-off ──
-        increase_eff = self.state.get_active_tesla_settle(
-            now, current_qh=qh_name, data_point_at=data_point_at,
-            direction="increase",
-        )
-        if (
-            corrected_gap_wh < 0
-            and abs(corrected_gap_wh) < self.engine.TESLA_SETTLE_SUPPRESS_WH
-            and increase_eff is not None
-        ):
-            settle_remaining = (
-                self.state.effective_settle_secs
-                - (now - increase_eff.timestamp).total_seconds()
-            )
-            logger.info(
-                "[_cycle_async_phase] suppressing turn-off: settling after Tesla "
-                "amp increase (gap=%.1f Wh, %.0f s left in settle window)",
-                corrected_gap_wh,
-                settle_remaining,
-            )
-            return True
-        # ── Post-decrease: suppress turn-on ──
-        decrease_eff = self.state.get_active_tesla_settle(
-            now, current_qh=qh_name, data_point_at=data_point_at,
-            direction="decrease",
-        )
-        if (
-            0 < corrected_gap_wh < self.engine.TESLA_SETTLE_SUPPRESS_WH
-            and decrease_eff is not None
-        ):
-            settle_remaining = (
-                self.state.effective_settle_secs
-                - (now - decrease_eff.timestamp).total_seconds()
-            )
-            logger.info(
-                "[_cycle_async_phase] suppressing turn-on: settling after Tesla "
-                "amp decrease (gap=%.1f Wh, %.0f s left in settle window)",
-                corrected_gap_wh,
-                settle_remaining,
-            )
-            return True
-        return False
-
     def _eligible_for_decision(
         self, now: datetime, tesla_state: TeslaState | None,
         gap_wh: float | None = None,
@@ -2495,6 +2700,30 @@ class LoadManager:
             eligible_tesla = None
         return eligible_plugs, eligible_tesla
 
+    @staticmethod
+    def _effective_seconds_remaining(
+        seconds_remaining: int, elapsed_secs: float
+    ) -> int:
+        """Shrink the fetch-start remainder by measured execution lag.
+
+        The NBC fetch reports wall-clock seconds left at fetch start, but
+        the decision runs after the fetch plus plug/Tesla sync round-trips,
+        during which the enabled loads keep burning at full rate
+        (bugs/2026-10-14-water-heater-overshoot.log c658: 835 s booked vs
+        ~831 s realizable, ~5.7 Wh overbooked). Ceil rounds the lag up so
+        savings are never booked for time already spent.
+
+        Args:
+            seconds_remaining: Fetch-start seconds left in the quarter-hour.
+            elapsed_secs: Seconds between post-fetch and decision time.
+
+        Returns:
+            Remaining seconds at decision time, floored at zero.
+        """
+        if elapsed_secs <= 0:
+            return seconds_remaining
+        return max(0, seconds_remaining - math.ceil(elapsed_secs))
+
     def _decide_actions(
         self,
         eligible_plugs: dict[str, PlugConfig],
@@ -2504,6 +2733,8 @@ class LoadManager:
         seconds_remaining: int,
         dry_run: bool,
         data_point_at: datetime | None,
+        *,
+        banked_wh: float | None = None,
     ) -> list[PendingEffect]:
         """Run GapMinder.decide() with the eligible candidates.
 
@@ -2515,28 +2746,36 @@ class LoadManager:
             seconds_remaining: Seconds left in the current quarter-hour.
             dry_run: When True, decide without mutating device state.
             data_point_at: Current NBC data-point-at timestamp.
+            banked_wh: Already-accumulated quarter energy (``qh1.raw_wh``),
+                or None when unknown. Feeds the banked-cover override.
 
         Returns:
             List of decided PendingEffect actions.
         """
-        return self.engine.decide(
-            ctx=DecideContext(
-                now=now,
-                seconds_remaining=seconds_remaining,
-                state=self.state,
-                plugs=eligible_plugs,
-                tesla=eligible_tesla,
-                dry_run=dry_run,
-                data_point_at=data_point_at,
-                requires_home_check=(
-                    self.tesla_config is not None
-                    and self.tesla_config.home_lat is not None
-                    and self.tesla_config.home_lon is not None
-                ),
+        decide_ctx = DecideContext(
+            now=now,
+            seconds_remaining=seconds_remaining,
+            state=self.state,
+            plugs=eligible_plugs,
+            tesla=eligible_tesla,
+            dry_run=dry_run,
+            data_point_at=data_point_at,
+            requires_home_check=(
+                self.tesla_config is not None
+                and self.tesla_config.home_lat is not None
+                and self.tesla_config.home_lon is not None
             ),
+            gap_trend_wh_per_s=self._last_gap_trend_wh_per_s,
+            cycle_secs=self.config_interval_secs,
+            banked_wh=banked_wh,
+            observability_secs=self.state.effective_settle_secs,
+        )
+        actions = self.engine.decide(
+            ctx=decide_ctx,
             predicted_wh=corrected_adjusted_wh,
             target_wh=self.target_wh,
         )
+        return actions
 
     async def _run_actions(
         self, actions: list[PendingEffect], dry_run: bool
@@ -2574,14 +2813,20 @@ class LoadManager:
         now: datetime,
         seconds_remaining: int,
         dry_run: bool,
-        qh_name: str | None = None,
         data_point_at: datetime | None = None,
+        *,
+        pre_synced_external: list[PendingEffect] | None = None,
+        banked_wh: float | None = None,
     ) -> AsyncPhaseResult:
         """Run the async portion of a cycle in a single event loop.
 
         Syncs plug states from controllers, fetches Tesla state, calls decide()
         with that state, then executes all resulting actions. Consolidating into
         one coroutine means one event loop per cycle instead of one per action.
+
+        When ``pre_synced_external`` is not None the pre-gate dashboard poll
+        already reconciled plug state (and queued its alerts), so the body
+        reuses that state instead of re-polling controllers.
 
         Tesla amp-change effects have no power_watts so they're excluded from
         estimated_current_wh(). After fetching the vehicle state we recompute
@@ -2598,7 +2843,9 @@ class LoadManager:
         try:
             return await self._cycle_async_phase_body(
                 gap_wh, adjusted_wh, now, seconds_remaining,
-                dry_run, qh_name=qh_name, data_point_at=data_point_at,
+                dry_run, data_point_at=data_point_at,
+                pre_synced_external=pre_synced_external,
+                banked_wh=banked_wh,
             )
         finally:
             await self._cleanup_sessions()
@@ -2610,18 +2857,36 @@ class LoadManager:
         now: datetime,
         seconds_remaining: int,
         dry_run: bool,
-        qh_name: str | None = None,
         data_point_at: datetime | None = None,
+        *,
+        pre_synced_external: list[PendingEffect] | None = None,
+        banked_wh: float | None = None,
     ) -> AsyncPhaseResult:
         """Body of _cycle_async_phase, extracted for try/finally cleanup."""
         self._vehicle_offline_this_cycle = False
-        early, external_actions = await self._async_sync_and_check_sentinel()
-        if early is not None:
-            return early
+        if pre_synced_external is not None:
+            # Pre-gate poll already reconciled state and queued its alerts;
+            # reuse it without re-polling controllers or double-queuing.
+            if self.is_sentinel_on():
+                return AsyncPhaseResult(sentinel_on=True)
+            external_actions: list[PendingEffect] = []
+        else:
+            early, external_actions = await self._async_sync_and_check_sentinel()
+            if early is not None:
+                return early
         tesla_state, tesla_error, tesla_login_url = (
             await self._fetch_tesla_state_async(now=now)
         )
         self._record_tesla_auth_error(tesla_error, tesla_login_url)
+        # Execution-lag correction (bugs/2026-10-14-water-heater-overshoot.log
+        # c658): the fetch-start remainder overbooks savings for the fetch +
+        # sync time already spent. Shrink it to decision time; the in-flight
+        # correction, decide, and actuation below share the same horizon.
+        # ``now`` itself is left alone: it stamps effects and gates
+        # time-range/debounce checks, whose contract is post-fetch time.
+        seconds_remaining = self._effective_seconds_remaining(
+            seconds_remaining, (self._clock.now() - now).total_seconds()
+        )
         corrected_adjusted_wh, corrected_gap_wh = self._correct_gap_with_inflight(
             adjusted_wh, tesla_state, seconds_remaining, now, data_point_at
         )
@@ -2648,22 +2913,13 @@ class LoadManager:
                 gap_wh=corrected_gap_wh,
                 adjusted_wh=corrected_adjusted_wh,
             )
-        if self._suppressed_by_settle(
-            corrected_gap_wh, now, qh_name, data_point_at
-        ):
-            return AsyncPhaseResult(
-                tesla_state=tesla_state,
-                tesla_error=tesla_error,
-                tesla_login_url=tesla_login_url,
-                gap_wh=corrected_gap_wh,
-                adjusted_wh=corrected_adjusted_wh,
-            )
         eligible_plugs, eligible_tesla = self._eligible_for_decision(
             now, tesla_state, gap_wh=corrected_gap_wh
         )
         actions = self._decide_actions(
             eligible_plugs, eligible_tesla, corrected_adjusted_wh,
             now, seconds_remaining, dry_run, data_point_at,
+            banked_wh=banked_wh,
         )
         succeeded_effects, results = await self._run_actions(actions, dry_run)
 
@@ -2790,6 +3046,12 @@ class LoadManager:
                     hysteresis_wh=self.engine.HYSTERESIS_WH,
                     charge_amps_min=new_tesla.charge_amps_min,
                     charge_amps_max=new_tesla.charge_amps_max,
+                    lumpy_first=getattr(
+                        self.engine, "lumpy_first", self.lumpy_first
+                    ),
+                    ramp_aware=getattr(
+                        self.engine, "ramp_aware", self.ramp_aware
+                    ),
                 )
 
         tg_config = device_config.get_telegram_config()

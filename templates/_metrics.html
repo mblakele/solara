@@ -31,14 +31,22 @@
       </div>
     </header>
 
-    <div class="forecast__value {{ 'forecast__value--gen' if qh1.predicted_wh is not none and qh1.predicted_wh < 0 else 'forecast__value--load' }}">
-      {% if qh1.predicted_wh is not none %}
-      {{ "%+.0f" % (qh1.predicted_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period">{{ _status_label(load_management.last_cycle_result.status if load_management and load_management.last_cycle_result else "ok") }}</span>
+    {# Forecast-period label. Abnormal states — waiting for data and
+       stale data — carry the "⚠ " prefix; _status_is_warn derives the
+       red warn styling from the same label table (no string matching
+       here). Server-rendered, arrives with the usual SSE fragment swap
+       (no client-side ticking). #}
+    {% set period_status = load_management.last_cycle_result.status if load_management and load_management.last_cycle_result else "ok" %}
+    {% set period_warn = _status_is_warn(period_status) %}
+    {% set period_label = _status_label(period_status) %}
+    {% set headline_wh = qh1.predicted_wh if (qh1 is not none and qh1.predicted_wh is not none) else (qh1.raw_wh if (qh1 is not none and qh1.complete) else none) %}
+    <div class="forecast__value {{ 'forecast__value--gen' if headline_wh is not none and headline_wh < 0 else 'forecast__value--load' }}">
+      {% if headline_wh is not none %}
+      {{ "%+.0f" % (headline_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period{{ ' forecast__period--warn' if period_warn else '' }}">{{ period_label }}</span>
       {% else %}
-      <span class="forecast__placeholder">—</span>
+      <span class="forecast__placeholder">—</span><span class="forecast__period{{ ' forecast__period--warn' if period_warn else '' }}">{{ period_label }}</span>
       {% endif %}
     </div>
-
     <div class="sparkline">{{ vd.per_second_data | default([]) | per_second_sparkline(bucket_secs=quantization_seconds | default(1)) | safe }}</div>
 
     {% set w = 60 * qh1.prediction_w if qh1.prediction_w is not none else none %}
