@@ -76,6 +76,23 @@ load — availability is universal, so the report says so and leaves "did the de
 action" to the replay), 767 rescues, 172 deferrals (median R 382 s), 0 ramp fires / 14 eligible,
 settle 30 s x 55299 / 15 s x 103 / 21 s x 4 / 6 commits. Default output stays byte-identical.
 
+Hedge attribution (B1, 2026-10-22, 17-log corpus). `--turn-offs` also buckets every shed by the
+quarter's rate sigma (`TURN_OFF_SIGMA_EDGES` 0.10/0.20 Wh/s), the quarter's median rebuilt churn
+(`TURN_OFF_CHURN_EDGES` 0.10/0.30) and the shed's own pre-shed `|gap|` (`TURN_OFF_GAP_EDGES`
+20/60 Wh), reporting overshoot and reversal rate per bucket plus a per-axis direction line
+(`quarter_uncertainty` rolls the two quarter signals from the same anchors). Snapshot: 28617
+decisions over 1291 quarters, 1034 sheds with a logged saving, 817 plug legs, 616 reversed
+(median 330 s), 733 overshoots (max 452.30 Wh). Verdict: the SIGMA axis has no signal — overshoot
+471/604 (<0.10) then 80/135 (0.10-0.20) then 175/286 (>=0.20), reversal 365/472, 64/80, 180/256,
+so a sigma-scaled hedge has nothing to scale on. Churn reversal rises with the signal (8/23 ->
+126/176 -> 482/618) but its overshoot does not (16/24 -> 153/201 -> 564/809). The gap axis
+dominates and is the only one available at the shed: `|gap| < 60 Wh` overshoots ~90% with a
+POSITIVE median overshoot (19.2 / 18.4 Wh) while `|gap| >= 60 Wh` overshoots 163/406 and the
+median shed there falls 17.1 Wh SHORT of the gap — the path over-sheds small gaps and under-sheds
+large ones. Caveat: sigma and churn are whole-quarter (retrospective) values, so they bound what a
+decision-time rule could see rather than reproducing it. Any revisit of the unguarded path should
+key on the gap it still has, not on forecast uncertainty.
+
 Run from the repo root:
 
 ```bash
@@ -172,6 +189,16 @@ variance and |miss| punishes removing it. lumpy_first fires but nets out (23.51 
 2026-10-17 disagrees with the corpus again (turn-on margin 20: 4.78 vs 10.54 there, 23.40 vs
 17.99 on the car corpus) — the one-log trap. The granularity cure must win without shedding less
 on average.
+
+Reversal-cost axis (2026-10-22, refreshed 17-log corpus; 141 car-active / 1287 plug-only
+quarters). The report already prints `reversals/q` beside `actions/q`, so the turn-off margin was
+re-run at 0/5/10 Wh on that second verdict column (status-quo rate, inert guards): all-regime
+22.79 / 22.72 / 22.99 mean|miss| at 1.05 / 0.94 / 0.84 reversals/q; plug-only 24.15 / 24.06 /
+24.17 at 0.93 / 0.83 / 0.75; car-active 10.34 / 10.51 / 12.26 at 2.14 / 1.95 / 1.72 (medians
+3.69 / 4.07 / 6.60). A 5 Wh margin removes ~10% of the reversal churn for a 0.09 Wh plug-only gain
+but loses in the car regime; 10 Wh removes ~20% and loses in both. Reversal churn is cheap to buy
+and the car-active regime pays for it disproportionately, so no margin ships — the actuator-cost
+axis does not overturn the `|miss|` verdict.
 
 Amp-floor verdict (code + flag removed 2026-10-18; car-active only; the plug-only regime is
 bit-identical as it must be with no car commanded): it LOSES — car-active 19.34 mean|miss| vs

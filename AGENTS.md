@@ -152,7 +152,9 @@ These are design decisions. Do not change them without the owner's approval.
   count-vs-span, interior-gap, or null-bucket check exists anywhere. Do not add
   one without revisiting the axiom first.
 - **Turn-off is unguarded.** `_decide_turn_off` has no minimum-time floor and
-  no overshoot cap. Do not add either one.
+  no overshoot cap. Do not add either one. B1 found no sigma or churn signal
+  behind the overshoot — the pre-shed gap carries it — so no hedged margin
+  ships (`docs/MEASUREMENTS.md`).
 - **Defer deadline sizing.** `defer_lookahead_quanta` counts observation
   windows, never seconds. Size any new decision rule from
   `DecideContext.observability_secs`, not from a literal 30 s.

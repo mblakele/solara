@@ -20,7 +20,10 @@ drift checks.
   (decision entry ↔ same-second shed attachment incl. the orphan-shed skip, per-action
   overshoot/residual roll-ups, Tesla stop reasons without savings, the reversal join's time
   window bounding quarter scope, per-quarter miss join, empty-summary zeros, CLI section +
-  default-output parity, multi-word device names), the suppression census (guard-decline
+  default-output parity, multi-word device names, the B1 hedge attribution: quarter sigma/churn
+  roll-up with thin-quarter None, bucket edges and labels, overshoot/reversal fractions with
+  their separate denominators, unassigned sheds still landing on the gap axis, summary carries
+  the attribution only when handed the map, report + CLI section), the suppression census (guard-decline
   parsing scoped to the diagnostics segment, candidate dedup and the off+toggleable filter,
   banked overrides, defer horizons, ramp fires and the band arithmetic pinned against
   load_nbc/load_manager's own constants, the settle trace's commits, the guarded/unguarded

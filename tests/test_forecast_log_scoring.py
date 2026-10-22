@@ -1829,6 +1829,161 @@ def test_real_log_turn_off_decisions_parse() -> None:
     assert "turn-off decisions:" in fls.format_turn_offs(summary)
 
 
+# ── hedge attribution (B1: is overshoot keyed to uncertainty?) ───────
+#
+# The closed-loop margin sweep says a constant turn-off hedge is worth
+# paying. B1 asks a different question: is the overshoot — and the reversal
+# that undoes it — concentrated in the quarters whose forecast is actually
+# uncertain? These tests pin the attribution table, not a verdict.
+
+
+def _hedge_anchor(
+    quarter: datetime,
+    minute: int,
+    *,
+    remaining: int = 600,
+    rate: float = 0.0,
+    actual: float | None = -9.0,
+) -> ForecastAnchor:
+    """One synthetic anchor, placed ``minute`` minutes into its quarter."""
+    return ForecastAnchor(
+        source="x.log",
+        quarter_start=quarter,
+        data_point_at=quarter + timedelta(minutes=minute),
+        remaining_secs=remaining,
+        samples_used=30,
+        prediction_values=30,
+        raw_wh=0.0,
+        prediction_w=rate,
+        predicted_wh=rate * remaining,
+        actual_wh=actual,
+    )
+
+
+def test_quarter_uncertainty_rolls_sigma_and_churn_up_per_quarter() -> None:
+    """Each quarter gets its own rate sigma and churn; thin quarters get None."""
+    first = datetime(2026, 10, 17, 21, 30, tzinfo=timezone.utc)
+    second = datetime(2026, 10, 17, 21, 45, tzinfo=timezone.utc)
+    anchors = [
+        _hedge_anchor(first, 1, remaining=840, rate=0.0),
+        _hedge_anchor(first, 2, remaining=780, rate=0.02),
+        _hedge_anchor(first, 3, remaining=720, rate=-0.01),
+        _hedge_anchor(second, 1, remaining=840, rate=0.0),
+    ]
+    stats = fls.quarter_uncertainty(anchors)
+    assert set(stats) == {("x.log", first), ("x.log", second)}
+    assert stats[("x.log", first)].sigma_rate > 0.0
+    assert stats[("x.log", first)].churn_wh_per_s is not None
+    assert stats[("x.log", first)].churn_wh_per_s > 0.0
+    # One scored anchor cannot estimate a spread, and none has two slopes.
+    assert stats[("x.log", second)].sigma_rate is None
+    assert stats[("x.log", second)].churn_wh_per_s is None
+
+
+def _hedge_fixture() -> tuple[
+    list[fls.TurnOffDecision], list[fls.TurnOnRecord], dict
+]:
+    """Two quarters: a low-signal early shed and a high-signal late one."""
+    first = datetime(2026, 10, 17, 21, 30, tzinfo=timezone.utc)
+    second = datetime(2026, 10, 17, 22, 15, tzinfo=timezone.utc)
+    text = "\n".join(
+        [
+            _off_entry("21:36:07", 5.0, 500),
+            _plug_off("21:36:07", "jackery", 10.0, 5.0),
+            _plug_on("21:37:07", "jackery", 60.0, 90.0),
+            _off_entry("22:15:59", 80.0, 800),
+            _plug_off("22:15:59", "ecoflow", 61.0, 80.0),
+        ]
+    )
+    uncertainty = {
+        ("x.log", first): fls.QuarterUncertainty(
+            sigma_rate=0.05, churn_wh_per_s=0.04
+        ),
+        ("x.log", second): fls.QuarterUncertainty(
+            sigma_rate=0.30, churn_wh_per_s=0.60
+        ),
+    }
+    return (
+        fls.parse_turn_offs(text, source="x.log"),
+        fls.parse_turn_ons(text, source="x.log"),
+        uncertainty,
+    )
+
+
+def test_attribute_sheds_buckets_overshoot_and_reversal_by_signal() -> None:
+    """Each axis buckets the same sheds; the fractions follow the bucket."""
+    decisions, ons, uncertainty = _hedge_fixture()
+    hedge = fls.attribute_sheds(decisions, ons, uncertainty)
+
+    sigma = {bucket.label: bucket for bucket in hedge.sigma}
+    assert sigma["<0.10"].shed_count == 1
+    assert sigma["<0.10"].reversal_count == 1
+    assert sigma["<0.10"].overshoot_fraction == pytest.approx(1.0)
+    assert sigma[">=0.20"].shed_count == 1
+    assert sigma[">=0.20"].reversal_count == 0
+
+    churn = {bucket.label: bucket for bucket in hedge.churn}
+    assert churn["<0.10"].shed_count == 1
+    assert churn[">=0.30"].shed_count == 1
+
+    gap = {bucket.label: bucket for bucket in hedge.gap}
+    assert gap["<20"].shed_count == 1
+    assert gap["<20"].reversal_fraction == pytest.approx(1.0)
+    assert gap[">=60"].shed_count == 1
+    assert gap[">=60"].overshoot_fraction == pytest.approx(0.0)
+    assert hedge.unassigned_count == 0
+
+
+def test_attribute_sheds_counts_sheds_with_no_quarter_signal() -> None:
+    """A shed in an unscored quarter is unassigned on sigma/churn, not dropped."""
+    decisions, ons, _ = _hedge_fixture()
+    hedge = fls.attribute_sheds(decisions, ons, {})
+    assert hedge.unassigned_count == 2
+    assert all(bucket.shed_count == 0 for bucket in hedge.sigma)
+    assert sum(bucket.shed_count for bucket in hedge.gap) == 2
+
+
+def test_summarize_turn_offs_carries_the_hedge_attribution() -> None:
+    """Passing the uncertainty map adds the attribution; omitting it leaves None."""
+    decisions, ons, uncertainty = _hedge_fixture()
+    assert fls.summarize_turn_offs(decisions, ons).hedge is None
+    summary = fls.summarize_turn_offs(decisions, ons, uncertainty=uncertainty)
+    assert summary.hedge is not None
+    assert sum(bucket.shed_count for bucket in summary.hedge.sigma) == 2
+
+
+def test_format_turn_offs_reports_hedge_attribution() -> None:
+    """The text report names each axis and its buckets."""
+    decisions, ons, uncertainty = _hedge_fixture()
+    body = fls.format_turn_offs(
+        fls.summarize_turn_offs(decisions, ons, uncertainty=uncertainty)
+    )
+    assert "hedge attribution" in body
+    assert "sigma_rate" in body
+    assert "churn" in body
+    assert "gap (Wh)" in body
+    assert "<0.10" in body
+    assert ">=0.20" in body
+
+
+def test_cli_turn_offs_includes_the_hedge_attribution(tmp_path, capsys) -> None:
+    """``--turn-offs`` prints the attribution from the scored anchors."""
+    log = tmp_path / "hedge.log"
+    log.write_text(
+        "\n".join(
+            [
+                _fetch(500, -50.0, 0.1, -10.0, 400, 500, complete_q2=-9.0),
+                _fetch(1800, -100.0, 0.05, -55.0, 500, 1300, complete_q2=-9.0),
+                _off_entry("21:44:58", 5.8, 4),
+                _plug_off("21:44:58", "jackery", 0.3, 5.8),
+            ]
+        )
+    )
+    assert fls.main([str(log), "--turn-offs"]) == 0
+    out = capsys.readouterr().out
+    assert "hedge attribution" in out
+
+
 # ── suppression census (--guards) ────────────────────────────────────
 #
 # Every mechanism that *declines* to act is invisible to a closed loop that

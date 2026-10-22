@@ -39,8 +39,12 @@ unguarded ``GapMinder._decide_turn_off`` (horizon, gap, each shed it booked,
 whether the gap was covered, whether a shed overshot it, and whether a plug
 was turned back on in the same quarter) beside the quarter it produced.
 That path has no minimum-horizon floor and no overshoot cap by design, so
-the data is collected before any guard is considered. Also opt-in; the
-default output is unchanged.
+the data is collected before any guard is considered. The same section ends
+with a hedge attribution: every shed bucketed by its quarter's rate sigma,
+its quarter's production churn, and its own pre-shed gap, with the overshoot
+and reversal rate per bucket. The two quarter signals are retrospective (the
+whole quarter's anchors), the gap is the only one a decision had at the
+shed. Also opt-in; the default output is unchanged.
 
 ``--guards`` adds the historical suppression census: every mechanism that
 only *declines* work is invisible to a closed loop that watches actions, so
@@ -71,7 +75,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence, TypeVar
+from typing import Iterable, Iterator, Mapping, Sequence, TypeVar
 
 import pytz
 
@@ -1907,6 +1911,23 @@ quarter — and short enough that a turn-on driven by genuinely new
 conditions is not counted as churn.
 """
 
+TURN_OFF_SIGMA_EDGES: tuple[float, ...] = (0.10, 0.20)
+"""Rate-sigma edges (Wh/s) for the hedge-attribution buckets.
+
+Two cuts, because the corpus's per-quarter sigma sits mostly below 0.20:
+below 0.10 the trailing mean is steady, above 0.20 it is not.
+"""
+
+TURN_OFF_CHURN_EDGES: tuple[float, ...] = (0.10, 0.30)
+"""Production-churn edges (Wh/s) for the hedge-attribution buckets."""
+
+TURN_OFF_GAP_EDGES: tuple[float, ...] = (20.0, 60.0)
+"""Pre-shed ``|gap|`` edges (Wh) for the hedge-attribution buckets.
+
+A shed covers ``P * R / 3600`` Wh, so the corpus's median shed (~60 Wh)
+is the top bucket: the path most often fires when the gap is large.
+"""
+
 _TURN_OFF_ENTRY_RE = re.compile(
     r"\[_decide_turn_off\] gap=(-?[\d.]+) Wh, seconds_remaining=(\d+)"
 )
@@ -2048,6 +2069,76 @@ class TurnOffQuarter:
 
 
 @dataclass(frozen=True)
+class QuarterUncertainty:
+    """The two forecast signals a turn-off decision had at its quarter.
+
+    Attributes:
+        sigma_rate: Population sigma of the quarter's scored rate
+            shortfalls (Wh/s), or None when fewer than two anchors were
+            scored.
+        churn_wh_per_s: Median non-zero production churn in the quarter
+            (Wh/s), or None when no anchor had two slopes behind it.
+    """
+
+    sigma_rate: float | None
+    churn_wh_per_s: float | None
+
+
+@dataclass(frozen=True)
+class ShedBucket:
+    """One hedge-attribution bucket: sheds sharing a signal range.
+
+    The two denominators differ on purpose. ``saving_count`` is every shed
+    that logged a saving (the plug and Tesla-amp legs), so it is the
+    overshoot denominator; ``plug_count`` is the plug legs only, because a
+    reversal needs a plug turn-on to undo the shed.
+    """
+
+    label: str
+    shed_count: int
+    saving_count: int
+    overshoot_count: int
+    plug_count: int
+    reversal_count: int
+    median_overshoot_wh: float | None
+
+    @property
+    def overshoot_fraction(self) -> float | None:
+        """Share of the bucket's logged savings that overshot, if any."""
+        if self.saving_count == 0:
+            return None
+        return self.overshoot_count / self.saving_count
+
+    @property
+    def reversal_fraction(self) -> float | None:
+        """Share of the bucket's plug sheds that were undone, if any."""
+        if self.plug_count == 0:
+            return None
+        return self.reversal_count / self.plug_count
+
+
+@dataclass(frozen=True)
+class HedgeAttribution:
+    """Sheds bucketed by each uncertainty signal, for the B1 question.
+
+    Every shed lands in exactly one gap bucket. A shed lands in a sigma or
+    churn bucket only when its quarter carries that signal, so the three
+    axes can total differently; ``unassigned_count`` says how many sheds
+    had no quarter signal at all.
+    """
+
+    sigma: tuple[ShedBucket, ...]
+    churn: tuple[ShedBucket, ...]
+    gap: tuple[ShedBucket, ...]
+    unassigned_count: int
+
+    @property
+    def shed_count(self) -> int:
+        """Sheds bucketed on the gap axis (every shed the path booked)."""
+        return sum(bucket.shed_count for bucket in self.gap)
+
+
+@dataclass(frozen=True)
 class TurnOffSummary:
     """What the corpus says about the unguarded turn-off path.
 
@@ -2057,6 +2148,10 @@ class TurnOffSummary:
     zero median reads as "the path kept up", not "the gap was tiny". The
     overshoot pair is scoped to the sheds that logged a saving — the
     plug/Tesla-amp legs, which the path books against the gap it still had.
+
+    ``hedge`` is set only when the caller supplies the per-quarter
+    uncertainty map; a summary built without one has no anchors to key the
+    attribution on. See :class:`HedgeAttribution`.
     """
 
     decision_count: int
@@ -2075,6 +2170,7 @@ class TurnOffSummary:
     max_overshoot_wh: float
     reversals: tuple[Reversal, ...]
     quarters: tuple[TurnOffQuarter, ...]
+    hedge: HedgeAttribution | None = None
 
     @property
     def action_count(self) -> int:
@@ -2266,10 +2362,199 @@ def find_reversals(
     return reversals
 
 
+def quarter_uncertainty(
+    anchors: Sequence[ForecastAnchor],
+) -> dict[_QuarterKey, QuarterUncertainty]:
+    """Roll each quarter's forecast spread and production churn up.
+
+    Both signals are the ones production already holds when it decides: the
+    spread of the trailing mean's rate error over the quarter, and the
+    churn the (now removed) turn-on guard used to consume. The churn is
+    rebuilt offline by :func:`churn_by_anchor`.
+
+    Args:
+        anchors: Anchors in log order, as parsed for the same logs.
+
+    Returns:
+        ``(source, quarter_start)`` to signals. ``sigma_rate`` needs two
+        scored anchors; ``churn_wh_per_s`` is the median of the non-zero
+        rebuilt churn values, so the two anchors before the tracker warms
+        up do not drag a quarter's signal to zero. Either is None when the
+        quarter does not carry it.
+    """
+    churns = churn_by_anchor(anchors)
+    shortfalls: dict[_QuarterKey, list[float]] = {}
+    churn_samples: dict[_QuarterKey, list[float]] = {}
+    for anchor, churn in zip(anchors, churns):
+        key = (anchor.source, anchor.quarter_start)
+        shortfall = anchor.rate_shortfall
+        if shortfall is not None:
+            shortfalls.setdefault(key, []).append(shortfall)
+        if churn > 0.0:
+            churn_samples.setdefault(key, []).append(churn)
+    keys = set(shortfalls) | set(churn_samples) | {
+        (anchor.source, anchor.quarter_start) for anchor in anchors
+    }
+    return {
+        key: QuarterUncertainty(
+            sigma_rate=(
+                stddev(shortfalls[key]) if len(shortfalls.get(key, ())) > 1 else None
+            ),
+            churn_wh_per_s=(
+                percentile(churn_samples[key], 0.5)
+                if churn_samples.get(key)
+                else None
+            ),
+        )
+        for key in keys
+    }
+
+
+@dataclass
+class _BucketAccumulator:
+    """Mutable tally for one bucket while :func:`attribute_sheds` walks."""
+
+    shed_count: int = 0
+    saving_count: int = 0
+    overshoot_count: int = 0
+    plug_count: int = 0
+    reversal_count: int = 0
+    overshoots: list[float] = field(default_factory=list)
+
+
+def _bucket_label(value: float, edges: Sequence[float], digits: int) -> str:
+    """Label the bucket ``value`` falls in for an ascending ``edges`` tuple."""
+    low: float | None = None
+    for edge in edges:
+        if value < edge:
+            if low is None:
+                return f"<{edge:.{digits}f}"
+            return f"{low:.{digits}f}-{edge:.{digits}f}"
+        low = edge
+    return f">={edges[-1]:.{digits}f}"
+
+
+def _new_buckets(
+    edges: Sequence[float], digits: int
+) -> dict[str, _BucketAccumulator]:
+    """Empty accumulators keyed by every label the axis can produce.
+
+    Building them all up front keeps the report's bucket order stable even
+    when no shed lands in one of them.
+    """
+    labels = [f"<{edges[0]:.{digits}f}"]
+    for low, high in zip(edges, edges[1:]):
+        labels.append(f"{low:.{digits}f}-{high:.{digits}f}")
+    labels.append(f">={edges[-1]:.{digits}f}")
+    return {label: _BucketAccumulator() for label in labels}
+
+
+def _freeze_bucket(label: str, acc: _BucketAccumulator) -> ShedBucket:
+    """Turn one accumulator into its frozen report row."""
+    return ShedBucket(
+        label=label,
+        shed_count=acc.shed_count,
+        saving_count=acc.saving_count,
+        overshoot_count=acc.overshoot_count,
+        plug_count=acc.plug_count,
+        reversal_count=acc.reversal_count,
+        median_overshoot_wh=(
+            percentile(acc.overshoots, 0.5) if acc.overshoots else None
+        ),
+    )
+
+
+def attribute_sheds(
+    decisions: Sequence[TurnOffDecision],
+    turn_ons: Sequence[TurnOnRecord],
+    uncertainty: Mapping[_QuarterKey, QuarterUncertainty],
+) -> HedgeAttribution:
+    """Bucket every shed by its quarter's signals and its own pre-shed gap.
+
+    The B1 question is whether the overshoot and the reversal that undoes it
+    concentrate in the quarters whose forecast is *measurably* uncertain. A
+    constant hedge would then be paying in the calm quarters for the noisy
+    ones; a signal-scaled one would not.
+
+    Args:
+        decisions: Parsed turn-off decisions.
+        turn_ons: Parsed turn-ons, for the reversal join.
+        uncertainty: Per-quarter signals from :func:`quarter_uncertainty`.
+
+    Returns:
+        One bucket row per axis and label, plus the count of sheds whose
+        quarter carried no signal (those still appear on the gap axis).
+    """
+    undone = {
+        (reversal.source, reversal.device_name, reversal.off_at)
+        for reversal in find_reversals(decisions, turn_ons)
+    }
+    sigma_buckets = _new_buckets(TURN_OFF_SIGMA_EDGES, 2)
+    churn_buckets = _new_buckets(TURN_OFF_CHURN_EDGES, 2)
+    gap_buckets = _new_buckets(TURN_OFF_GAP_EDGES, 0)
+    unassigned = 0
+    for decision in decisions:
+        signals = uncertainty.get((decision.source, decision.quarter_start))
+        for action in decision.actions:
+            gap = action.remaining_gap_wh
+            if gap is None:
+                gap = decision.gap_wh
+            rows = [gap_buckets[_bucket_label(abs(gap), TURN_OFF_GAP_EDGES, 0)]]
+            if signals is None or (
+                signals.sigma_rate is None and signals.churn_wh_per_s is None
+            ):
+                unassigned += 1
+            else:
+                if signals.sigma_rate is not None:
+                    rows.append(
+                        sigma_buckets[
+                            _bucket_label(
+                                signals.sigma_rate, TURN_OFF_SIGMA_EDGES, 2
+                            )
+                        ]
+                    )
+                if signals.churn_wh_per_s is not None:
+                    rows.append(
+                        churn_buckets[
+                            _bucket_label(
+                                signals.churn_wh_per_s, TURN_OFF_CHURN_EDGES, 2
+                            )
+                        ]
+                    )
+            overshoot = action.overshoot_wh
+            reversed_ = (
+                decision.source,
+                action.device_name,
+                decision.at,
+            ) in undone
+            for acc in rows:
+                acc.shed_count += 1
+                if overshoot is not None:
+                    acc.saving_count += 1
+                    acc.overshoots.append(overshoot)
+                    if overshoot > 1e-9:
+                        acc.overshoot_count += 1
+                if action.kind == "plug":
+                    acc.plug_count += 1
+                    if reversed_:
+                        acc.reversal_count += 1
+    return HedgeAttribution(
+        sigma=tuple(
+            _freeze_bucket(label, acc) for label, acc in sigma_buckets.items()
+        ),
+        churn=tuple(
+            _freeze_bucket(label, acc) for label, acc in churn_buckets.items()
+        ),
+        gap=tuple(_freeze_bucket(label, acc) for label, acc in gap_buckets.items()),
+        unassigned_count=unassigned,
+    )
+
+
 def summarize_turn_offs(
     decisions: Sequence[TurnOffDecision],
     turn_ons: Sequence[TurnOnRecord] = (),
     quarters: Sequence[QuarterSummary] = (),
+    uncertainty: Mapping[_QuarterKey, QuarterUncertainty] | None = None,
 ) -> TurnOffSummary:
     """Roll the turn-off path's decisions into the collection report.
 
@@ -2279,6 +2564,9 @@ def summarize_turn_offs(
         quarters: Per-quarter roll-ups from :func:`summarize`, joined by
             ``(source, quarter_start)`` for each turn-off quarter's
             completed total (optional).
+        uncertainty: Per-quarter signals from :func:`quarter_uncertainty`.
+            Supplying it adds the B1 hedge attribution; omitting it leaves
+            ``hedge`` as None.
 
     Returns:
         The summary; all zeros for a log with no turn-off path lines.
@@ -2343,6 +2631,11 @@ def summarize_turn_offs(
         max_overshoot_wh=max([0.0, *overshoots]),
         reversals=tuple(reversals),
         quarters=tuple(rows),
+        hedge=(
+            None
+            if uncertainty is None
+            else attribute_sheds(decisions, turn_ons, uncertainty)
+        ),
     )
 
 
@@ -2391,7 +2684,81 @@ def format_turn_offs(summary: TurnOffSummary) -> str:
             f"{row.min_remaining_secs:>6} {row.reversal_count:>9} {actual:>8} "
             f"{target:>7} {miss:>8}"
         )
+    if summary.hedge is not None:
+        lines.extend(_format_hedge(summary.hedge))
     return "\n".join(lines)
+
+
+def _fraction(count: int, denom: int) -> str:
+    """Render ``count/denom`` with a whole-percent share, or ``-``."""
+    if denom == 0:
+        return "-"
+    return f"{count}/{denom} ({100 * count / denom:.0f}%)"
+
+
+def _trend(fractions: Sequence[float]) -> str:
+    """Describe how a fraction moves across the filled buckets.
+
+    Only the direction is reported: three buckets cannot support a
+    correlation statistic, but they can say whether a constant hedge is
+    subsidising a regime that never overshoots.
+    """
+    if len(fractions) < 2:
+        return "n/a"
+    steps = [high - low for low, high in zip(fractions, fractions[1:])]
+    if all(step > 0 for step in steps):
+        return "rises"
+    if all(step < 0 for step in steps):
+        return "falls"
+    return "mixed"
+
+
+def _format_hedge(hedge: HedgeAttribution) -> list[str]:
+    """Render the B1 bucket table and its per-axis trend lines."""
+    lines = [
+        "",
+        "hedge attribution — overshoot and reversal rate per bucket",
+        f"  {'axis':<11} {'bucket':<11} {'sheds':>5} {'overshoot':>16} "
+        f"{'reversal':>16} {'med OS Wh':>10}",
+    ]
+    axes = (
+        ("sigma_rate", hedge.sigma),
+        ("churn", hedge.churn),
+        ("gap (Wh)", hedge.gap),
+    )
+    for name, buckets in axes:
+        for bucket in buckets:
+            if bucket.shed_count == 0:
+                continue
+            median = (
+                f"{bucket.median_overshoot_wh:.2f}"
+                if bucket.median_overshoot_wh is not None
+                else "-"
+            )
+            lines.append(
+                f"  {name:<11} {bucket.label:<11} {bucket.shed_count:>5} "
+                f"{_fraction(bucket.overshoot_count, bucket.saving_count):>16} "
+                f"{_fraction(bucket.reversal_count, bucket.plug_count):>16} "
+                f"{median:>10}"
+            )
+    lines.append("")
+    for name, buckets in axes:
+        overshoot = [
+            f for f in (b.overshoot_fraction for b in buckets) if f is not None
+        ]
+        reversal = [
+            f for f in (b.reversal_fraction for b in buckets) if f is not None
+        ]
+        lines.append(
+            f"  {name}: overshoot {_trend(overshoot)}, "
+            f"reversal {_trend(reversal)} across buckets"
+        )
+    if hedge.unassigned_count:
+        lines.append(
+            f"  {hedge.unassigned_count}/{hedge.shed_count} sheds had no "
+            "quarter signal (gap axis only)"
+        )
+    return lines
 
 
 def _iter_log_texts(paths: Sequence[Path]) -> Iterator[tuple[Path, str]]:
@@ -3120,7 +3487,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print()
         print(
             format_turn_offs(
-                summarize_turn_offs(decisions, turn_ons, report.quarters)
+                summarize_turn_offs(
+                    decisions,
+                    turn_ons,
+                    report.quarters,
+                    uncertainty=quarter_uncertainty(anchors),
+                )
             )
         )
     if guards:
