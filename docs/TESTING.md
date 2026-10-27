@@ -109,6 +109,10 @@ drift checks.
 - **test_sheddable_residual.py**
   the controllable-load residual prototype (net-of-lumpy counterfactual + replayed c658 / c817
   small-plug prescriptions, production unwired)
+- **test_sync_external_effect.py**
+  the external-flip reconcile (an actual change records the synthetic effect, debounce bump and
+  runtime book; an unchanged reading past the observation window is adopted as reality — the
+  2026-10-26 water heater held desired=on for 33 min against a plug that never reported on)
 - **test_residual_feedback_replay.py**
   the meter-feedback harness (event-driven counterfactual meter + closed-loop residual policy
   over both 2026-10-14 quarters; symmetric margin pinned harmful in B)

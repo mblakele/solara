@@ -1936,6 +1936,11 @@ class LoadManager:
         GapMinder makes decisions based on current conditions. Daily ON-time books
         move via note_desired_transition, exactly as for managed decisions.
 
+        A mismatch is credited to our own command only while that command's
+        observation window is open (``_command_may_be_in_flight``). Once the
+        window expires, an unchanged reading is reality: the manager adopts
+        it instead of holding a belief the plug contradicts forever.
+
         Returns:
             Synthetic PendingEffects for reconciled external flips (empty
             when nothing diverged). The async phase queues Telegram alerts
@@ -1970,10 +1975,11 @@ class LoadManager:
             else:
                 prev_actual = dev_state.actual_state
                 dev_state.actual_state = actual
-                if prev_actual == actual:
-                    # No change in reported state — a desired/actual
-                    # mismatch is our own unconfirmed command, not an
-                    # external flip. Keep desired so the dashboard holds
+                if prev_actual == actual and self._command_may_be_in_flight(
+                    dev_state
+                ):
+                    # No change in reported state while our own command may
+                    # still be landing — keep desired so the dashboard holds
                     # pending instead of flapping to off/on.
                     continue
                 # Reconcile: if external actor changed the state, match it
@@ -1995,6 +2001,28 @@ class LoadManager:
                     if effect is not None:
                         external.append(effect)
         return external
+
+    def _command_may_be_in_flight(self, dev_state: DeviceState) -> bool:
+        """Return True while an issued plug command may still be landing.
+
+        A desired/actual mismatch is credited to our own command for exactly
+        one observation window. The window is the same quantization-derived
+        settle window the pending-effect store uses, so it scales with the
+        meter's reporting cadence. It expires the belief, not only the
+        effect, so a command the plug never reported cannot hold
+        desired_state indefinitely.
+
+        Args:
+            dev_state: Tracked state for the plug.
+
+        Returns:
+            True when the last command is inside one observation window.
+        """
+        if dev_state.last_toggle is None:
+            return False
+        window = self.state.effective_settle_secs
+        elapsed = (self._clock.now() - dev_state.last_toggle).total_seconds()
+        return elapsed < window
 
     def _record_external_effect(
         self,

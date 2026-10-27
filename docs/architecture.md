@@ -613,9 +613,11 @@ this axiom before adding defensive checks.
   while a pending effect exists, else fall back to unconfirmed `desired_state`
   mismatch (desired=True/actual=False → pending-on, desired=False/actual=True
   → pending-off) so pruning before controller confirmation never flaps to
-  off/on; `_sync_plug_states` (`load_manager.py`) only reconciles `desired`
-  when the reported `actual` actually changed, preserving our own unconfirmed
-  command. Covered by `tests/test_desired_pending.py`.
+  off/on; `_sync_plug_states` (`load_manager.py`) credits a mismatch to our own
+  command for one observation window (`_command_may_be_in_flight`, sized from
+  `effective_settle_secs`), then adopts the reported state so a command the
+  plug never reported cannot hold `desired_state` forever. Covered by
+  `tests/test_desired_pending.py` and `tests/test_sync_external_effect.py`.
 - Stale detection uses **data-point age** (not fetch time): `data_point_at = fetched_at - timedelta(seconds=data_lag_secs)`.
   The threshold is `STALE_DATA_THRESHOLD_SECS` (80 seconds, constants.py) from the most
   recent per-second data point, accounting for Emporia API lag. Min toggle interval: 60 seconds.

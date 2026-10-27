@@ -7,7 +7,7 @@ change before the next decision.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from clock import FakeClock
 from load_controllers import PlugController
@@ -190,3 +190,63 @@ def test_sync_skips_effect_on_first_observation() -> None:
     assert dev.desired_state is False
     assert mgr.state.snapshot_effects() == []
     assert dev.last_toggle is None
+
+
+def test_sync_adopts_reality_after_command_window() -> None:
+    """An unchanged reading past the window is an override, not our command.
+
+    The controller never reported the commanded ON state: actual was
+    False before the command and is still False one observation window
+    later. That is reality, not an unconfirmed command, so the manager
+    adopts it and records the change for NBC math and the debounce.
+    """
+    now = datetime(2026, 9, 5, 15, 16, 3, tzinfo=timezone.utc)
+    plugs = {
+        "heater": PlugConfig(
+            name="heater", accessory_id="h1",
+            power_watts=2000.0, priority=10,
+        ),
+    }
+    mgr = _make_mgr(plugs, now=now)
+    window = mgr.state.effective_settle_secs
+    mgr.plug_ctrl._state["heater"] = False  # type: ignore[attr-defined]
+    mgr.state.devices["heater"] = DeviceState(
+        name="heater", desired_state=True, actual_state=False,
+        last_toggle=now - timedelta(seconds=window + 1),
+    )
+
+    asyncio.run(mgr._sync_plug_states())
+
+    dev = mgr.state.devices["heater"]
+    assert dev.actual_state is False
+    assert dev.desired_state is False
+    assert dev.last_toggle == now
+    effects = mgr.state.snapshot_effects()
+    assert len(effects) == 1
+    assert effects[0].device_name == "heater"
+    assert effects[0].action == "turn_off"
+    assert effects[0].power_watts == -2000.0
+
+
+def test_sync_holds_desired_inside_command_window() -> None:
+    """Inside the window the mismatch is our own command still in flight."""
+    now = datetime(2026, 9, 5, 15, 16, 3, tzinfo=timezone.utc)
+    plugs = {
+        "heater": PlugConfig(
+            name="heater", accessory_id="h1",
+            power_watts=2000.0, priority=10,
+        ),
+    }
+    mgr = _make_mgr(plugs, now=now)
+    window = mgr.state.effective_settle_secs
+    mgr.plug_ctrl._state["heater"] = False  # type: ignore[attr-defined]
+    mgr.state.devices["heater"] = DeviceState(
+        name="heater", desired_state=True, actual_state=False,
+        last_toggle=now - timedelta(seconds=window - 1),
+    )
+
+    asyncio.run(mgr._sync_plug_states())
+
+    dev = mgr.state.devices["heater"]
+    assert dev.desired_state is True
+    assert mgr.state.snapshot_effects() == []
