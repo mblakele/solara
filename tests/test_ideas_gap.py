@@ -77,19 +77,31 @@ def test_fallback_derives_gap_from_target() -> None:
     assert "+12.5 Amps 240V" in html
 
 
-def test_ideas_hide_values_below_one() -> None:
-    """Only ideas >= 1.0 render: gap 85 gives shower 1.0 and car 1.4."""
+def test_ideas_show_values_from_half() -> None:
+    """Ideas >= 0.5 render: gap 85 gives shower 1.0, laundry 0.97, car 1.4."""
     html = _render(predicted_wh=-135.0, gap_wh=85.0, target_wh=-50.0)
     assert ">Ideas<" in html
-    # 85/81 = 1.05 -> shows; 85/88 = 0.97 -> hidden.
+    # 85/81 = 1.05, 85/88 = 0.97, 85/0.25/240 = 1.42 -> all show.
     assert "🚿" in html
-    assert "👕" not in html
-    # 85/0.25/240 = 1.42 -> shows.
+    assert "👕" in html
     assert "Amps 240V" in html
 
 
-def test_ideas_section_hidden_when_all_below_one() -> None:
-    """Gap above hysteresis but every idea < 1.0 hides the section."""
+def test_ideas_hide_values_below_half() -> None:
+    """Ideas < 0.5 stay hidden: gap 40 hides shower 0.49 and laundry 0.45."""
+    html = _render(
+        predicted_wh=-90.0, gap_wh=40.0, target_wh=-50.0, hysteresis_wh=5.0
+    )
+    assert ">Ideas<" in html
+    # 40/81 = 0.49 and 40/88 = 0.45 -> hidden.
+    assert "🚿" not in html
+    assert "👕" not in html
+    # 40/0.25/240 = 0.67 -> shows.
+    assert "Amps 240V" in html
+
+
+def test_ideas_section_hidden_when_all_below_half() -> None:
+    """Gap above hysteresis but every idea < 0.5 hides the section."""
     html = _render(
         predicted_wh=-60.0, gap_wh=10.0, target_wh=-50.0, hysteresis_wh=5.0
     )

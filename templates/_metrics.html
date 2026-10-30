@@ -90,9 +90,9 @@
     {% elif gap_wh > hyst %}
     {% set shower_min = (gap_wh / 81.0) | abs %}
     {% set laundry_min = (gap_wh / 88.0) | abs %}
-    {% set show_shower = shower_min >= 1.0 %}
-    {% set show_laundry = laundry_min >= 1.0 %}
-    {% set show_car = car_amps is not none and (car_amps | abs) >= 1.0 %}
+    {% set show_shower = shower_min >= 0.5 %}
+    {% set show_laundry = laundry_min >= 0.5 %}
+    {% set show_car = car_amps is not none and (car_amps | abs) >= 0.5 %}
     {% if show_shower or show_laundry or show_car %}
     <div class="demand">
       <span class="demand__label">Ideas</span>
