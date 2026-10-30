@@ -191,6 +191,9 @@ class TeslaConfig:
         private_key_path: Path to private key for signing requests.
         time_range: Optional (start, end) time window for device eligibility.
         vehicle_command_proxy_url: Optional proxy URL for vehicle commands.
+        priority: Sort priority for amp-change decisions against plugs. A
+            higher number is more important, as with ``PlugConfig.priority``.
+            Defaults to 0. Stop-charging decisions ignore it.
     """
 
     client_id: str
@@ -205,6 +208,7 @@ class TeslaConfig:
     private_key_path: str | None = None
     time_range: tuple[time, time] | None = None
     vehicle_command_proxy_url: str | None = None
+    priority: int = 0
 
 
 @dataclass

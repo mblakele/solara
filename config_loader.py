@@ -232,11 +232,13 @@ def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[retu
     home_radius_m = 500.0
     charge_amps_min = 5
     charge_amps_max = 48
+    priority = 0
     time_range = None
     if dc is not None:
         home_radius_m = float(dc.get("home_radius_m", 500))
         charge_amps_min = int(dc.get("charge_amps_min", 5))
         charge_amps_max = int(dc.get("charge_amps_max", 48))
+        priority = int(dc.get("priority", 0))
         time_range = _parse_device_time_range(dc.get("time_range"))
 
     return TeslaConfig(
@@ -252,4 +254,5 @@ def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[retu
         private_key_path=private_key_path,
         time_range=time_range,
         vehicle_command_proxy_url=vehicle_command_proxy_url,
+        priority=priority,
     )

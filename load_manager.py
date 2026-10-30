@@ -369,6 +369,9 @@ class LoadManager:
                 lumpy_first=lumpy_first,
                 ramp_aware=ramp_aware,
                 defer_lookahead_quanta=defer_lookahead_quanta,
+                tesla_priority=(
+                    tesla_config.priority if tesla_config else 0
+                ),
             )
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),

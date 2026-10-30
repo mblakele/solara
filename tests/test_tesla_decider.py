@@ -95,6 +95,27 @@ def test_decider_clamps_to_config_max():
     assert action.target_amps <= 24
 
 
+def test_clamped_increase_reports_actual_amp_delta():
+    """A clamped increase reports the delta actually commanded.
+
+    The requested gap asks for far more than the 10 A ceiling allows.
+    ``power_watts`` must reflect the real 5 A increase (5 → 10), not the
+    unclamped request, because the priority path subtracts this delta from
+    the remaining gap.
+    """
+    ctx = replace(
+        _ctx(),
+        tesla=TeslaState(
+            is_charging=True, current_amps=5, plugged_in=True, at_home=True
+        ),
+    )
+    decider = TeslaDecider(charge_amps_min=5, charge_amps_max=10)
+    action = decider.decide_increase(ctx, 10000.0)
+    assert action is not None
+    assert action.target_amps == 10
+    assert action.power_watts == pytest.approx(StateTracker.amps_to_watts(5))
+
+
 def test_gapminder_owns_configured_decider():
     """GapMinder wires its amp limits into TeslaDecider."""
     engine = GapMinder(charge_amps_min=6, charge_amps_max=32)

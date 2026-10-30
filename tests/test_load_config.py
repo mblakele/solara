@@ -100,6 +100,7 @@ def test_load_tesla_config_all_vars():
             "home_radius_m": 800,
             "charge_amps_min": 8,
             "charge_amps_max": 32,
+            "priority": 42,
         }
     }):
         device_config.reload()
@@ -111,6 +112,7 @@ def test_load_tesla_config_all_vars():
     assert tesla_config.home_lat == 37.7749
     assert tesla_config.home_lon == -122.4194
     assert tesla_config.redirect_uri == "http://localhost/callback"
+    assert tesla_config.priority == 42
 
 
 def test_load_tesla_config_missing_vehicle_id():
@@ -194,6 +196,7 @@ def test_load_tesla_config_optionals():
     assert tesla_config.charge_amps_max == 32
     # Defaults when devices.json omits them
     assert tesla_config.home_radius_m == 500.0
+    assert tesla_config.priority == 0
 
 
 def test_load_tesla_config_vehicle_command_proxy_url():

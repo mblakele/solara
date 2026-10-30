@@ -467,6 +467,12 @@ this axiom before adding defensive checks.
   GapMinder keeps thin `_decide_tesla_*` delegates so existing call sites and tests
   keep working. Plug candidate collection is unified in
   `GapMinder._eligible_plugs(ctx, want_on)` (priority order baked in).
+- `GapMinder._ordered_candidates` merges plugs and Tesla into one order.
+  Tesla joins at `tesla.priority` (default 0) for amp changes only; stop
+  decisions ignore it. Equal priorities keep the legacy order (plugs
+  first on surplus, Tesla first on deficit), so an unset priority is
+  bit-identical. `lumpy_first` reorders plugs only; Tesla is inserted at
+  the first position where it outranks a plug.
 - The turn-on fit test prices a *starting* load over the whole remaining window
   (`GapMinder._decide_turn_on`): a load may only start if its held cost fits the
   surplus, and the running debit and `estimated_current_wh` are window-priced. The

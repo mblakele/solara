@@ -1852,7 +1852,7 @@ class TeslaDecider:
                    "target_amps": target_amps, "previous_amps": current_amps, "gap_wh": gap_wh},
         )
         return make_tesla_set_amps(
-            target_amps, additional_amps, ctx.now,
+            target_amps, target_amps - current_amps, ctx.now,
             data_point_at=ctx.data_point_at,
         )
 
@@ -2090,6 +2090,7 @@ class GapMinder:
         max_defer_secs: int | None = None,
         ramp_aware: bool = False,
         defer_lookahead_quanta: int = 1,
+        tesla_priority: int = 0,
     ) -> None:
         """Initialize the GapMinder.
 
@@ -2136,6 +2137,11 @@ class GapMinder:
                 (shipped) stops instead of deferring whenever the deadline
                 sits inside the next window; ``0`` restores the pre-2026-10-19
                 static defer rule.
+            tesla_priority: Priority of Tesla amp changes against plug
+                on/off decisions. A higher number is more important, as with
+                ``PlugConfig.priority``. Defaults to 0. Equal priorities keep
+                the legacy order: plugs before Tesla on surplus, Tesla before
+                plugs on deficit. Stop-charging decisions ignore it.
 
         Raises:
             ValueError: If ``max_defer_secs`` is not positive.
@@ -2157,6 +2163,7 @@ class GapMinder:
         self.max_defer_secs = max_defer_secs
         self.ramp_aware = ramp_aware
         self.defer_lookahead_quanta = defer_lookahead_quanta
+        self.tesla_priority = tesla_priority
         self.charge_amps_min = charge_amps_min
         self.charge_amps_max = min(charge_amps_max, self.HARD_MAX_AMPS)
         self.tesla_decider = TeslaDecider(
@@ -2237,6 +2244,58 @@ class GapMinder:
         # important first, turn off the least important first.
         candidates.sort(key=lambda x: x[0], reverse=want_on)
         return candidates
+
+    def _ordered_candidates(
+        self,
+        ctx: DecideContext,
+        want_on: bool,
+        plug_candidates: list[tuple[int, str, Any]] | None = None,
+    ) -> list[tuple[int, str, str, Any]]:
+        """Merge plugs and Tesla into one priority-ordered candidate list.
+
+        Each entry is ``(priority, kind, name, plug)``. ``kind`` is
+        ``"plug"`` or ``"tesla"``; ``plug`` is the PlugConfig for a plug and
+        ``None`` for Tesla. Higher priority numbers are more important, so
+        turn-on starts them first and turn-off sheds them last.
+
+        Equal priorities keep the legacy order: plugs before Tesla on
+        turn-on, Tesla before plugs on turn-off. That makes an unset
+        ``tesla_priority`` (0) bit-identical to the pre-priority engine.
+
+        Args:
+            ctx: Decision context.
+            want_on: True for turn-on candidates, False for turn-off.
+            plug_candidates: Optional pre-sorted plug list. Used by
+                ``_decide_turn_off`` after the lumpy-first reorder. When
+                None, ``_eligible_plugs`` supplies the list.
+
+        Returns:
+            Candidate tuples in decision order.
+        """
+        if plug_candidates is None:
+            plug_candidates = self._eligible_plugs(ctx, want_on)
+        candidates: list[tuple[int, str, str, Any]] = [
+            (priority, "plug", name, plug)
+            for priority, name, plug in plug_candidates
+        ]
+        if ctx.tesla is None or not ctx.tesla.is_charging:
+            return candidates
+
+        tesla: tuple[int, str, str, Any] = (
+            self.tesla_priority, "tesla", "tesla", None,
+        )
+        # Insert Tesla at the first position where it outranks a plug.
+        # Plugs keep their supplied order, so a lumpy-first reorder is
+        # preserved; Tesla's own position still follows its priority.
+        for index, (priority, _kind, _name, _plug) in enumerate(candidates):
+            tesla_first = (
+                self.tesla_priority > priority
+                if want_on
+                else self.tesla_priority <= priority
+            )
+            if tesla_first:
+                return candidates[:index] + [tesla] + candidates[index:]
+        return candidates + [tesla]
 
     def _turn_on_budget(self, gap: float) -> float:
         """Compute the turn-on budget from the full surplus gap.
@@ -2332,10 +2391,28 @@ class GapMinder:
 
         remaining_gap = gap
 
-        # Collect eligible loads that are currently off (highest priority first).
-        candidates = self._eligible_plugs(ctx, want_on=True)
+        # Collect eligible loads in explicit priority order. Plugs and Tesla
+        # share one list; a high-priority Tesla takes amps before lower-
+        # priority plugs start.
+        for _, kind, name, plug in self._ordered_candidates(ctx, want_on=True):
+            if remaining_gap <= 0:
+                break
+            if kind == "tesla":
+                logger.debug(
+                    "[_decide_turn_on] trying Tesla amps increase "
+                    "for remaining %.1f Wh",
+                    remaining_gap,
+                )
+                tesla_action = self._decide_tesla_amps(ctx, remaining_gap)
+                if tesla_action:
+                    actions.append(tesla_action)
+                    current_amps = ctx.tesla.current_amps if ctx.tesla else 0
+                    target_amps = tesla_action.target_amps or 0
+                    remaining_gap -= StateTracker.delta_amps_to_wh(
+                        target_amps - (current_amps or 0), ctx.seconds_remaining,
+                    )
+                continue
 
-        for _, name, plug in candidates:
             capacity = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
             if capacity <= remaining_gap:
                 logger.debug(
@@ -2370,16 +2447,6 @@ class GapMinder:
                     capacity,
                     remaining_gap,
                 )
-
-        if remaining_gap > 0 and ctx.tesla is not None and ctx.tesla.is_charging:
-            logger.debug(
-                "[_decide_turn_on] trying Tesla amps increase "
-                "for remaining %.1f Wh",
-                remaining_gap,
-            )
-            tesla_action = self._decide_tesla_amps(ctx, remaining_gap)
-            if tesla_action:
-                actions.append(tesla_action)
 
         return actions
 
@@ -2447,11 +2514,12 @@ class GapMinder:
         """Turn off loads to reduce consumption.
 
         Priority order:
-          1. Reduce Tesla charge amps (partial, no stop).
-          2. Disable plugs in priority order (lowest-priority first), or
-             lumpy-first when ``lumpy_first`` applies (see
-             :meth:`_lumpy_first_names`).
-          3. Stop Tesla charging if a deficit still remains.
+          1. Shed loads in explicit priority order (lowest priority first).
+             Tesla amp reduction joins the same order at
+             ``tesla_priority``. ``lumpy_first`` reorders plugs among
+             themselves only.
+          2. Stop Tesla charging if a deficit still remains, using the
+             existing defer/ramp rule. Priority does not affect the stop.
 
         Args:
             ctx: Decision context.
@@ -2471,62 +2539,70 @@ class GapMinder:
             ctx.seconds_remaining,
         )
 
-        # ── Step 1: reduce Tesla charge amps first (no stop) ──────────────────
-        if ctx.tesla and ctx.tesla.is_charging:
-            logger.debug(
-                "[_decide_turn_off] trying Tesla amps-only reduce "
-                "for %.1f Wh remaining",
-                remaining_reduction,
-            )
-            tesla_action = self._decide_tesla_reduce(
-                ctx,
-                remaining_reduction,
-                stop_allowed=False,
-            )
-            if tesla_action:
-                actions.append(tesla_action)
-                current_amps = ctx.tesla.current_amps or 0
-                target_amps = tesla_action.target_amps or 0
-                savings = StateTracker.delta_amps_to_wh(
-                    current_amps - target_amps, ctx.seconds_remaining
-                )
-                logger.debug(
-                    "[_decide_turn_off] Tesla amps %d → %d, "
-                    "savings=%.1f Wh, remaining %.1f → %.1f Wh",
-                    current_amps,
-                    target_amps,
-                    savings,
-                    remaining_reduction,
-                    remaining_reduction - savings,
-                )
-                remaining_reduction -= savings
-
-        # ── Step 2: disable plugs in priority order ────────────────────────────
-        # Least important eligible plugs (currently on) first. With
-        # lumpy_first, implicated lumpy loads lead (largest first) and the
-        # smalls then budget off the remainder, which the shared
-        # remaining_reduction decrement turns into the residual exactly.
+        # ── Step 1: shed loads in explicit priority order ─────────────────────
+        # Least important eligible plugs (currently on) first. Tesla amp
+        # reduction joins the same list at ``tesla_priority``. With
+        # lumpy_first, implicated lumpy plugs lead the plug list (largest
+        # first); the merge keeps Tesla in its priority position.
         candidates = self._eligible_plugs(ctx, want_on=False)
         lead_names = self._lumpy_first_names(ctx, predicted_wh, candidates, gap_wh)
         if lead_names:
             lead = [c for c in candidates if c[1] in lead_names]
             tail = [c for c in candidates if c[1] not in lead_names]
             candidates = lead + tail
-            # The reorder emits the same action=turn_off lines as production
-            # order, so announce the lead that was actually taken — otherwise
-            # the flag's effect is invisible in a log (Subtask 4a census hook).
-            logger.info(
-                "gapminder_lumpy_first lead=%s gap=%.1f remaining=%.1f",
-                ",".join(lead_names), gap_wh, remaining_reduction,
-                extra={"event": "gapminder_lumpy_first",
-                       "lead": list(lead_names),
-                       "gap_wh": gap_wh,
-                       "remaining_wh": remaining_reduction},
-            )
 
-        for _, name, plug in candidates:
+        lumpy_logged = False
+        for _, kind, name, plug in self._ordered_candidates(
+            ctx, want_on=False, plug_candidates=candidates,
+        ):
             if remaining_reduction <= 0:
                 break
+            if kind == "tesla":
+                logger.debug(
+                    "[_decide_turn_off] trying Tesla amps-only reduce "
+                    "for %.1f Wh remaining",
+                    remaining_reduction,
+                )
+                tesla_action = self._decide_tesla_reduce(
+                    ctx,
+                    remaining_reduction,
+                    stop_allowed=False,
+                )
+                if tesla_action:
+                    actions.append(tesla_action)
+                    current_amps = ctx.tesla.current_amps if ctx.tesla else 0
+                    target_amps = tesla_action.target_amps or 0
+                    savings = StateTracker.delta_amps_to_wh(
+                        (current_amps or 0) - target_amps,
+                        ctx.seconds_remaining,
+                    )
+                    logger.debug(
+                        "[_decide_turn_off] Tesla amps %d → %d, "
+                        "savings=%.1f Wh, remaining %.1f → %.1f Wh",
+                        current_amps or 0,
+                        target_amps,
+                        savings,
+                        remaining_reduction,
+                        remaining_reduction - savings,
+                    )
+                    remaining_reduction -= savings
+                continue
+
+            if name in lead_names and not lumpy_logged:
+                # The reorder emits the same action=turn_off lines as
+                # production order, so announce the lead that was actually
+                # taken — otherwise the flag's effect is invisible in a log
+                # (Subtask 4a census hook).
+                logger.info(
+                    "gapminder_lumpy_first lead=%s gap=%.1f remaining=%.1f",
+                    ",".join(lead_names), gap_wh, remaining_reduction,
+                    extra={"event": "gapminder_lumpy_first",
+                           "lead": list(lead_names),
+                           "gap_wh": gap_wh,
+                           "remaining_wh": remaining_reduction},
+                )
+                lumpy_logged = True
+
             savings = StateTracker.watts_to_wh(plug.power_watts, ctx.seconds_remaining)
 
             # omit any "too large to turn off" logic:
@@ -2557,11 +2633,11 @@ class GapMinder:
             if remaining_reduction <= 0:
                 break
 
-        # ── Step 3: if deficit remains, stop Tesla charging ────────────
+        # ── Step 2: if deficit remains, stop Tesla charging ────────────
         # Delegates to _decide_tesla_reduce with stop_allowed=True so
         # the gap-aware deferral logic (safe_defer_secs) decides whether
-        # to stop now or keep the car on.  This path fires when Step 1
-        # returned no action (e.g. car at min amps with stop_allowed=False).
+        # to stop now or keep the car on. This path fires when the merged
+        # loop added no Tesla amp effect (e.g. the car is at min amps).
         tesla_already_acted = any(a.device_name == "tesla" for a in actions)
         if ctx.tesla and ctx.tesla.is_charging and remaining_reduction > 0 and not tesla_already_acted:
             tesla_action = self._decide_tesla_reduce(ctx, remaining_reduction)

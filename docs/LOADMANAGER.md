@@ -62,7 +62,8 @@ This section overrides the equivalent env vars:
 
 - **smartmeter**: `device` (equivalent to `LOAD_NBC_DEVICE`), `target_wh` (equivalent to `LOAD_TARGET_WH`)
 - **plugs**: `homekit` and `vocolinc` arrays — name, accessory/device id, power, priority
-- **tesla**: `vehicle_id`, OAuth endpoints, charging limits, time range
+- **tesla**: `vehicle_id`, OAuth endpoints, charging limits, `priority`,
+  time range
 - **timezone**: Device timezone (equivalent to `TIMEZONE` env var)
 
 ## LOAD_MANAGE_ENABLED
@@ -192,6 +193,31 @@ shedding less and never more than one 260 W plug. The residual carries
 NO margin — corpus sizing (`tools/forecast_log_scoring.py` residual
 series: sigma 0.29 vs raw 0.18) supports none, and a symmetric margin
 demonstrably churns (six flip-flops, −63 vs −28.65 in the replay harness).
+
+## Tesla priority
+
+`tesla.priority` in `devices.json` (default `0`) joins the plug priority
+order for Tesla **amp changes** only. A higher number is more important,
+as with `PlugConfig.priority`:
+
+- Surplus: higher-priority loads start first. A high-priority Tesla
+  raises amps before lower-priority plugs turn on. A high-priority plug
+  starts before a lower-priority Tesla takes the residual.
+- Deficit: lower-priority loads shed first. A high-priority Tesla keeps
+  its amps while lower-priority plugs turn off. A low-priority Tesla is
+  trimmed before higher-priority plugs.
+
+Equal priorities keep the legacy order: plugs before Tesla on surplus,
+Tesla before plugs on deficit. With every device at the default `0`, the
+engine is bit-identical to the pre-priority behavior.
+
+`lumpy_first` reorders plugs among themselves only; it does not move a
+plug across Tesla's priority position.
+
+Priority does **not** affect Tesla stop-charging decisions. The stop still
+uses `TeslaDecider.decide_reduce` with `stop_allowed=True` and the
+existing defer/ramp rule. Tesla turn-on also stays disabled: a
+high-priority Tesla only changes amps on a car that is already charging.
 
 ## Tesla stop deferral and ramp awareness
 

@@ -76,9 +76,14 @@ drift checks.
   churn_ready gate are gone,
 - **test_tesla_decider.py**
   the ramp-aware stop rule, the reduction amp step (a ceil that covers the gap, the shipped
-  rounding pinned), and the defer quantum lookahead (TestDeferQuantumLookahead: the 2026-10-18
-  incident cycle stops at one window, defers at zero, is inert without a window, scales in
-  quanta, and the log line reports it),
+  rounding pinned), the clamped-increase actual amp delta (5 → 10 reports 5 A, not the
+  unclamped request), and the defer quantum lookahead (TestDeferQuantumLookahead: the
+  2026-10-18 incident cycle stops at one window, defers at zero, is inert without a window,
+  scales in quanta, and the log line reports it),
+- **test_tesla_priority.py**
+  the explicit `tesla.priority` order against plug on/off decisions (a high-priority Tesla
+  keeps amps while a low-priority plug sheds; a high-priority Tesla increases amps before a
+  low-priority plug starts),
 - **test_tesla_ramp_replay.py**
   the 2026-09-26 incident sequence (ramp_aware=True) plus a skipif-guarded drift check that
   the inline INCIDENT_POINTS gaps still match the log,
