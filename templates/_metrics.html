@@ -40,7 +40,17 @@
     {% set period_warn = _status_is_warn(period_status) %}
     {% set period_label = _status_label(period_status) %}
     {% set headline_wh = qh1.predicted_wh if (qh1 is not none and qh1.predicted_wh is not none) else (qh1.raw_wh if (qh1 is not none and qh1.complete) else none) %}
-    <div class="forecast__value {{ 'forecast__value--gen' if headline_wh is not none and headline_wh < 0 else 'forecast__value--load' }}">
+    {% set fcast_target = load_management.target_wh if load_management and load_management.target_wh is defined and load_management.target_wh is not none else none %}
+    {% set fcast_hyst = diag.hysteresis_wh if diag and diag.hysteresis_wh is defined and diag.hysteresis_wh is not none else none %}
+    {% set fcast_class = "" %}
+    {% if headline_wh is not none and fcast_target is not none and fcast_hyst is not none %}
+      {% if headline_wh > fcast_target + fcast_hyst %}
+        {% set fcast_class = " forecast__value--load" %}
+      {% elif headline_wh < fcast_target - fcast_hyst %}
+        {% set fcast_class = " forecast__value--gen" %}
+      {% endif %}
+    {% endif %}
+    <div class="forecast__value{{ fcast_class }}">
       {% if headline_wh is not none %}
       {{ "%+.0f" % (headline_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period{{ ' forecast__period--warn' if period_warn else '' }}">{{ period_label }}</span>
       {% else %}

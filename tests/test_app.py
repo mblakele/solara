@@ -280,16 +280,24 @@ class TestApp(unittest.TestCase):
     def _forecast_value_markup(self, predicted_wh: float) -> str:
         """Render the index template and return the forecast-value markup."""
         from flask import render_template
+        from load_models import CycleDiagnostics
 
         nbc = realistic_metrics()["devices"][0]["nbc"]
         # Keep QH1's shape but override predicted_wh to control the sign.
         nbc = {"QH1": dict(nbc["QH1"], predicted_wh=predicted_wh)}
         metrics = {"devices": [{"name": "dev", "nbc": nbc, "per_second_data": [0.001]}]}
+        diag_obj = CycleDiagnostics(hysteresis_wh=50)
+        load_management = {
+            "target_wh": -50,
+            "last_cycle_result": MagicMock(
+                diagnostics=diag_obj, status="ok"
+            ),
+        }
         with app.test_request_context():
             html = render_template(
                 "index.html",
                 metrics=metrics,
-                load_management=None,
+                load_management=load_management,
                 refresh_secs=None,
             )
         return html

@@ -7,12 +7,12 @@ must still render the forecast-period label (``waiting for data``) next
 to the placeholder instead of leaving a blank space.
 """
 
-from load_models import CycleResult
+from load_models import CycleDiagnostics, CycleResult
 import unittest
 from unittest.mock import MagicMock
 
 from app import app
-from load_models import CycleResult
+from load_models import CycleDiagnostics, CycleResult
 
 from tests.test_app import mock_config
 
@@ -34,7 +34,10 @@ class TestQHBoundaryForecastLabel(unittest.TestCase):
         mock_lm.state = MagicMock()
         mock_lm.state.devices = {}
         mock_lm.state.pending_effects = []
-        mock_lm.run_cycle.return_value = CycleResult(status="no_incomplete_qh")
+        mock_lm.run_cycle.return_value = CycleResult(
+            status="no_incomplete_qh",
+            diagnostics=CycleDiagnostics(hysteresis_wh=0),
+        )
         mock_lm.sentinel_names = []
 
         with mock_config(overrides={"MOCK": "True", "DEBUG": "True"}):
