@@ -50,7 +50,9 @@ drift checks.
   pinned verdicts), a turn-off margin as wide as the 260 W plug's own 43.3 Wh declines the
   shed, the turn-on margin leaves the surplus unspent, replay_all forwards the knobs, a
   supplied banked_wh is what arms the lumpy-first gate (without it the flag is a silent
-  no-op), the shipped whole-window fit declines a plug it cannot hold, and the CLI header
+  no-op), the shipped whole-window fit declines a plug it cannot hold, the car's priority
+  against the plugs (--tesla-priority: 0 is the shipped order, 100 lets a lower-priority plug
+  shed before the car is trimmed), and the CLI header
   names the policy it ran; and the derived-signal arm (GUARD_MODES inert/live through
   --guards) is spec'd on a synthetic RAMPING quarter — the live arm feeds gap_trend_wh_per_s
   and the inert arm leaves it dark, a spy on GapMinder.decide pins what each arm handed the
@@ -124,7 +126,10 @@ drift checks.
   over both 2026-10-14 quarters; symmetric margin pinned harmful in B)
 - **test_divergence_audit.py**
   the status-quo vs residual audit (logged priorities, watts-compared; 9/1015 corpus quarters
-  diverge, always sheds less)
+  diverge, always sheds less), plus the opt-in car arm: `--tesla-priority` puts the charging car
+  in both orders at that priority (0 trims the car first, 100 lets a lower-priority plug shed
+  first), a car at the 5 A floor is not a candidate, and the cycle parser reports
+  `tesla_state=None` as unknown rather than an idle car
 - **test_settle_window_counterfactual.py**
   the Subtask-6 counterfactual (cycle/effect repr parsing + UTC conversion, the short-window
   wait the pinned window takes, the adaptation's protection case — a 60 s committed window

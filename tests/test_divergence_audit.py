@@ -14,13 +14,17 @@ class under test.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from tools.divergence_audit import (
     PlugState,
+    TeslaShed,
     audit_anchors,
     parse_plug_states,
     parse_priorities,
+    parse_tesla_timeline,
 )
 
 
@@ -125,6 +129,68 @@ def test_audit_respects_priority_order_over_line_order() -> None:
         plugs=_plugs(("water heater", 4857.0, True), ("ecoflow", 260.0, True)),
         priorities={"ecoflow": 50, "water heater": 60},
     ) == (5117.0, 5117.0)
+
+
+def test_tesla_default_priority_trims_the_car_first() -> None:
+    """At priority 0 the car is the first shed candidate, as in production.
+
+    Deficit 20 Wh at R=600 s. One amp is 40 Wh, so the car closes it with
+    one amp (240 W) and the 260 W plug is never reached.
+    """
+    assert audit_anchors(
+        predicted_wh=11.0, prediction_w=0.0, target_wh=-9.0,
+        remaining_secs=600,
+        plugs=_plugs(("ecoflow", 260.0, True)),
+        priorities={"ecoflow": 50},
+        tesla=TeslaShed(amps=8.0, priority=0),
+    )[0] == pytest.approx(240.0)
+
+
+def test_tesla_high_priority_lets_the_plug_shed_first() -> None:
+    """At priority 100 the ecoflow plug (50) sheds before the car is trimmed."""
+    assert audit_anchors(
+        predicted_wh=11.0, prediction_w=0.0, target_wh=-9.0,
+        remaining_secs=600,
+        plugs=_plugs(("ecoflow", 260.0, True)),
+        priorities={"ecoflow": 50},
+        tesla=TeslaShed(amps=8.0, priority=100),
+    )[0] == pytest.approx(260.0)
+
+
+def test_car_at_the_amp_floor_is_not_a_shed_candidate() -> None:
+    """A car at 5 A has no amps to give up without stopping."""
+    assert audit_anchors(
+        predicted_wh=11.0, prediction_w=0.0, target_wh=-9.0,
+        remaining_secs=600,
+        plugs=_plugs(("ecoflow", 260.0, True)),
+        priorities={"ecoflow": 50},
+        tesla=TeslaShed(amps=5.0, priority=0),
+    )[0] == pytest.approx(260.0)
+
+
+def test_parse_tesla_timeline_reads_the_charging_car() -> None:
+    """A cycle that reports a charging car yields its amps."""
+    line = (
+        "[2026-10-14 23:16:40 +0000] [1] [DEBUG] app Load management cycle result: "
+        "CycleResult(status='ok', candidates=[], diagnostics=CycleDiagnostics("
+        "tesla_state={'is_charging': True, 'current_amps': 12.0, "
+        "'plugged_in': True, 'at_home': True}))"
+    )
+    ((stamp, state),) = parse_tesla_timeline(line, source="s.log")
+    assert stamp == datetime(2026, 10, 14, 23, 16, 40, tzinfo=timezone.utc)
+    assert state == (True, 12.0)
+
+
+def test_parse_tesla_timeline_reports_unknown_state_as_none() -> None:
+    """``tesla_state=None`` is unknown, never an idle car at 0 A."""
+    line = (
+        "[2026-10-14 23:16:40 +0000] [1] [DEBUG] app Load management cycle result: "
+        "CycleResult(status='ok', candidates=[], "
+        "diagnostics=CycleDiagnostics(tesla_state=None))"
+    )
+    assert parse_tesla_timeline(line) == [
+        (datetime(2026, 10, 14, 23, 16, 40, tzinfo=timezone.utc), None)
+    ]
 
 
 def test_parse_plug_states_dedupes_repeated_candidate_lists() -> None:

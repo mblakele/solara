@@ -1002,10 +1002,42 @@ def test_policy_defaults_are_the_shipped_engine() -> None:
     assert engine.TURN_ON_MARGIN_WH == 0.0
     assert engine.TURN_OFF_MARGIN_WH == 0.0
     assert engine.lumpy_first is False
+    assert engine.tesla_priority == 0
     assert er.Policy().label == (
         "turn-on margin 0 Wh, turn-off margin 0 Wh, lumpy-first off, "
-        "defer on, defer cap 900 s, defer lookahead 1q, ramp-aware off"
+        "defer on, defer cap 900 s, defer lookahead 1q, ramp-aware off, "
+        "tesla priority 0"
     )
+
+
+def test_policy_carries_tesla_priority_into_the_engine() -> None:
+    """The priority knob is production surface, so it reaches ``GapMinder``."""
+    assert er.Policy().tesla_priority == 0
+    assert er.Policy(tesla_priority=100).engine().tesla_priority == 100
+    assert er.Policy(tesla_priority=100).label.endswith("tesla priority 100")
+
+
+def test_tesla_priority_reorders_the_shed() -> None:
+    """A high-priority car keeps its amps while a lower-priority plug sheds.
+
+    Deficit 20 Wh at R=600 s. One amp is 40 Wh, so the car can close it
+    with one amp; the 260 W plug is worth 43.3 Wh. At the shipped priority
+    (0) the car is trimmed first and the plug stays on. At priority 100 the
+    ecoflow plug (50) sheds first and the car is untouched.
+    """
+    quarter = dataclasses.replace(
+        _plug_quarter(predicted_wh=11.0, remaining_secs=600, all_on=True),
+        tesla_samples=(
+            er.TeslaSample(t=300.0, amps=8.0, plugged_in=True, at_home=True),
+        ),
+        car_active=True,
+    )
+    shipped = er.replay(quarter, er.rate_status_quo, policy=er.Policy())
+    high = er.replay(
+        quarter, er.rate_status_quo, policy=er.Policy(tesla_priority=100)
+    )
+    assert shipped.actions == (("tesla", "set_amps"),)
+    assert high.actions == (("ecoflow", "turn_off"),)
 
 
 def test_turn_off_margin_withholds_a_coarse_shed() -> None:
@@ -1202,7 +1234,7 @@ def test_defer_lookahead_scales_with_the_quarters_window() -> None:
 def test_policy_label_names_the_lookahead() -> None:
     """The header always says which defer-lookahead the run used."""
     assert er.Policy().label.endswith(
-        "defer lookahead 1q, ramp-aware off"
+        "defer lookahead 1q, ramp-aware off, tesla priority 0"
     )
     assert "defer lookahead 0q, ramp-aware off" in er.Policy(
         defer_lookahead_quanta=0

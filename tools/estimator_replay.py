@@ -20,7 +20,9 @@ The other axis is the decision policy itself (``Policy``), expressed only
 through existing production surface — ``GapMinder``'s constructor:
 ``--turn-on-margin``, ``--turn-off-margin`` (whole Wh withheld from each
 budget, the deliberate form of the hedge the loop currently gets by accident),
-``--lumpy-first`` (production's ``LOAD_MANAGE_LUMPY_FIRST``). The Tesla-stop
+``--lumpy-first`` (production's ``LOAD_MANAGE_LUMPY_FIRST``), and
+``--tesla-priority`` (production's ``tesla.priority``, default 0: where the
+car's amp changes rank against the plugs' on/off decisions). The Tesla-stop
 trio prices the *reluctance to stop charging*: ``--defer {on,off}`` (the defer rule
 itself; off stops the moment a deficit exists), ``--max-defer-secs`` (the safe
 buffer the defer rule requires, shipped 900 s — a whole quarter-hour, so the
@@ -575,6 +577,14 @@ class Policy:
     deadline still clears that many windows. ``0`` restores the pre-2026-10-19
     static rule. Sized from each quarter's own data-point spacing
     (``Quarter.observability_secs``), never from a literal 30 s."""
+    tesla_priority: int = 0
+    """Priority of the car's amp changes against the plugs' on/off decisions
+    (production's ``tesla.priority``, default 0). A higher number is more
+    important, so on a deficit the car is trimmed after every plug whose
+    priority is lower, and on a surplus it takes amps before them. Equal
+    priorities keep the legacy order: plugs before Tesla on surplus, Tesla
+    before plugs on deficit, which makes 0 the shipped engine. Stop-charging
+    decisions ignore it."""
 
     @property
     def label(self) -> str:
@@ -591,7 +601,8 @@ class Policy:
             f"defer {'on' if self.defer_stop else 'off'}, "
             f"defer cap {cap} s, "
             f"defer lookahead {self.defer_lookahead_quanta}q, "
-            f"ramp-aware {'on' if self.ramp_aware else 'off'}"
+            f"ramp-aware {'on' if self.ramp_aware else 'off'}, "
+            f"tesla priority {self.tesla_priority}"
         )
 
     def engine(self) -> GapMinder:
@@ -605,6 +616,7 @@ class Policy:
             max_defer_secs=self.max_defer_secs,
             ramp_aware=self.ramp_aware,
             defer_lookahead_quanta=self.defer_lookahead_quanta,
+            tesla_priority=self.tesla_priority,
         )
 
 
@@ -2124,7 +2136,7 @@ _USAGE = (
     "[--defer {on,off}] [--max-defer-secs SECS] "
     "[--defer-lookahead-quanta K] [--defer-cap-sweep SECS,SECS] "
     "[--trace-quarter YYYY-MM-DDTHH:MM] "
-    "[--ramp-aware] [--guards {inert,live}] "
+    "[--ramp-aware] [--tesla-priority N] [--guards {inert,live}] "
     "[--rate-window-quanta K|all]"
 )
 
@@ -2264,6 +2276,18 @@ def build_parser() -> argparse.ArgumentParser:
         "deadline is shorter than the next observation cannot be acted on; K "
         "windows of each quarter's own data-point spacing are withheld from "
         "it, and 0 restores the pre-2026-10-19 static rule",
+    )
+    parser.add_argument(
+        "--tesla-priority",
+        type=int,
+        default=0,
+        metavar="N",
+        help="priority of the car's amp changes against the plugs' on/off "
+        "decisions (production's tesla.priority; default %(default)s). A "
+        "higher number is more important: on a deficit the car is trimmed "
+        "after every lower-priority plug, on a surplus it takes amps first. "
+        "0 keeps the legacy order (plugs first on surplus, Tesla first on "
+        "deficit)",
     )
     parser.add_argument(
         "--guards",
@@ -2454,6 +2478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_defer_secs=args.max_defer_secs,
         ramp_aware=args.ramp_aware,
         defer_lookahead_quanta=args.defer_lookahead_quanta,
+        tesla_priority=args.tesla_priority,
     )
     if trace_start is not None:
         quarter = quarters.get(trace_start)

@@ -211,7 +211,7 @@ static/                # Design-system CSS and the SSE dashboard client
 templates/             # Jinja2 pages and SSE-swappable fragments
 tests/                 # Pytest suite; what each file pins: docs/TESTING.md
 tools/                 # Offline analysis only; never imported by production
-tools/divergence_audit.py            # Status-quo vs residual shed-watts audit
+tools/divergence_audit.py            # Status-quo vs residual shed-watts audit, car priority
 tools/estimator_replay.py            # Closed-loop estimator and policy replay
 tools/forecast_log_scoring.py        # Score forecast anchors against actuals
 tools/settle_window_counterfactual.py  # Price adaptive vs pinned settle window

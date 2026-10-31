@@ -111,9 +111,12 @@ variants/Policy) lives here; tests/test_estimator_replay.py is its spec. Two ind
 the rate estimator (only `rate_fn` differs between runs, pinned equal to the scorer's
 estimate_prior_only/estimate_prior_blend) and the decision Policy, expressed *only* through
 production GapMinder constructor surface — `--turn-on-margin WH` `--turn-off-margin WH`
-`--lumpy-first` `--defer {on,off}` `--max-defer-secs SECS` `--ramp-aware` (the Tesla-stop
-reluctance trio: the defer rule itself, its safe-buffer cap, and the trend hastener; all default
-to the shipped values — defer on, cap 900 s, ramp off) The meter has two actuator populations:
+`--lumpy-first` `--defer {on,off}` `--max-defer-secs SECS` `--ramp-aware` `--tesla-priority N`.
+The defer trio is `--defer` / `--max-defer-secs` / `--ramp-aware` (the defer rule itself, its
+safe-buffer cap, and the trend hastener; all default to the shipped values — defer on, cap
+900 s, ramp off); `--tesla-priority` is the car's rank against the plugs (production's
+`tesla.priority`, shipped 0, which keeps the legacy order — plugs first on surplus, car first
+on deficit). The meter has two actuator populations:
 plugs (ON/OFF, nameplate watts) and the car (TeslaSample steps of REPORTED amps, replaced by a
 policy set_amps/Tesla turn_off, priced at nominal_voltage() W/amp so one amp over R is
 240*R/3600 Wh — the quantum behind the 2026-10-17 overshoots). plugged_in/at_home ride along
@@ -311,6 +314,7 @@ uv run python tools/estimator_replay.py corpus/*.log --guards live
 uv run python tools/estimator_replay.py corpus/*.log --rate-window-quanta 2,3,4,all
 uv run python tools/estimator_replay.py corpus/*.log --defer-lookahead-quanta 0
 uv run python tools/estimator_replay.py corpus/*.log --defer-cap-sweep 120,300,900
+uv run python tools/estimator_replay.py corpus/*.log --tesla-priority 100 --regime tesla
 uv run python tools/estimator_replay.py corpus/*.log --trace-quarter 2026-10-20T22:15
 ```
 
@@ -349,4 +353,12 @@ uv run python tools/settle_window_counterfactual.py corpus/*.log --pinned-secs 3
 
 Status-quo vs residual shed-watts audit over logs: per-anchor ON states (deduped candidates) +
 logged priorities, lumpy-first iff implicated and beyond smalls capacity; corpus/ verdict 9/1015
-quarters,
+quarters (a snapshot — the corpus is refreshed, so re-run before quoting). The charging car is
+out of scope by default; `--tesla-priority N` puts it in both arms at that priority (production's
+`tesla.priority`), where it gives up amps down to the 5 A floor before the plugs that rank below
+it. `tesla_state=None` is unknown, never an idle car.
+
+```bash
+uv run python tools/divergence_audit.py corpus/*.log
+uv run python tools/divergence_audit.py corpus/*.log --tesla-priority 100
+```
