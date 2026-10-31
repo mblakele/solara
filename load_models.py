@@ -512,6 +512,10 @@ class CycleDiagnostics:
         gap_wh: Predicted surplus/deficit for the current quarter-hour,
             or None if not available.
         hysteresis_wh: Hysteresis threshold used in load decisions.
+        target_wh_low: Lower bound of the configured acceptable Wh band,
+            or None when no band is active.
+        target_wh_high: Upper bound of the configured acceptable Wh band,
+            or None when no band is active.
         seconds_remaining: Seconds left in the current QH, or None.
         data_point_at: Timestamp of the most recent NBC data point,
             or None if unavailable.
@@ -552,6 +556,8 @@ class CycleDiagnostics:
 
     gap_wh: float | None = None
     hysteresis_wh: int = 0
+    target_wh_low: int | None = None
+    target_wh_high: int | None = None
     seconds_remaining: int | None = None
     data_point_at: datetime | None = None
     reason: str = ""
@@ -585,6 +591,8 @@ class CycleDiagnostics:
         return {
             "gap_wh": self.gap_wh,
             "hysteresis_wh": self.hysteresis_wh,
+            "target_wh_low": self.target_wh_low,
+            "target_wh_high": self.target_wh_high,
             "seconds_remaining": self.seconds_remaining,
             "data_point_at": (
                 self.data_point_at.isoformat()

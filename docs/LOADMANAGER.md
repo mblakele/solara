@@ -60,11 +60,47 @@ If actions were taken after the last data point, the system enters a
 Device-specific settings live in `devices.json` (copy from `devices.json.example`).
 This section overrides the equivalent env vars:
 
-- **smartmeter**: `device` (equivalent to `LOAD_NBC_DEVICE`), `target_wh` (equivalent to `LOAD_TARGET_WH`)
+- **smartmeter**: `device` (equivalent to `LOAD_NBC_DEVICE`), `target_wh`,
+  `target_wh_range`, `target_wh_schedule` (see below)
 - **plugs**: `homekit` and `vocolinc` arrays — name, accessory/device id, power, priority
 - **tesla**: `vehicle_id`, OAuth endpoints, charging limits, `priority`,
   time range
 - **timezone**: Device timezone (equivalent to `TIMEZONE` env var)
+
+### Target Wh band and TOU schedule
+
+Three sibling keys replace each other by precedence. `target_wh` keeps its
+old scalar meaning:
+
+```json
+"smartmeter": {
+  "device": "M1208.24",
+  "target_wh": -9,
+  "target_wh_range": [-10, -5],
+  "target_wh_schedule": [
+    { "time_range": "00:00-15:00", "target_wh_range": [90, 110] },
+    { "time_range": "15:00-00:00", "target_wh_range": [-10, -5] }
+  ]
+}
+```
+
+- `target_wh` is the aim point for `gap = target_wh - predicted_wh`.
+- `target_wh_range` is `[low, high]`, low first, both bounds inclusive. While
+  the adjusted prediction sits inside the band, the engine takes no action.
+  The band is absolute Wh, not a width around the aim. When a band is
+  present it replaces `int(abs(target_wh) / 3)`; without one, that heuristic
+  remains the fallback.
+- `target_wh_schedule` is a list of `time_range` windows. Each window has at
+  least one of `target_wh` or `target_wh_range`. A band-only window aims at
+  its own midpoint (rounded). Missing pieces inherit from the top level.
+- Windows use local `TIMEZONE` time. `from` is inclusive, `to` is exclusive.
+  `to: "00:00"` means 24:00. Windows must not wrap past midnight, and they
+  must not overlap. Uncovered time falls back to the top-level setting.
+- If `LOAD_TARGET_WH` is set, it overrides the scalar, the band, and the
+  schedule. A warning is logged once per `LoadManager`.
+
+Malformed values raise `DeviceConfigError` at load time, so a typo stops the
+application rather than silently changing the target.
 
 ## LOAD_MANAGE_ENABLED
 
@@ -156,14 +192,16 @@ reading any accuracy figure:
 
 ## Hysteresis
 
-Production `hysteresis_wh = int(abs(target_wh) / 3)` (`load_manager.py`,
-proportion in `constants.py:HYSTERESIS_PROPORTION`). With the current
-`target_wh = -9` (`devices.json`) that is **3 Wh** — essentially no deadband
+Without a band, production falls back to
+`hysteresis_wh = int(abs(target_wh) / 3)` (`load_manager.py`, proportion in
+`constants.py:HYSTERESIS_PROPORTION`). With the current `target_wh = -9`
+(`devices.json`) that is **3 Wh** — essentially no deadband
 against hundred-Wh gap errors (e.g. a 2000 W plug with ~800 s left is
 ~440 Wh). The old **1000 Wh** figure was the previous `GapMinder` unit-test
 default; the fallback is now **20 Wh** (`constants.py:DEFAULT_HYSTERESIS_WH`),
-used only when no explicit value is passed. Production always passes
-`int(abs(target_wh) / 3)` explicitly — do not rely on the fallback when
+used only when no explicit value is passed. When a `target_wh_range` is
+active, production passes `max(target_wh - low, high - target_wh)` instead,
+and the band itself gates action. Do not rely on the 20 Wh fallback when
 reasoning about production over-commit risk.
 
 ## Lumpy-first residual turn_off (flagged off by default)

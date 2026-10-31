@@ -288,11 +288,23 @@ class Config:
         return device_config.has_smartmeter()
 
     @property
+    def load_target_wh_override(self) -> int | None:
+        """Return the raw ``LOAD_TARGET_WH`` override, or None.
+
+        When set, this scalar overrides ``target_wh``, ``target_wh_range``,
+        and ``target_wh_schedule`` in devices.json.
+        """
+        raw = self._get("LOAD_TARGET_WH")
+        if raw is None or str(raw).strip() == "":
+            return None
+        return int(raw)
+
+    @property
     def load_target_wh(self) -> int:
         """Return target Wh per quarter-hour for load decisions."""
-        raw = self._get("LOAD_TARGET_WH")
-        if raw is not None:
-            return int(raw)
+        override = self.load_target_wh_override
+        if override is not None:
+            return override
         return device_config.get_target_wh()
 
     @property

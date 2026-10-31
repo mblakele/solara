@@ -304,8 +304,14 @@ class TestLoadManagerReloadConfig:
         from load_models import PlugConfig
         from load_nbc import GapMinder
 
+        from clock import FakeClock
+
         mgr = MagicMock()
         mgr.target_wh = -50
+        mgr.target_wh_band = None
+        mgr._target_static = False
+        mgr._target_override = None
+        mgr._clock = FakeClock()
         mgr.nbc_device = "EM1-001"
         mgr.tesla_config = None
         mgr._telegram_devices = None

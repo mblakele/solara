@@ -135,7 +135,10 @@ class LoadManagerConfig:
         plug_ctrl: Plug controller instance; auto-detected from env when None.
         tesla_ctrl: Tesla controller instance; loaded from config when None.
         engine: GapMinder instance; created with defaults if None.
-        target_wh: Target Wh per QH (defaults to smartmeter.target_wh in devices.json).
+        target_wh: Target Wh per QH (defaults to the resolved smartmeter
+            target in devices.json). Injecting this disables the schedule.
+        target_wh_band: Optional inclusive acceptable Wh band. Injecting
+            this disables the schedule.
         nbc_device: Device name for NBC readings (defaults to smartmeter.device in devices.json).
         enabled: Whether load management is active. Accepts True/False, or a time range tuple.
             Defaults to LOAD_MANAGE_ENABLED env var parsed via _parse_load_manage_enabled.
@@ -160,6 +163,7 @@ class LoadManagerConfig:
     tesla_ctrl: AbstractTeslaController | None = None
     engine: GapMinder | None = None
     target_wh: int | None = None
+    target_wh_band: tuple[int, int] | None = None
     nbc_device: str | None = None
     enabled: bool | tuple[Any, Any] | None = None  # type: ignore[type-arg]
     dry_run: bool | None = None
@@ -307,9 +311,35 @@ class LoadManager:
         self.tesla_ctrl: AbstractTeslaController | None
         self.plugs: dict[str, PlugConfig]
 
-        if target_wh is None:
-            target_wh = device_config.get_target_wh()
+        target_wh_band = cfg.target_wh_band
+        self._target_override: int | None = None
+        if target_wh is not None:
+            self._target_static = True
+        elif target_wh_band is not None:
+            self._target_static = True
+            low, high = target_wh_band
+            target_wh = int(round((low + high) / 2))
+        else:
+            self._target_static = False
+            override = self._cfg.load_target_wh_override
+            if override is not None:
+                self._target_override = override
+                logger.warning(
+                    "LOAD_TARGET_WH=%s overrides devices.json target_wh, "
+                    "target_wh_range, and target_wh_schedule",
+                    override,
+                )
+                target_wh = override
+                target_wh_band = None
+            else:
+                setting = device_config.get_target_wh_setting(
+                    self._clock.now()
+                )
+                target_wh = setting.target_wh
+                target_wh_band = setting.band
+        assert target_wh is not None
         self.target_wh = target_wh
+        self.target_wh_band = target_wh_band
 
         if nbc_device is None:
             nbc_device = device_config.get_smartmeter_device()
@@ -336,7 +366,7 @@ class LoadManager:
 
         self.config_interval_secs = interval_secs  # type: ignore[assignment]
 
-        hysteresis_wh = int(abs(target_wh) / 3)
+        hysteresis_wh = self._band_hysteresis(target_wh, target_wh_band)
         self.tesla_config = load_tesla_config(config=self._cfg)
         tesla_config = self.tesla_config
         # Device-level settings apply even when REST credentials are absent
@@ -666,6 +696,55 @@ class LoadManager:
         ctx.now_postfetch = ctx.now + timedelta(seconds=fetch_end - fetch_start)
         return None
 
+    @staticmethod
+    def _band_hysteresis(
+        target_wh: int, band: tuple[int, int] | None
+    ) -> int:
+        """Return the effective deadband width for *target_wh* and *band*."""
+        if band is None:
+            return int(abs(target_wh) / 3)
+        low, high = band
+        return max(target_wh - low, high - target_wh)
+
+    def _refresh_target(self, now: datetime) -> None:
+        """Re-resolve the target and band from devices.json for *now*.
+
+        A schedule moves with wall-clock time, so this runs every cycle.
+        Injected targets and the ``LOAD_TARGET_WH`` override stay fixed.
+        """
+        if self._target_static or self._target_override is not None:
+            return
+        setting = device_config.get_target_wh_setting(now)
+        band = setting.band
+        if setting.target_wh == self.target_wh and band == self.target_wh_band:
+            return
+        logger.info(
+            "target_wh updated target=%s band=%s -> target=%s band=%s",
+            self.target_wh, self.target_wh_band,
+            setting.target_wh, band,
+            extra={
+                "event": "target_wh_updated",
+                "target_wh": setting.target_wh,
+                "band": list(band) if band else None,
+            },
+        )
+        self.target_wh = setting.target_wh
+        self.target_wh_band = band
+        self.engine.HYSTERESIS_WH = self._band_hysteresis(
+            setting.target_wh, band
+        )
+
+    def _inside_target_band(self, value: float) -> bool:
+        """Return True when *value* needs no action.
+
+        A configured band is absolute and inclusive. Without one, the scalar
+        hysteresis width around ``target_wh`` applies.
+        """
+        if self.target_wh_band is not None:
+            low, high = self.target_wh_band
+            return low <= value <= high
+        return abs(self.target_wh - value) <= self.engine.HYSTERESIS_WH
+
     def _stage_compute_gap(self, ctx: CycleContext) -> None:
         """Stage 4: Accept fresh data and compute the Wh gap.
 
@@ -674,6 +753,7 @@ class LoadManager:
         gap_wh (target - adjusted). Mutates ctx in place. Always returns
         None (continue pipeline).
         """
+        self._refresh_target(ctx.now)
         # Resolve the prediction/settle window now that this cycle's fetch
         # has populated the shared energy cache with quantization data
         # (first resolution wins for the session).
@@ -804,10 +884,16 @@ class LoadManager:
                 ),
             )
 
-        # Hysteresis check
+        # Hysteresis check: configured band, else scalar width.
         gap_wh = ctx.gap_wh
         assert gap_wh is not None
-        if abs(gap_wh) <= self.engine.HYSTERESIS_WH:
+        if self.target_wh_band is not None:
+            adjusted_wh = ctx.adjusted_wh
+            assert adjusted_wh is not None
+            inside_band = self._inside_target_band(adjusted_wh)
+        else:
+            inside_band = abs(gap_wh) <= self.engine.HYSTERESIS_WH
+        if inside_band:
             return self._early_exit(
                 ctx,
                 "dry-run" if self.dry_run else "ok",
@@ -870,6 +956,12 @@ class LoadManager:
             diagnostics=CycleDiagnostics(
                 gap_wh=gap_wh,
                 hysteresis_wh=self.engine.HYSTERESIS_WH,
+                target_wh_low=(
+                    self.target_wh_band[0] if self.target_wh_band else None
+                ),
+                target_wh_high=(
+                    self.target_wh_band[1] if self.target_wh_band else None
+                ),
                 seconds_remaining=seconds_remaining,
                 data_point_at=ctx.data_point_at,
                 reason=reason,
@@ -1555,6 +1647,12 @@ class LoadManager:
             diagnostics=CycleDiagnostics(
                 gap_wh=gap_wh,
                 hysteresis_wh=self.engine.HYSTERESIS_WH,
+                target_wh_low=(
+                    self.target_wh_band[0] if self.target_wh_band else None
+                ),
+                target_wh_high=(
+                    self.target_wh_band[1] if self.target_wh_band else None
+                ),
                 seconds_remaining=seconds_remaining,
                 data_point_at=data_point_at,
                 reason=reason,
@@ -2807,6 +2905,7 @@ class LoadManager:
             ctx=decide_ctx,
             predicted_wh=corrected_adjusted_wh,
             target_wh=self.target_wh,
+            target_wh_band=self.target_wh_band,
         )
         return actions
 
@@ -3047,10 +3146,24 @@ class LoadManager:
         device_config.reload()
         changes: list[str] = []
 
-        new_target = device_config.get_target_wh()
+        if self._target_static or self._target_override is not None:
+            new_target = self.target_wh
+            new_band = self.target_wh_band
+        else:
+            now = self._clock.now()
+            new_target = device_config.get_target_wh(now=now)
+            new_band = device_config.get_target_wh_band(now=now)
         if new_target != self.target_wh:
             changes.append(f"target_wh: {self.target_wh} -> {new_target}")
             self.target_wh = new_target
+        if new_band != self.target_wh_band:
+            changes.append(
+                f"target_wh_band: {self.target_wh_band} -> {new_band}"
+            )
+            self.target_wh_band = new_band
+            self.engine.HYSTERESIS_WH = self._band_hysteresis(
+                new_target, new_band
+            )
 
         new_nbc = device_config.get_smartmeter_device()
         if new_nbc != self.nbc_device:

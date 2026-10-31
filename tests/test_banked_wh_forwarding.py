@@ -86,9 +86,13 @@ def test_decide_actions_forwards_banked_to_engine(mock_config) -> None:
     seen: list[float | None] = []
     original = GapMinder.decide
 
-    def spy(self, ctx, predicted_wh, target_wh):  # type: ignore[no-untyped-def]
+    def spy(  # type: ignore[no-untyped-def]
+        self, ctx, predicted_wh, target_wh, target_wh_band=None
+    ):
         seen.append(ctx.banked_wh)
-        return original(self, ctx, predicted_wh, target_wh)
+        return original(
+            self, ctx, predicted_wh, target_wh, target_wh_band=target_wh_band
+        )
 
     GapMinder.decide = spy  # type: ignore[method-assign]
     try:

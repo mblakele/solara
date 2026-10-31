@@ -2330,6 +2330,7 @@ class GapMinder:
         ctx: DecideContext,
         predicted_wh: float,
         target_wh: float,
+        target_wh_band: tuple[int, int] | None = None,
     ) -> list[PendingEffect]:
         """Decide what actions to take based on the predicted Wh and target Wh.
 
@@ -2337,6 +2338,8 @@ class GapMinder:
             ctx: Decision context containing time, state, devices, and Tesla info.
             predicted_wh: The predicted Wh for the current quarter-hour.
             target_wh: The target Wh to achieve (negative = surplus).
+            target_wh_band: Optional inclusive ``(low, high)`` acceptable
+                range. When set, it replaces the scalar hysteresis check.
 
         Returns:
             List of PendingEffect objects representing actions to take.
@@ -2344,7 +2347,22 @@ class GapMinder:
         gap = target_wh - predicted_wh
         abs_gap = abs(gap)
 
-        if abs_gap <= self.HYSTERESIS_WH:
+        if target_wh_band is not None:
+            low, high = target_wh_band
+            if low <= predicted_wh <= high:
+                logger.info(
+                    "gapminder_hysteresis gap=%.1f band=%d..%d "
+                    "no_action_needed",
+                    gap, low, high,
+                    extra={
+                        "event": "gapminder_hysteresis",
+                        "gap_wh": gap,
+                        "band_low_wh": low,
+                        "band_high_wh": high,
+                    },
+                )
+                return []
+        elif abs_gap <= self.HYSTERESIS_WH:
             logger.info(
                 "gapminder_hysteresis gap=%.1f hysteresis=%d no_action_needed",
                 gap, self.HYSTERESIS_WH,

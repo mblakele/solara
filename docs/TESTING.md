@@ -140,6 +140,12 @@ drift checks.
   the Subtask-4 wiring (flag-off parity with history, flag-on c658/c817 prescriptions,
   config/env plumbing, and the 4a gapminder_lumpy_first census log when the lead is taken)
 
+- **test_target_wh_band.py**
+  the explicit target band and TOU schedule (band gates action inside
+  `[low, high]`, the heuristic deadband returns without a band, schedule
+  windows switch on the clock, and `LOAD_TARGET_WH` overrides every
+  devices.json form)
+
 ## Removed
 
 - **test_dispatch_quantum.py**

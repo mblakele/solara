@@ -1734,9 +1734,14 @@ def test_decide_actions_passes_the_quantisation_window(lm: LoadManager) -> None:
     seen = []
     real_decide = lm.engine.decide
 
-    def spy(*, ctx, predicted_wh, target_wh):
+    def spy(*, ctx, predicted_wh, target_wh, target_wh_band=None):
         seen.append(ctx)
-        return real_decide(ctx=ctx, predicted_wh=predicted_wh, target_wh=target_wh)
+        return real_decide(
+            ctx=ctx,
+            predicted_wh=predicted_wh,
+            target_wh=target_wh,
+            target_wh_band=target_wh_band,
+        )
 
     lm.engine.decide = spy  # type: ignore[method-assign]
     lm._decide_actions(
