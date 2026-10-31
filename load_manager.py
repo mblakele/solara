@@ -36,7 +36,6 @@ from constants import (
     MIN_SAMPLES_FOR_PREDICTION,
     STALE_DATA_THRESHOLD_SECS,
     TESLA_ARBITRATION_COOLDOWN_SECS,
-    TESLA_CHARGE_AMPS_MAX_DEFAULT,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
 )
 
@@ -47,6 +46,7 @@ from config_loader import (
 from config_loader import (
     load_plugs_from_file,
     load_tesla_config,
+    load_tesla_settings,
     load_vocolinc_credentials,
     load_vocolinc_plugs_from_file,
 )
@@ -339,6 +339,9 @@ class LoadManager:
         hysteresis_wh = int(abs(target_wh) / 3)
         self.tesla_config = load_tesla_config(config=self._cfg)
         tesla_config = self.tesla_config
+        # Device-level settings apply even when REST credentials are absent
+        # (telemetry-only operation), so read them independently.
+        self.tesla_settings = load_tesla_settings()
         lumpy_first = cfg.lumpy_first
         if lumpy_first is None:
             lumpy_first = self._cfg.lumpy_first
@@ -358,20 +361,12 @@ class LoadManager:
         else:
             self.engine = GapMinder(
                 hysteresis_wh=hysteresis_wh,
-                charge_amps_min=(
-                    tesla_config.charge_amps_min
-                    if tesla_config else TESLA_CHARGE_AMPS_MIN_DEFAULT
-                ),
-                charge_amps_max=(
-                    tesla_config.charge_amps_max
-                    if tesla_config else TESLA_CHARGE_AMPS_MAX_DEFAULT
-                ),
+                charge_amps_min=self.tesla_settings.charge_amps_min,
+                charge_amps_max=self.tesla_settings.charge_amps_max,
                 lumpy_first=lumpy_first,
                 ramp_aware=ramp_aware,
                 defer_lookahead_quanta=defer_lookahead_quanta,
-                tesla_priority=(
-                    tesla_config.priority if tesla_config else 0
-                ),
+                tesla_priority=self.tesla_settings.priority,
             )
         self.state = StateTracker(
             prediction_window_seconds=self._resolve_prediction_window(),
@@ -1455,7 +1450,14 @@ class LoadManager:
         Returns:
             True when no Tesla config/time range exists or now is inside it.
         """
-        time_range = self.tesla_config.time_range if self.tesla_config else None
+        # Prefer the REST config when present (it carries the same JSON
+        # settings); fall back to the device settings so telemetry-only
+        # deployments still honor devices.json.
+        time_range = (
+            self.tesla_config.time_range
+            if self.tesla_config is not None
+            else self.tesla_settings.time_range
+        )
         return self._is_device_in_time_range(now, time_range)
 
     def _tesla_state_missing_reason(

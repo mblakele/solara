@@ -219,6 +219,13 @@ uses `TeslaDecider.decide_reduce` with `stop_allowed=True` and the
 existing defer/ramp rule. Tesla turn-on also stays disabled: a
 high-priority Tesla only changes amps on a car that is already charging.
 
+`priority`, `charge_amps_min`, `charge_amps_max`, `home_radius_m`, and
+`time_range` come from `devices.json` through `load_tesla_settings()`.
+That read is independent of the REST credentials, so a telemetry-only
+deployment (MQTT only, no `TESLA_CLIENT_ID`) still honors them. The
+`GapMinder` init log reports the effective value as
+`tesla_priority=N`; check that line after editing `devices.json`.
+
 ## Tesla stop deferral and ramp awareness
 
 At Tesla's 5 A minimum there is nothing to trim: the only shed action is

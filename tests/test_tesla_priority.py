@@ -9,7 +9,10 @@ plug 0), so they do not depend on the equal-priority tie rule.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import patch
 
+import device_config
+from load_manager import LoadManager, LoadManagerConfig
 from load_models import DeviceState, PlugConfig, TeslaState
 from load_nbc import DecideContext, GapMinder, StateTracker
 
@@ -101,3 +104,35 @@ def test_high_priority_tesla_increases_amps_before_turning_on_plug():
     assert actions[0].target_amps == 16
     assert actions[1].device_name == "lamp"
     assert actions[1].action == "turn_on"
+
+
+def test_tesla_settings_apply_without_rest_credentials():
+    """devices.json Tesla settings reach the engine without REST secrets.
+
+    Telemetry-only deployments have no client_id/client_secret, so
+    ``load_tesla_config`` returns None. The device-level settings
+    (priority, amp limits, time range) must still come from devices.json.
+    """
+    from config_loader import load_tesla_settings
+
+    devices = {
+        "smartmeter": {"device": "main", "target_wh": -9},
+        "plugs": {"homekit": [], "vocolinc": []},
+        "tesla": {
+            "priority": 100,
+            "charge_amps_min": 5,
+            "charge_amps_max": 24,
+            "time_range": "10:00-19:00",
+        },
+    }
+    with patch("device_config._load", return_value=devices):
+        device_config.reload()
+        settings = load_tesla_settings()
+        manager = LoadManager(LoadManagerConfig(dry_run=True))
+
+    assert settings.priority == 100
+    assert settings.charge_amps_max == 24
+    assert settings.time_range is not None
+    assert manager.tesla_config is None
+    assert manager.engine.tesla_priority == 100
+    assert manager.engine.charge_amps_max == 24

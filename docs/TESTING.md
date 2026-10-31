@@ -83,7 +83,8 @@ drift checks.
 - **test_tesla_priority.py**
   the explicit `tesla.priority` order against plug on/off decisions (a high-priority Tesla
   keeps amps while a low-priority plug sheds; a high-priority Tesla increases amps before a
-  low-priority plug starts),
+  low-priority plug starts), plus the telemetry-only path where `devices.json` settings
+  reach the engine with no REST credentials and `load_tesla_config()` returns None,
 - **test_tesla_ramp_replay.py**
   the 2026-09-26 incident sequence (ramp_aware=True) plus a skipif-guarded drift check that
   the inline INCIDENT_POINTS gaps still match the log,

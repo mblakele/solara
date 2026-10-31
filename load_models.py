@@ -212,6 +212,29 @@ class TeslaConfig:
 
 
 @dataclass
+class TeslaSettings:
+    """Device-level Tesla settings from devices.json (no secrets).
+
+    These settings apply even when REST credentials are absent
+    (telemetry-only operation). Secrets and identifiers stay in
+    :class:`TeslaConfig`.
+
+    Attributes:
+        priority: Sort priority for amp-change decisions against plugs.
+        charge_amps_min: Minimum charge amps before stopping.
+        charge_amps_max: Maximum charge amps.
+        home_radius_m: Radius in metres around home for at_home detection.
+        time_range: Optional (start, end) time window for eligibility.
+    """
+
+    priority: int = 0
+    charge_amps_min: int = TESLA_CHARGE_AMPS_MIN_DEFAULT
+    charge_amps_max: int = TESLA_CHARGE_AMPS_MAX_DEFAULT
+    home_radius_m: float = TESLA_HOME_RADIUS_M_DEFAULT
+    time_range: tuple[time, time] | None = None
+
+
+@dataclass
 class DeviceState:
     """Runtime state of a managed device.
 

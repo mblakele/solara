@@ -2175,10 +2175,14 @@ class GapMinder:
             defer_lookahead_quanta=defer_lookahead_quanta,
         )
         logger.info(
-            "GapMinder: charge_amps_min=%d charge_amps_max=%d (config provided %d)",
+            "GapMinder: charge_amps_min=%d charge_amps_max=%d "
+            "(config provided %d) tesla_priority=%d",
             self.charge_amps_min, self.charge_amps_max, charge_amps_max,
+            self.tesla_priority,
             extra={"event": "gapminder_init", "charge_amps_min": self.charge_amps_min,
-                   "charge_amps_max": self.charge_amps_max, "config_charge_amps_max": charge_amps_max},
+                   "charge_amps_max": self.charge_amps_max,
+                   "config_charge_amps_max": charge_amps_max,
+                   "tesla_priority": self.tesla_priority},
         )
 
     def _safe_defer_secs(self, remaining_reduction: float) -> int:
