@@ -50,6 +50,7 @@
     "home_radius_m": 500,
     "charge_amps_min": 5,
     "charge_amps_max": 48,
+    "priority": 0,
     "time_range": "08:00-20:00"
   }
 }

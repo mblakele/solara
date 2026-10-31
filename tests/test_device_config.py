@@ -1,5 +1,7 @@
 """Tests for device_config module — JSON-based device configuration."""
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -317,3 +319,193 @@ def test_load_whitespace_only_file_raises_error(tmp_path):
         device_config.reload()
         with pytest.raises(device_config.DeviceConfigError):
             device_config.get_timezone()
+
+
+# --- Target Wh band and TOU schedule ---
+
+UTC = timezone.utc
+NOON = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+
+
+def _resolve(tmp_path: Path, payload: dict, now: datetime):
+    """Write *payload* to devices.json and resolve the target at *now*."""
+    path = tmp_path / "devices.json"
+    path.write_text(json.dumps(payload))
+    with patch.object(device_config, "_DEVICES_FILE", path):
+        device_config.reload()
+        return device_config.get_target_wh_setting(now=now)
+
+
+def _scheduled() -> dict:
+    """TOU payload: positive import band by day, negative export band by night."""
+    return {
+        "timezone": "UTC",
+        "smartmeter": {
+            "device": "M1208.24",
+            "target_wh": -9,
+            "target_wh_schedule": [
+                {"time_range": "00:00-15:00", "target_wh_range": [90, 110]},
+                {"time_range": "15:00-00:00", "target_wh_range": [-10, -5]},
+            ],
+        },
+    }
+
+
+def test_target_wh_scalar_unchanged(tmp_path: Path) -> None:
+    """A scalar target keeps its old meaning and has no band."""
+    setting = _resolve(
+        tmp_path,
+        {"timezone": "UTC", "smartmeter": {"device": "M1", "target_wh": -9}},
+        NOON,
+    )
+    assert setting.target_wh == -9
+    assert setting.low_wh is None
+    assert setting.high_wh is None
+    assert setting.source == "target_wh"
+
+
+def test_target_wh_top_level_band(tmp_path: Path) -> None:
+    """A top-level band applies at every time of day."""
+    setting = _resolve(
+        tmp_path,
+        {
+            "timezone": "UTC",
+            "smartmeter": {
+                "device": "M1",
+                "target_wh": -9,
+                "target_wh_range": [-10, -5],
+            },
+        },
+        NOON,
+    )
+    assert setting.target_wh == -9
+    assert setting.low_wh == -10
+    assert setting.high_wh == -5
+    assert setting.source == "target_wh_range"
+
+
+@pytest.mark.parametrize(
+    ("hh", "mm", "ss", "target", "low", "high"),
+    [
+        (0, 0, 0, 100, 90, 110),
+        (14, 59, 59, 100, 90, 110),
+        (15, 0, 0, -8, -10, -5),
+        (23, 59, 59, -8, -10, -5),
+    ],
+)
+def test_schedule_half_open_boundaries(
+    tmp_path: Path, hh: int, mm: int, ss: int,
+    target: int, low: int, high: int,
+) -> None:
+    """Windows are start-inclusive and end-exclusive; 00:00 ends the day."""
+    now = datetime(2026, 5, 7, hh, mm, ss, tzinfo=UTC)
+    setting = _resolve(tmp_path, _scheduled(), now)
+    assert setting.target_wh == target
+    assert setting.low_wh == low
+    assert setting.high_wh == high
+    assert setting.source == "target_wh_schedule"
+
+
+def test_schedule_window_aim_overrides_top_level(tmp_path: Path) -> None:
+    """A window scalar wins over the top-level scalar."""
+    payload = {
+        "timezone": "UTC",
+        "smartmeter": {
+            "target_wh": -9,
+            "target_wh_schedule": [
+                {"time_range": "08:00-20:00", "target_wh": 100},
+            ],
+        },
+    }
+    setting = _resolve(tmp_path, payload, NOON)
+    assert setting.target_wh == 100
+    assert setting.low_wh is None
+
+
+def test_schedule_gap_falls_back_to_top_level(tmp_path: Path) -> None:
+    """Uncovered time uses the top-level scalar and band."""
+    payload = {
+        "timezone": "UTC",
+        "smartmeter": {
+            "target_wh": -9,
+            "target_wh_range": [-10, -5],
+            "target_wh_schedule": [
+                {"time_range": "08:00-20:00", "target_wh_range": [90, 110]},
+            ],
+        },
+    }
+    setting = _resolve(
+        tmp_path, payload, datetime(2026, 5, 7, 4, 0, tzinfo=UTC)
+    )
+    assert setting.target_wh == -9
+    assert setting.low_wh == -10
+    assert setting.high_wh == -5
+
+
+def test_get_target_wh_wrapper_uses_now(tmp_path: Path) -> None:
+    """The legacy scalar accessor accepts an explicit now."""
+    path = tmp_path / "devices.json"
+    path.write_text(json.dumps(_scheduled()))
+    with patch.object(device_config, "_DEVICES_FILE", path):
+        device_config.reload()
+        assert device_config.get_target_wh(now=NOON) == 100
+        late = datetime(2026, 5, 7, 16, 0, tzinfo=UTC)
+        assert device_config.get_target_wh(now=late) == -8
+
+
+@pytest.mark.parametrize(
+    ("smartmeter", "match"),
+    [
+        ({"target_wh": "nine"}, "target_wh"),
+        ({"target_wh": True}, "target_wh"),
+        ({"target_wh_range": [-5]}, "target_wh_range"),
+        ({"target_wh_range": [1.5, 2]}, "target_wh_range"),
+        ({"target_wh_range": [-5, -10]}, "low"),
+        ({"target_wh_schedule": [{"target_wh_range": [1, 2]}]}, "time_range"),
+        ({"target_wh_schedule": [{"time_range": "08:00-20:00"}]}, "target_wh"),
+        (
+            {"target_wh_schedule": [{"time_range": "25:00-26:00", "target_wh": 1}]},
+            "time_range",
+        ),
+        (
+            {"target_wh_schedule": [{"time_range": "23:00-02:00", "target_wh": 1}]},
+            "time_range",
+        ),
+        (
+            {
+                "target_wh_schedule": [
+                    {"time_range": "00:00-16:00", "target_wh": 1},
+                    {"time_range": "15:00-00:00", "target_wh": 2},
+                ]
+            },
+            "overlap",
+        ),
+    ],
+)
+def test_invalid_target_config_raises(
+    tmp_path: Path, smartmeter: dict, match: str
+) -> None:
+    """Malformed target keys fail loudly at load time."""
+    payload = {"timezone": "UTC", "smartmeter": smartmeter}
+    path = tmp_path / "devices.json"
+    path.write_text(json.dumps(payload))
+    with patch.object(device_config, "_DEVICES_FILE", path):
+        device_config.reload()
+        with pytest.raises(device_config.DeviceConfigError, match=match):
+            device_config.get_target_wh_setting(now=NOON)
+
+
+def test_has_smartmeter_true_for_band_only() -> None:
+    """A band-only smartmeter section still enables load management."""
+    with patch("device_config._load", return_value={
+        "smartmeter": {"device": "M1", "target_wh_range": [-10, -5]}
+    }):
+        assert device_config.has_smartmeter() is True
+
+
+def test_has_smartmeter_true_for_schedule_only() -> None:
+    """A schedule-only smartmeter section still enables load management."""
+    with patch("device_config._load", return_value={
+        "smartmeter": {"device": "M1", "target_wh_schedule": []}
+    }):
+        assert device_config.has_smartmeter() is True

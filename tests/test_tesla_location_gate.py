@@ -261,11 +261,11 @@ def test_tesla_amp_reduce_without_coords_at_home_true():
 
 
 def test_tesla_turn_off_without_coords_at_home_false():
-    """Large deficit, Tesla at min amps, at_home=False.
+    """Large deficit, Tesla at min amps, at_home=False, no home check.
 
-    Vehicle should NOT be stopped — Step 1 was entered (car was charging)
-    and returned None (already at minimum amps, stop_allowed=False).
-    Step 3 must respect that decision.
+    With no coordinates configured the location gate is off, so at_home
+    cannot withhold the stop. The 5009 Wh gap is far beyond what the
+    remaining 711 s can pay, so Step 3 stops instead of deferring.
     """
     engine = GapMinder(hysteresis_wh=3)
     tesla = TeslaState(
@@ -282,15 +282,16 @@ def test_tesla_turn_off_without_coords_at_home_false():
         target_wh=-9.0,
     )
 
-    assert len(actions) == 0
+    assert len(actions) == 1
+    assert actions[0].device_name == "tesla"
+    assert actions[0].action == "turn_off"
 
 
 def test_tesla_turn_off_without_coords_at_home_true():
-    """Large deficit, Tesla at min amps, at_home=True.
+    """Large deficit, Tesla at min amps, at_home=True, no home check.
 
-    Vehicle should NOT be stopped — Step 1 was entered (car was charging)
-    and returned None (already at minimum amps, stop_allowed=False).
-    Step 3 must respect that decision.
+    The location gate is off, and the gap is far beyond what the
+    remaining 711 s can pay, so the stop is due now.
     """
     engine = GapMinder(hysteresis_wh=3)
     tesla = TeslaState(
@@ -307,7 +308,9 @@ def test_tesla_turn_off_without_coords_at_home_true():
         target_wh=-9.0,
     )
 
-    assert len(actions) == 0
+    assert len(actions) == 1
+    assert actions[0].device_name == "tesla"
+    assert actions[0].action == "turn_off"
 
 
 # ---------------------------------------------------------------------------
@@ -449,9 +452,8 @@ def test_tesla_turn_off_with_coords_at_home_false():
 def test_tesla_turn_off_with_coords_at_home_true():
     """Large deficit, requires_home_check=True, at_home=True.
 
-    Vehicle should NOT be stopped — Step 1 was entered (car was charging)
-    and returned None (already at minimum amps, stop_allowed=False).
-    Step 3 must respect that decision.
+    The home gate passes and the gap is beyond what the remaining 711 s
+    can pay, so Step 3 stops now rather than deferring.
     """
     engine = GapMinder(hysteresis_wh=3)
     tesla = TeslaState(
@@ -468,7 +470,9 @@ def test_tesla_turn_off_with_coords_at_home_true():
         target_wh=-9.0,
     )
 
-    assert len(actions) == 0
+    assert len(actions) == 1
+    assert actions[0].device_name == "tesla"
+    assert actions[0].action == "turn_off"
 
 
 # ---------------------------------------------------------------------------

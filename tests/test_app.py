@@ -199,15 +199,15 @@ class TestApp(unittest.TestCase):
         from load_models import CycleResult
 
         cases = [
-            ("ok", "forecast this period"),
-            ("dry-run", "dry run"),
-            ("disabled", "disabled"),
-            ("no_incomplete_qh", "waiting for data"),
-            ("stale_data", "stale data"),
-            ("waiting_for_fresh_data", "waiting for data"),
+            ("ok", "forecast this period", False),
+            ("dry-run", "dry run", False),
+            ("disabled", "disabled", False),
+            ("no_incomplete_qh", "⚠ waiting for data", True),
+            ("stale_data", "⚠ stale data", True),
+            ("waiting_for_fresh_data", "⚠ waiting for data", True),
         ]
 
-        for status, expected_label in cases:
+        for status, expected_label, expect_warn in cases:
             with self.subTest(status=status):
                 mock_lm = unittest.mock.MagicMock()
                 mock_lm.enabled = True
@@ -230,6 +230,7 @@ class TestApp(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 data = response.data.decode("utf-8")
                 self.assertIn(expected_label, data)
+                self.assertEqual("forecast__period--warn" in data, expect_warn)
 
     def test_index_real_mode_lm_disabled(self):
         """Index returns 200 in real mode when load management is disabled.
@@ -279,16 +280,24 @@ class TestApp(unittest.TestCase):
     def _forecast_value_markup(self, predicted_wh: float) -> str:
         """Render the index template and return the forecast-value markup."""
         from flask import render_template
+        from load_models import CycleDiagnostics
 
         nbc = realistic_metrics()["devices"][0]["nbc"]
         # Keep QH1's shape but override predicted_wh to control the sign.
         nbc = {"QH1": dict(nbc["QH1"], predicted_wh=predicted_wh)}
         metrics = {"devices": [{"name": "dev", "nbc": nbc, "per_second_data": [0.001]}]}
+        diag_obj = CycleDiagnostics(hysteresis_wh=50)
+        load_management = {
+            "target_wh": -50,
+            "last_cycle_result": MagicMock(
+                diagnostics=diag_obj, status="ok"
+            ),
+        }
         with app.test_request_context():
             html = render_template(
                 "index.html",
                 metrics=metrics,
-                load_management=None,
+                load_management=load_management,
                 refresh_secs=None,
             )
         return html
@@ -2176,13 +2185,30 @@ class TestLoadManagementSectionDebug(unittest.TestCase):
         self.app = app.test_client()
         self.app.testing = True
 
+    @staticmethod
+    def _freshness(metrics_data, load_management, refresh_secs, now=None):
+        import app as app_mod
+
+        return app_mod._metrics_freshness_payload(
+            metrics_data, load_management, refresh_secs, now=now
+        )
+
+    @staticmethod
+    def _now() -> datetime:
+        return datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
     @contextlib.contextmanager
-    def _lm_wired_real_mode(self, debug):
-        """Real-mode config with LM enabled and a controllable debug flag."""
+    def _lm_wired_real_mode(self, debug, result=None):
+        """Real-mode config with LM enabled and a controllable debug flag.
+
+        Args:
+            debug: Value served as metrics.debug by the mocked cache.
+            result: Cycle result to publish; defaults to ``_cycle_result()``.
+        """
         import app as app_mod
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
-            lm = _make_lm(_cycle_result())
+            lm = _make_lm(result if result is not None else _cycle_result())
             Config().set("LOAD_MANAGE_ENABLED", "True")
             app_mod._state.load_manager = lm
             app_mod._state.load_manager_init_failed = False
@@ -2237,36 +2263,6 @@ class TestLoadManagementSectionDebug(unittest.TestCase):
         self.assertIn(
             'id="load-management-section"', response.data.decode("utf-8")
         )
-
-
-class TestDataFreshness(unittest.TestCase):
-    """Data-freshness strip: surfaces how old the per-second data is and the
-    expected cadence of the next update, unobtrusively.
-
-    The strip is server-rendered (templates/_metrics.html) and ticked
-    client-side (static/app.js). It doubles as the signal the JS client uses
-    to decide whether SSE is a continuous driver (load management enabled:
-    keep the page live) or a one-shot snapshot (load management disabled:
-    keep the server auto-refresh / JS reload timer alive).
-    """
-
-    def setUp(self):
-        self.app = app.test_client()
-        self.app.testing = True
-
-    @staticmethod
-    def _freshness(metrics_data, load_management, refresh_secs, now=None):
-        import app as app_mod
-
-        return app_mod._metrics_freshness_payload(
-            metrics_data, load_management, refresh_secs, now=now
-        )
-
-    @staticmethod
-    def _now() -> datetime:
-        return datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-    # --- _metrics_freshness_payload unit tests -------------------------
 
     def test_freshness_payload_none_when_no_devices(self):
         """No devices means there is nothing fresh/stale to report."""

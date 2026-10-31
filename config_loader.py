@@ -13,9 +13,12 @@ from __future__ import annotations
 import logging
 import re
 from datetime import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import device_config
+
+if TYPE_CHECKING:
+    from load_models import TeslaSettings
 
 from config import Config, _config
 
@@ -179,6 +182,28 @@ def load_vocolinc_plugs_from_file() -> dict[str, Any]:
     return plugs
 
 
+def load_tesla_settings() -> TeslaSettings:
+    """Load device-level Tesla settings from devices.json.
+
+    These settings apply even when REST credentials are absent
+    (telemetry-only operation). Secrets and identifiers stay in
+    :func:`load_tesla_config`.
+
+    Returns:
+        TeslaSettings with defaults when the section is absent.
+    """
+    from load_models import TeslaSettings
+
+    dc = device_config.get_tesla_config() or {}
+    return TeslaSettings(
+        priority=int(dc.get("priority", 0)),
+        charge_amps_min=int(dc.get("charge_amps_min", 5)),
+        charge_amps_max=int(dc.get("charge_amps_max", 48)),
+        home_radius_m=float(dc.get("home_radius_m", 500)),
+        time_range=_parse_device_time_range(dc.get("time_range")),
+    )
+
+
 def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[return-value]
     """Load Tesla configuration.
 
@@ -228,16 +253,7 @@ def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[retu
     home_lat = cfg.tesla_home_lat
     home_lon = cfg.tesla_home_lon
 
-    dc = device_config.get_tesla_config()
-    home_radius_m = 500.0
-    charge_amps_min = 5
-    charge_amps_max = 48
-    time_range = None
-    if dc is not None:
-        home_radius_m = float(dc.get("home_radius_m", 500))
-        charge_amps_min = int(dc.get("charge_amps_min", 5))
-        charge_amps_max = int(dc.get("charge_amps_max", 48))
-        time_range = _parse_device_time_range(dc.get("time_range"))
+    settings = load_tesla_settings()
 
     return TeslaConfig(
         client_id=client_id,
@@ -246,10 +262,11 @@ def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[retu
         vehicle_id=vehicle_id,
         home_lat=home_lat,
         home_lon=home_lon,
-        home_radius_m=home_radius_m,
-        charge_amps_min=charge_amps_min,
-        charge_amps_max=charge_amps_max,
+        home_radius_m=settings.home_radius_m,
+        charge_amps_min=settings.charge_amps_min,
+        charge_amps_max=settings.charge_amps_max,
         private_key_path=private_key_path,
-        time_range=time_range,
+        time_range=settings.time_range,
         vehicle_command_proxy_url=vehicle_command_proxy_url,
+        priority=settings.priority,
     )
