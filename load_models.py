@@ -20,6 +20,7 @@ from constants import (
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
     TESLA_HOME_RADIUS_M_DEFAULT,
+    TESLA_ZERO_AMPS_CLEAR_SAMPLES,
 )
 
 
@@ -309,6 +310,147 @@ def derive_plug_state(
     if actual is False:
         return PlugState.OFF
     return PlugState.UNKNOWN
+
+
+class TeslaAmpState(StrEnum):
+    """Lifecycle of one commanded Tesla amp level.
+
+    Derived by :func:`classify_tesla_amp` from the commanded level, the
+    reported level, the zero-sample counter, and two window booleans. The
+    tracker stores the command and the counter; the state is never stored.
+    """
+
+    IDLE = "idle"
+    AWAITING_REPORT = "awaiting_report"
+    AWAITING_STOP = "awaiting_stop"
+    RAMPING = "ramping"
+    SETTLING = "settling"
+    CONFIRMED = "confirmed"
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True)
+class TeslaAmpDecision:
+    """One classifier pass, before the tracker applies it.
+
+    Attributes:
+        state: The lifecycle state after the observation.
+        credit_amps: Amps still to account over the remaining window.
+        zero_samples: Counter value to store for the next pass.
+        clear_command: True when the command must become None.
+        reason: Free-text audit reason. Never feeds a decision.
+    """
+
+    state: TeslaAmpState
+    credit_amps: float
+    zero_samples: int
+    clear_command: bool
+    reason: str
+
+
+def classify_tesla_amp(
+    *,
+    commanded_amps: int | None,
+    reported_amps: int | None,
+    zero_samples: int,
+    has_settle: bool,
+    settle_open: bool,
+    command_window_open: bool,
+    zero_clear_samples: int = TESLA_ZERO_AMPS_CLEAR_SAMPLES,
+) -> TeslaAmpDecision:
+    """Classify one Tesla amp observation into a lifecycle decision.
+
+    Pure: it reads no clock and no store. The tracker computes the window
+    booleans and applies the returned decision. The confirmed check runs
+    before the 1 A ramp branch, so a report equal to the command is always
+    a confirmation.
+
+    Args:
+        commanded_amps: Last commanded amp level, or None.
+        reported_amps: Amps reported by the vehicle this cycle, or None.
+        zero_samples: Consecutive 0 A samples seen before this one.
+        has_settle: At least one directed ``set_amps`` effect exists.
+        settle_open: An increase or decrease settle window is still open.
+        command_window_open: The newest Tesla command is inside the window
+            on the wall clock or the data-point clock.
+        zero_clear_samples: Consecutive zeros that confirm a stop.
+
+    Returns:
+        The decision: state, credit, counter, clear flag, and reason.
+    """
+    if commanded_amps is None:
+        return TeslaAmpDecision(
+            state=TeslaAmpState.IDLE,
+            credit_amps=0.0,
+            zero_samples=zero_samples,
+            clear_command=False,
+            reason="idle",
+        )
+    if reported_amps is None:
+        return TeslaAmpDecision(
+            state=TeslaAmpState.AWAITING_REPORT,
+            credit_amps=0.0,
+            zero_samples=zero_samples,
+            clear_command=False,
+            reason="awaiting_report",
+        )
+    if reported_amps == 0:
+        seen = zero_samples + 1
+        if seen >= zero_clear_samples:
+            return TeslaAmpDecision(
+                state=TeslaAmpState.IDLE,
+                credit_amps=0.0,
+                zero_samples=0,
+                clear_command=True,
+                reason="stop_confirmed",
+            )
+        return TeslaAmpDecision(
+            state=TeslaAmpState.AWAITING_STOP,
+            credit_amps=float(commanded_amps),
+            zero_samples=seen,
+            clear_command=False,
+            reason="stop_unconfirmed",
+        )
+    delta = commanded_amps - reported_amps
+    if delta == 0:
+        return TeslaAmpDecision(
+            state=TeslaAmpState.CONFIRMED,
+            credit_amps=0.0,
+            zero_samples=0,
+            clear_command=False,
+            reason="confirmed",
+        )
+    if reported_amps == 1:
+        if command_window_open:
+            return TeslaAmpDecision(
+                state=TeslaAmpState.RAMPING,
+                credit_amps=float(commanded_amps - 1),
+                zero_samples=0,
+                clear_command=False,
+                reason="window_open",
+            )
+        return TeslaAmpDecision(
+            state=TeslaAmpState.EXPIRED,
+            credit_amps=0.0,
+            zero_samples=0,
+            clear_command=True,
+            reason="ramp_stale",
+        )
+    if has_settle and not settle_open:
+        return TeslaAmpDecision(
+            state=TeslaAmpState.EXPIRED,
+            credit_amps=0.0,
+            zero_samples=0,
+            clear_command=True,
+            reason="settle_expired",
+        )
+    return TeslaAmpDecision(
+        state=TeslaAmpState.SETTLING,
+        credit_amps=float(delta),
+        zero_samples=0,
+        clear_command=False,
+        reason="settle_open",
+    )
 
 
 @dataclass

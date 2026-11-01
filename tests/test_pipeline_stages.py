@@ -835,6 +835,49 @@ class TestTeslaActionClamping:
         mgr.tesla_ctrl = TeslaController(mgr.tesla_config)  # type: ignore[assignment]
         return mgr
 
+    @pytest.fixture
+    def lm_with_high_min(self) -> LoadManager:
+        """LoadManager whose configured minimum is above the 5 A default."""
+        from load_controllers import TeslaController
+        from load_models import TeslaConfig
+
+        mgr = LoadManager(LoadManagerConfig(dry_run=True, config_interval_secs=30))
+        mgr.tesla_config = TeslaConfig(
+            client_id="test",
+            client_secret="test",
+            redirect_uri="http://localhost/callback",
+            vehicle_id="v1",
+            home_lat=37.0,
+            home_lon=-122.0,
+            home_radius_m=500,
+            charge_amps_min=8,
+            charge_amps_max=24,
+        )
+        mgr.tesla_ctrl = TeslaController(mgr.tesla_config)  # type: ignore[assignment]
+        return mgr
+
+    def test_execute_set_amps_below_configured_min_stops_charging(
+        self, lm_with_high_min: LoadManager
+    ):
+        """The executor must use the configured minimum, not the constant 5."""
+        import asyncio
+
+        action = PendingEffect(
+            device_name="tesla",
+            action="set_amps",
+            timestamp=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+            data_point_at=datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+            power_watts=0.0,
+            target_amps=6,  # below the configured min of 8
+        )
+
+        result = asyncio.run(lm_with_high_min._execute_tesla_action(action))
+
+        assert result is True
+        state = asyncio.run(lm_with_high_min.tesla_ctrl.get_charging_state())
+        assert state.is_charging is False
+        assert state.current_amps is None
+
     def test_execute_set_amps_clamped_to_max(self, lm_with_tesla_config: LoadManager):
         """When action.target_amps exceeds charge_amps_max, it must be clamped."""
         import asyncio

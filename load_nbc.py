@@ -24,8 +24,11 @@ from load_models import (
     DeviceState,
     PendingEffect,
     PlugState,
+    TeslaAmpDecision,
+    TeslaAmpState,
     TeslaState,
     TeslaVehicleTelemetry,
+    classify_tesla_amp,
     derive_plug_state,
 )
 
@@ -621,6 +624,8 @@ class TeslaSettleTracker:
         # A single 0 A telemetry frame is not enough to confirm the car
         # stopped — see inflight_wh() (plan 3.5).
         self._zero_amp_samples: int = 0
+        # Last logged state for deduplication of audit log lines.
+        self._last_logged_state: TeslaAmpState | None = None
 
     def record_command(self, amps: int | None) -> None:
         """Record a commanded Tesla amp level and reset zero-amp confirmation.
@@ -636,12 +641,119 @@ class TeslaSettleTracker:
         self.last_commanded_amps = amps
         self._zero_amp_samples = 0
 
+    def _command_window_open(self, now: datetime,
+                             data_point_at: datetime | None = None) -> bool:
+        """Return True when the newest Tesla effect is inside the window.
+
+        Checks both wall-clock and data-point-at age against ``window_secs``.
+        Returns False when no Tesla effect exists (pruned or never recorded).
+
+        Args:
+            now: Current wall-clock time.
+            data_point_at: Current NBC data-point-at timestamp, or None.
+
+        Returns:
+            True if the latest Tesla command is still within the window on
+            either measure.
+        """
+        latest_cmd = self.effects.latest_for("tesla")
+        if latest_cmd is None:
+            return False
+        elapsed_wall = (now - latest_cmd.timestamp).total_seconds()
+        if elapsed_wall < self.window_secs:
+            return True
+        if data_point_at is not None and latest_cmd.data_point_at is not None:
+            elapsed_data = (
+                data_point_at - latest_cmd.data_point_at
+            ).total_seconds()
+            if elapsed_data < self.window_secs:
+                return True
+        return False
+
+    def classify(
+        self, reported_amps: int | None, now: datetime,
+        data_point_at: datetime | None = None,
+    ) -> TeslaAmpDecision:
+        """Classify the current observation without mutating state.
+
+        Builds ``has_settle``, ``settle_open``, and ``command_window_open``
+        from ``self.effects`` and delegates to the pure classifier.
+
+        For ``reported_amps == 0`` the tracker's ``_zero_amp_samples`` is an
+        already-applied count (incremented by ``inflight_wh`` before calling
+        this method).  The pure classifier expects a pre-increment count, so
+        we subtract one when the counter is positive.
+
+        Args:
+            reported_amps: Amps reported by the vehicle this cycle, or None.
+            now: Current wall-clock time (injected so tests can pin it).
+            data_point_at: Current NBC data-point-at timestamp, or None.
+
+        Returns:
+            The decision: state, credit amps, counter value, clear flag, and
+            reason.
+        """
+        snapshot = self.effects.snapshot()
+        has_settle = any(
+            eff.device_name == "tesla" and eff.action == "set_amps"
+            and eff.direction is not None
+            for eff in snapshot
+        )
+        settle_open = (
+            self.is_settling(now, data_point_at=data_point_at,
+                             direction="increase")
+            or self.is_settling(now, data_point_at=data_point_at,
+                                direction="decrease")
+        )
+        command_window_open = self._command_window_open(
+            now, data_point_at=data_point_at
+        )
+        # _zero_amp_samples is an already-applied count.  The pure classifier
+        # expects a pre-increment count, so subtract one when positive.
+        raw = self._zero_amp_samples
+        if reported_amps == 0 and raw > 0:
+            raw -= 1
+        return classify_tesla_amp(
+            commanded_amps=self.last_commanded_amps,
+            reported_amps=reported_amps,
+            zero_samples=raw,
+            has_settle=has_settle,
+            settle_open=settle_open,
+            command_window_open=command_window_open,
+        )
+
+    def _apply_decision(self, decision: TeslaAmpDecision) -> None:
+        """Apply the side-effects of a classifier decision.
+
+        Only updates ``_zero_amp_samples`` when the new value differs from
+        the current one — this prevents non-zero branches (which reset to 0)
+        from overwriting an incremented zero-amp counter that was set by
+        :meth:`classify`.
+
+        Zero-sample convention: ``inflight_wh()`` increments
+        ``_zero_amp_samples`` *before* calling ``classify()``, so the
+        classifier receives a pre-increment count and subtracts 1 back when
+        it sees ``reported_amps == 0``.  This keeps ``classify()`` pure and
+        read-only — it never mutates state, only returns what to mutate.
+
+        Args:
+            decision: Outcome from :meth:`classify`.
+        """
+        if self._zero_amp_samples != decision.zero_samples:
+            self._zero_amp_samples = decision.zero_samples
+        if decision.clear_command:
+            self.last_commanded_amps = None
+
     def inflight_wh(
         self, reported_amps: int | None, seconds_remaining: int,
         now: datetime,
         data_point_at: datetime | None = None,
     ) -> float:
         """Compute the still-unconfirmed Tesla amp-change contribution.
+
+        Three-step flow: (1) classify the observation into a named state;
+        (2) apply the decision (mutate counter / clear command);
+        (3) return Wh credit via the classifier's ``credit_amps`` field.
 
         Recomputed fresh every cycle using the vehicle API's reported
         current_amps, so the adjustment decays correctly as seconds_remaining
@@ -662,119 +774,30 @@ class TeslaSettleTracker:
         Returns:
             Wh still expected from the in-flight amp delta.
         """
-        if self.last_commanded_amps is None or reported_amps is None:
-            return 0.0
+        # Increment the zero-amp counter before classify().  The pure
+        # classifier expects a pre-increment count; inflight_wh handles the
+        # increment so classify() stays read-only.
         if reported_amps == 0:
-            return self._inflight_zero(seconds_remaining)
-        # Any non-zero report resets the zero-amp confirmation counter.
-        self._zero_amp_samples = 0
-        if reported_amps == 1:
-            return self._inflight_one_amp(
-                seconds_remaining, now, data_point_at=data_point_at
-            )
-        delta = self.last_commanded_amps - reported_amps
-        if delta == 0:
-            return 0.0
-        # After both settle windows expire, if the car still hasn't reached
-        # the commanded level, treat the command as unsuccessful and clear
-        # the stale state so it doesn't distort the gap forever.
-        # Only fires when at least one settle effect was ever recorded — tests
-        # that set last_commanded_amps directly without pending effects
-        # still compute the delta as expected.
-        has_settle = any(
-            eff.device_name == "tesla" and eff.action == "set_amps"
-            and eff.direction is not None
-            for eff in self.effects.snapshot()
-        )
-        if (has_settle
-                and not self.is_settling(now, data_point_at=data_point_at,
-                                        direction="increase")
-                and not self.is_settling(now, data_point_at=data_point_at,
-                                        direction="decrease")):
+            self._zero_amp_samples += 1
+        decision = self.classify(reported_amps, now, data_point_at=data_point_at)
+        self._apply_decision(decision)
+        # Audit log: one DEBUG line per state change, never on a repeat.
+        if decision.state != self._last_logged_state:
             logger.debug(
-                "[tesla_inflight_wh] settle expired — clearing stale last_commanded_amps=%d "
-                "(reported=%d)",
-                self.last_commanded_amps, reported_amps,
+                "[tesla_amp] %s -> %s cmd=%s reported=%s "
+                "zero=%d/%d reason=%s",
+                self._last_logged_state or "none",
+                decision.state,
+                self.last_commanded_amps,
+                reported_amps,
+                self._zero_amp_samples,
+                TESLA_ZERO_AMPS_CLEAR_SAMPLES,
+                decision.reason,
             )
-            self.last_commanded_amps = None
-            self._zero_amp_samples = 0
-            return 0.0
-        return StateTracker.delta_amps_to_wh(delta, seconds_remaining)
-
-    def _inflight_zero(self, seconds_remaining: int) -> float:
-        """Handle a reported 0 A frame.
-
-        A single zero frame can be stale or in-transit while the car is
-        still ramping, so the command is only cleared after
-        ``TESLA_ZERO_AMPS_CLEAR_SAMPLES`` consecutive zero samples. Until
-        then the full commanded delta stays accounted.
-
-        Args:
-            seconds_remaining: Seconds left in the current quarter-hour.
-
-        Returns:
-            Wh still expected from the in-flight amp delta.
-        """
-        self._zero_amp_samples += 1
-        if self._zero_amp_samples >= TESLA_ZERO_AMPS_CLEAR_SAMPLES:
-            self.last_commanded_amps = None
-            self._zero_amp_samples = 0
-            return 0.0
-        # Unconfirmed stop — keep accounting for the full commanded delta.
-        assert self.last_commanded_amps is not None
+            self._last_logged_state = decision.state
         return StateTracker.delta_amps_to_wh(
-            self.last_commanded_amps, seconds_remaining,
+            decision.credit_amps, seconds_remaining,
         )
-
-    def _inflight_one_amp(
-        self, seconds_remaining: int, now: datetime,
-        data_point_at: datetime | None = None,
-    ) -> float:
-        """Handle a reported 1 A frame during possible ramp-up.
-
-        During ramp-up the car briefly reports 1 A — treat as stale only
-        when the command was issued long enough ago that the car should
-        have reached a higher level by now. The settle window considers
-        both wall-clock age and data-point-at age.
-
-        Args:
-            seconds_remaining: Seconds left in the current quarter-hour.
-            now: Current wall-clock time.
-            data_point_at: Current NBC data-point-at timestamp, or None.
-
-        Returns:
-            Wh still expected from the unconfirmed portion of the delta,
-            or 0.0 when the 1 A report is treated as stale (clearing the
-            recorded command).
-        """
-        assert self.last_commanded_amps is not None
-        latest_cmd = self.effects.latest_for("tesla")
-        if latest_cmd is not None:
-            elapsed_wall = (now - latest_cmd.timestamp).total_seconds()
-            if elapsed_wall < self.window_secs:
-                # Recent command — car is ramping up, don't clear.
-                # Credit the unconfirmed portion so surplus is not
-                # overstated after an amp increase (plan 3.5).
-                return StateTracker.delta_amps_to_wh(
-                    self.last_commanded_amps - 1,
-                    seconds_remaining,
-                )
-            # Wall clock expired — check data-point-at age.
-            if (data_point_at is not None
-                    and latest_cmd.data_point_at is not None):
-                elapsed_data = (
-                    data_point_at - latest_cmd.data_point_at
-                ).total_seconds()
-                if elapsed_data < self.window_secs:
-                    return StateTracker.delta_amps_to_wh(
-                        self.last_commanded_amps - 1,
-                        seconds_remaining,
-                    )
-        # No recent command (or command age exceeds settle window) —
-        # treat as stale and clear.
-        self.last_commanded_amps = None
-        self._zero_amp_samples = 0
-        return 0.0
 
     def _find_active(
         self, now: datetime, current_qh: str | None = None,
@@ -972,6 +995,28 @@ class StateTracker:
     @last_commanded_amps.setter
     def last_commanded_amps(self, value: int | None) -> None:
         self.settle.last_commanded_amps = value
+
+    def tesla_amp_state(
+        self, now: datetime, data_point_at: datetime | None = None,
+    ) -> TeslaAmpDecision:
+        """Return the current Tesla amp lifecycle decision (read-only).
+
+        Thin passthrough to :meth:`TeslaSettleTracker.classify` for tests and
+        diagnostics.  Not added to ``to_dict()`` or the JSON payload — see
+        resolved decision 2 of the tesla-amp-lifecycle plan.
+
+        Args:
+            now: Current wall-clock time (injected so tests can pin it).
+            data_point_at: Current NBC data-point-at timestamp, or None.
+
+        Returns:
+            The classification: state, credit amps, counter value, clear flag,
+            and reason.
+        """
+        return self.settle.classify(
+            reported_amps=None, now=now,
+            data_point_at=data_point_at,
+        )
 
     @property
     def pending_effects(self) -> list[PendingEffect]:

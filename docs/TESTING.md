@@ -108,6 +108,23 @@ drift checks.
   beside the placeholder instead of a blank)
 - **test_prune_orphaned_tesla_command.py**
   the 2026-10-08 orphaned 12A command (pruning the last set_amps clears last_commanded_amps)
+- **test_tesla_amp_state.py**
+  the pure classifier (`classify_tesla_amp`) truth table: every row of the
+  transition table, `zero_clear_samples` read from the constant, `IDLE` and
+  `AWAITING_REPORT` identity behaviour, `EXPIRED` clearing the command,
+  `RAMPING` crediting `commanded − 1` even when `commanded == 1`, and the
+  StrEnum string serialisation.
+- **test_tesla_amp_parity.py**
+  behaviour parity against the pre-refactor `inflight_wh()`: literal Wh values
+  for rows 1–10, the six quirks (`C==1` / `R==1` inside and outside window,
+  `None` report between zeros, `turn_on` effect as newest Tesla effect on the
+  1 A path, `has_settle` false with open delta and expired effect, wall-clock
+  expiry vs fresh data-point clock and reverse, `current_qh` not changing the
+  result), and the orphan guard.
+- **test_tesla_amp_audit.py**
+  audit surface: one `debug` log line per state change (with state, command,
+  report, counter, reason), no log when the state does not change, and
+  `tesla_amp_state()` returning the same value as `classify()`.
 - **test_commit_tesla_direction.py**
   the 2026-10-08 7->5 cut (commit classifies direction from live amps when the command
   expired)

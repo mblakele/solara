@@ -36,7 +36,6 @@ from constants import (
     MIN_SAMPLES_FOR_PREDICTION,
     STALE_DATA_THRESHOLD_SECS,
     TESLA_ARBITRATION_COOLDOWN_SECS,
-    TESLA_CHARGE_AMPS_MIN_DEFAULT,
 )
 
 from config_loader import (
@@ -3460,9 +3459,14 @@ class LoadManager:
         if action.action == "turn_off":
             return await self._execute_tesla_stop()
         if action.action == "set_amps":
-            # Below the minimum charge rate the vehicle cannot reduce further —
-            # stop charging instead.
-            if action.target_amps is None or action.target_amps < TESLA_CHARGE_AMPS_MIN_DEFAULT:
+            # Below the configured minimum charge rate the vehicle cannot
+            # reduce further — stop charging instead. Use the configured
+            # minimum, not the constant, so the execution floor and the
+            # decision floor cannot disagree.
+            if (
+                action.target_amps is None
+                or action.target_amps < self.tesla_config.charge_amps_min
+            ):
                 return await self._execute_tesla_stop()
             clamped_amps = min(action.target_amps, self.tesla_config.charge_amps_max)
             clamped_amps = min(clamped_amps, GapMinder.HARD_MAX_AMPS)

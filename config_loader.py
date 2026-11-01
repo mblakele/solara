@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from load_models import TeslaSettings
 
 from config import Config, _config
+from constants import TESLA_CHARGE_AMPS_MIN_DEFAULT
 
 
 logger = logging.getLogger(__name__)
@@ -191,13 +192,27 @@ def load_tesla_settings() -> TeslaSettings:
 
     Returns:
         TeslaSettings with defaults when the section is absent.
+
+    Raises:
+        ValueError: When ``charge_amps_min`` is below the 5 A vehicle
+            minimum. The executor converts a sub-5 A ``set_amps`` into a
+            stop, so a lower configured value would record a command the
+            car never receives.
     """
     from load_models import TeslaSettings
 
     dc = device_config.get_tesla_config() or {}
+    charge_amps_min = int(
+        dc.get("charge_amps_min", TESLA_CHARGE_AMPS_MIN_DEFAULT)
+    )
+    if charge_amps_min < TESLA_CHARGE_AMPS_MIN_DEFAULT:
+        raise ValueError(
+            f"devices.json tesla.charge_amps_min={charge_amps_min} is below "
+            f"the vehicle minimum of {TESLA_CHARGE_AMPS_MIN_DEFAULT} A"
+        )
     return TeslaSettings(
         priority=int(dc.get("priority", 0)),
-        charge_amps_min=int(dc.get("charge_amps_min", 5)),
+        charge_amps_min=charge_amps_min,
         charge_amps_max=int(dc.get("charge_amps_max", 48)),
         home_radius_m=float(dc.get("home_radius_m", 500)),
         time_range=_parse_device_time_range(dc.get("time_range")),

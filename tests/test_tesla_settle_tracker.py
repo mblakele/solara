@@ -91,6 +91,24 @@ def test_settle_expires_across_qh():
     assert tracker.is_settling(FIXED_NOW, current_qh="QH1") is False
 
 
+def test_one_amp_confirmed_keeps_command_after_window():
+    """A 1 A command matched by a 1 A report is confirmed, not a stale ramp."""
+    tracker = _tracker(window_secs=60)
+    tracker.effects.add(_settle_effect(age_secs=300, direction="increase"))
+    tracker.record_command(1)
+    assert tracker.inflight_wh(1, 900, FIXED_NOW) == 0.0
+    assert tracker.last_commanded_amps == 1
+
+
+def test_one_amp_confirmed_keeps_command_inside_window():
+    """The confirmation also holds while the settle window is still open."""
+    tracker = _tracker(window_secs=60)
+    tracker.effects.add(_settle_effect(age_secs=10, direction="increase"))
+    tracker.record_command(1)
+    assert tracker.inflight_wh(1, 900, FIXED_NOW) == 0.0
+    assert tracker.last_commanded_amps == 1
+
+
 def test_state_tracker_delegates_command_state():
     """StateTracker.last_commanded_amps stays settable and in sync."""
     tracker = StateTracker()

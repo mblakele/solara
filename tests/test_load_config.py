@@ -15,6 +15,7 @@ from config_loader import (
     _parse_load_manage_enabled,
     load_plugs_from_file,
     load_tesla_config,
+    load_tesla_settings,
 )
 from load_controllers import PlugController
 from load_manager import LoadManager, LoadManagerConfig
@@ -113,6 +114,28 @@ def test_load_tesla_config_all_vars():
     assert tesla_config.home_lon == -122.4194
     assert tesla_config.redirect_uri == "http://localhost/callback"
     assert tesla_config.priority == 42
+
+
+def test_load_tesla_settings_rejects_min_below_vehicle_floor():
+    """A configured minimum below the 5 A vehicle floor fails at load."""
+    with patch("device_config._load", return_value={
+        "tesla": {"charge_amps_min": 4},
+    }):
+        device_config.reload()
+        with pytest.raises(
+            ValueError,
+            match=r"charge_amps_min=4.*vehicle minimum of 5",
+        ):
+            load_tesla_settings()
+
+
+def test_load_tesla_settings_accepts_vehicle_floor():
+    """The 5 A floor itself is a valid configured minimum."""
+    with patch("device_config._load", return_value={
+        "tesla": {"charge_amps_min": 5},
+    }):
+        device_config.reload()
+        assert load_tesla_settings().charge_amps_min == 5
 
 
 def test_load_tesla_config_missing_vehicle_id():

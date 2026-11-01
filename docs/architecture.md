@@ -637,6 +637,53 @@ this axiom before adding defensive checks.
   The threshold is `STALE_DATA_THRESHOLD_SECS` (80 seconds, constants.py) from the most
   recent per-second data point, accounting for Emporia API lag. Min toggle interval: 60 seconds.
 
+### Tesla amp state
+
+The in-flight Tesla amp command follows a seven-state lifecycle managed by
+`TeslaSettleTracker`. The classifier (`classify_tesla_amp` in `load_models.py`)
+is pure — it reads no clock and no store — and returns a frozen
+`TeslaAmpDecision`. The tracker computes three booleans (`has_settle`,
+`settle_open`, `command_window_open`) from its effects and applies the
+decision. `inflight_wh()` is the only writer; it calls `classify()`, mutates
+`last_commanded_amps` / `_zero_samples` per the decision, and returns the Wh
+credit.
+
+Transition table (rows are evaluated in order):
+
+| Trigger | Next state | `credit_amps` | `clear_command` | `zero_samples` |
+|---|---|---|---|---|
+| `commanded_amps is None` | `IDLE` | 0 | false | input |
+| `reported_amps is None` | `AWAITING_REPORT` | 0 | false | input |
+| `reported == 0`, next count < 2 | `AWAITING_STOP` | `commanded` | false | input + 1 |
+| `reported == 0`, next count ≥ 2 | `IDLE` | 0 | true | 0 |
+| `reported == commanded` | `CONFIRMED` | 0 | false | 0 |
+| `reported == 1`, window open | `RAMPING` | `commanded − 1` | false | 0 |
+| `reported == 1`, window closed | `EXPIRED` | 0 | true | 0 |
+| delta open, `has_settle`, not `settle_open` | `EXPIRED` | 0 | true | 0 |
+| delta open, otherwise | `SETTLING` | `commanded − reported` | false | 0 |
+
+Quirks preserved from the original code:
+
+1. A `None` report does **not** reset the zero counter.
+2. The 1 A branch reads `effects.latest_for("tesla")`, which is the newest
+   Tesla effect of any action, not only `set_amps`.
+3. The delta-path expiry needs `has_settle`. An undirected (`direction is None`)
+   `set_amps` effect never arms the gate.
+4. `_find_active()` returns `None` at the first expired matching effect; it does
+   not continue to an older but still fresh one.
+5. `prune_old_effects()` clears `last_commanded_amps` when the last `set_amps`
+   effect is pruned (the orphan guard).
+6. The counter is reset by `record_command()` only, never by effect pruning.
+
+The QH-boundary expiry rule (wall-clock vs data-point age) is reachable through
+the public `is_settling(current_qh=...)` API but is **not reachable from**
+`inflight_wh()`, which always passes `data_point_at=None`.
+
+Audit surface: `classify()` returns the full decision. `inflight_wh()` logs one
+`debug` line per state change (tracked via `_last_logged_state`).
+`StateTracker.tesla_amp_state()` is a thin read-only passthrough for tests and
+diagnostics; the state stays out of `to_dict()` and the JSON payload.
+
 ## EnergyCache & Incremental Fetch
 
 Sample contiguity and its consequences: see "Per-second sample contiguity" above.
