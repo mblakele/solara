@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from constants import DEFAULT_PREDICTION_WINDOW_SECS
-from load_models import PlugConfig, DeviceState, PendingEffect, TeslaState
+from load_models import PlugConfig, DeviceState, PendingEffect, PlugState, TeslaState
 from load_nbc import StateTracker, nominal_voltage
 
 fixed_now = datetime(2026, 5, 7, 15, 10, 0, tzinfo=timezone.utc)
@@ -425,6 +425,93 @@ class TestTeslaTelemetryState:
         tracker.pending_effects.append(make_settle_effect(age_secs=0, target_amps=16))
         d = tracker.to_dict()
         assert d["pending_effects"][0]["target_amps"] == 16
+
+
+class TestPlugStateProjection:
+    """PlugState is derived from snapshots, never stored."""
+
+    def _tracker(self) -> StateTracker:
+        tracker = StateTracker()
+        tracker.set_device_state(
+            "plug_on",
+            DeviceState(name="plug_on", desired_state=True, actual_state=True),
+        )
+        tracker.set_device_state(
+            "plug_off",
+            DeviceState(name="plug_off", desired_state=False, actual_state=False),
+        )
+        tracker.set_device_state(
+            "plug_pending",
+            DeviceState(name="plug_pending", desired_state=True, actual_state=False),
+        )
+        return tracker
+
+    def _effect(self, name: str, action: str) -> PendingEffect:
+        return PendingEffect(
+            device_name=name,
+            action=action,  # type: ignore[arg-type]
+            timestamp=fixed_now,
+            data_point_at=fixed_now,
+            power_watts=0.0,
+            target_amps=None,
+        )
+
+    def test_plug_states_projects_the_stored_pair(self) -> None:
+        """ON/OFF/PENDING come from desired vs actual."""
+        states = self._tracker().plug_states()
+        assert states["plug_on"] is PlugState.ON
+        assert states["plug_off"] is PlugState.OFF
+        assert states["plug_pending"] is PlugState.PENDING_ON
+
+    def test_to_dict_carries_state(self) -> None:
+        """to_dict() serializes the derived state as a string."""
+        data = self._tracker().to_dict()
+        assert data["devices"]["plug_on"]["state"] == "on"
+        assert data["devices"]["plug_off"]["state"] == "off"
+        assert data["devices"]["plug_pending"]["state"] == "pending_on"
+
+    def test_newest_effect_wins(self) -> None:
+        """The newest effect overrides the stored pair."""
+        tracker = self._tracker()
+        tracker.add_effect(self._effect("plug_pending", "turn_on"))
+        tracker.add_effect(self._effect("plug_pending", "turn_off"))
+        assert tracker.plug_states()["plug_pending"] is PlugState.PENDING_OFF
+        assert (
+            tracker.to_dict()["devices"]["plug_pending"]["state"]
+            == "pending_off"
+        )
+
+    def test_to_dict_state_is_point_in_time(self) -> None:
+        """A later mutation does not change an earlier serialized state."""
+        tracker = self._tracker()
+        data = tracker.to_dict()
+        tracker.set_device_state(
+            "plug_off",
+            DeviceState(name="plug_off", desired_state=True, actual_state=True),
+        )
+        assert data["devices"]["plug_off"]["state"] == "off"
+        assert tracker.plug_states()["plug_off"] is PlugState.ON
+
+    def test_load_status_carries_state(self) -> None:
+        """The JSON endpoint exposes the same derived state."""
+        import app as app_mod
+        from load_manager import LoadManager, LoadManagerConfig
+
+        lm = LoadManager(
+            LoadManagerConfig(dry_run=True, config_interval_secs=30)
+        )
+        lm.state.devices["plug_a"] = DeviceState(
+            name="plug_a", desired_state=True, actual_state=False
+        )
+
+        client = app_mod.app.test_client()
+        client.testing = True
+        with patch("app._get_load_manager", return_value=lm):
+            response = client.get("/api/v1/load/status")
+
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["devices"]["plugA"]["state"] == "pending_on"
 
 
 class TestTeslaInflightWh:

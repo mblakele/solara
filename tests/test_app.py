@@ -2834,6 +2834,36 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         """
         from flask import render_template
         import app as app_mod
+        from load_models import derive_plug_state
+
+        # Production builds `state` in StateTracker.to_dict(); mirror that
+        # here so the raw-dict fixtures stay focused on the template mapping.
+        devices = {
+            name: dict(
+                dev,
+                state=derive_plug_state(
+                    desired=dev.get("desired_state"),
+                    actual=dev.get("actual_state"),
+                    pending_action=next(
+                        (
+                            effect["action"]
+                            for effect in reversed(effects)
+                            if effect["device_name"] == name
+                        ),
+                        None,
+                    ),
+                    pending_amps=next(
+                        (
+                            effect.get("target_amps")
+                            for effect in reversed(effects)
+                            if effect["device_name"] == name
+                        ),
+                        None,
+                    ),
+                ).value,
+            )
+            for name, dev in devices.items()
+        }
 
         metrics = realistic_metrics()
         nbc = metrics["devices"][0]["nbc"]

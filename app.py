@@ -1338,7 +1338,9 @@ def load_status() -> Response:
         },
     }
 
-    for name, device_state in lm.state.snapshot_devices().items():
+    devices = lm.state.snapshot_devices()
+    effects = lm.state.snapshot_effects()
+    for name, device_state in devices.items():
         payload["devices"][name] = {
             "desired_state": device_state.desired_state,
             "actual_state": device_state.actual_state,
@@ -1348,9 +1350,12 @@ def load_status() -> Response:
                 if device_state.last_toggle
                 else None
             ),
+            "state": lm.state.plug_state_for(
+                device_state, effects
+            ).value,
         }
 
-    for effect in lm.state.snapshot_effects():
+    for effect in effects:
         payload["pending_effects"].append(
             {
                 "device_name": effect.device_name,

@@ -117,6 +117,15 @@ drift checks.
 - **test_sheddable_residual.py**
   the controllable-load residual prototype (net-of-lumpy counterfactual + replayed c658 / c817
   small-plug prescriptions, production unwired)
+- **test_plug_state.py**
+  the plug lifecycle truth table (`PlugState` derived from desired/actual plus the newest
+  pending effect; pending wins, `set_amps` at 0 A is pending-off, no observation is
+  `unknown`) and the string values the dashboard and JSON consume
+- **test_plug_transitions.py**
+  the `StateTracker` writers (`record_command`, `record_observation`, `record_toggle`) own
+  the stored facts: a command starts the observation window, an observation confirms it
+  without moving `last_toggle`, a repeat command does not restart it, and the daily
+  runtime books still move through `note_desired_transition`
 - **test_sync_external_effect.py**
   the external-flip reconcile (an actual change records the synthetic effect, debounce bump and
   runtime book; an unchanged reading past the observation window is adopted as reality — the

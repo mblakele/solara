@@ -20,7 +20,14 @@ import pytz
 
 from energy_cache import EnergyCache
 from config import Config
-from load_models import DeviceState, PendingEffect, TeslaState, TeslaVehicleTelemetry
+from load_models import (
+    DeviceState,
+    PendingEffect,
+    PlugState,
+    TeslaState,
+    TeslaVehicleTelemetry,
+    derive_plug_state,
+)
 
 from constants import (
     DEFAULT_HYSTERESIS_WH,
@@ -994,6 +1001,118 @@ class StateTracker:
         """Return an atomic copy of pending effects for cross-thread readers."""
         return self._effects.snapshot()
 
+    @staticmethod
+    def plug_state_for(
+        dev: DeviceState, effects: list[PendingEffect]
+    ) -> PlugState:
+        """Derive one device's lifecycle state from a snapshot.
+
+        The newest effect for the device wins, matching
+        ``EffectStore.latest_for()``. Sentinels and Tesla keep their own
+        presentation paths; this projection is defined for every device.
+
+        Args:
+            dev: Device state snapshot.
+            effects: Pending-effect snapshot.
+
+        Returns:
+            The derived plug lifecycle state.
+        """
+        latest = next(
+            (
+                effect
+                for effect in reversed(effects)
+                if effect.device_name == dev.name
+            ),
+            None,
+        )
+        return derive_plug_state(
+            desired=dev.desired_state,
+            actual=dev.actual_state,
+            pending_action=latest.action if latest is not None else None,
+            pending_amps=latest.target_amps if latest is not None else None,
+        )
+
+    def plug_states(self) -> dict[str, PlugState]:
+        """Return the derived lifecycle state for every tracked device.
+
+        Reads only snapshot copies, so the result is a consistent
+        point-in-time view for Flask request threads.
+
+        Returns:
+            Mapping of device name to derived state.
+        """
+        devices = self.snapshot_devices()
+        effects = self.snapshot_effects()
+        return {
+            name: self.plug_state_for(dev, effects)
+            for name, dev in devices.items()
+        }
+
+    def record_command(
+        self, name: str, desired: bool, now: datetime
+    ) -> PlugState:
+        """Record a wanted state and start its observation window.
+
+        The single command funnel for GapMinder decisions. It keeps the
+        daily runtime books in step with ``note_desired_transition`` and
+        moves ``last_toggle`` only when the wanted state actually changes,
+        matching the pre-extraction call sites.
+
+        Args:
+            name: Device name key.
+            desired: Wanted state (True = on).
+            now: Current wall-clock time.
+
+        Returns:
+            The derived lifecycle state after the command.
+        """
+        changed = self.note_desired_transition(name, desired, now)
+        if changed:
+            self.record_toggle(name, now)
+        with self._state_lock:
+            dev = self.devices.get(name)
+        if dev is None:
+            return PlugState.UNKNOWN
+        return self.plug_state_for(dev, self.snapshot_effects())
+
+    def record_observation(self, name: str, actual: bool) -> PlugState:
+        """Record a controller observation without reconciling desired state.
+
+        Creates the device on first sight with ``desired_state=None`` so a
+        first observation is never treated as an external flip.
+
+        Args:
+            name: Device name key.
+            actual: Reported state (True = on).
+
+        Returns:
+            The derived lifecycle state after the observation.
+        """
+        with self._state_lock:
+            dev = self.devices.get(name)
+            if dev is None:
+                dev = DeviceState(name=name, actual_state=actual)
+                self.devices[name] = dev
+            else:
+                dev.actual_state = actual
+        return self.plug_state_for(dev, self.snapshot_effects())
+
+    def record_toggle(self, name: str, now: datetime) -> None:
+        """Start the debounce and in-flight window for a device.
+
+        Called by the command and external-adoption paths; a plain
+        observation must not move it.
+
+        Args:
+            name: Device name key.
+            now: Current wall-clock time.
+        """
+        with self._state_lock:
+            dev = self.devices.get(name)
+            if dev is not None:
+                dev.last_toggle = now
+
     def set_device_state(self, name: str, state: DeviceState) -> None:
         """Insert or replace a device state under the state lock.
 
@@ -1409,6 +1528,8 @@ class StateTracker:
                 "plugged_in": self.tesla_telemetry_state.plugged_in,
                 "at_home": self.tesla_telemetry_state.at_home,
             }
+        devices = self.snapshot_devices()
+        effects = self.snapshot_effects()
         return {
             "devices": {name: {
                 "desired_state": ds.desired_state,
@@ -1416,7 +1537,8 @@ class StateTracker:
                 "current_amps": ds.current_amps,
                 "last_toggle": ds.last_toggle.isoformat()
                 if ds.last_toggle else None,
-            } for name, ds in self.snapshot_devices().items()},
+                "state": self.plug_state_for(ds, effects).value,
+            } for name, ds in devices.items()},
             "pending_effects": [{
                 "device_name": eff.device_name,
                 "action": eff.action,
@@ -1424,7 +1546,7 @@ class StateTracker:
                 "data_point_at": eff.data_point_at.isoformat(),
                 "power_watts": eff.power_watts,
                 "target_amps": eff.target_amps,
-            } for eff in self.snapshot_effects()],
+            } for eff in effects],
             "last_data_point_at": (self.last_data_point_at.isoformat()
                                    if self.last_data_point_at else None),
             "last_commanded_amps": self.last_commanded_amps,
@@ -2458,8 +2580,7 @@ class GapMinder:
                 )
                 remaining_gap -= capacity
                 if not ctx.dry_run:
-                    if ctx.state.note_desired_transition(name, True, ctx.now):
-                        ctx.state.devices[name].last_toggle = ctx.now
+                    ctx.state.record_command(name, True, ctx.now)
 
             else:
                 logger.debug(
@@ -2650,8 +2771,7 @@ class GapMinder:
             )
             remaining_reduction -= savings
             if not ctx.dry_run:
-                if ctx.state.note_desired_transition(name, False, ctx.now):
-                    ctx.state.devices[name].last_toggle = ctx.now
+                ctx.state.record_command(name, False, ctx.now)
             if remaining_reduction <= 0:
                 break
 

@@ -615,15 +615,24 @@ this axiom before adding defensive checks.
   `StateTracker.note_desired_transition()` (single funnel for GapMinder
   decisions and `_sync_plug_states` reconciliation; meter-local midnight
   resets/clips) and read via `runtime_today_for()` for alerts only
-- Dashboard pills (`templates/_metrics.html`) show `pending-on/off` (faded)
-  while a pending effect exists, else fall back to unconfirmed `desired_state`
-  mismatch (desired=True/actual=False → pending-on, desired=False/actual=True
-  → pending-off) so pruning before controller confirmation never flaps to
-  off/on; `_sync_plug_states` (`load_manager.py`) credits a mismatch to our own
+- Dashboard pills (`templates/_metrics.html`) read the derived `state`
+  (`PlugState` in `load_models.py`, computed by `derive_plug_state()`):
+  `on` -> solid green, `pending_on` -> faded green, `pending_off` -> blue,
+  `off`/`unknown` -> grey. The derivation is a pure projection over
+  `desired_state`, `actual_state`, and the newest pending effect (pending
+  wins; a `set_amps` effect at 0 A is pending-off). It is never stored, so
+  the stored facts remain the decision truth. Sentinels use their own branch;
+  Tesla keeps its amps-based branch. `StateTracker` exposes
+  `plug_state_for()` / `plug_states()` and serializes the value in
+  `to_dict()` and `/api/v1/load/status`. Command and observation writes go
+  through `record_command()` / `record_observation()` / `record_toggle()`,
+  which keep `note_desired_transition()` as the runtime-book funnel.
+  `_sync_plug_states` (`load_manager.py`) credits a mismatch to our own
   command for one observation window (`_command_may_be_in_flight`, sized from
   `effective_settle_secs`), then adopts the reported state so a command the
   plug never reported cannot hold `desired_state` forever. Covered by
-  `tests/test_desired_pending.py` and `tests/test_sync_external_effect.py`.
+  `tests/test_plug_state.py`, `tests/test_plug_transitions.py`,
+  `tests/test_desired_pending.py`, and `tests/test_sync_external_effect.py`.
 - Stale detection uses **data-point age** (not fetch time): `data_point_at = fetched_at - timedelta(seconds=data_lag_secs)`.
   The threshold is `STALE_DATA_THRESHOLD_SECS` (80 seconds, constants.py) from the most
   recent per-second data point, accounting for Emporia API lag. Min toggle interval: 60 seconds.

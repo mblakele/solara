@@ -48,6 +48,7 @@ class TestDesiredFallbackDisplay(unittest.TestCase):
         html = self._render(
             devices={
                 "water_heater": {
+                    "state": "pending_on",
                     "desired_state": True,
                     "actual_state": False,
                     "current_amps": None,
@@ -62,6 +63,7 @@ class TestDesiredFallbackDisplay(unittest.TestCase):
         html = self._render(
             devices={
                 "water_heater": {
+                    "state": "pending_off",
                     "desired_state": False,
                     "actual_state": True,
                     "current_amps": None,
@@ -70,6 +72,44 @@ class TestDesiredFallbackDisplay(unittest.TestCase):
             effects=[],
         )
         assert "device-pill--pending-off" in html
+
+
+class TestPlugStatePillMapping(unittest.TestCase):
+    """The template reads `state`; it does not re-derive it from the pair."""
+
+    def _render_state(self, state: str) -> str:
+        return TestDesiredFallbackDisplay()._render(
+            devices={
+                "water_heater": {
+                    "state": state,
+                    # Deliberately opposite to `state` so the test proves the
+                    # template trusts the derived field.
+                    "desired_state": False,
+                    "actual_state": False,
+                    "current_amps": None,
+                },
+            },
+            effects=[],
+        )
+
+    def test_on_maps_to_solid_green(self) -> None:
+        assert "device-pill--on" in self._render_state("on")
+
+    def test_off_maps_to_grey(self) -> None:
+        html = self._render_state("off")
+        assert "device-pill--off" in html
+        assert "device-pill--on" not in html
+
+    def test_pending_on_maps_to_faded_green(self) -> None:
+        assert "device-pill--pending-on" in self._render_state("pending_on")
+
+    def test_pending_off_maps_to_blue(self) -> None:
+        assert "device-pill--pending-off" in self._render_state("pending_off")
+
+    def test_unknown_maps_to_grey(self) -> None:
+        html = self._render_state("unknown")
+        assert "device-pill--off" in html
+        assert "device-pill--on" not in html
 
 
 class TestSyncPreservesUnconfirmedDesired(unittest.TestCase):

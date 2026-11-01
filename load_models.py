@@ -12,6 +12,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -234,6 +235,21 @@ class TeslaSettings:
     time_range: tuple[time, time] | None = None
 
 
+class PlugState(StrEnum):
+    """Lifecycle of one managed plug.
+
+    Derived from ``DeviceState.desired_state``, ``DeviceState.actual_state``
+    and the newest pending effect. It is never stored: the stored facts stay
+    the source of truth for decisions. See :func:`derive_plug_state`.
+    """
+
+    UNKNOWN = "unknown"
+    OFF = "off"
+    ON = "on"
+    PENDING_ON = "pending_on"
+    PENDING_OFF = "pending_off"
+
+
 @dataclass
 class DeviceState:
     """Runtime state of a managed device.
@@ -252,6 +268,47 @@ class DeviceState:
     on_since: datetime | None = None
     runtime_today_secs: float = 0.0
     runtime_day: date | None = None
+
+
+def derive_plug_state(
+    *,
+    desired: bool | None,
+    actual: bool | None,
+    pending_action: str | None = None,
+    pending_amps: int | None = None,
+) -> PlugState:
+    """Derive the plug lifecycle state from stored facts.
+
+    Pending effects win over the stored pair: an action was just issued and
+    the controller has not confirmed it yet. Without a pending effect, a
+    desired/actual mismatch is the unconfirmed-command state.
+
+    Args:
+        desired: Last wanted state, or None when never commanded.
+        actual: Last reported state, or None when never observed.
+        pending_action: Newest pending effect action for the device, if any.
+        pending_amps: Target amps for a ``set_amps`` effect.
+
+    Returns:
+        The derived plug lifecycle state.
+    """
+    if pending_action == "turn_on":
+        return PlugState.PENDING_ON
+    if pending_action == "turn_off":
+        return PlugState.PENDING_OFF
+    if pending_action == "set_amps":
+        if pending_amps == 0:
+            return PlugState.PENDING_OFF
+        return PlugState.PENDING_ON
+    if desired is True:
+        return PlugState.ON if actual is True else PlugState.PENDING_ON
+    if desired is False:
+        return PlugState.PENDING_OFF if actual is True else PlugState.OFF
+    if actual is True:
+        return PlugState.ON
+    if actual is False:
+        return PlugState.OFF
+    return PlugState.UNKNOWN
 
 
 @dataclass

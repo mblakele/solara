@@ -2066,18 +2066,13 @@ class LoadManager:
             dev_state = self.state.devices.get(name)
             if dev_state is None:
                 # First time seeing this plug's state
-                self.state.set_device_state(
-                    name,
-                    DeviceState(
-                        name=name, actual_state=actual, desired_state=None
-                    ),
-                )
+                self.state.record_observation(name, actual)
                 self.state.note_desired_transition(
                     name, actual, self._clock.now()
                 )
             else:
                 prev_actual = dev_state.actual_state
-                dev_state.actual_state = actual
+                self.state.record_observation(name, actual)
                 if prev_actual == actual and self._command_may_be_in_flight(
                     dev_state
                 ):
@@ -2162,9 +2157,7 @@ class LoadManager:
         action: Literal["turn_on", "turn_off"] = "turn_on" if actual else "turn_off"
         effect = make_plug_effect(name, action, power, now, now)
         self.state.add_effect(effect)
-        dev_state = self.state.devices.get(name)
-        if dev_state is not None:
-            dev_state.last_toggle = now
+        self.state.record_toggle(name, now)
         return effect
 
     def _runtime_for_actions(

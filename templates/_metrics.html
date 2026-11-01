@@ -136,27 +136,15 @@
         {% set pending_action = pending.action %}
         {% set pending_amps = pending.amps %}
         {# Pill color: sentinel on -> red, sentinel off -> grey (pending
-           effects never apply to sentinels); pending turn_off -> blue,
-           pending turn_on / set_amps -> faded green; unconfirmed
-           desired (no pending effect but desired != actual) -> faded
-           pending so the pill never flaps to off/on between "pending on"
-           and on; otherwise on -> solid green, off -> grey. Tesla counts
-           as on (green) only when charging; stopped or unavailable
-           renders grey. #}
+           effects never apply to sentinels); Tesla counts as on (green)
+           only when charging, stopped or unavailable renders grey; every
+           other device uses the derived `state` (on -> solid green,
+           pending_on -> faded green, pending_off -> blue, off/unknown ->
+           grey). The derivation lives in load_models.derive_plug_state. #}
         {% set pill_class = "device-pill--off" %}
         {% if is_sentinel %}
         {% if dev.actual_state %}
         {% set pill_class = "device-pill--sentinel-on" %}
-        {% endif %}
-        {% elif pending_action == "turn_off" %}
-        {% set pill_class = "device-pill--pending-off" %}
-        {% elif pending_action == "turn_on" %}
-        {% set pill_class = "device-pill--pending-on" %}
-        {% elif pending_action == "set_amps" %}
-        {% if pending_amps is not none and pending_amps == 0 %}
-        {% set pill_class = "device-pill--pending-off" %}
-        {% else %}
-        {% set pill_class = "device-pill--pending-on" %}
         {% endif %}
         {% elif name == "tesla" %}
         {% if dev.current_amps is not none %}
@@ -166,12 +154,15 @@
         {% elif dev.actual_state %}
         {% set pill_class = "device-pill--on" %}
         {% endif %}
-        {% elif dev.desired_state is sameas true and not dev.actual_state %}
-        {% set pill_class = "device-pill--pending-on" %}
-        {% elif dev.desired_state is sameas false and dev.actual_state %}
-        {% set pill_class = "device-pill--pending-off" %}
-        {% elif dev.actual_state %}
+        {% else %}
+        {% set plug_state = dev.state if dev.state is defined else "unknown" %}
+        {% if plug_state == "on" %}
         {% set pill_class = "device-pill--on" %}
+        {% elif plug_state == "pending_on" %}
+        {% set pill_class = "device-pill--pending-on" %}
+        {% elif plug_state == "pending_off" %}
+        {% set pill_class = "device-pill--pending-off" %}
+        {% endif %}
         {% endif %}
         {# Label: plain device name for plugs (state carried by color);
            Tesla appends amps in parens when charging, or old>new while a
