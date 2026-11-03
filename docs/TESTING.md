@@ -126,6 +126,15 @@ drift checks.
   audit surface: one `debug` log line per state change (with state, command,
   report, counter, reason), no log when the state does not change, and
   `tesla_amp_state()` returning the same value as `classify()`.
+- **test_tesla_arbitration_machine.py**
+  the REST arbitration verdict state machine: every row of the transition table,
+  the exact 300 s cooldown boundary, the `UNKNOWN`/`CHARGING`/`IDLE` invariants,
+  the transport-failure no-op, and one debug line per verdict change.
+- **test_tesla_arbitration_parity.py**
+  observable parity for the REST arbitration path: one poll for an external
+  session, sustain inside the cooldown, re-poll after it, negative-answer
+  cooling, zero-amps clearing without resetting the poll clock, the stop reset,
+  transport-failure retry, the time-range gate, and corroborated-idle clearing.
 - **test_commit_tesla_direction.py**
   the 2026-10-08 7->5 cut (commit classifies direction from live amps when the command
   expired)

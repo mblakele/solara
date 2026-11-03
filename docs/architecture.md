@@ -355,9 +355,25 @@ this axiom before adding defensive checks.
   `_commanded_charge_echo()` trusts positive amps under an active command (the car
   answering us; bugs/2026-09-11-tesla-ghost-c.log), and `_arbitrate_tesla_state_from_rest()`
   polls REST `charge_state` for ambiguous (positive, uncorroborated, uncommanded) amps —
-  load manager never starts charging itself, so every session begins this way. Polls are
-  spaced `TESLA_ARBITRATION_COOLDOWN_SECS` (300 s) apart (definitive answers only — transport failures such as 408 offline leave the timestamp untouched so the next cycle retries instead of latching idle; bugs/2026-10-08-tesla-ghost.log); the verdict is sustained while
-  amps stay positive and cleared on amps-zero, corroborated idle, or our own stop command
+  load manager never starts charging itself, so every session begins this way. The verdict
+  and poll clock live in `RestArbitrationMachine` (`tesla_arbitration.py`); every transition
+  has one owner:
+
+  | Event | State | Poll clock |
+  |---|---|---|
+  | `record_answer(now, charging=True)` | `CHARGING` | `now` |
+  | `record_answer(now, charging=False)` | `IDLE` | `now` |
+  | `observe_amps(None or <= 0)` | `IDLE` | unchanged |
+  | `note_corroborated_idle()` | `IDLE` | unchanged |
+  | `note_commanded_change()` | `IDLE` | unchanged |
+  | `record_transport_failure()` | unchanged | unchanged |
+
+  Polls are spaced `TESLA_ARBITRATION_COOLDOWN_SECS` (300 s) apart. Only a definitive
+  answer starts the cooldown; a transport failure such as 408 offline changes nothing, so
+  the next cycle retries instead of latching idle (bugs/2026-10-08-tesla-ghost.log).
+  Clearing the verdict keeps the poll clock, so a cleared verdict still blocks a re-poll
+  until the cooldown ends. `sustains(now)` is true only for `CHARGING` inside the cooldown.
+  The commit stage emits `note_commanded_change()` after a Tesla `turn_on`/`turn_off`
   (prevents a trim-restart loop). When live telemetry parses to `None` with no echo and
   no arbitration answer, the vehicle is treated as idle/disconnected — a not-charging
   `TeslaState` is returned (`current_amps=0`, `plugged_in=False`, `at_home` from live
@@ -740,6 +756,7 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
 | NBC reading, EffectStore / TeslaSettleTracker / StateTracker, TeslaDecider + GapMinder bin-packing | `load_nbc.py` |
 | Gap EWMA slope tracker (ramp-aware Tesla stop) | `gap_trend.py` |
 | Load cycle orchestration, OAuth, notifications queue | `load_manager.py` |
+| REST arbitration verdict state machine and poll cooldown | `tesla_arbitration.py` |
 | Device controllers (HomeKit, Tesla, Vocolinc), factories | `load_controllers.py` |
 | Vocolinc cloud API client | `vocolinc.py` |
 | Shared data models, telemetry parsing helpers | `load_models.py` |

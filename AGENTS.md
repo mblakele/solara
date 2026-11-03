@@ -204,6 +204,7 @@ quantization.py        # N-second constant-window detection
 sse_event.py           # SSE broadcaster and event stream
 telegram.py            # TelegramSender, NotificationEvent
 telegram_client.py     # Async Telegram Bot API client
+tesla_arbitration.py   # REST arbitration verdict state machine and cooldown
 tesla_oauth.py         # Tesla OAuth blueprint and token flow
 util.py                # Timezone, JSON, and quarter-hour helpers
 vocolinc.py            # VOCOlinc cloud API client

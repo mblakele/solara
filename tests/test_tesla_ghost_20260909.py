@@ -20,6 +20,7 @@ from unittest.mock import patch
 from load_manager import LoadManager, LoadManagerConfig
 from load_models import TeslaConfig, TeslaState, PendingEffect
 from mqtt_telemetry import tesla_state_from_snapshot
+from tesla_arbitration import ArbitrationState
 
 
 def test_snapshot_amps_alone_returns_none():
@@ -501,8 +502,8 @@ def test_stop_clears_arbitration_latch():
     from load_models import CycleContext
 
     mgr = _make_lm()
-    mgr._last_rest_arbitration_charging = True  # noqa: SLF001
     now = datetime(2026, 9, 11, 21, 2, 53, tzinfo=timezone.utc)
+    mgr.tesla_arbitration.record_answer(now, charging=True)
     ctx = CycleContext(now=now, force=False)
     ctx.sentinel_on = False
     ctx.qh_name = "QH1"
@@ -523,7 +524,7 @@ def test_stop_clears_arbitration_latch():
         )
     ]
     mgr._stage_commit(ctx)  # noqa: SLF001
-    assert mgr._last_rest_arbitration_charging is False  # noqa: SLF001
+    assert mgr.tesla_arbitration.state == ArbitrationState.IDLE
 
 
 def test_arbitration_transport_failure_does_not_latch_cooldown():
@@ -533,7 +534,7 @@ def test_arbitration_transport_failure_does_not_latch_cooldown():
     uncorroborated 8A, REST returned 408 vehicle-offline, and the failure
     latched a 300 s idle verdict while the car was actually charging (Tesla
     app). The next poll only ran after cooldown expiry and failed again.
-    A transport failure must leave _last_rest_arbitration_at unset so the
+    A transport failure must leave the poll clock unset so the
     next cycle retries instead of reporting idle for 5 minutes.
     """
     from clock import FakeClock
@@ -555,9 +556,74 @@ def test_arbitration_transport_failure_does_not_latch_cooldown():
         state1, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
         assert state1 is not None and state1.is_charging is False
         assert mock_rest.call_count == 1
-        assert mgr._last_rest_arbitration_at is None  # noqa: SLF001
+        assert mgr.tesla_arbitration.last_poll_at is None  # noqa: SLF001
         # Next cycle retries immediately instead of serving a latched idle.
         clock.advance(60)
         state2, _, _ = asyncio.run(mgr._fetch_tesla_state_async())
         assert state2 is not None and state2.is_charging is False
         assert mock_rest.call_count == 2
+
+
+def test_display_refresh_clears_arbitration_on_zero_amps():
+    """Zero amps ends the session, even on an early-exit display refresh."""
+    from clock import FakeClock
+
+    clock = FakeClock()
+    mgr, _ = _make_lm_with_real_ctrl_and_clock(clock)
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    mgr.tesla_arbitration.record_answer(clock.now(), charging=True)
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 0},
+        ),
+    ):
+        mgr._refresh_tesla_display_from_telemetry()  # noqa: SLF001
+    assert mgr.tesla_arbitration.state == ArbitrationState.IDLE
+    dev = mgr.state.devices.get("tesla")
+    assert dev is not None
+    assert dev.actual_state is False
+
+
+def test_display_refresh_clears_arbitration_on_corroborated_idle():
+    """Authoritative idle telemetry ends the session on the display path."""
+    from clock import FakeClock
+
+    clock = FakeClock()
+    mgr, _ = _make_lm_with_real_ctrl_and_clock(clock)
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    mgr.tesla_arbitration.record_answer(clock.now(), charging=True)
+    snapshot = {
+        "DetailedChargeState": "DetailedChargeStateComplete",
+        "ChargeAmps": 5.0,
+    }
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch("load_manager.get_telemetry_snapshot", return_value=snapshot),
+    ):
+        mgr._refresh_tesla_display_from_telemetry()  # noqa: SLF001
+    assert mgr.tesla_arbitration.state == ArbitrationState.IDLE
+
+
+def test_display_refresh_sustains_charging_inside_cooldown():
+    """Positive amps inside the cooldown still sustain the verdict."""
+    from clock import FakeClock
+
+    clock = FakeClock()
+    mgr, _ = _make_lm_with_real_ctrl_and_clock(clock)
+    mgr._last_tesla_at_home = True  # noqa: SLF001
+    mgr.tesla_arbitration.record_answer(clock.now(), charging=True)
+    with (
+        patch("load_manager.has_telemetry", return_value=True),
+        patch(
+            "load_manager.get_telemetry_snapshot",
+            return_value={"ChargeAmps": 11.0},
+        ),
+    ):
+        mgr._refresh_tesla_display_from_telemetry()  # noqa: SLF001
+    assert mgr.tesla_arbitration.state == ArbitrationState.CHARGING
+    dev = mgr.state.devices.get("tesla")
+    assert dev is not None
+    assert dev.actual_state is True
+    assert dev.current_amps == 11

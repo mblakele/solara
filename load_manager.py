@@ -35,7 +35,6 @@ from constants import (
     DEFAULT_SLEEP_HINT_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
     STALE_DATA_THRESHOLD_SECS,
-    TESLA_ARBITRATION_COOLDOWN_SECS,
 )
 
 from config_loader import (
@@ -103,6 +102,8 @@ from quantization import usable_window
 from energy_cache import EnergyCache
 
 from gap_trend import GapTrendTracker
+
+from tesla_arbitration import RestArbitrationMachine
 
 from metrics import DriftAlert, drain_drift_alerts
 
@@ -410,12 +411,9 @@ class LoadManager:
         # GapMinder doesn't incorrectly block Tesla decisions.
         self._last_tesla_at_home: bool | None = None
         # REST arbitration verdict for ambiguous telemetry (positive but
-        # uncorroborated ChargeAmps, no active command). _last_at stamps the
-        # most recent poll; _charging holds its answer, sustained between
-        # polls while amps stay positive so decisions don't flap. Cleared
-        # when amps drop to zero and when we command a stop.
-        self._last_rest_arbitration_at: datetime | None = None
-        self._last_rest_arbitration_charging: bool = False
+        # uncorroborated ChargeAmps, no active command). The machine holds
+        # the verdict and the poll clock, and owns every transition.
+        self.tesla_arbitration = RestArbitrationMachine()
         # Anti-spam dedup: tracks the last auth error text sent to Telegram so we
         # only send one alert per unique error message (not one per 30 s cycle).
         self._last_auth_error_msg: str | None = None
@@ -858,10 +856,12 @@ class LoadManager:
             elif effect.device_name == "tesla" and effect.action in ("turn_off", "turn_on"):
                 self.state.record_tesla_amp_command(None)
                 self.state.clear_tesla_settle_effects()
-                # Our stop invalidates any confirmed-charging arbitration
+                # Our command invalidates any confirmed-charging arbitration
                 # verdict — without this the sustained verdict could
                 # re-trigger a trim and restart the car we just stopped.
-                self._last_rest_arbitration_charging = False
+                self.tesla_arbitration.note_commanded_change(
+                    now=now_postfetch,
+                )
             self.state.add_effect(effect)
 
         # Sync Tesla entry in devices from live vehicle state.
@@ -1052,15 +1052,21 @@ class LoadManager:
         Telemetry-only: never touches REST or the network. Uncorroborated
         amps (no charging state) display as idle via the same ghost-guard
         rule as the async phase, except when the amps echo an active
-        command (see _commanded_charge_echo). When ``at_home`` is unseeded
-        and ``Location`` is absent, the display is left alone for the async
-        phase REST fallback to resolve.
+        command (see _commanded_charge_echo). The display path reports the
+        same arbitration events as the async phase, so zero or absent amps
+        and corroborated idle clear the verdict here too. When ``at_home``
+        is unseeded and ``Location`` is absent, the display is left alone
+        for the async phase REST fallback to resolve.
         """
         if self.tesla_ctrl is None or not has_telemetry():
             return
         snapshot = get_telemetry_snapshot()
         state = tesla_state_from_snapshot(snapshot)
         if state is not None:
+            if not state.is_charging:
+                self.tesla_arbitration.note_corroborated_idle(
+                    now=self._clock.now(),
+                )
             if "Location" in snapshot:
                 self._last_tesla_at_home = state.at_home
             elif self._last_tesla_at_home is not None:
@@ -1080,8 +1086,10 @@ class LoadManager:
             self.state.sync_tesla_device_state(echo)
             return
         reported = parse_charge_amps(snapshot.get("ChargeAmps"))
+        now = self._clock.now()
+        self.tesla_arbitration.observe_amps(reported, now=now)
         if reported is not None and reported > 0:
-            sustained = self._arbitration_sustain(snapshot, reported)
+            sustained = self._arbitration_sustain(snapshot, reported, now)
             if sustained is not None:
                 self.state.sync_tesla_device_state(sustained)
                 return
@@ -1180,33 +1188,24 @@ class LoadManager:
         )
 
     def _arbitration_sustain(
-        self, snapshot: dict[str, Any], reported_amps: int,
+        self, snapshot: dict[str, Any], reported_amps: int, now: datetime,
     ) -> TeslaState | None:
         """Report charging from a fresh REST arbitration verdict.
 
-        Returns a charging state at the live MQTT amps when the most
-        recent arbitration poll confirmed charging and its cooldown has
-        not elapsed. Amps dropping to zero clears the verdict immediately
-        (the session ended — no need to wait for a re-poll).
+        Read-only: the machine owns the verdict and every transition. The
+        caller must pass positive ``reported_amps``; ``observe_amps()`` owns
+        the zero-amps clear.
 
         Args:
             snapshot: Telemetry snapshot dict.
             reported_amps: Parsed positive ChargeAmps value.
+            now: Current time for the cooldown check.
 
         Returns:
             Charging ``TeslaState`` at ``reported_amps``, or ``None``
             when no fresh confirmed verdict exists.
         """
-        if reported_amps <= 0:
-            self._last_rest_arbitration_charging = False
-            return None
-        if not self._last_rest_arbitration_charging:
-            return None
-        last_at = self._last_rest_arbitration_at
-        if last_at is None:
-            return None
-        age = (self._clock.now() - last_at).total_seconds()
-        if age >= TESLA_ARBITRATION_COOLDOWN_SECS:
+        if not self.tesla_arbitration.sustains(now):
             return None
         if "Location" in snapshot:
             at_home = _compute_at_home_from_location(snapshot)
@@ -1236,7 +1235,8 @@ class LoadManager:
         spaced at least ``TESLA_ARBITRATION_COOLDOWN_SECS`` apart; between
         polls the last confirmed answer is sustained (see
         :meth:`_arbitration_sustain`). A negative answer is also latched
-        for the cooldown so ghost periods don't poll-storm.
+        for the cooldown so ghost periods don't poll-storm. The verdict and
+        poll clock live in :class:`RestArbitrationMachine`.
 
         Skipped entirely outside the configured tesla.time_range window:
         the state would be discarded by eligibility filtering anyway, so
@@ -1255,21 +1255,17 @@ class LoadManager:
         if not self._is_tesla_in_range(effective_now):
             return None
         reported = parse_charge_amps(snapshot.get("ChargeAmps"))
+        self.tesla_arbitration.observe_amps(reported, now=effective_now)
         if reported is None or reported <= 0:
-            self._last_rest_arbitration_charging = False
             return None
         if not isinstance(self.tesla_ctrl, RealTeslaController):
             return None
-        sustained = self._arbitration_sustain(snapshot, reported)
+        sustained = self._arbitration_sustain(
+            snapshot, reported, effective_now,
+        )
         if sustained is not None:
             return sustained
-        now = effective_now
-        last_at = self._last_rest_arbitration_at
-        if (
-            last_at is not None
-            and (now - last_at).total_seconds()
-            < TESLA_ARBITRATION_COOLDOWN_SECS
-        ):
+        if not self.tesla_arbitration.needs_poll(effective_now):
             return None
         logger.debug(
             "tesla REST arbitration: polling charge_state for "
@@ -1278,20 +1274,23 @@ class LoadManager:
         )
         rest_state = await self.tesla_ctrl._init_from_rest(snapshot=None)  # noqa: SLF001
         if rest_state is not None and rest_state.is_charging:
-            self._last_rest_arbitration_at = now
-            self._last_rest_arbitration_charging = True
+            self.tesla_arbitration.record_answer(
+                effective_now, charging=True,
+            )
             self._last_tesla_at_home = rest_state.at_home
             return rest_state
         if rest_state is not None:
             # Definitive idle answer: latch the cooldown so ghost periods
             # don't poll-storm.
-            self._last_rest_arbitration_at = now
-            self._last_rest_arbitration_charging = False
+            self.tesla_arbitration.record_answer(
+                effective_now, charging=False,
+            )
             return None
         # Transport failure (408 offline, timeouts — bugs/2026-10-08-tesla-ghost.log
         # c95): not an answer. Leave the timestamp and verdict untouched so the
         # next cycle retries instead of serving a latched idle for 5 minutes
         # while the car is actually charging.
+        self.tesla_arbitration.record_transport_failure()
         return None
 
     def _stage_pending_check(
@@ -1912,7 +1911,9 @@ class LoadManager:
                     # Corroborated idle (e.g. DetailedChargeState Complete
                     # while the pilot lingers): authoritative, so drop any
                     # stale arbitration verdict.
-                    self._last_rest_arbitration_charging = False
+                    self.tesla_arbitration.note_corroborated_idle(
+                        now=effective_now,
+                    )
                 # Track at_home from Location snapshots; preserve the last
                 # known at_home when Location is absent so the
                 # requires_home_check gate doesn't block Tesla decisions.
