@@ -3,7 +3,8 @@ Data classes and abstract interfaces for load management, plus small
 shared parsing helpers (unwrap_telemetry_value, parse_charge_amps) used by
 both mqtt_telemetry and load_controllers.
 
-Pure data structures, ABCs, and pure functions — no business logic, no I/O.
+Pure data structures, ABCs, pure functions, and pure decision classifiers —
+no I/O.
 """
 
 from __future__ import annotations

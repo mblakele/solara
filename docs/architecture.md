@@ -590,7 +590,7 @@ this axiom before adding defensive checks.
    backward compat plus thin delegating methods.
 - TeslaSettleTracker class (load_nbc.py) owns the in-flight Tesla amp command
    (`last_commanded_amps`, zero-sample confirmation): `record_command()`,
-   `inflight_wh()` (with `_inflight_zero()` / `_inflight_one_amp()` helpers),
+   `classify()` / `inflight_wh()` (see "Tesla amp state" below),
    `get_active()` / `is_settling()` sharing one `_find_active()` lookup
    (dual wall-clock + data-point age, QH-boundary expiry). StateTracker keeps
    a `last_commanded_amps` property plus delegating `tesla_inflight_wh()`,
@@ -645,8 +645,8 @@ is pure — it reads no clock and no store — and returns a frozen
 `TeslaAmpDecision`. The tracker computes three booleans (`has_settle`,
 `settle_open`, `command_window_open`) from its effects and applies the
 decision. `inflight_wh()` is the only writer; it calls `classify()`, mutates
-`last_commanded_amps` / `_zero_samples` per the decision, and returns the Wh
-credit.
+`last_commanded_amps` / `_zero_amp_samples` per the decision, and returns the
+Wh credit.
 
 Transition table (rows are evaluated in order):
 
@@ -675,9 +675,10 @@ Quirks preserved from the original code:
    effect is pruned (the orphan guard).
 6. The counter is reset by `record_command()` only, never by effect pruning.
 
-The QH-boundary expiry rule (wall-clock vs data-point age) is reachable through
-the public `is_settling(current_qh=...)` API but is **not reachable from**
-`inflight_wh()`, which always passes `data_point_at=None`.
+Wall-clock and data-point-age expiry are reachable from `inflight_wh()`.
+The QH-boundary rule (`qh_name != current_qh`) is reachable through the public
+`is_settling(current_qh=...)` API but is **not reachable from** `inflight_wh()`,
+which never passes `current_qh`.
 
 Audit surface: `classify()` returns the full decision. `inflight_wh()` logs one
 `debug` line per state change (tracked via `_last_logged_state`).

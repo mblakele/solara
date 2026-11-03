@@ -37,6 +37,14 @@ def test_no_command_is_idle() -> None:
     assert decision.reason == "idle"
 
 
+def test_idle_keeps_a_nonzero_counter() -> None:
+    """No command must not move an already-applied zero counter."""
+    decision = decide(commanded_amps=None, zero_samples=1)
+    assert decision.state is TeslaAmpState.IDLE
+    assert decision.zero_samples == 1
+    assert decision.clear_command is False
+
+
 def test_no_report_keeps_the_command_and_counter() -> None:
     """A missing report must not move anything, including the counter."""
     decision = decide(reported_amps=None, zero_samples=1)
@@ -130,11 +138,13 @@ def test_delta_outside_every_settle_window_expires() -> None:
     """A directed settle effect plus closed windows clears a stale delta."""
     decision = decide(
         reported_amps=10,
+        zero_samples=1,
         has_settle=True,
         settle_open=False,
     )
     assert decision.state is TeslaAmpState.EXPIRED
     assert decision.clear_command is True
+    assert decision.zero_samples == 0
     assert decision.reason == "settle_expired"
 
 
@@ -243,12 +253,15 @@ def test_classify_awaits_a_report_without_moving_the_counter() -> None:
 
 
 def test_classify_counts_zero_frames() -> None:
-    """The tracker feeds its applied counter into the classifier."""
+    """The tracker feeds its stored counter into the classifier."""
     t = _tracker()
     t.record_command(18)
     t.inflight_wh(0, 900, NOW)
     assert t._zero_amp_samples == 1
-    assert t.classify(0, NOW).state is TeslaAmpState.AWAITING_STOP
+    # A second zero would confirm the stop, but classify() is read-only.
+    assert t.classify(0, NOW).state is TeslaAmpState.IDLE
+    assert t.classify(0, NOW).clear_command is True
+    assert t.last_commanded_amps == 18
     t.inflight_wh(0, 900, NOW)
     assert t.last_commanded_amps is None
 

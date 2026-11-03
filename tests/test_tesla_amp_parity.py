@@ -25,8 +25,6 @@ test fails after the refactor, the refactor drifted.
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from load_models import PendingEffect
 from load_nbc import EffectStore, StateTracker, TeslaSettleTracker
 
@@ -269,6 +267,19 @@ class TestQuirks:
         assert result == 0.0
         assert tracker.last_commanded_amps is None
 
+    def test_quirk_fresh_turn_on_keeps_the_ramp_credit(self):
+        """Quirk 3: a fresh turn_on effect opens the window on the 1 A path.
+
+        An implementation that reads only set_amps effects would treat the
+        window as closed and clear the command.
+        """
+        tracker = _tracker(window_secs=60)
+        tracker.effects.add(_turn_on_effect(age_secs=10))
+        tracker.record_command(18)
+        result = tracker.inflight_wh(1, SECONDS_REMAINING_900, FIXED_NOW)
+        assert result == WH_C17_R1_S900
+        assert tracker.last_commanded_amps == 18
+
 
 # ── has_settle false with open delta and expired effect ───────────────────
 
@@ -359,15 +370,16 @@ class TestQHIndependence:
     """inflight_wh() never receives current_qh — it must be QH-independent."""
 
     def test_inflight_wh_same_across_qh(self):
-        """Same C, R, seconds → same Wh regardless of which QH the effect is in."""
-        tracker = _tracker()
-        tracker.record_command(18)
-        # inflight_wh does not accept current_qh.
-        result_a = tracker.inflight_wh(10, SECONDS_REMAINING_900, FIXED_NOW)
-        assert result_a == 480.0
+        """The effect's QH does not change the inflight_wh() credit."""
+        for qh in ("QH1", "QH2"):
+            tracker = _tracker(window_secs=60)
+            tracker.effects.add(_settle_effect(age_secs=10, qh_name=qh))
+            tracker.record_command(18)
+            result = tracker.inflight_wh(10, SECONDS_REMAINING_900, FIXED_NOW)
+            assert result == 480.0
 
     def test_state_tracker_is_settling_respects_qh(self):
-        """StateTracker.is_settling() does respect QH — but inflight_wh() doesn't use it."""
+        """is_settling() respects QH; inflight_wh() does not pass current_qh."""
         tracker = StateTracker(prediction_window_seconds=30)
         effect = PendingEffect(
             device_name="tesla",
@@ -380,10 +392,13 @@ class TestQHIndependence:
             qh_name="QH2",
         )
         tracker.add_effect(effect)
+        tracker.last_commanded_amps = 18
         # is_settling with a different QH → False (QH-boundary expiry).
         assert tracker.is_settling(FIXED_NOW, current_qh="QH1") is False
-        # But inflight_wh() doesn't pass current_qh — it uses is_settling()
-        # without direction constraints for the settle-expired gate.
+        # inflight_wh() ignores the QH boundary and still credits the delta.
+        assert tracker.tesla_inflight_wh(
+            10, SECONDS_REMAINING_900, FIXED_NOW
+        ) == 480.0
 
 
 # ── Orphan guard ─────────────────────────────────────────────────────────

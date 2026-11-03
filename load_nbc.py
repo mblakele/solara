@@ -677,12 +677,9 @@ class TeslaSettleTracker:
         """Classify the current observation without mutating state.
 
         Builds ``has_settle``, ``settle_open``, and ``command_window_open``
-        from ``self.effects`` and delegates to the pure classifier.
-
-        For ``reported_amps == 0`` the tracker's ``_zero_amp_samples`` is an
-        already-applied count (incremented by ``inflight_wh`` before calling
-        this method).  The pure classifier expects a pre-increment count, so
-        we subtract one when the counter is positive.
+        from ``self.effects`` and delegates to the pure classifier with the
+        current zero-sample counter. The returned ``zero_samples`` is the
+        value that ``inflight_wh()`` must store.
 
         Args:
             reported_amps: Amps reported by the vehicle this cycle, or None.
@@ -708,15 +705,10 @@ class TeslaSettleTracker:
         command_window_open = self._command_window_open(
             now, data_point_at=data_point_at
         )
-        # _zero_amp_samples is an already-applied count.  The pure classifier
-        # expects a pre-increment count, so subtract one when positive.
-        raw = self._zero_amp_samples
-        if reported_amps == 0 and raw > 0:
-            raw -= 1
         return classify_tesla_amp(
             commanded_amps=self.last_commanded_amps,
             reported_amps=reported_amps,
-            zero_samples=raw,
+            zero_samples=self._zero_amp_samples,
             has_settle=has_settle,
             settle_open=settle_open,
             command_window_open=command_window_open,
@@ -725,22 +717,14 @@ class TeslaSettleTracker:
     def _apply_decision(self, decision: TeslaAmpDecision) -> None:
         """Apply the side-effects of a classifier decision.
 
-        Only updates ``_zero_amp_samples`` when the new value differs from
-        the current one — this prevents non-zero branches (which reset to 0)
-        from overwriting an incremented zero-amp counter that was set by
-        :meth:`classify`.
-
-        Zero-sample convention: ``inflight_wh()`` increments
-        ``_zero_amp_samples`` *before* calling ``classify()``, so the
-        classifier receives a pre-increment count and subtracts 1 back when
-        it sees ``reported_amps == 0``.  This keeps ``classify()`` pure and
-        read-only — it never mutates state, only returns what to mutate.
+        Stores the classifier's counter value and clears the command when
+        the decision says the command is stale. The classifier is pure, so
+        this method is the only writer of the tracked amp state.
 
         Args:
             decision: Outcome from :meth:`classify`.
         """
-        if self._zero_amp_samples != decision.zero_samples:
-            self._zero_amp_samples = decision.zero_samples
+        self._zero_amp_samples = decision.zero_samples
         if decision.clear_command:
             self.last_commanded_amps = None
 
@@ -774,11 +758,8 @@ class TeslaSettleTracker:
         Returns:
             Wh still expected from the in-flight amp delta.
         """
-        # Increment the zero-amp counter before classify().  The pure
-        # classifier expects a pre-increment count; inflight_wh handles the
-        # increment so classify() stays read-only.
-        if reported_amps == 0:
-            self._zero_amp_samples += 1
+        # The command can clear below, so keep the in-force value for the log.
+        commanded = self.last_commanded_amps
         decision = self.classify(reported_amps, now, data_point_at=data_point_at)
         self._apply_decision(decision)
         # Audit log: one DEBUG line per state change, never on a repeat.
@@ -788,9 +769,9 @@ class TeslaSettleTracker:
                 "zero=%d/%d reason=%s",
                 self._last_logged_state or "none",
                 decision.state,
-                self.last_commanded_amps,
+                commanded,
                 reported_amps,
-                self._zero_amp_samples,
+                decision.zero_samples,
                 TESLA_ZERO_AMPS_CLEAR_SAMPLES,
                 decision.reason,
             )
@@ -998,6 +979,7 @@ class StateTracker:
 
     def tesla_amp_state(
         self, now: datetime, data_point_at: datetime | None = None,
+        reported_amps: int | None = None,
     ) -> TeslaAmpDecision:
         """Return the current Tesla amp lifecycle decision (read-only).
 
@@ -1008,13 +990,14 @@ class StateTracker:
         Args:
             now: Current wall-clock time (injected so tests can pin it).
             data_point_at: Current NBC data-point-at timestamp, or None.
+            reported_amps: Amps reported by the vehicle this cycle, or None.
 
         Returns:
             The classification: state, credit amps, counter value, clear flag,
             and reason.
         """
         return self.settle.classify(
-            reported_amps=None, now=now,
+            reported_amps=reported_amps, now=now,
             data_point_at=data_point_at,
         )
 

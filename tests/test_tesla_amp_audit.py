@@ -14,10 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
-from clock import FakeClock
-from load_models import TeslaAmpState
+from load_models import PendingEffect, TeslaAmpState
 from load_nbc import EffectStore, StateTracker, TeslaSettleTracker
 
 NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -79,6 +76,32 @@ def test_inflight_wh_logs_each_transition(caplog):
     assert "reason=stop_confirmed" in second_msg
 
 
+def test_inflight_wh_logs_the_expired_command(caplog):
+    """A clearing transition logs the command that just expired."""
+    caplog.set_level(logging.DEBUG, logger="load_nbc")
+    ts = NOW - timedelta(seconds=300)
+    effect = PendingEffect(
+        device_name="tesla",
+        action="set_amps",
+        timestamp=ts,
+        data_point_at=ts,
+        power_watts=0.0,
+        target_amps=18,
+        direction="increase",
+        qh_name="QH1",
+    )
+    t = _tracker(effect)
+    t.record_command(18)
+
+    t.inflight_wh(10, 900, NOW)
+
+    messages = [r.getMessage() for r in caplog.records
+                if "[tesla_amp]" in r.getMessage()]
+    assert messages
+    assert "cmd=18" in messages[-1]
+    assert "reason=settle_expired" in messages[-1]
+
+
 def test_inflight_wh_does_not_log_same_state_twice(caplog):
     """Repeated zero frames at the threshold do not re-log the same state."""
     caplog.set_level(logging.DEBUG, logger="load_nbc")
@@ -114,7 +137,7 @@ def test_tesla_amp_state_returns_classify_result():
     assert decision.reason == classify.reason
 
 
-def test_tesla_amp_state_with_report():
+def test_tesla_amp_state_with_data_point():
     """tesla_amp_state() with data_point_at mirrors classify()."""
     st = _state_tracker()
     st.record_tesla_amp_command(18)
@@ -123,6 +146,17 @@ def test_tesla_amp_state_with_report():
     classify = st.settle.classify(None, NOW, data_point_at=NOW)
     assert decision.state == classify.state
     assert decision.credit_amps == classify.credit_amps
+
+
+def test_tesla_amp_state_accepts_a_report():
+    """tesla_amp_state() can classify an actual amp report."""
+    st = _state_tracker()
+    st.record_tesla_amp_command(18)
+
+    decision = st.tesla_amp_state(NOW, reported_amps=10)
+
+    assert decision.state is TeslaAmpState.SETTLING
+    assert decision.credit_amps == 8.0
 
 
 def test_tesla_amp_state_idle():

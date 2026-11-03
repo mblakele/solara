@@ -111,16 +111,17 @@ drift checks.
 - **test_tesla_amp_state.py**
   the pure classifier (`classify_tesla_amp`) truth table: every row of the
   transition table, `zero_clear_samples` read from the constant, `IDLE` and
-  `AWAITING_REPORT` identity behaviour, `EXPIRED` clearing the command,
-  `RAMPING` crediting `commanded − 1` even when `commanded == 1`, and the
-  StrEnum string serialisation.
+  `AWAITING_REPORT` identity behaviour, `IDLE` keeping a nonzero counter,
+  `EXPIRED` clearing the command and resetting the counter, `RAMPING`
+  crediting `commanded − 1`, a matched 1 A command taking `CONFIRMED` before
+  the ramp branch, and the StrEnum string serialisation.
 - **test_tesla_amp_parity.py**
   behaviour parity against the pre-refactor `inflight_wh()`: literal Wh values
-  for rows 1–10, the six quirks (`C==1` / `R==1` inside and outside window,
-  `None` report between zeros, `turn_on` effect as newest Tesla effect on the
-  1 A path, `has_settle` false with open delta and expired effect, wall-clock
-  expiry vs fresh data-point clock and reverse, `current_qh` not changing the
-  result), and the orphan guard.
+  for rows 1–10, the preserved quirks (`C==1` / `R==1` inside and outside
+  window, `None` report between zeros, fresh and expired `turn_on` effects as
+  the newest Tesla effect on the 1 A path, `has_settle` false with open delta
+  and expired effect, wall-clock expiry vs fresh data-point clock and reverse,
+  `current_qh` not changing the result), and the orphan guard.
 - **test_tesla_amp_audit.py**
   audit surface: one `debug` log line per state change (with state, command,
   report, counter, reason), no log when the state does not change, and
