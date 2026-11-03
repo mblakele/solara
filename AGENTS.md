@@ -201,6 +201,7 @@ metrics.py             # NBC fetch, HourlyProjection, cache guards, drift alerts
 mockdata.py            # Test data generation
 mqtt_telemetry.py      # Tesla MQTT parsing and subscriber lifecycle
 quantization.py        # N-second constant-window detection
+settle_window.py       # Adaptive prediction/settle window state machine
 sse_event.py           # SSE broadcaster and event stream
 telegram.py            # TelegramSender, NotificationEvent
 telegram_client.py     # Async Telegram Bot API client

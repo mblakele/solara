@@ -172,6 +172,16 @@ drift checks.
   defers where the pinned 30 s decides — agreement when the effect is far, tolerance of the
   retired suppress_action token, the window histogram / non-default count, report totals +
   gate counts, default constant, standalone CLI)
+- **test_settle_window_machine.py**
+  the `SettleWindowMachine` transition table (all four rows), initial state,
+  equality reset, deadband edge (strict `<`, diff=5 seeds candidate),
+  interleaved values never committing, deadband=0 special cases, StrEnum
+  serialization, frozen decision dataclass, and all invariants
+- **test_settle_window_parity.py**
+  the pinned sequences against `StateTracker` (two-consecutive commit,
+  alternating never-commit, deadband ignores ±1 s, 115 candidate from 120,
+  store propagation to `_effects.window_secs` and `settle.window_secs`,
+  `has_pending_effect_since` answer change at new window, sub-floor values)
 - **test_lumpy_first.py**
   the Subtask-4 wiring (flag-off parity with history, flag-on c658/c817 prescriptions,
   config/env plumbing, and the 4a gapminder_lumpy_first census log when the lead is taken)

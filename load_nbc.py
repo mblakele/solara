@@ -37,13 +37,14 @@ from constants import (
     DEFAULT_PREDICTION_WINDOW_SECS,
     LUMPY_PLUG_MIN_WATTS,
     MIN_SECONDS_TO_ACT,
-    SETTLE_WINDOW_DEADBAND_SECS,
     TESLA_CHARGE_AMPS_MAX_DEFAULT,
     TESLA_CHARGE_AMPS_MIN_DEFAULT,
     TESLA_HARD_MAX_AMPS,
     TESLA_NOMINAL_VOLTAGE,
     TESLA_ZERO_AMPS_CLEAR_SAMPLES,
 )
+
+from settle_window import SettleWindowMachine
 
 
 logger = logging.getLogger(__name__)
@@ -875,7 +876,7 @@ class StateTracker:
         absorbs load changes.  With the default 30 s prediction window the
         settle is 30 s; with a 60 s quantization window it is 60 s.
         """
-        return self._pending_effect_min_secs
+        return self.settle_window.committed_secs
 
     @staticmethod
     def watts_to_wh(power_watts: float, seconds: int) -> float:
@@ -933,11 +934,9 @@ class StateTracker:
         return energy_wh * 3600.0 / (nominal_voltage() * seconds)
 
     def __init__(self, prediction_window_seconds: int = DEFAULT_PREDICTION_WINDOW_SECS) -> None:
-        self._pending_effect_min_secs = prediction_window_seconds
-        # Adaptive settle window: a candidate is committed only after it is
-        # observed on two consecutive cycles (see apply_prediction_window).
-        self._window_candidate: int | None = None
-        self._window_candidate_confirmations = 0
+        # Adaptive settle window state machine. The committed value starts at
+        # the constructor argument; candidates are tracked by the machine.
+        self.settle_window = SettleWindowMachine(prediction_window_seconds)
         # Guards devices/pending_effects against cross-thread readers
         # (Flask request threads) vs writers (the load-management thread).
         # RLock so internal mutators can nest.
@@ -1266,30 +1265,21 @@ class StateTracker:
         settle window stable under ±1 s quantization jitter while still
         tracking genuine, sustained meter-behavior changes.
 
+        The transition logic is owned by :class:`settle_window.SettleWindowMachine`.
+
         Args:
             prediction_window_seconds: Prediction window in seconds.
         """
-        committed = self._pending_effect_min_secs
-        if prediction_window_seconds == committed:
-            self._window_candidate = None
-            self._window_candidate_confirmations = 0
-            return
-        if abs(prediction_window_seconds - committed) < SETTLE_WINDOW_DEADBAND_SECS:
-            # Jitter around the committed window — reset any in-flight candidate.
-            self._window_candidate = None
-            self._window_candidate_confirmations = 0
-            return
-        if self._window_candidate == prediction_window_seconds:
-            self._window_candidate_confirmations += 1
-            if self._window_candidate_confirmations >= 2:
-                self._pending_effect_min_secs = prediction_window_seconds
-                self._effects.window_secs = prediction_window_seconds
-                self.settle.window_secs = prediction_window_seconds
-                self._window_candidate = None
-                self._window_candidate_confirmations = 0
-        else:
-            self._window_candidate = prediction_window_seconds
-            self._window_candidate_confirmations = 1
+        decision = self.settle_window.observe(prediction_window_seconds)
+        if decision.changed:
+            self._effects.window_secs = decision.committed_secs
+            self.settle.window_secs = decision.committed_secs
+            logger.debug(
+                "[settle_window] %s -> %s event=%s",
+                decision.committed_secs,
+                decision.committed_secs,
+                decision.reason,
+            )
 
     def estimated_current_wh(self, nbc_predicted_wh: float, seconds_remaining:
   int) -> float:
@@ -1450,7 +1440,7 @@ class StateTracker:
             after ``nbc_timestamp``.
         """
         return self._effects.has_since(
-            nbc_timestamp, window_secs=self._pending_effect_min_secs
+            nbc_timestamp, window_secs=self.effective_settle_secs
         )
 
     def pending_since_count(self, nbc_timestamp: datetime) -> int:
@@ -1468,7 +1458,7 @@ class StateTracker:
             within ``prediction_window_seconds`` after ``nbc_timestamp``.
         """
         return self._effects.count_since(
-            nbc_timestamp, window_secs=self._pending_effect_min_secs
+            nbc_timestamp, window_secs=self.effective_settle_secs
         )
 
     def prune_old_effects(
@@ -1495,7 +1485,7 @@ class StateTracker:
             Number of effects removed.
         """
         pruned = self._effects.prune(
-            data_point_at, now, window_secs=self._pending_effect_min_secs
+            data_point_at, now, window_secs=self.effective_settle_secs
         )
         if pruned:
             # Orphaned-command guard (bugs/2026-10-08-weird-behavior.log):

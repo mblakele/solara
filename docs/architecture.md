@@ -325,10 +325,17 @@ this axiom before adding defensive checks.
 - `_resolve_prediction_window()` / `StateTracker.apply_prediction_window()` — the
   prediction/settle window is adaptive: it resolves lazily from shared-cache
   quantization (quantization data only exists after the first fetch of a cycle) and
-  tracks sustained meter-behavior changes. A new window is committed only after two
-  consecutive `_stage_compute_gap` calls, and detections within
-  `SETTLE_WINDOW_DEADBAND_SECS` (5 s) of the committed window are treated as detector
-  jitter (e.g. 29/30/31 s around a true 30 s period). Periods below
+  tracks sustained meter-behavior changes. The state machine lives in
+  ``settle_window.py`` with one explicit transition table:
+
+  | Event | Next state | Committed | Pending | Changed |
+  |---|---|---|---|---|
+  | Same as committed | COMMITTED | unchanged | None | no |
+  | Within deadband (5 s) | COMMITTED | unchanged | None | no |
+  | Same candidate again | COMMITTED | candidate | None | yes |
+  | Anything else | CANDIDATE | unchanged | value | no |
+
+  A commit requires two consecutive observations of the same candidate. Periods below
   `MIN_QUANTIZATION_WINDOW_SECS` (15 s) — e.g. the flat-data N=2 artifact — are
   rejected by `_resolve_prediction_window` and fall back to the default. The window
   tracks the *quantum* because the meter reports a per-quantum power held constant

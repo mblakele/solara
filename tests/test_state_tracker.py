@@ -787,6 +787,47 @@ class TestApplyPredictionWindow:
         assert tracker.effective_settle_secs == 30
 
 
+class TestMachineOwner:
+    """Tests for the new SettleWindowMachine owner.
+
+    The three private fields are gone; the machine owns the state.
+    """
+
+    def test_candidate_state_after_first_call(self) -> None:
+        """After one call, settle_window.state is CANDIDATE."""
+        tracker = StateTracker()
+        tracker.apply_prediction_window(120)
+        assert tracker.settle_window.state.name == "CANDIDATE"
+        assert tracker.settle_window.pending_secs == 120
+
+    def test_committed_state_after_second_call(self) -> None:
+        """After two calls, state is COMMITTED and pending is None."""
+        tracker = StateTracker()
+        tracker.apply_prediction_window(120)
+        tracker.apply_prediction_window(120)
+        assert tracker.settle_window.state.name == "COMMITTED"
+        assert tracker.settle_window.pending_secs is None
+        assert tracker.settle_window.committed_secs == 120
+
+    def test_equality_reset_clears_candidate(self) -> None:
+        """observe(committed) returns COMMITTED and clears the candidate."""
+        tracker = StateTracker()
+        tracker.apply_prediction_window(120)  # CANDIDATE
+        assert tracker.settle_window.state.name == "CANDIDATE"
+        tracker.apply_prediction_window(30)  # same as committed → COMMITTED
+        assert tracker.settle_window.state.name == "COMMITTED"
+        assert tracker.settle_window.pending_secs is None
+
+    def test_deadband_observation_clears_candidate(self) -> None:
+        """observe within deadband returns COMMITTED and clears the candidate."""
+        tracker = StateTracker()  # committed=30
+        tracker.apply_prediction_window(120)  # CANDIDATE (120)
+        assert tracker.settle_window.state.name == "CANDIDATE"
+        tracker.apply_prediction_window(34)  # within deadband → COMMITTED
+        assert tracker.settle_window.state.name == "COMMITTED"
+        assert tracker.settle_window.pending_secs is None
+
+
 class TestSyncTeslaDeviceState:
     """Tests for StateTracker.sync_tesla_device_state()."""
 

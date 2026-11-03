@@ -406,10 +406,23 @@ period is filtered by `_resolve_prediction_window` (`load_manager.py`): a
 period at or above `MIN_QUANTIZATION_WINDOW_SECS` (15 s) with confidence at or
 above threshold is taken, anything shorter (the flat-data N=2 artifact) falls
 back to `DEFAULT_PREDICTION_WINDOW_SECS` (30 s).
-`StateTracker.apply_prediction_window` commits a change only after two
-consecutive confirmations and ignores values within
-`SETTLE_WINDOW_DEADBAND_SECS` (5 s) of the committed window as detector
-jitter, so a genuine meter-behaviour change is tracked but ±1 s noise is not.
+
+The adaptation logic is an explicit state machine owned by
+`SettleWindowMachine` in `settle_window.py`. `StateTracker.apply_prediction_window()`
+delegates to the machine and applies confirmed commits to `_effects.window_secs`
+and `settle.window_secs`. The transition table:
+
+| Event | Next state | Committed | Pending | Changed |
+|---|---|---|---|---|
+| Same as committed | COMMITTED | unchanged | None | no |
+| Within deadband (5 s) | COMMITTED | unchanged | None | no |
+| Same candidate again | COMMITTED | candidate | None | yes |
+| Anything else | CANDIDATE | unchanged | value | no |
+
+A commit requires two consecutive observations of the same candidate. Values within
+`SETTLE_WINDOW_DEADBAND_SECS` (5 s) of the committed window are treated as detector
+jitter and never seed a candidate, so ±1 s noise is absorbed while genuine meter
+behaviour changes are tracked.
 
 ### The sensing model behind the window
 
