@@ -340,6 +340,56 @@
     }
   }
 
+  // Write-request wrapper: the server gate requires the same-origin
+  // fetch marker on every non-read request. Future write calls must go
+  // through this rather than bare fetch(). On 401 (session expired) it
+  // sends the user to the OIDC login with the current page as `next`.
+  window.solaraFetch = function (url, options) {
+    var opts = options || {}
+    var headers = {}
+    for (var k in (opts.headers || {})) {
+      if (Object.prototype.hasOwnProperty.call(opts.headers, k)) {
+        headers[k] = opts.headers[k]
+      }
+    }
+    headers['X-Requested-With'] = 'fetch'
+    opts.headers = headers
+    return fetch(url, opts).then(function (resp) {
+      if (resp.status === 401) {
+        window.location.href = 'oidc/login?next='
+          + encodeURIComponent(window.location.pathname + window.location.search)
+      }
+      return resp
+    })
+  }
+
+  // Cosmetic auth state for the header sign-in link. When the user can
+  // write, the link becomes a logout link; reads stay open regardless.
+  fetch('api/me', { headers: { Accept: 'application/json' } })
+    .then(function (resp) {
+      return resp.ok ? resp.json() : null
+    })
+    .then(function (me) {
+      var host = document.getElementById('auth-state')
+      var link = document.getElementById('auth-link')
+      if (!host || !link) {
+        return
+      }
+      host.removeAttribute('hidden')
+      if (me && me.can_write) {
+        link.textContent = 'Sign out'
+        link.href = 'oidc/logout'
+      } else if (me && me.authenticated) {
+        link.textContent = 'Signed in (read-only)'
+        link.href = 'oidc/logout'
+      } else {
+        link.textContent = 'Sign in'
+        link.href = 'oidc/login?next='
+          + encodeURIComponent(window.location.pathname + window.location.search)
+      }
+    })
+    .catch(function () { /* keep the server-rendered hidden state */ })
+
   // Tapping the connection dot reveals/hides the age text when the
   // indicator is otherwise dot-only (live+fresh). Pure display toggle on
   // #connection (a <button>, so tap and keyboard come free).
