@@ -2079,7 +2079,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "pylint", specifier = ">=4.0.5" },
+    { name = "pylint", specifier = ">=4.0.9" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest-asyncio", specifier = ">=0.25.0" },
     { name = "pytest-cov", specifier = ">=5.0" },
