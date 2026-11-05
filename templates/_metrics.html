@@ -23,6 +23,7 @@
 {% for vd in metrics.devices %}
   {% if vd.nbc %}
   {% set qh1 = vd.nbc.get("QH1") %}
+  {% set qh2 = vd.nbc.get("QH2") %}
   {% set diag = load_management.last_cycle_result.diagnostics if load_management and load_management.last_cycle_result else none %}
   <article class="forecast">
     <header class="forecast__header">
@@ -39,7 +40,19 @@
     {% set period_status = load_management.last_cycle_result.status if load_management and load_management.last_cycle_result else "ok" %}
     {% set period_warn = _status_is_warn(period_status) %}
     {% set period_label = _status_label(period_status) %}
-    {% set headline_wh = qh1.predicted_wh if (qh1 is not none and qh1.predicted_wh is not none) else (qh1.raw_wh if (qh1 is not none and qh1.complete) else none) %}
+    {# Headline fallback chain: incomplete QH1 forecast → complete QH1 raw
+       total → the last completed quarter's raw total (QH2), which keeps the
+       card showing the last known complete value while we wait for fresh
+       data instead of a stale wall-clock extrapolation from the finished
+       quarter. #}
+    {% set headline_wh = none %}
+    {% if qh1 is not none and qh1.predicted_wh is not none %}
+      {% set headline_wh = qh1.predicted_wh %}
+    {% elif qh1 is not none and qh1.complete %}
+      {% set headline_wh = qh1.raw_wh %}
+    {% elif qh2 is not none %}
+      {% set headline_wh = qh2.raw_wh %}
+    {% endif %}
     {% set fcast_target = load_management.target_wh if load_management and load_management.target_wh is defined and load_management.target_wh is not none else none %}
     {% set fcast_hyst = diag.hysteresis_wh if diag and diag.hysteresis_wh is defined and diag.hysteresis_wh is not none else none %}
     {% set fcast_class = "" %}
@@ -52,18 +65,22 @@
     {% endif %}
     <div class="forecast__value{{ fcast_class }}">
       {% if headline_wh is not none %}
-      {{ "%+.0f" % (headline_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period{{ ' forecast__period--warn' if period_warn else '' }}">{{ period_label }}</span>
+      {{ _fmt_wh(headline_wh) }}<span class="forecast__unit">Wh</span><span class="forecast__period{{ ' forecast__period--warn' if period_warn else '' }}">{{ period_label }}</span>
       {% else %}
       <span class="forecast__placeholder">—</span><span class="forecast__period{{ ' forecast__period--warn' if period_warn else '' }}">{{ period_label }}</span>
       {% endif %}
     </div>
     <div class="sparkline">{{ vd.per_second_data | default([]) | per_second_sparkline(bucket_secs=quantization_seconds | default(1)) | safe }}</div>
 
-    {% set w = 60 * qh1.prediction_w if qh1.prediction_w is not none else none %}
+    {% set qh1_prediction_w = qh1.prediction_w if qh1 is not none else none %}
+    {% set w = 60 * qh1_prediction_w if qh1_prediction_w is not none else none %}
+    {# Period is the current QH1 total only. With no QH1 the headline falls
+       back to QH2, so repeating QH2 here would show one value twice. #}
+    {% set period_raw = qh1.raw_wh if qh1 is not none else none %}
     <dl class="details">
       <div class="details__stat">
         <dt>Period</dt>
-        <dd>{{ "%+.0f" % (qh1.raw_wh) }}</dd>
+        <dd>{% if period_raw is none %}—{% else %}{{ _fmt_wh(period_raw) }}{% endif %}</dd>
       </div>
       <div class="details__stat">
         <dt>Wh/min</dt>
@@ -77,7 +94,7 @@
       </div>
     </dl>
 
-    {% if diag is not none and qh1.predicted_wh is not none %}
+    {% if diag is not none and qh1 is not none and qh1.predicted_wh is not none %}
     {# Actionable surplus/deficit after the target is met: prefer the cycle
        gap (target - adjusted, includes pending effects), else derive
        target - predicted when a target is known. Positive gap = surplus
@@ -192,7 +209,10 @@
       <div class="demand__label">Recent</div>
       {% set hist_target = load_management.get("target_wh") if load_management else none %}
       {% set hist_hyst = diag.hysteresis_wh if diag else none %}
-      {% for qh_key in ["QH2", "QH3", "QH4"] %}
+      {# QH2 is the headline when QH1 is absent; start at QH3 so the same
+         value is not shown twice. #}
+      {% set hist_keys = ["QH3", "QH4"] if qh1 is none else ["QH2", "QH3", "QH4"] %}
+      {% for qh_key in hist_keys %}
       {% set qh = vd.nbc.get(qh_key) %}
       {% if qh is not none and qh is not false %}
       {% set pill_class = "" %}
@@ -203,7 +223,7 @@
       {% set pill_class = " history__pill--gen" %}
       {% endif %}
       {% endif %}
-      <span class="history__pill{{ pill_class }}">{{ "%+.0f" % (qh.raw_wh) }}</span>
+      <span class="history__pill{{ pill_class }}">{{ _fmt_wh(qh.raw_wh) }}</span>
       {% endif %}
       {% endfor %}
     </div>

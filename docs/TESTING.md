@@ -105,7 +105,11 @@ drift checks.
   (the lumpy-first gate still reads it)
 - **test_qh_boundary_forecast.py**
   the 2026-10-14 QH-boundary glitch (complete QH1 keeps the waiting-for-data period label
-  beside the placeholder instead of a blank)
+  beside the placeholder instead of a blank) and the 2026-11-05 stale-slice glitch (a
+  finished 16:15 quarter is finalized from its measured sum into QH2, never extrapolated
+  into 16:30; a short 839-sample slice leaves QH2 empty and injects 16:00 into QH3; a
+  complete gap moves the last fetched quarter to QH3; injection does not duplicate a
+  finalized quarter; and the card shows `0` rather than `-0` for a sub-Wh total)
 - **test_prune_orphaned_tesla_command.py**
   the 2026-10-08 orphaned 12A command (pruning the last set_amps clears last_commanded_amps)
 - **test_tesla_amp_state.py**

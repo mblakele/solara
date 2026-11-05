@@ -191,13 +191,14 @@ def create_metrics(energy_cache: EnergyCache, now: datetime, logger: logging.Log
         hp.populate(chart_start)
         logger.debug(
             "create_metrics result: devices=%d, data_start=%s, "
-            "per_second_data_total=%d",
+            "per_second_data_total=%d, data_lag_secs=%.1f",
             len(hp.metrics.get("devices", [])),
             hp.metrics.get("data_start"),
             sum(
                 len(d.get("per_second_data", []))
                 for d in hp.metrics.get("devices", [])
             ) if hp.metrics.get("devices") else 0,
+            hp.metrics.get("_data_lag_secs", 0.0),
         )
         # Stamp the fetch time so consumers (SSE lag recalculation in
         # app.py, data_point_at in load_nbc.py) compute elapsed time from

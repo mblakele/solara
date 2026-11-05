@@ -8,6 +8,17 @@ from __future__ import annotations
 
 # ── NBC / Data freshness ─────────────────────────────────────────────
 
+FINALIZE_MAX_SHORTFALL_SECS: int = 5
+"""Maximum missing seconds that still lets a finished trailing quarter be
+finalized as a measured total instead of being rejected as unknown.
+
+The API tail is usually a few seconds short at the first fetch after a
+quarter-hour boundary. A one-second shortfall was observed in the
+2026-11-05 incident (899 samples of the 16:15 quarter); 61 s was observed
+after a longer lag. At 5 s the tolerance accepts the near-full case and
+rejects the genuinely short one. At 7 kW, 5 s is about 10 Wh against a
+2625 Wh quarter."""
+
 STALE_DATA_THRESHOLD_SECS: int = 80
 """Maximum age (in seconds) of a per-second data point before we consider
 the NBC prediction stale and skip the load management cycle. Note: the

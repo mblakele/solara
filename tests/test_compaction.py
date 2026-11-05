@@ -400,6 +400,129 @@ class TestInjectCompletedQH:
         assert result.qh2 is not None
         assert result.qh2.raw_wh == 999.0  # Existing preserved, not overwritten
 
+    def test_inject_before_skips_represented_period(self) -> None:
+        """A finalized 16:15 must not be injected a second time from cache."""
+        from util import inject_completed_qh
+
+        finalized = NBCQuarter(complete=True, raw_wh=-0.1367, wh=0.0)
+        nbc = NBCQuarterSet(
+            qh1=None,
+            qh2=finalized,
+            qh3=None,
+            qh4=None,
+            inject_before=datetime(2026, 11, 5, 16, 15, tzinfo=timezone.utc),
+        )
+
+        completed = [
+            CompletedNBCPeriod(
+                start=datetime(2026, 11, 5, 16, 15, tzinfo=timezone.utc),
+                raw_wh=999.0,
+            ),
+            CompletedNBCPeriod(
+                start=datetime(2026, 11, 5, 16, 0, tzinfo=timezone.utc),
+                raw_wh=3.136,
+            ),
+            CompletedNBCPeriod(
+                start=datetime(2026, 11, 5, 15, 45, tzinfo=timezone.utc),
+                raw_wh=-1.469,
+            ),
+        ]
+
+        result = inject_completed_qh(nbc, completed)
+        assert result.qh2 is not None
+        assert result.qh2.raw_wh == -0.1367  # finalized value preserved
+        assert result.qh3 is not None
+        assert result.qh3.raw_wh == 3.136
+        assert result.qh4 is not None
+        assert result.qh4.raw_wh == -1.469
+        assert all(
+            q is None or q.raw_wh != 999.0
+            for q in (result.qh1, result.qh2, result.qh3, result.qh4)
+        )
+
+    def test_backfill_from_qh3_leaves_qh2_empty(self) -> None:
+        """A short finished quarter leaves QH2 empty and starts at QH3."""
+        from util import inject_completed_qh
+
+        nbc = NBCQuarterSet(
+            qh1=None,
+            qh2=None,
+            qh3=None,
+            qh4=None,
+            inject_before=datetime(2026, 11, 5, 16, 15, tzinfo=timezone.utc),
+            backfill_from="QH3",
+        )
+        completed = [
+            CompletedNBCPeriod(
+                start=datetime(2026, 11, 5, 16, 0, tzinfo=timezone.utc),
+                raw_wh=3.136,
+            ),
+            CompletedNBCPeriod(
+                start=datetime(2026, 11, 5, 15, 45, tzinfo=timezone.utc),
+                raw_wh=-1.469,
+            ),
+        ]
+
+        result = inject_completed_qh(nbc, completed)
+        assert result.qh2 is None
+        assert result.qh3 is not None
+        assert result.qh3.raw_wh == 3.136
+        assert result.qh4 is not None
+        assert result.qh4.raw_wh == -1.469
+
+    def test_defaults_keep_current_behaviour(self) -> None:
+        """With no hints, injection starts at QH2 and uses every period."""
+        from util import inject_completed_qh
+
+        nbc = NBCQuarterSet(qh1=None, qh2=None, qh3=None, qh4=None)
+        completed = [
+            CompletedNBCPeriod(
+                start=datetime(2025, 6, 15, 14, 0, tzinfo=timezone.utc),
+                raw_wh=200.0,
+            ),
+        ]
+
+        result = inject_completed_qh(nbc, completed)
+        assert result.inject_before is None
+        assert result.backfill_from == "QH2"
+        assert result.qh2 is not None
+        assert result.qh2.raw_wh == 200.0
+
+    def test_hints_are_copied_to_the_result(self) -> None:
+        """Injection hints survive into the returned set."""
+        from util import inject_completed_qh
+
+        before = datetime(2026, 11, 5, 16, 15, tzinfo=timezone.utc)
+        nbc = NBCQuarterSet(
+            qh1=None,
+            qh2=None,
+            qh3=None,
+            qh4=None,
+            inject_before=before,
+            backfill_from="QH3",
+        )
+
+        result = inject_completed_qh(nbc, [])
+        assert result.inject_before == before
+        assert result.backfill_from == "QH3"
+
+
+class TestCompactBoundaryShortfall:
+    """A near-full finished quarter still waits for 900 samples to compact."""
+
+    def test_899_samples_do_not_compact(self) -> None:
+        data_start = datetime(2026, 11, 5, 16, 15, tzinfo=timezone.utc)
+        now = datetime(2026, 11, 5, 16, 30, 25, tzinfo=timezone.utc)
+        cache = _make_cache([0.001] * 899, data_start, now)
+
+        with cache._lock:
+            cache.compact(now)
+
+        assert cache._data is not None
+        assert cache._data.samples is not None
+        assert len(cache._data.samples) == 899
+        assert not cache._data.completed_periods
+
 
 # ---------------------------------------------------------------------------
 # Phase 2: _merge_samples_replace()

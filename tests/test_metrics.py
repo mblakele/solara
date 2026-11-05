@@ -1932,7 +1932,7 @@ class TestNBCUsesFullCache(unittest.TestCase):
         import metrics
 
         hp = HourlyProjection(
-            instant=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            instant=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
             logger_next=logging.getLogger("test"),
             energy_cache=metrics.EnergyCache(),  # fresh cache, no samples
         )
@@ -2209,6 +2209,29 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["_fetched_at"], now)
 
+    def test_create_metrics_logs_data_lag(self):
+        """The fetch summary carries the API lag next to the sample count."""
+        from metrics import create_metrics
+
+        cache = EnergyCache()
+        now = datetime(2026, 11, 5, 16, 30, 2, tzinfo=timezone.utc)
+
+        with patch("hourly_fetch.HourlyProjection") as MockHP:
+            MockHP.return_value.metrics = {
+                "devices": [],
+                "_data_lag_secs": 27.0,
+            }
+            with self.assertLogs("hourly_fetch", level="DEBUG") as captured:
+                create_metrics(cache, now, logging.getLogger("hourly_fetch"))
+
+        messages = [
+            record.getMessage()
+            for record in captured.records
+            if "create_metrics result:" in record.getMessage()
+        ]
+        self.assertTrue(messages, "create_metrics must log its fetch summary")
+        self.assertIn("data_lag_secs=27.0", messages[-1])
+
     def test_create_metrics_uses_data_start_for_chart_start(self):
         """create_metrics uses data_start (not last_sample_at) for incremental chart_start.
 
@@ -2431,7 +2454,7 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
         Returns the DeviceMetrics nbc field.
         """
         hp = HourlyProjection(
-            instant=datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc),
+            instant=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
             logger_next=logging.getLogger("test"),
             energy_cache=cache,
         )
@@ -2465,7 +2488,7 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
 
         Data: 70 samples of 0.001 + 30 samples of 0.003 = 100.
         C.2: the incomplete quarter extrapolates with the wall-clock
-        remainder (900 s at the 14:30 fixture instant), not the sample count.
+        remainder (900 s at the 14:00 fixture instant), not the sample count.
         With 30s window: prediction_w = 3.0 W → predicted_wh = 2860.
         With 60s window: prediction_w = 2.0 W → predicted_wh = 1960.
         """
@@ -2679,7 +2702,7 @@ class TestNbcLogging:
     ``_compute_device_metrics``; ``_compute_nbc`` itself stays silent.
     """
 
-    INSTANT = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    INSTANT = datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
     LOGGER_NAME = "test-nbc-logging"
 
     def _make_hp(self, energy_cache):
@@ -2700,7 +2723,7 @@ class TestNbcLogging:
             per_second_data=[0.001] * n_samples,
             chart_data=[],
             nbc_seconds=[0.001] * n_samples,
-            nbc_data_start=datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc),
+            nbc_data_start=datetime(2025, 6, 15, 14, 15, 0, tzinfo=timezone.utc),
             nbc_sample_count=n_samples,
         )
 

@@ -158,6 +158,64 @@ class TestSinglePredictedWh:
         assert result["seconds_remaining"] == 600
 
 
+class TestCacheRejectsFinishedTrailingWindow:
+    """The cache path keeps returning ``None`` for a finished trailing chunk.
+
+    The return value does not change. It gains one structured log line that
+    names the shortfall, so a lagging API tail is visible in the corpus.
+    """
+
+    DATA_START = datetime(2026, 11, 5, 16, 15, 0, tzinfo=timezone.utc)
+
+    def test_get_current_qh_returns_none_for_near_full_window(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        now = datetime(2026, 11, 5, 16, 30, 25, tzinfo=timezone.utc)
+        cache = _seeded_cache([0.001] * 899, self.DATA_START, now)
+
+        with caplog.at_level(logging.INFO, logger="energy_cache"):
+            assert cache.get_current_qh(now) is None
+
+        records = [r for r in caplog.records if r.name == "energy_cache"]
+        assert records, "a finished trailing chunk must log its shortfall"
+        message = records[-1].getMessage()
+        assert "trailing_qh kind=finished_near_full" in message
+        assert "shortfall_secs=1" in message
+        assert "raw_wh=899.00000" in message
+        assert records[-1].levelno == logging.INFO
+
+    def test_get_current_qh_returns_none_for_short_window(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        now = datetime(2026, 11, 5, 16, 30, 7, tzinfo=timezone.utc)
+        cache = _seeded_cache([0.001] * 839, self.DATA_START, now)
+
+        with caplog.at_level(logging.WARNING, logger="energy_cache"):
+            assert cache.get_current_qh(now) is None
+
+        records = [r for r in caplog.records if r.name == "energy_cache"]
+        assert records
+        message = records[-1].getMessage()
+        assert "trailing_qh kind=finished_short" in message
+        assert "shortfall_secs=61" in message
+        assert "raw_wh=839.00000" in message
+        assert records[-1].levelno == logging.WARNING
+
+    def test_current_window_does_not_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        now = datetime(2026, 11, 5, 16, 29, 59, tzinfo=timezone.utc)
+        cache = _seeded_cache([0.001] * 899, self.DATA_START, now)
+
+        with caplog.at_level(logging.DEBUG, logger="energy_cache"):
+            result = cache.get_current_qh(now)
+
+        assert result is not None
+        assert not [
+            r for r in caplog.records if "trailing_qh" in r.getMessage()
+        ]
+
+
 class TestQhHelperEquivalence:
     """``qh_seconds_remaining`` is the one quarter-hour remainder definition."""
 

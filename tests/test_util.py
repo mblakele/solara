@@ -7,11 +7,19 @@ Covers:
 
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from util import _haversine_distance, compute_nbc_quarter
+from util import (
+    _haversine_distance,
+    classify_trailing_chunk,
+    complete_quarter,
+    compute_nbc_quarter,
+    is_stale_trailing_qh,
+    TrailingChunkKind,
+)
 
 
 class TestHaversineDistance:
@@ -453,3 +461,146 @@ class TestSecondsRemainingOverride:
         )
         assert qset.qh1.remaining_seconds == 250
         assert qset.qh2.complete is True
+
+
+class TestTrailingChunkClassifier:
+    """One classifier for a finished trailing quarter.
+
+    ``data_start`` is 16:15. A finished 899-sample chunk is one second
+    short of the full 16:15 window; a 839-sample chunk is 61 seconds short.
+    A count that is a multiple of 900 means the whole trailing window is
+    missing.
+    """
+
+    DATA_START = datetime(2026, 11, 5, 16, 15, 0, tzinfo=timezone.utc)
+
+    def test_classifies_current_window(self) -> None:
+        info = classify_trailing_chunk(
+            self.DATA_START,
+            899,
+            datetime(2026, 11, 5, 16, 29, 59, tzinfo=timezone.utc),
+        )
+        assert info.kind is TrailingChunkKind.CURRENT
+        assert info.shortfall_secs == 0
+        assert info.start == self.DATA_START
+        assert info.sample_count == 899
+
+    def test_classifies_near_full_finished_window(self) -> None:
+        info = classify_trailing_chunk(
+            self.DATA_START,
+            899,
+            datetime(2026, 11, 5, 16, 30, 25, tzinfo=timezone.utc),
+        )
+        assert info.kind is TrailingChunkKind.FINISHED_NEAR_FULL
+        assert info.shortfall_secs == 1
+        assert info.start == self.DATA_START
+        assert info.sample_count == 899
+
+    def test_classifies_short_finished_window(self) -> None:
+        info = classify_trailing_chunk(
+            self.DATA_START,
+            839,
+            datetime(2026, 11, 5, 16, 30, 7, tzinfo=timezone.utc),
+        )
+        assert info.kind is TrailingChunkKind.FINISHED_SHORT
+        assert info.shortfall_secs == 61
+        assert info.start == self.DATA_START
+        assert info.sample_count == 839
+
+    def test_classifies_complete_gap(self) -> None:
+        info = classify_trailing_chunk(
+            self.DATA_START,
+            900,
+            datetime(2026, 11, 5, 16, 45, 0, tzinfo=timezone.utc),
+        )
+        assert info.kind is TrailingChunkKind.FINISHED_SHORT
+        assert info.shortfall_secs == 900
+        assert info.start == datetime(
+            2026, 11, 5, 16, 30, tzinfo=timezone.utc
+        )
+        assert info.sample_count == 0
+
+    @pytest.mark.parametrize(
+        "sample_count,kind",
+        [
+            (895, TrailingChunkKind.FINISHED_NEAR_FULL),
+            (894, TrailingChunkKind.FINISHED_SHORT),
+        ],
+    )
+    def test_tolerance_boundary(
+        self, sample_count: int, kind: TrailingChunkKind
+    ) -> None:
+        info = classify_trailing_chunk(
+            self.DATA_START,
+            sample_count,
+            datetime(2026, 11, 5, 16, 30, 25, tzinfo=timezone.utc),
+        )
+        assert info.kind is kind
+
+    def test_complete_quarter_uses_measured_sum(self) -> None:
+        """899 samples finalize without padding to 900."""
+        quarter = complete_quarter([0.001] * 899)
+        assert quarter.complete is True
+        assert quarter.raw_wh == pytest.approx(899.0)
+        assert quarter.wh == pytest.approx(899.0)
+        assert quarter.samples_used is None
+
+    def test_complete_quarter_clamps_negative_wh(self) -> None:
+        quarter = complete_quarter([-0.001] * 10)
+        assert quarter.raw_wh == pytest.approx(-10.0)
+        assert quarter.wh == 0.0
+
+    @pytest.mark.parametrize(
+        "sample_count,now",
+        [
+            (899, datetime(2026, 11, 5, 16, 29, 59, tzinfo=timezone.utc)),
+            (899, datetime(2026, 11, 5, 16, 30, 25, tzinfo=timezone.utc)),
+            (25, datetime(2026, 11, 5, 16, 15, 25, tzinfo=timezone.utc)),
+            (900, datetime(2026, 11, 5, 16, 44, 59, tzinfo=timezone.utc)),
+            (900, datetime(2026, 11, 5, 16, 45, 0, tzinfo=timezone.utc)),
+        ],
+    )
+    def test_is_stale_trailing_qh_matches_classifier(
+        self, sample_count: int, now: datetime
+    ) -> None:
+        info = classify_trailing_chunk(self.DATA_START, sample_count, now)
+        assert is_stale_trailing_qh(self.DATA_START, sample_count, now) is (
+            info.kind is not TrailingChunkKind.CURRENT
+        )
+
+
+class TestStaleTrailingQH:
+    """The shared stale-slice predicate used by the cache and display paths.
+
+    ``data_start`` is 16:15. A partial slice of 899 samples covers
+    16:15:00-16:29:59 and its wall window ends at 16:30. A count that is a
+    multiple of 900 means the trailing chunk is the next, unfetched window,
+    so a complete-but-old data set also reports stale.
+    """
+
+    DATA_START = datetime(2026, 11, 5, 16, 15, 0, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize(
+        "sample_count,now,expected",
+        [
+            # Partial slice, still inside its own window.
+            (899, datetime(2026, 11, 5, 16, 29, 59, tzinfo=timezone.utc), False),
+            # Partial slice, the window has ended (inclusive boundary).
+            (899, datetime(2026, 11, 5, 16, 30, 0, tzinfo=timezone.utc), True),
+            (899, datetime(2026, 11, 5, 16, 30, 25, tzinfo=timezone.utc), True),
+            # Fresh partial slice is inside its own window.
+            (25, datetime(2026, 11, 5, 16, 15, 25, tzinfo=timezone.utc), False),
+            # Complete chunk: the trailing chunk is the next, unfetched one.
+            (900, datetime(2026, 11, 5, 16, 44, 59, tzinfo=timezone.utc), False),
+            (900, datetime(2026, 11, 5, 16, 45, 0, tzinfo=timezone.utc), True),
+            (1800, datetime(2026, 11, 5, 16, 59, 59, tzinfo=timezone.utc), False),
+            (1800, datetime(2026, 11, 5, 17, 0, 0, tzinfo=timezone.utc), True),
+        ],
+    )
+    def test_window_end_uses_floor_to_qh(
+        self, sample_count: int, now: datetime, expected: bool
+    ) -> None:
+        """Only ``floor_to_qh(now)`` decides whether the window has ended."""
+        assert (
+            is_stale_trailing_qh(self.DATA_START, sample_count, now) is expected
+        )

@@ -16,6 +16,9 @@ from energy_cache import EnergyCache
 from quantization import usable_window
 from util import (
     NBCQuarterSet,
+    TrailingChunkKind,
+    classify_trailing_chunk,
+    complete_quarter,
     compute_nbc_quarters,
     inject_completed_qh,
     qh_seconds_remaining,
@@ -186,6 +189,7 @@ class PredictionMixin:
         usage_data_local: list[float],
         prediction_window_seconds: int | None = None,
         now: datetime | None = None,
+        data_start: datetime | None = None,
     ) -> NBCQuarterSet:
         """Compute NBC values for each quarter hour in the current hour.
 
@@ -201,6 +205,22 @@ class PredictionMixin:
         and ``NBCReader._parse_metrics`` therefore report the same
         ``predicted_wh`` for the same samples and clock.
 
+        Stale-QH finalize: when *data_start* is known and the wall window of
+        the trailing partial slice has already ended, the slice is the
+        previous quarter, not the current one. Applying the wall-clock
+        remainder would credit live quarters of future energy out of a
+        finished window (the 2026-11-05 boundary glitch: 899 samples from the
+        16:15 quarter were extrapolated with the 16:30 quarter's 875
+        remaining seconds). A near-full finished window (at most
+        ``FINALIZE_MAX_SHORTFALL_SECS`` short) becomes a measured QH2 with no
+        forecast. A genuinely short window leaves QH2 empty so the card shows
+        an em dash. ``util.classify_trailing_chunk`` is the same classifier
+        that ``EnergyCache.get_current_qh`` uses, so display and decision math
+        cannot drift apart.
+
+        The result carries ``inject_before=data_start`` so injection never
+        reintroduces a quarter the fetched window already represents.
+
         Args:
             usage_data_local: Per-second kWh data for the current hour.
             prediction_window_seconds: Number of trailing seconds to use for
@@ -208,15 +228,70 @@ class PredictionMixin:
                 to ``compute_nbc_quarters``. Defaults to 60 when ``None``.
             now: Wall-clock time to extrapolate from. Defaults to
                 ``self.instant``.
+            data_start: Wall-clock start of ``usage_data_local``. Optional;
+                when omitted the stale-QH guard is skipped.
 
         Returns:
             An ``NBCQuarterSet`` with QH1-QH4 containing NBC metrics or
             ``None`` if the quarter has not yet started.
         """
-        return compute_nbc_quarters(
-            usage_data_local,
+        wall_now = now or self.instant
+        values = usage_data_local
+
+        trailing = (
+            classify_trailing_chunk(data_start, len(values), wall_now)
+            if values and data_start is not None
+            else None
+        )
+
+        if (
+            trailing is not None
+            and trailing.kind is TrailingChunkKind.FINISHED_NEAR_FULL
+        ):
+            prefix_len = len(values) - trailing.sample_count
+            base = compute_nbc_quarters(
+                values[:prefix_len],
+                prediction_window_seconds=prediction_window_seconds,
+            )
+            return NBCQuarterSet(
+                qh1=None,
+                qh2=complete_quarter(values[prefix_len:]),
+                qh3=base.qh1,
+                qh4=base.qh2,
+                inject_before=data_start,
+            )
+
+        if (
+            trailing is not None
+            and trailing.kind is TrailingChunkKind.FINISHED_SHORT
+        ):
+            prefix_len = len(values) - trailing.sample_count
+            base = compute_nbc_quarters(
+                values[:prefix_len],
+                prediction_window_seconds=prediction_window_seconds,
+            )
+            return NBCQuarterSet(
+                qh1=None,
+                qh2=None,
+                qh3=base.qh1,
+                qh4=base.qh2,
+                inject_before=data_start,
+                backfill_from="QH3",
+            )
+
+        result = compute_nbc_quarters(
+            values,
             prediction_window_seconds=prediction_window_seconds,
-            seconds_remaining_override=qh_seconds_remaining(now or self.instant),
+            seconds_remaining_override=qh_seconds_remaining(wall_now),
+        )
+        if data_start is None:
+            return result
+        return NBCQuarterSet(
+            qh1=result.qh1,
+            qh2=result.qh2,
+            qh3=result.qh3,
+            qh4=result.qh4,
+            inject_before=data_start,
         )
 
     def _predict_device(
@@ -297,7 +372,9 @@ class PredictionMixin:
         prediction_window_seconds = prediction_window_from_cache(energy_cache)
 
         nbc_result = self._compute_nbc(
-            nbc_seconds, prediction_window_seconds, now=self.instant
+            nbc_seconds, prediction_window_seconds,
+            now=self.instant,
+            data_start=pop_result.nbc_data_start,
         )
 
         # If cache has completed periods, inject QH2-QH4 from them.

@@ -362,3 +362,27 @@ it. `tesla_state=None` is unknown, never an idle car.
 uv run python tools/divergence_audit.py corpus/*.log
 uv run python tools/divergence_audit.py corpus/*.log --tesla-priority 100
 ```
+
+## 2026-11-05: finished quarter finalized at the QH boundary
+
+Corpus log `2026-11-04-90f147336d90510250e037d7f562bb9c.log`. After the 16:30
+UTC boundary the fetched window still started at 16:15:00. At 16:30:25 it held
+899 samples, so the unguarded display path extrapolated the finished 16:15
+quarter with 875 seconds of the new 16:30 quarter and showed +50.18 Wh. The
+scorer's actuals are 16:15 = -0.08 Wh and 16:00 = +3.14 Wh. The 899-sample sum
+is -0.1367 Wh: one second short at the 207 W tail, 0.0575 Wh low. The 900th
+sample arrived at 16:30:51, and `compact()` then materialized the quarter
+normally.
+
+The load manager never acted on the finished quarter: cycles at 16:30:20,
+16:30:28, 16:30:37, and 16:30:46 exited with `reason=previous_qh`, and the first
+action came at 16:30:55 on a real 29-sample 16:30 quarter. The decision contract
+is unchanged: `EnergyCache.get_current_qh` still returns `None` for a finished
+trailing chunk.
+
+Verdict (shipped): a finished trailing window at most
+`FINALIZE_MAX_SHORTFALL_SECS` (5 s) short is finalized from its measured sum
+and never forecast. The 1 s incident is accepted; the 61 s case seen earlier in
+the same log is rejected, leaving QH2 empty rather than moving 16:00 into the
+finished slot. The trade is bounded: at 7 kW, 5 s is about 10 Wh against a
+2625 Wh quarter, and the value self-corrects when the full 900 samples land.

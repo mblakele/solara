@@ -24,10 +24,10 @@ from constants import (
 from quantization import detect_quantization, usable_window
 from util import (
     CompletedNBCPeriod,
-    QH_PERIOD_SECONDS,
     RetryableError,
+    TrailingChunkKind,
     ceil_to_qh,
-    floor_to_qh,
+    classify_trailing_chunk,
     compute_nbc_quarters,
     qh_seconds_remaining,
 )
@@ -1056,16 +1056,28 @@ class EnergyCache:
         # matters. Extrapolating it with the wall-clock remainder would
         # credit a full quarter of *future* energy to a window that is
         # already over; report no incomplete QH instead (same contract as
-        # the qh1-complete branch below).
-        chunk_start = data_start + timedelta(
-            seconds=(samples_len // QH_PERIOD_SECONDS) * QH_PERIOD_SECONDS
-        )
-        if floor_to_qh(now) >= chunk_start + timedelta(seconds=QH_PERIOD_SECONDS):
-            logger.info(
-                "EnergyCache get_current_qh: cached window starting %s ended "
-                "before %s; reporting no incomplete QH",
-                chunk_start,
-                now,
+        # the qh1-complete branch below). ``util.classify_trailing_chunk``
+        # is the same classifier the display path uses. The one structured
+        # log line names the shortfall so a lagging API tail is visible.
+        trailing = classify_trailing_chunk(data_start, samples_len, now)
+        if trailing.kind is not TrailingChunkKind.CURRENT:
+            trailing_values = (
+                samples[len(samples) - trailing.sample_count:]
+                if trailing.sample_count
+                else []
+            )
+            raw_wh = 1000.0 * sum(trailing_values)
+            log_line = (
+                logger.info
+                if trailing.kind is TrailingChunkKind.FINISHED_NEAR_FULL
+                else logger.warning
+            )
+            log_line(
+                "trailing_qh kind=%s start=%s shortfall_secs=%d raw_wh=%.5f",
+                trailing.kind.value,
+                trailing.start,
+                trailing.shortfall_secs,
+                raw_wh,
             )
             return None
 

@@ -808,7 +808,22 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
 - One `predicted_wh`: `PredictionMixin._compute_nbc`, `EnergyCache.get_current_qh`, and
   `NBCReader._parse_metrics` extrapolate the incomplete quarter with
   `util.qh_seconds_remaining(now)`. The display path, cache path, and decision math share
-  one wall-clock remainder.
+  one wall-clock remainder — with one exception: when the trailing partial slice's wall
+  window has already ended (the 2026-11-05 boundary glitch), the display path never
+  extrapolates the finished quarter into the new one. Both paths call the shared
+  `util.classify_trailing_chunk` classifier, so the guard cannot drift apart. A
+  `FINISHED_NEAR_FULL` slice (at most `constants.FINALIZE_MAX_SHORTFALL_SECS` short) is
+  finalized with `util.complete_quarter`: its measured sum becomes QH2 and is never
+  forecast. A `FINISHED_SHORT` slice leaves QH2 empty, so the card shows an em dash
+  instead of moving an older quarter into the finished slot. A whole missing trailing
+  window (`n % 900 == 0`) is the complete-gap case: the last fetched complete quarter
+  moves to QH3, not QH2. Injection starts at `backfill_from` (`"QH3"` for a short QH2) and
+  skips every completed period at or after `inject_before = data_start`, because the
+  fetched window already represents every quarter from its first sample. The cache path
+  still returns `None` for a finished trailing chunk and logs one structured `trailing_qh`
+  line (INFO for near full, WARNING for short). The index template shows the finalized
+  QH2 value as the headline while the warn label stays visible, and `Recent` starts at
+  QH3 so that value is not shown twice.
 
 ## Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.

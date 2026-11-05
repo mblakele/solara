@@ -5,6 +5,7 @@ Utility functions and custom JSON provider for the application.
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, time as TimeType, timedelta
+from enum import Enum
 import json
 import math
 import os
@@ -17,7 +18,7 @@ from flask.json.provider import DefaultJSONProvider
 
 from config import Config, _config
 
-from constants import DEFAULT_PREDICTION_WINDOW_SECS
+from constants import DEFAULT_PREDICTION_WINDOW_SECS, FINALIZE_MAX_SHORTFALL_SECS
 
 
 class RetryableError(Exception):
@@ -114,6 +115,156 @@ def qh_seconds_remaining(dt: datetime) -> int:
     """
     return QH_PERIOD_SECONDS - (dt.second + (dt.minute % 15) * 60)
 
+
+def trailing_chunk_start(data_start: datetime, sample_count: int) -> datetime:
+    """Return the wall-clock start of the trailing quarter-hour chunk.
+
+    The trailing chunk is the last partial quarter when *sample_count* is not
+    a multiple of ``QH_PERIOD_SECONDS``. When it is a multiple, the returned
+    time is the start of the next, not-yet-fetched chunk.
+
+    Args:
+        data_start: Wall-clock start of the first sample.
+        sample_count: Number of contiguous one-second samples.
+
+    Returns:
+        Wall-clock start of the trailing chunk.
+    """
+    return data_start + timedelta(
+        seconds=(sample_count // QH_PERIOD_SECONDS) * QH_PERIOD_SECONDS
+    )
+
+
+class TrailingChunkKind(Enum):
+    """Whether the trailing quarter-hour chunk is live or already finished.
+
+    Attributes:
+        CURRENT: The trailing chunk's wall window has not ended.
+        FINISHED_NEAR_FULL: The window ended with at most
+            ``FINALIZE_MAX_SHORTFALL_SECS`` missing samples, so its measured
+            sum can stand as the quarter's final total.
+        FINISHED_SHORT: The window ended with too many missing samples (or
+            none at all), so the quarter's total is unknown.
+    """
+
+    CURRENT = "current"
+    FINISHED_NEAR_FULL = "finished_near_full"
+    FINISHED_SHORT = "finished_short"
+
+
+@dataclass(frozen=True)
+class TrailingChunkInfo:
+    """Classification of the trailing quarter-hour chunk.
+
+    Attributes:
+        start: Wall-clock start of the trailing chunk.
+        sample_count: Number of samples in the trailing chunk (0 when the
+            whole trailing window is missing).
+        shortfall_secs: Missing seconds in the trailing chunk (0 for a
+            current window).
+        kind: The classification.
+    """
+
+    start: datetime
+    sample_count: int
+    shortfall_secs: int
+    kind: TrailingChunkKind
+
+
+def classify_trailing_chunk(
+    data_start: datetime,
+    sample_count: int,
+    now: datetime,
+    max_shortfall_secs: int = FINALIZE_MAX_SHORTFALL_SECS,
+) -> TrailingChunkInfo:
+    """Classify the trailing quarter-hour chunk of a fetched window.
+
+    The trailing chunk is the last partial quarter when *sample_count* is
+    not a multiple of ``QH_PERIOD_SECONDS``. When it is a multiple, the
+    trailing chunk is the next, not-yet-fetched window and therefore counts
+    as entirely missing.
+
+    A chunk whose wall window has not ended is ``CURRENT``. Once the window
+    has ended, a shortfall within *max_shortfall_secs* is
+    ``FINISHED_NEAR_FULL`` (the measured sum can be finalized); anything
+    larger, including a whole missing window, is ``FINISHED_SHORT``.
+
+    Args:
+        data_start: Wall-clock start of the first sample.
+        sample_count: Number of contiguous one-second samples.
+        now: Wall-clock time to compare against.
+        max_shortfall_secs: Largest missing-seconds count still accepted as
+            near full.
+
+    Returns:
+        A ``TrailingChunkInfo`` describing the trailing chunk.
+    """
+    chunk_start = trailing_chunk_start(data_start, sample_count)
+    window_ended = floor_to_qh(now) >= chunk_start + timedelta(
+        seconds=QH_PERIOD_SECONDS
+    )
+    trailing_count = sample_count % QH_PERIOD_SECONDS
+
+    if not window_ended:
+        return TrailingChunkInfo(
+            start=chunk_start,
+            sample_count=trailing_count,
+            shortfall_secs=0,
+            kind=TrailingChunkKind.CURRENT,
+        )
+
+    if trailing_count == 0:
+        return TrailingChunkInfo(
+            start=chunk_start,
+            sample_count=0,
+            shortfall_secs=QH_PERIOD_SECONDS,
+            kind=TrailingChunkKind.FINISHED_SHORT,
+        )
+
+    shortfall = QH_PERIOD_SECONDS - trailing_count
+    kind = (
+        TrailingChunkKind.FINISHED_NEAR_FULL
+        if shortfall <= max_shortfall_secs
+        else TrailingChunkKind.FINISHED_SHORT
+    )
+    return TrailingChunkInfo(
+        start=chunk_start,
+        sample_count=trailing_count,
+        shortfall_secs=shortfall,
+        kind=kind,
+    )
+
+
+def is_stale_trailing_qh(
+    data_start: datetime, sample_count: int, now: datetime
+) -> bool:
+    """Return whether the trailing QH chunk's wall window has already ended.
+
+    This is the one stale-slice predicate shared by the display path
+    (``PredictionMixin._compute_nbc``) and the cache path
+    (``EnergyCache.get_current_qh``). A trailing partial slice whose window
+    ended before *now* belongs to a finished quarter, so applying the current
+    wall-clock remainder to it would credit future energy to a window that is
+    already over.
+
+    A count that is a multiple of ``QH_PERIOD_SECONDS`` makes the trailing
+    chunk the next, unfetched window. A complete-but-old data set then also
+    reports stale, which is what the cache path needs before it can serve a
+    fallback quarter.
+
+    Args:
+        data_start: Wall-clock start of the first sample.
+        sample_count: Number of contiguous one-second samples.
+        now: Wall-clock time to compare against.
+
+    Returns:
+        ``True`` when the trailing chunk has ended at or before *now*.
+    """
+    return (
+        classify_trailing_chunk(data_start, sample_count, now).kind
+        is not TrailingChunkKind.CURRENT
+    )
+
 @dataclass(frozen=True)
 class NBCQuarter:
     """NBC (Non-Bypassable Charge) metrics for a single 15-minute quarter-hour.
@@ -166,12 +317,22 @@ class NBCQuarterSet:
         qh2: Second most recent quarter-hour (always complete).
         qh3: Third most recent quarter-hour (always complete).
         qh4: Fourth most recent quarter-hour (always complete).
+        inject_before: When set, ``inject_completed_qh`` ignores completed
+            periods that start at or after this time. The fetched window
+            already represents every quarter from its first sample, so a
+            finalized trailing quarter must not be injected again from the
+            cache after compaction.
+        backfill_from: First QH slot that ``inject_completed_qh`` may fill.
+            ``"QH2"`` is the historical default. ``"QH3"`` leaves a short,
+            unknown QH2 empty.
     """
 
     qh1: NBCQuarter | None
     qh2: NBCQuarter | None
     qh3: NBCQuarter | None
     qh4: NBCQuarter | None
+    inject_before: datetime | None = None
+    backfill_from: str = "QH2"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to ``{"QH1": ..., "QH2": ..., "QH3": ..., "QH4": ...}``.
@@ -350,6 +511,26 @@ def _completed_quarter(period: CompletedNBCPeriod) -> NBCQuarter:
     )
 
 
+def complete_quarter(values: list[float]) -> NBCQuarter:
+    """Build a complete, measured quarter from whatever samples arrived.
+
+    This is the finalize primitive for a finished quarter that is at most
+    ``FINALIZE_MAX_SHORTFALL_SECS`` short. "Complete" here means "measured
+    total, do not extrapolate", not "exactly 900 samples": the API tail can
+    be a few seconds short at the boundary and the measured sum is still the
+    quarter's best known total.
+
+    Args:
+        values: Per-second kWh values that arrived for the quarter.
+
+    Returns:
+        An ``NBCQuarter`` with the measured raw Wh and a zero-clamped
+        display value.
+    """
+    raw_wh = 1000 * sum(values)
+    return NBCQuarter(complete=True, raw_wh=raw_wh, wh=max(0.0, raw_wh))
+
+
 def inject_completed_qh(
     nbc: NBCQuarterSet,
     completed_periods: list[CompletedNBCPeriod],
@@ -365,29 +546,56 @@ def inject_completed_qh(
     label.  This is display-only and transient (the template labels rows by
     slot name QH1-QH4), so it self-corrects once fresh data arrives.
 
+    Two assembly hints narrow that behaviour. ``nbc.inject_before`` filters
+    out periods the fetched window already represents (a finalized trailing
+    quarter must not appear twice after compaction). ``nbc.backfill_from``
+    selects the first slot injection may fill, so a short finished quarter
+    can leave QH2 empty and start the fallback at QH3.
+
     Args:
         nbc: The NBC quarter set (QH1 may be present, QH2-QH4 may be None).
         completed_periods: Completed QH periods sorted by start time.
 
     Returns:
-        New NBCQuarterSet with QH2-QH4 filled from completed periods.
+        New NBCQuarterSet with QH2-QH4 filled from completed periods and the
+        assembly hints copied through.
     """
     # Stack of completed periods with the most recent on top; each vacant
     # QH slot pops the next most recent period.
-    stack = sorted(completed_periods, key=lambda p: p.start)
+    stack = sorted(
+        (
+            period
+            for period in completed_periods
+            if nbc.inject_before is None or period.start < nbc.inject_before
+        ),
+        key=lambda period: period.start,
+    )
 
-    qh2 = nbc.qh2
-    qh3 = nbc.qh3
-    qh4 = nbc.qh4
+    slots: dict[str, NBCQuarter | None] = {
+        "QH1": nbc.qh1,
+        "QH2": nbc.qh2,
+        "QH3": nbc.qh3,
+        "QH4": nbc.qh4,
+    }
 
-    if qh2 is None and stack:
-        qh2 = _completed_quarter(stack.pop())
-    if qh3 is None and stack:
-        qh3 = _completed_quarter(stack.pop())
-    if qh4 is None and stack:
-        qh4 = _completed_quarter(stack.pop())
+    start_index = (
+        QH_NAMES.index(nbc.backfill_from)
+        if nbc.backfill_from in QH_NAMES
+        else 1
+    )
+    # QH1 is never reconstructed from completed periods.
+    for qh_name in QH_NAMES[max(1, start_index):]:
+        if slots[qh_name] is None and stack:
+            slots[qh_name] = _completed_quarter(stack.pop())
 
-    return NBCQuarterSet(qh1=nbc.qh1, qh2=qh2, qh3=qh3, qh4=qh4)
+    return NBCQuarterSet(
+        qh1=slots["QH1"],
+        qh2=slots["QH2"],
+        qh3=slots["QH3"],
+        qh4=slots["QH4"],
+        inject_before=nbc.inject_before,
+        backfill_from=nbc.backfill_from,
+    )
 
 
 def _clock_boundary_windows(now: datetime) -> list[tuple[datetime, datetime]]:

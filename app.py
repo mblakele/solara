@@ -1929,6 +1929,27 @@ def _status_is_warn(status: str) -> bool:
     return _STATUS_LABELS.get(status, "").startswith("⚠")
 
 
+def _fmt_wh(value: float | None) -> str:
+    """Format a watt-hour value for display.
+
+    ``"%+.0f" % -0.1367`` renders ``-0``, which reads as a real negative
+    value. Values smaller than half a Wh are display noise, so they render
+    as ``0``.
+
+    Args:
+        value: Watt-hours to format, or ``None``.
+
+    Returns:
+        A signed integer string, ``0`` for tiny magnitudes, or ``—`` when
+        the value is unknown.
+    """
+    if value is None:
+        return "—"
+    if abs(value) < 0.5:
+        return "0"
+    return f"{value:+.0f}"
+
+
 def create_app(
     config: Config | None = None,
     energy_cache: EnergyCache | None = None,
@@ -1998,6 +2019,7 @@ def create_app(
     application.jinja_env.filters["per_second_sparkline"] = per_second_sparkline
     application.jinja_env.globals["_status_label"] = _status_label
     application.jinja_env.globals["_status_is_warn"] = _status_is_warn
+    application.jinja_env.globals["_fmt_wh"] = _fmt_wh
     application.json = CustomJSONProvider(application)
     application.register_error_handler(RetryableMetricsException, error_retryable)
     application.add_url_rule("/", "index", index)

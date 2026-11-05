@@ -42,10 +42,11 @@ Stop and ask the user when:
 
 ## Analyzing a log in `bugs/`
 
-When a task names a path under `bugs/`, your FIRST tool call is the scorer:
+When a task names a `.log` file under `bugs/` or `corpus/`,
+start with the scoring tool:
 
 ```bash
-uv run python tools/forecast_log_scoring.py bugs/<file>.log
+uv run python tools/forecast_log_scoring.py <file>.log
 ```
 
 Lead your reply with its raw output. Then explain that output from the
