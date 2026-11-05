@@ -15,18 +15,23 @@ block), so tests and tooling can import the module safely.
 
 import asyncio
 import atexit
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
+import fcntl
+import concurrent.futures
+import hashlib
 
 import logging
 import logging.handlers
 
+import os
 import sys
 import signal
+import tempfile
 import threading
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable, get_args
 
 import pytz
 import requests
@@ -34,7 +39,9 @@ from flask import (
     Flask,
     Response,
     abort,
+    after_this_request,
     current_app,
+    has_app_context,
     make_response,
     render_template,
     request,
@@ -53,26 +60,30 @@ from constants import (
     STALE_DATA_THRESHOLD_SECS,
 )
 
-from energy_cache import EnergyCache
+from energy_cache import DaemonThreadPoolExecutor, EnergyCache
 from energy_aggregator import EnergyDataAggregator
 from quantization import usable_window
 import logfmt
 from metrics import (
     create_metrics,
     Metrics,
+    TOUBudgetExceeded,
     TOUReporter,
     TOUResult,
     RetryableMetricsException,
 )
 from mockdata import MetricsMock
 import mqtt_telemetry
-from load_models import CycleResult
+from load_models import CycleResult, CycleStatus
 from sse_event import SSEBroadcaster, event_stream
 from util import CustomJSONProvider, is_debug
 
 from tesla_oauth import bp
 
 
+# The state object is the single home for process-wide runtime flags; one
+# attribute per lifecycle signal keeps each one explicit (18/17).
+# pylint: disable=too-many-instance-attributes
 @dataclass
 class _AppState:
     """Mutable runtime state shared across views and background threads.
@@ -95,6 +106,9 @@ class _AppState:
     consecutive_error_count: int = 0
     last_error_type: str | None = None
     lm_thread_started: bool = False
+    # Cache refresher (architecture-v2 F.1): warms the cache when load
+    # management is disabled so requests never fetch.
+    cache_refiller_started: bool = False
     # Init-retry state (plan 2.6): failures back off instead of latching.
     load_manager_init_attempts: int = 0
     load_manager_next_init_retry_at: datetime | None = None
@@ -104,6 +118,12 @@ class _AppState:
     background_services_started_at: datetime | None = None
     # Watchdog input (plan 2.7): last completed loop iteration.
     lm_last_cycle_finished_at: datetime | None = None
+    # Observability counters (architecture-v2 G.2): every cycle status,
+    # early-exit reason, and arbitration verdict is countable without
+    # reading logs.
+    cycle_status_counts: Counter[str] = field(default_factory=Counter)
+    early_exit_counts: Counter[str] = field(default_factory=Counter)
+    arbitration_counts: Counter[str] = field(default_factory=Counter)
 
 
 # Application-level configuration injected into all consumers.
@@ -111,7 +131,7 @@ _config = Config()
 
 # Shared runtime state (cache, broadcaster, load-manager singleton, ...).
 _state = _AppState(
-    energy_cache=EnergyCache(ttl_seconds=60),
+    energy_cache=EnergyCache(),
     sse_broadcaster=SSEBroadcaster(),
 )
 
@@ -122,6 +142,37 @@ _stop_event = threading.Event()
 # Guard so signal-hook installation happens once (see
 # install_shutdown_signal_hooks()).
 _shutdown_hooks_installed = False
+
+# Cross-process single-controller lock (architecture-v2 Phase B0.1): held
+# for the process lifetime while background services run, released on
+# shutdown. A second live claimant for the same deployment defers startup.
+_controller_lock_fd: int | None = None
+
+
+def _request_state() -> _AppState:
+    """Return the runtime state bound to the active app.
+
+    ``create_app()`` binds either the process singleton or a per-app state
+    to ``app.extensions["solara_state"]`` (architecture-v2 A.1). Request
+    handlers read through this helper so an injected cache or broadcaster
+    actually serves that app's requests. Calls outside an app context (the
+    background loops and tests that drive helpers directly) get the process
+    singleton.
+    """
+    if has_app_context():
+        state = current_app.extensions.get("solara_state")
+        if isinstance(state, _AppState):
+            return state
+    return _state
+
+
+def _request_config() -> Config:
+    """Return the config bound to the active app, or the process singleton."""
+    if has_app_context():
+        cfg = current_app.config.get("SOLARA_CONFIG")
+        if isinstance(cfg, Config):
+            return cfg
+    return _config
 
 
 def camelize(obj: object) -> object:
@@ -201,7 +252,7 @@ def _enrich_metrics_for_sse(metrics_data: dict[str, Any], now: datetime | None =
         for d in metrics_data.get("devices", []):
             cached_lag = d.get("lag", timedelta(0))
             d["lag"] = timedelta(seconds=cached_lag.total_seconds() + elapsed)
-    samples = _state.energy_cache.samples
+    samples = _request_state().energy_cache.samples
     if samples:
         accumulated = list(samples)
         devices = metrics_data.get("devices", [])
@@ -376,30 +427,54 @@ def _get_model(
     """
     if is_mock_error:
         raise RetryableMetricsException("mock")
-    is_mock = _config.is_mock_mode or force_mock
+    cfg = _request_config()
+    is_mock = cfg.is_mock_mode or force_mock
     if is_mock:
         if instant_minute is not None:
             return MetricsMock(instant_minute=instant_minute)
         return MetricsMock()
-    return Metrics(instant, logger, config=_config)
+    return Metrics(instant, logger, config=cfg)
 
 
-def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = False) -> TOUResult:
+def _get_tou_model(
+    start_date: datetime,
+    end_date: datetime,
+    force_mock: bool = False,
+    budget_secs: float | None = None,
+    config: Config | None = None,
+) -> TOUResult:
     """Return TOU buckets and NBC total based on configuration.
 
-    Raises requests.exceptions.HTTPError or IOError from TOUReporter.
+    Raises requests.exceptions.HTTPError or IOError from TOUReporter, and
+    TOUBudgetExceeded when *budget_secs* elapses between chunks.
     Returns a TOUResult with buckets (TOU totals), nbc (total Wh
     across all 15-minute periods), and periods (per-15-minute details).
     In mock mode, returns realistic non-zero values.
+
+    Args:
+        start_date: Range start (UTC).
+        end_date: Exclusive range end (UTC).
+        force_mock: Use mock data even when credentials are configured.
+        budget_secs: Wall-clock budget checked between 15-minute chunks.
+        config: Config to read; defaults to the process singleton. The
+            request path passes its per-app config because this helper runs
+            in a worker thread with no Flask app context.
     """
-    is_mock = _config.is_mock_mode or force_mock
+    cfg = config if config is not None else _config
+    is_mock = cfg.is_mock_mode or force_mock
     if is_mock:
         mock = MetricsMock()
         periods = _mock_tou_periods(start_date, end_date)
         return TOUResult(
             buckets=mock.tou_result, nbc=mock.nbc_result, periods=tuple(periods)
         )
-    model = TOUReporter(start_date, end_date, logger, config=_config)
+    model = TOUReporter(
+        start_date,
+        end_date,
+        logger,
+        config=cfg,
+        budget_secs=budget_secs,
+    )
     assert model.tou_result is not None
     assert model.nbc_result is not None
     return TOUResult(
@@ -407,6 +482,61 @@ def _get_tou_model(start_date: datetime, end_date: datetime, force_mock: bool = 
         nbc=model.nbc_result,
         periods=tuple(getattr(model, "periods", [])),
     )
+
+
+# Request budget for a synchronous TOU report (architecture-v2 F.2). The
+# 366-day cap bounds the chunk count; this bounds the wall clock so a slow
+# API cannot reach the gunicorn timeout. Chunk-level checks stop the work
+# cooperatively; the outer wait covers one stalled HTTP call.
+_TOU_REQUEST_BUDGET_SECS = 45.0
+_TOU_HARD_TIMEOUT_MARGIN_SECS = 2.0
+# A running pyemvue call cannot be interrupted. One shared pool caps how
+# many such calls can exist at once; a per-request pool leaked one blocked
+# thread per timeout (review finding F.2).
+_TOU_EXECUTOR_MAX_WORKERS = 4
+_tou_executor: DaemonThreadPoolExecutor | None = None
+_tou_executor_lock = threading.Lock()
+
+
+def _get_tou_executor() -> DaemonThreadPoolExecutor:
+    """Return the shared, bounded executor for TOU report calls."""
+    global _tou_executor  # pylint: disable=global-statement
+    with _tou_executor_lock:
+        if _tou_executor is None:
+            _tou_executor = DaemonThreadPoolExecutor(
+                max_workers=_TOU_EXECUTOR_MAX_WORKERS
+            )
+        return _tou_executor
+
+
+def _run_tou_with_budget(start_date: datetime, end_date: datetime) -> TOUResult:
+    """Run a TOU report with a hard wall-clock bound.
+
+    Args:
+        start_date: Range start (UTC).
+        end_date: Exclusive range end (UTC).
+
+    Returns:
+        The aggregated TOU result.
+
+    Raises:
+        TOUBudgetExceeded: The report did not finish inside the budget.
+    """
+    budget_secs = _TOU_REQUEST_BUDGET_SECS
+    cfg = _request_config()
+    future = _get_tou_executor().submit(
+        _get_tou_model, start_date, end_date, False, budget_secs, cfg
+    )
+    try:
+        return future.result(
+            timeout=budget_secs + _TOU_HARD_TIMEOUT_MARGIN_SECS
+        )
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise TOUBudgetExceeded(
+            "TOU report exceeded its request time budget"
+        ) from exc
+
 
 
 def _mock_tou_periods(
@@ -541,19 +671,73 @@ def error_retryable(e: RetryableMetricsException) -> Response:
     return resp
 
 
+def _attach_cache_age(age_secs: int) -> None:
+    """Attach an ``Age`` header to the response for a stale-cache serve.
+
+    Args:
+        age_secs: Whole seconds since the cached snapshot was fetched.
+    """
+    @after_this_request
+    def _add_age_header(response: Response) -> Response:
+        response.headers["Age"] = str(age_secs)
+        return response
+
+
+def _cache_cold_response(retry_secs: int) -> Response:
+    """Return a fast 503 while the cache is still cold.
+
+    Request handlers never fetch (architecture-v2 F.1): the background
+    warmer owns the Emporia call that fills the cache. ``Retry-After``
+    tells clients when to try again; HTML clients also get the empty
+    dashboard with a short meta refresh so the page self-heals.
+
+    Args:
+        retry_secs: Hint for the ``Retry-After`` header.
+
+    Returns:
+        A 503 response with ``Retry-After`` set.
+    """
+    logger.warning("index: cache cold; serving 503 (retry in %ds)", retry_secs)
+    if request.args.get("partial") is not None:
+        resp = make_response("", 503)
+    elif request.accept_mimetypes.accept_html:
+        resp = make_response(
+            render_template(
+                "index.html",
+                metrics={"devices": [], "api_response": {}, "instant": None},
+                load_management={},
+                refresh_secs=min(retry_secs, 5),
+                freshness=None,
+                quantization_seconds=None,
+            ),
+            503,
+        )
+    elif request.accept_mimetypes.accept_json:
+        resp = _json_response(
+            {"error": "cache warming", "retryAfterSecs": retry_secs}
+        )
+        resp.status_code = 503
+    else:
+        abort(406)
+    resp.headers["Retry-After"] = str(retry_secs)
+    return resp
+
+
 def index() -> ResponseReturnValue:
     """Main index endpoint serving HTML or JSON based on Accept header.
 
     In mock mode, falls back to MetricsMock for deterministic test data.
     """
     logger.debug("index")
-    is_mock_error = _config.is_mock_error
+    cfg = _request_config()
+    state = _request_state()
+    is_mock_error = cfg.is_mock_error
 
     if is_mock_error:
         raise RetryableMetricsException("mock error")
 
     # Determine whether to use mock or real data
-    is_mock = _config.is_mock_mode
+    is_mock = cfg.is_mock_mode
 
     now = datetime.now(timezone.utc)
 
@@ -569,15 +753,16 @@ def index() -> ResponseReturnValue:
         model = _get_model(logger, now, is_mock_error, instant_minute=instant_minute)
         metrics_data = model.metrics
     else:
-        # Real mode: use cached metrics to avoid hammering the API
-        metrics_data, was_fresh = _state.energy_cache.get_or_fetch(
-            lambda: create_metrics(_state.energy_cache, datetime.now(pytz.timezone(_config.timezone)), logger),
-            now
-        )
-        if was_fresh:
-            logger.debug("Fetched fresh metrics for index endpoint")
-        else:
-            logger.debug("Serving cached metrics for index endpoint")
+        # Real mode: serve the warm cache only. Fetching belongs to the
+        # background warmer (the load-management loop, or the read-only
+        # refresher when load management is disabled), so a cold or slow
+        # Emporia API can never hold a request open (architecture-v2 F.1).
+        cache = state.energy_cache
+        metrics_data, cache_age_secs = cache.cached_metrics(now)
+        if metrics_data is None:
+            return _cache_cold_response(max(1, int(cache.ttl_seconds)))
+        if cache_age_secs is not None and not cache.is_valid(now):
+            _attach_cache_age(int(cache_age_secs))
 
     # Enrich metrics for output: recalculate lag, merge samples, trim output.
     metrics_data = _enrich_metrics_for_sse(metrics_data, now=now)
@@ -599,7 +784,7 @@ def index() -> ResponseReturnValue:
     if partial is not None or request.accept_mimetypes.accept_html:
         refresh_secs: int | None = None
         quantization_seconds: int | None = None
-        cache_data = _state.energy_cache.data
+        cache_data = state.energy_cache.data
         if cache_data is not None:
             quantization_seconds = usable_window(
                 cache_data.quantization_seconds,
@@ -779,13 +964,19 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
         ``components`` map: load_manager_thread, energy_cache,
         mqtt_telemetry, errors.
     """
+    # Too many locals (23/21): one local per health signal keeps each
+    # component's inputs explicit and independently testable.
+    # pylint: disable=too-many-locals
 
     def _iso(value: datetime | None) -> str | None:
         return value.isoformat() if value is not None else None
 
+    cfg = _request_config()
+    state = _request_state()
+
     # ── Load-management thread liveness ──────────────────────────────
-    lm_enabled = _config.load_manage_enabled is not False
-    heartbeat = _state.lm_heartbeat_at
+    lm_enabled = cfg.load_manage_enabled is not False
+    heartbeat = state.lm_heartbeat_at
     lm_state = "disabled"
     lm_age: float | None = None
     if lm_enabled:
@@ -795,12 +986,12 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
             lm_age = (now - heartbeat).total_seconds()
             stale_bound = max(
                 _HEALTH_LM_MIN_STALE_SECS,
-                3.0 * float(_config.load_manage_interval_secs),
+                3.0 * float(cfg.load_manage_interval_secs),
             )
             lm_state = "alive" if lm_age <= stale_bound else "stale"
 
     # ── Emporia sample-cache freshness ────────────────────────────────
-    cache_data = _state.energy_cache.data
+    cache_data = state.energy_cache.data
     cache_state = "empty"
     cache_age: float | None = None
     if (
@@ -821,7 +1012,7 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
             if cache_age <= 2 * STALE_DATA_THRESHOLD_SECS
             else "stale"
         )
-    started_at = _state.background_services_started_at
+    started_at = state.background_services_started_at
     booted_long_ago = (
         started_at is not None
         and (now - started_at).total_seconds() > _HEALTH_BOOT_GRACE_SECS
@@ -839,7 +1030,7 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
         else None
     )
     mqtt_connected: bool | None = None
-    if not _state.mqtt_subscriber_started:
+    if not state.mqtt_subscriber_started:
         mqtt_state = "not_started"
         mqtt_gated = False
     else:
@@ -865,7 +1056,7 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
 
     # ── Sustained cycle errors ────────────────────────────────────────
     errors_gated = (
-        _state.consecutive_error_count >= _HEALTH_ERROR_THRESHOLD
+        state.consecutive_error_count >= _HEALTH_ERROR_THRESHOLD
     )
 
     degraded = (
@@ -890,11 +1081,62 @@ def _build_health_payload(now: datetime) -> dict[str, Any]:
                 "last_update_age_secs": mqtt_last_age,
             },
             "errors": {
-                "consecutive_error_count": _state.consecutive_error_count,
-                "last_error_type": _state.last_error_type,
+                "consecutive_error_count": state.consecutive_error_count,
+                "last_error_type": state.last_error_type,
             },
         },
     }
+
+
+def _record_cycle_metrics(result: CycleResult, lm: Any | None = None) -> None:
+    """Count one cycle outcome for the metrics endpoint (G.2).
+
+    Args:
+        result: The cycle result returned by ``LoadManager.run_cycle()``.
+        lm: The load manager that produced the result, or None.
+    """
+    machine = getattr(lm, "tesla_arbitration", None)
+    verdict = getattr(machine, "state", None)
+    # Serialize with the endpoint's snapshot read: a new status or reason
+    # key can resize the Counter while a request copies it.
+    with _state.load_manager_lock:
+        _state.cycle_status_counts[result.status] += 1
+        if (
+            result.status not in ("ok", "dry-run")
+            and result.diagnostics is not None
+        ):
+            reason = result.diagnostics.reason or "unknown"
+            _state.early_exit_counts[f"{result.status}:{reason}"] += 1
+        if verdict is not None:
+            _state.arbitration_counts[
+                str(getattr(verdict, "value", verdict))
+            ] += 1
+
+
+def metrics_endpoint() -> Response:
+    """Return process counters as JSON for debugging without logs.
+
+    Every ``CycleStatus`` is present even at zero, so a missing status is
+    distinguishable from a status that never fired.
+    """
+    state = _request_state()
+    with state.load_manager_lock:
+        lm = state.load_manager
+        cycle_status_counts = dict(state.cycle_status_counts)
+        early_exit_counts = dict(state.early_exit_counts)
+        arbitration_counts = dict(state.arbitration_counts)
+    drift_escalations = getattr(lm, "drift_escalation_count", 0)
+    cycles = {status: cycle_status_counts.get(status, 0)
+              for status in get_args(CycleStatus)}
+    payload = {
+        "cycles": cycles,
+        "earlyExits": early_exit_counts,
+        "arbitration": arbitration_counts,
+        "driftEscalations": drift_escalations,
+        "sseEvictions": state.sse_broadcaster.eviction_count,
+        "fetchTimeouts": state.energy_cache.fetch_timeout_count,
+    }
+    return _json_response(payload)
 
 
 def health() -> Response:
@@ -931,7 +1173,16 @@ def tou() -> ResponseReturnValue:
     start_date, end_date = result
 
     try:
-        tou_data = _get_tou_model(start_date, end_date)
+        tou_data = _run_tou_with_budget(start_date, end_date)
+    except TOUBudgetExceeded:
+        logger.warning(
+            "TOU report exceeded its %.1fs budget; returning 504",
+            _TOU_REQUEST_BUDGET_SECS,
+        )
+        return abort(
+            504,
+            "TOU report exceeded its time budget; narrow the date range",
+        )
     except (requests.exceptions.HTTPError, IOError) as e:
         error_msg = str(e)
         if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
@@ -1068,15 +1319,21 @@ def _build_load_management_payload(lm: Any = None) -> dict:
         last cycle result; an empty dict when unavailable.
     """
     if lm is None:
-        if _config.load_manage_enabled is False:
+        cfg = _request_config()
+        state = _request_state()
+        if cfg.load_manage_enabled is False:
             return {}
-        lm = _get_load_manager()
+        # Read-only: requests must never construct a LoadManager
+        # (architecture-v2 F.2); the background loop owns initialization.
+        with state.load_manager_lock:
+            lm = state.load_manager
         if lm is None:
             return {}
-        with _state.load_manager_lock:
-            last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
+        with state.load_manager_lock:
+            last_result = _cycle_result_to_dict(state.last_cycle_result) if state.last_cycle_result else {}
     else:
-        last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
+        state = _request_state()
+        last_result = _cycle_result_to_dict(state.last_cycle_result) if state.last_cycle_result else {}
 
     sentinel_names = sorted(getattr(lm, "sentinel_names", frozenset()))
     state_dict = lm.state.to_dict()
@@ -1218,6 +1475,7 @@ def _load_management_loop() -> None:
             lm = _get_load_manager()
             if lm is not None:
                 result = lm.run_cycle()
+                _record_cycle_metrics(result, lm)
                 lm._send_pending_notifications_sync()  # flush Telegram sends outside lock
                 with _state.load_manager_lock:
                     _state.last_cycle_result = result
@@ -1286,14 +1544,18 @@ def load_status() -> Response:
     Returns StateTracker state, last cycle result timestamp, enabled/disabled flag,
     and cache status.
     """
-    lm = _get_load_manager()
+    state = _request_state()
+    with state.load_manager_lock:
+        lm = state.load_manager
+        last_result = (
+            _cycle_result_to_dict(state.last_cycle_result)
+            if state.last_cycle_result
+            else {}
+        )
     if lm is None:
         return abort(503, "LoadManager not initialized")
 
-    with _state.load_manager_lock:
-        last_result = _cycle_result_to_dict(_state.last_cycle_result) if _state.last_cycle_result else {}
-
-    cache_data = _state.energy_cache.data
+    cache_data = state.energy_cache.data
     if cache_data is not None:
         cache_payload = {
             "data_start": (
@@ -1326,10 +1588,10 @@ def load_status() -> Response:
         "devices": {},
         "pending_effects": [],
         "last_cycle_result": last_result,
-        "recent_cycles": list(_state.recent_cycles),
-        "consecutive_error_count": _state.consecutive_error_count,
-        "last_error_type": _state.last_error_type,
-        "sse_subscriber_count": _state.sse_broadcaster.subscriber_count(),
+        "recent_cycles": list(state.recent_cycles),
+        "consecutive_error_count": state.consecutive_error_count,
+        "last_error_type": state.last_error_type,
+        "sse_subscriber_count": state.sse_broadcaster.subscriber_count(),
         "cache": cache_payload,
         "mqtt": {
             "has_telemetry": mqtt_telemetry.has_telemetry(),
@@ -1377,13 +1639,14 @@ def stream_status():
     initial: list[tuple[str, object]] = [
         ("initial_load_state", camelize(_build_load_management_payload())),
     ]
-    full_metrics_dict = _state.energy_cache.full_metrics_dict
+    state = _request_state()
+    full_metrics_dict = state.energy_cache.full_metrics_dict
     if full_metrics_dict is not None:
         initial.append(
             ("initial_metrics", camelize(_enrich_metrics_for_sse(dict(full_metrics_dict))))
         )
     return Response(
-        event_stream(_state.sse_broadcaster, initial_events=initial, dumper=current_app.json.dumps),
+        event_stream(state.sse_broadcaster, initial_events=initial, dumper=current_app.json.dumps),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1415,6 +1678,64 @@ def _start_load_manager_thread():
     _state.lm_thread_started = True
     lm_thread = threading.Thread(target=_load_management_loop, daemon=True)
     lm_thread.start()
+
+
+# Cache refresher cadence floor (architecture-v2 F.1). The effective
+# cadence is half the cache TTL so a snapshot is refreshed before it is
+# served stale for long; the floor keeps a tiny TTL from busy-looping.
+_CACHE_REFILL_MIN_INTERVAL_SECS = 5.0
+
+
+def _refill_cache_once() -> None:
+    """Fetch fresh metrics into the shared cache once (background warmer)."""
+    now = datetime.now(timezone.utc)
+    _state.energy_cache.get_or_fetch(
+        lambda: create_metrics(
+            _state.energy_cache,
+            datetime.now(pytz.timezone(_config.timezone)),
+            logger,
+        ),
+        now,
+    )
+
+
+def _cache_refiller_interval_secs() -> float:
+    """Return the refresher cadence: half the cache TTL, floored.
+
+    Returns:
+        Seconds to wait between refresher passes.
+    """
+    return max(
+        _CACHE_REFILL_MIN_INTERVAL_SECS,
+        float(_state.energy_cache.ttl_seconds) / 2.0,
+    )
+
+
+def _cache_refiller_loop() -> None:
+    """Keep the shared cache warm while load management is disabled.
+
+    With load management off there is no cycle to fetch data, so this
+    read-only loop owns refreshing the cache. Request handlers never fetch
+    (architecture-v2 F.1): they serve what this loop stores.
+    """
+    logger.info("Cache refresher loop started (load management disabled)")
+    while not _stop_event.is_set():
+        try:
+            _refill_cache_once()
+        except Exception:  # pylint: disable=broad-exception-caught
+            # The loop must survive any single failed pass; the cache logs
+            # the underlying error and the next pass retries.
+            logger.exception("Cache refresher pass failed")
+        if _stop_event.wait(_cache_refiller_interval_secs()):
+            break
+
+
+def _start_cache_refiller() -> None:
+    """Start the cache refresher thread (called once per process)."""
+    if _state.cache_refiller_started:
+        return
+    _state.cache_refiller_started = True
+    threading.Thread(target=_cache_refiller_loop, daemon=True).start()
 
 
 def _shutdown_load_manager():
@@ -1457,6 +1778,7 @@ def request_shutdown(reason: str) -> None:
     # the subscriber directly, bypassing start_background_services()).
     stop_mqtt_subscriber()
     _shutdown_load_manager()
+    _release_controller_slot()
 
 
 def install_shutdown_signal_hooks() -> None:
@@ -1492,6 +1814,54 @@ def install_shutdown_signal_hooks() -> None:
     _shutdown_hooks_installed = True
 
 
+def _controller_lock_path() -> str:
+    """Return the cross-process lock file path for controller claims.
+
+    The default is scoped to this deployment directory, so two Solara
+    checkouts on one host do not fight over a single host-wide lock. Set
+    ``SOLARA_CONTROLLER_LOCK`` to share a different path across replicas.
+    """
+    override = os.environ.get("SOLARA_CONTROLLER_LOCK")
+    if override:
+        return override
+    deployment = os.path.dirname(os.path.abspath(__file__))
+    digest = hashlib.sha1(deployment.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(
+        tempfile.gettempdir(), f"solara-controller-{digest}.lock"
+    )
+
+
+def _claim_controller_slot() -> bool:
+    """Acquire the single-controller lock for this process.
+
+    Returns:
+        True when this process may run the load manager and MQTT subscriber;
+        False when another live controller already holds the slot.
+    """
+    global _controller_lock_fd  # pylint: disable=global-statement
+    if _controller_lock_fd is not None:
+        # A repeat start in the same process is idempotent, not a rival
+        # claimant.
+        return True
+    path = _controller_lock_path()
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _controller_lock_fd = fd
+    return True
+
+
+def _release_controller_slot() -> None:
+    """Release the controller lock acquired by :func:`_claim_controller_slot`."""
+    global _controller_lock_fd  # pylint: disable=global-statement
+    if _controller_lock_fd is not None:
+        os.close(_controller_lock_fd)
+        _controller_lock_fd = None
+
+
 def start_background_services() -> None:
     """Start MQTT subscriber and load-management background threads.
 
@@ -1499,11 +1869,25 @@ def start_background_services() -> None:
     side-effect free so tests and tooling can import it safely. The gunicorn
     entry point (wsgi.py) and the ``__main__`` block call this explicitly
     after the app is constructed.
+
+    Single-controller guard (architecture-v2 Phase B0.1): the first claimant
+    acquires the cross-process controller lock and starts background
+    services; a second claimant defers (logs CRITICAL, serves reads and the
+    SSE bootstrap only). The lock is held for the process lifetime and
+    released on shutdown.
     """
+    if not _claim_controller_slot():
+        logger.critical(
+            "Another Solara controller already holds the controller slot; "
+            "skipping background service start (single-controller guard)."
+        )
+        return
     if _config.load_tesla_controller == "real":
         _start_mqtt_subscriber()
     if _config.load_manage_enabled is not False:
         _start_load_manager_thread()
+    else:
+        _start_cache_refiller()
     _state.background_services_started_at = datetime.now(timezone.utc)
 
 
@@ -1545,28 +1929,69 @@ def _status_is_warn(status: str) -> bool:
     return _STATUS_LABELS.get(status, "").startswith("⚠")
 
 
-def create_app() -> Flask:
+def create_app(
+    config: Config | None = None,
+    energy_cache: EnergyCache | None = None,
+    broadcaster: SSEBroadcaster | None = None,
+    load_manager_factory: Callable[[], Any] | None = None,
+) -> Flask:
     """Create and configure the Flask application.
 
-    Builds the app, registers routes, attaches the module-level ``_config``
-    singleton to ``app.config["SOLARA_CONFIG"]``, and wires the JSON
-    provider, error handler, and Jinja filter. Does NOT start background
-    threads — call :func:`start_background_services` explicitly (see
-    wsgi.py and the ``__main__`` block).
+    Builds the app, registers routes, attaches the config singleton to
+    ``app.config["SOLARA_CONFIG"]``, and wires the JSON provider, error
+    handler, and Jinja filter. Does NOT start background threads — call
+    :func:`start_background_services` explicitly (see wsgi.py and the
+    ``__main__`` block).
 
-    Note:
-        The ``config`` override parameter was removed: views and background
-        services read the module-level ``_config`` singleton, so a per-app
-        override was inert and misleading.
+    Args:
+        config: Injected :class:`Config` instance; defaults to the module
+            singleton ``_config`` when omitted.
+        energy_cache: Injected :class:`EnergyCache`; defaults to the module
+            singleton when omitted.
+        broadcaster: Injected :class:`SSEBroadcaster`; defaults to the module
+            singleton when omitted.
+        load_manager_factory: Injected factory returning the load-manager
+            instance; defaults to the module singleton lifecycle when omitted.
 
     Returns:
-        A configured Flask application instance.
+        A configured Flask application instance. Injected runtime state is
+        bound per app via ``app.extensions["solara_state"]``, and every
+        request handler reads it through ``_request_state()`` /
+        ``_request_config()``.
+
+    Note:
+        The default call ``create_app()`` binds the module-level singletons
+        (``_config`` and ``_state``), preserving the pre-DI behaviour. Pass
+        *energy_cache*, *broadcaster*, or *load_manager_factory* to get a
+        per-app state; injecting *config* alone keeps the shared runtime
+        state but changes the config every view sees.
+
     """
-    cfg = _config
+    cfg = config if config is not None else _config
+    state_injected = (
+        energy_cache is not None
+        or broadcaster is not None
+        or load_manager_factory is not None
+    )
+    if state_injected:
+        state = _AppState(
+            energy_cache=(
+                energy_cache if energy_cache is not None else _state.energy_cache
+            ),
+            sse_broadcaster=(
+                broadcaster if broadcaster is not None else _state.sse_broadcaster
+            ),
+            load_manager=(
+                load_manager_factory() if load_manager_factory is not None else None
+            ),
+        )
+    else:
+        state = _state
     application = Flask(__name__)
     application.logger.handlers.clear()
     application.logger.propagate = True
     application.config["SOLARA_CONFIG"] = cfg
+    application.extensions["solara_state"] = state
     # Register Tesla OAuth routes.
     application.register_blueprint(bp)
     application.jinja_env.filters["astimezonestr"] = astimezone_filter
@@ -1579,6 +2004,7 @@ def create_app() -> Flask:
     application.add_url_rule("/health", "health", health)
     application.add_url_rule("/api/v1/tou", "tou", tou)
     application.add_url_rule("/api/v1/load/status", "load_status", load_status)
+    application.add_url_rule("/api/v1/metrics", "metrics_endpoint", metrics_endpoint)
     application.add_url_rule("/stream/status", "stream_status", stream_status)
     return application
 

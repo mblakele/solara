@@ -177,6 +177,9 @@ class TestApp(unittest.TestCase):
 
             app_mod._state.load_manager = None
             app_mod._state.load_manager_init_failed = False
+            # Pre-warm like startup does: requests never construct the
+            # LoadManager themselves (F.2).
+            app_mod._get_load_manager()
             response = self.app.get("/", headers={"Accept": "text/html"})
         self.assertEqual(response.status_code, 200)
         data = response.data.decode("utf-8")
@@ -233,18 +236,25 @@ class TestApp(unittest.TestCase):
                 self.assertEqual("forecast__period--warn" in data, expect_warn)
 
     def test_index_real_mode_lm_disabled(self):
-        """Index returns 200 in real mode when load management is disabled.
+        """Index returns 200 in real mode once the warmer has filled the cache.
 
         Regression for the production 500 where a real-mode fetch through
         EnergyCache._run_fetch_with_timeout crashed with
         ``AttributeError: 'DaemonThreadPoolExecutor' object has no attribute
         '_initializer'`` on Python 3.14 (ThreadPoolExecutor internals changed).
+        The fetch now happens on the background warmer (F.1), not in the
+        request, so this seeds the cache the way the warmer does.
         """
         import app as app_mod
+        from energy_cache import EnergyCache
 
         with self._real_mode_config():
-            with patch("app.create_metrics", return_value=realistic_metrics()):
-                response = self.app.get("/", headers={"Accept": "application/json"})
+            with patch.object(
+                app_mod._state, "energy_cache", EnergyCache(ttl_seconds=60)
+            ):
+                with patch("app.create_metrics", return_value=realistic_metrics()):
+                    app_mod._refill_cache_once()
+                    response = self.app.get("/", headers={"Accept": "application/json"})
         self.assertEqual(response.status_code, 200)
 
     def test_index_html_renders_per_second_sparkline(self):
@@ -349,6 +359,7 @@ class TestApp(unittest.TestCase):
             with app_mod._state.load_manager_lock:
                 app_mod._state.last_cycle_result = result
             with patch("app.create_metrics", return_value=realistic_metrics()):
+                app_mod._refill_cache_once()
                 response = self.app.get("/", headers={"Accept": "application/json"})
         self.assertEqual(response.status_code, 200)
 
@@ -496,6 +507,204 @@ def _make_lm(result, *, interval=30):
     return lm
 
 
+class TestRequestPathServesCacheOnly(unittest.TestCase):
+    """F.1: GET / serves the warm cache and never fetches inline.
+
+    Fetching belongs to the background warmer (the load-management loop,
+    or the read-only refresher when load management is disabled), so a
+    cold or slow Emporia API cannot hold a request open.
+    """
+
+    def setUp(self):
+        from energy_cache import EnergyCache
+
+        self.client = app.test_client()
+        self.cache = EnergyCache(ttl_seconds=60)
+
+    @contextlib.contextmanager
+    def _real_mode(self):
+        import app as app_mod
+
+        with real_mode_config():
+            with patch.object(app_mod._state, "energy_cache", self.cache):
+                yield
+
+    def test_cache_miss_returns_503_and_does_not_fetch_json(self):
+        with self._real_mode():
+            with patch("app.create_metrics") as mock_create:
+                resp = self.client.get("/", headers={"Accept": "application/json"})
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.headers.get("Retry-After"), "60")
+        mock_create.assert_not_called()
+
+    def test_cache_miss_returns_503_and_does_not_fetch_html(self):
+        with self._real_mode():
+            with patch("app.create_metrics") as mock_create:
+                resp = self.client.get("/", headers={"Accept": "text/html"})
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.headers.get("Retry-After"), "60")
+        # The empty dashboard carries a meta refresh so the page self-heals
+        # as soon as the background warmer fills the cache.
+        self.assertIn(b'http-equiv="refresh"', resp.data.lower())
+        mock_create.assert_not_called()
+
+    def test_stale_cache_serves_200_with_age_header_and_no_fetch(self):
+        from energy_cache import EnergyCacheData
+
+        fetched_at = datetime.now(timezone.utc) - timedelta(seconds=125)
+        self.cache._data = EnergyCacheData(
+            samples=[0.0] * 10,
+            data_start=fetched_at,
+            last_sample_at=fetched_at,
+            last_fetch_at=fetched_at,
+            sample_count=10,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+            full_metrics_dict=realistic_metrics(),
+        )
+        with self._real_mode():
+            with patch("app.create_metrics") as mock_create:
+                resp = self.client.get("/", headers={"Accept": "application/json"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertGreaterEqual(int(resp.headers["Age"]), 125)
+        mock_create.assert_not_called()
+
+
+class TestTouRequestBudget(unittest.TestCase):
+    """F.2: a slow TOU report cannot hold a worker past its budget."""
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def test_slow_tou_fetch_returns_504_within_budget(self):
+        def slow_tou(*args, **kwargs):
+            time_module.sleep(10)
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch("app._get_tou_model", side_effect=slow_tou), \
+                 patch("app._TOU_REQUEST_BUDGET_SECS", 0.1):
+                started = time_module.monotonic()
+                resp = self.client.get(
+                    "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-02"
+                )
+                elapsed = time_module.monotonic() - started
+
+        self.assertEqual(resp.status_code, 504)
+        self.assertLess(elapsed, 5.0)
+
+    def test_tou_survives_a_budget_timeout(self):
+        """A timed-out report must not poison later requests."""
+        def slow_tou(*args, **kwargs):
+            time_module.sleep(10)
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch("app._get_tou_model", side_effect=slow_tou), \
+                 patch("app._TOU_REQUEST_BUDGET_SECS", 0.1):
+                self.client.get(
+                    "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-02"
+                )
+
+        with mock_config(MOCK=True):
+            resp = self.client.get(
+                "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-01T04:00:00"
+            )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_tou_timeouts_reuse_one_bounded_executor(self):
+        """Repeated slow reports must not create one executor per request."""
+        import app as app_mod
+
+        def slow_tou(*args, **kwargs):
+            time_module.sleep(1)
+
+        app_mod._tou_executor = None
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch("app._get_tou_model", side_effect=slow_tou), \
+                 patch("app._TOU_REQUEST_BUDGET_SECS", 0.05), \
+                 patch("app._TOU_HARD_TIMEOUT_MARGIN_SECS", 0.05):
+                first = self.client.get(
+                    "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-02"
+                )
+                second = self.client.get(
+                    "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-02"
+                )
+
+        self.assertEqual(first.status_code, 504)
+        self.assertEqual(second.status_code, 504)
+        executor = app_mod._tou_executor
+        self.assertIsNotNone(executor)
+        self.assertIs(app_mod._get_tou_executor(), executor)
+
+    def test_oversized_range_rejected_without_fetch(self):
+        """The 366-day cap rejects before any report is built."""
+        with mock_config(MOCK=True):
+            with patch("app._get_tou_model") as mock_tou:
+                resp = self.client.get(
+                    "/api/v1/tou?start_date=2025-01-01&end_date=2026-01-03"
+                )
+        self.assertEqual(resp.status_code, 400)
+        mock_tou.assert_not_called()
+
+
+class TestRequestPathNeverConstructsLoadManager(unittest.TestCase):
+    """F.2: requests read the existing LoadManager; they never build one."""
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def test_load_status_does_not_construct(self):
+        import app as app_mod
+
+        with real_mode_config(LOAD_MANAGE_ENABLED="True"):
+            app_mod._state.load_manager = None
+            with patch(
+                "app._get_load_manager",
+                side_effect=AssertionError("constructed in request"),
+            ):
+                resp = self.client.get("/api/v1/load/status")
+        self.assertEqual(resp.status_code, 503)
+
+    def test_stream_status_does_not_construct(self):
+        import app as app_mod
+
+        with real_mode_config(LOAD_MANAGE_ENABLED="True"):
+            app_mod._state.load_manager = None
+            with patch(
+                "app._get_load_manager",
+                side_effect=AssertionError("constructed in request"),
+            ):
+                resp = self.client.get("/stream/status")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_index_does_not_construct(self):
+        import app as app_mod
+        from energy_cache import EnergyCache, EnergyCacheData
+
+        cache = EnergyCache(ttl_seconds=60)
+        fetched_at = datetime.now(timezone.utc)
+        cache._data = EnergyCacheData(
+            samples=[0.0] * 10,
+            data_start=fetched_at,
+            last_sample_at=fetched_at,
+            last_fetch_at=fetched_at,
+            sample_count=10,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+            full_metrics_dict=realistic_metrics(),
+        )
+        with real_mode_config(LOAD_MANAGE_ENABLED="True"):
+            app_mod._state.load_manager = None
+            with patch.object(app_mod._state, "energy_cache", cache), \
+                 patch(
+                     "app._get_load_manager",
+                     side_effect=AssertionError("constructed in request"),
+                 ):
+                resp = self.client.get("/", headers={"Accept": "application/json"})
+        self.assertEqual(resp.status_code, 200)
+
+
 class TestLoadManagementEndpoints(unittest.TestCase):
     """Tests for GET /api/v1/load/status and the index endpoint's
     load-management payload."""
@@ -527,8 +736,18 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             yield
 
     def test_load_status_503_when_not_initialized(self):
-        """GET /load/status returns 503 when LoadManager is None."""
-        with patch("app._get_load_manager", return_value=None):
+        """GET /load/status returns 503 when LoadManager is None.
+
+        The request must not build one (F.2): initialization belongs to the
+        background loop.
+        """
+        import app as app_mod
+
+        app_mod._state.load_manager = None
+        with patch(
+            "app._get_load_manager",
+            side_effect=AssertionError("constructed in request"),
+        ):
             response = self.app.get("/api/v1/load/status")
         self.assertEqual(response.status_code, 503)
 
@@ -543,8 +762,12 @@ class TestLoadManagementEndpoints(unittest.TestCase):
         mock_state.pending_effects = []
         mock_lm.state = mock_state
 
-        with patch("app._get_load_manager", return_value=mock_lm):
-            response = self.app.get("/api/v1/load/status")
+        with self._lm_wired(mock_lm):
+            with patch(
+                "app._get_load_manager",
+                side_effect=AssertionError("constructed in request"),
+            ):
+                response = self.app.get("/api/v1/load/status")
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.data)
         self.assertTrue(data["enabled"])
@@ -565,7 +788,7 @@ class TestLoadManagementEndpoints(unittest.TestCase):
 
         import app as app_mod
 
-        app_mod._state.last_cycle_result = CycleResult(
+        cycle_result = CycleResult(
             status="ok",
             qh="QH1",
             predicted_wh=-800.0,
@@ -588,9 +811,14 @@ class TestLoadManagementEndpoints(unittest.TestCase):
             sleep_hint=30.0,
             sleep_hint_at="2026-01-01T12:00:00+00:00",
         )
+        app_mod._state.last_cycle_result = cycle_result
 
-        with patch("app._get_load_manager", return_value=mock_lm):
-            response = self.app.get("/api/v1/load/status")
+        with self._lm_wired(mock_lm, last_cycle_result=cycle_result):
+            with patch(
+                "app._get_load_manager",
+                side_effect=AssertionError("constructed in request"),
+            ):
+                response = self.app.get("/api/v1/load/status")
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.data)
         diag = data["lastCycleResult"]["diagnostics"]
@@ -1122,6 +1350,7 @@ class TestIndexEndpointPerSecondData(unittest.TestCase):
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod._state, "energy_cache", fresh_cache):
                 with patch("app.create_metrics", return_value=metrics_dict):
+                    app_mod._refill_cache_once()
                     resp = self.app.get("/", headers={"Accept": "application/json"})
 
         self.assertEqual(resp.status_code, 200)
@@ -1143,45 +1372,42 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
     def setUp(self):
         self.app = app.test_client()
 
-    def test_index_returns_gracefully_when_metrics_none(self):
-        """Index endpoint returns 200 (not 500) when get_or_fetch returns None.
+    def test_index_cold_cache_returns_503_fast_during_outage(self):
+        """Index fails fast with Retry-After when the cache is cold.
 
-        During a network outage, EnergyCache.get_or_fetch() returns (None, True)
-        and _enrich_metrics_for_sse must not crash on None input.
+        During a network outage the warmer cannot fill the cache, so the
+        request path serves 503 + Retry-After instead of blocking on the
+        Emporia API.
         """
         import app as app_mod
+        from energy_cache import EnergyCache
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
-            with patch.object(app_mod._state, "energy_cache") as mock_cache:
-                mock_cache.get_or_fetch.return_value = (None, True)
-                mock_cache._data = None
+            with patch.object(
+                app_mod._state, "energy_cache", EnergyCache(ttl_seconds=60)
+            ):
                 resp = self.app.get("/", headers={"Accept": "application/json"})
 
-        self.assertEqual(resp.status_code, 200)
-        data = json.loads(resp.data)
-        self.assertIn("devices", data)
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.headers.get("Retry-After"), "60")
 
     def test_index_empty_dashboard_auto_refreshes(self):
-        """An empty dashboard (no devices) on the real-data path auto-refreshes.
+        """A cold cache renders the empty dashboard with a meta refresh.
 
-        On first boot during an API outage the fetch returns no devices and
-        index() renders an empty dashboard with a 200 — the 500 retry page is
-        dead for real-data paths. The empty dashboard must carry a meta
-        refresh so the browser self-heals without a manual refresh.
+        The background warmer fills the cache; until then index() serves a
+        503 whose HTML body still carries a meta refresh so the browser
+        self-heals without a manual reload.
         """
         import app as app_mod
+        from energy_cache import EnergyCache
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
-            with patch.object(app_mod._state, "energy_cache") as mock_cache:
-                mock_cache.get_or_fetch.return_value = (
-                    {"devices": [], "api_response": {}, "instant": None},
-                    True,
-                )
-                mock_cache.data = None
-                mock_cache.samples = []
+            with patch.object(
+                app_mod._state, "energy_cache", EnergyCache(ttl_seconds=60)
+            ):
                 resp = self.app.get("/", headers={"Accept": "text/html"})
 
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 503)
         self.assertIn(b'http-equiv="refresh"', resp.data.lower())
 
     def test_index_refresh_interval_from_quantization(self):
@@ -1191,9 +1417,9 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod._state, "energy_cache") as mock_cache:
-                mock_cache.get_or_fetch.return_value = (
+                mock_cache.cached_metrics.return_value = (
                     {"devices": [{"name": "test"}], "api_response": {}, "instant": None},
-                    True,
+                    0.0,
                 )
                 mock_cache.data = EnergyCacheData(
                     samples=[0.0] * 900,
@@ -1226,7 +1452,7 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod._state, "energy_cache") as mock_cache:
                 mock_cache.samples = None
-                mock_cache.get_or_fetch.return_value = (metrics, True)
+                mock_cache.cached_metrics.return_value = (metrics, 0.0)
                 mock_cache.data = EnergyCacheData(
                     samples=[0.0] * 900,
                     data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
@@ -1257,7 +1483,7 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod._state, "energy_cache") as mock_cache:
                 mock_cache.samples = None
-                mock_cache.get_or_fetch.return_value = (metrics, True)
+                mock_cache.cached_metrics.return_value = (metrics, 0.0)
                 mock_cache.data = EnergyCacheData(
                     samples=[0.0] * 900,
                     data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
@@ -1287,7 +1513,7 @@ class TestNetworkOutageGracefulDegradation(unittest.TestCase):
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod._state, "energy_cache") as mock_cache:
                 mock_cache.samples = None
-                mock_cache.get_or_fetch.return_value = (metrics, True)
+                mock_cache.cached_metrics.return_value = (metrics, 0.0)
                 mock_cache.data = EnergyCacheData(
                     samples=[0.0] * 900,
                     data_start=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
@@ -2214,14 +2440,14 @@ class TestLoadManagementSectionDebug(unittest.TestCase):
             app_mod._state.load_manager_init_failed = False
             app_mod._state.last_cycle_result = lm.run_cycle.return_value
             with patch.object(app_mod._state, "energy_cache") as mock_cache:
-                mock_cache.get_or_fetch.return_value = (
+                mock_cache.cached_metrics.return_value = (
                     {
                         "devices": [],
                         "api_response": {},
                         "instant": None,
                         "debug": debug,
                     },
-                    True,
+                    0.0,
                 )
                 mock_cache.data = None
                 yield
@@ -2386,13 +2612,13 @@ class TestLoadManagementSectionDebug(unittest.TestCase):
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod._state, "energy_cache") as mock_cache:
-                mock_cache.get_or_fetch.return_value = (
+                mock_cache.cached_metrics.return_value = (
                     {
                         "devices": [{"name": "meter", "lag": timedelta(seconds=450)}],
                         "api_response": {},
                         "instant": None,
                     },
-                    True,
+                    0.0,
                 )
                 mock_cache.data = None
                 response = self.app.get("/", headers={"Accept": "text/html"})
@@ -2407,13 +2633,13 @@ class TestLoadManagementSectionDebug(unittest.TestCase):
 
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             with patch.object(app_mod._state, "energy_cache") as mock_cache:
-                mock_cache.get_or_fetch.return_value = (
+                mock_cache.cached_metrics.return_value = (
                     {
                         "devices": [{"name": "meter", "lag": timedelta(seconds=6)}],
                         "api_response": {},
                         "instant": None,
                     },
-                    True,
+                    0.0,
                 )
                 mock_cache.data = EnergyCacheData(
                     samples=[0.0] * 900,
@@ -2443,13 +2669,13 @@ class TestLoadManagementSectionDebug(unittest.TestCase):
         with mock_config(MOCK=False, VUE_USERNAME="test_user"):
             TestIndexMobileAndLive._lm_wired_state()
             with patch.object(app_mod._state, "energy_cache") as mock_cache:
-                mock_cache.get_or_fetch.return_value = (
+                mock_cache.cached_metrics.return_value = (
                     {
                         "devices": [{"name": "meter", "lag": timedelta(seconds=6)}],
                         "api_response": {},
                         "instant": None,
                     },
-                    True,
+                    0.0,
                 )
                 mock_cache.data = EnergyCacheData(
                     samples=[0.0] * 900,

@@ -192,6 +192,32 @@ drift checks.
   windows switch on the clock, and `LOAD_TARGET_WH` overrides every
   devices.json form)
 
+- **test_app_factory.py**
+  `create_app()` isolation (injected config/cache/broadcaster drive the request
+  path, two apps do not share state), the single-controller guard (second
+  process claimant defers with CRITICAL; a repeat call in one process is
+  idempotent), and the cache refresher wiring for disabled load management
+- **test_notifier.py**
+  the notification policy seam (D.2): gated surplus (sender, dry-run, empty
+  actions, whitelist miss), bypass alerts (auth, drift, fatal fetch, stale data,
+  pipeline stall, out-of-range), the auth-alert switch, and the deferred queue
+  drain
+- **test_metrics_endpoint.py**
+  `GET /api/v1/metrics`: every `CycleStatus` present at zero, status and
+  `status:reason` increments, arbitration verdict counts, the state lock around
+  counter updates, and the source counters (SSE eviction, fetch timeout, drift
+  escalation)
+- **test_module_split.py**
+  the E.1 import-compat seam: `metrics` re-exports `MetricsBase`, TOU classes,
+  prediction models, and the `predict`/`_compute_nbc` mixin; the split modules
+  stay under 500 lines
+- **test_cache_time_contract.py**
+  the C.2 contracts: one TTL (`DEFAULT_CACHE_TTL_SECS`) for the app cache,
+  `EnergyCache`, and `NBCReader`; the display, cache, and loader paths reporting
+  one wall-clock `predicted_wh` on early-, late-, and mixed-rate quarters; and
+  `qh_seconds_remaining` matching the inline reference across midnight and both
+  DST transitions
+
 ## Removed
 
 - **test_dispatch_quantum.py**

@@ -1566,9 +1566,9 @@ make_tesla_config()
             ),
             target_wh=-500,
             config_interval_secs=30,
+            enabled=True,
         ))
         lm.nbc_reader = StaleQHReader()
-        lm.enabled = True
 
         # Pending effects present + stale data → stale_data status
         lm.state.pending_effects = [PendingEffect(
@@ -1611,9 +1611,9 @@ make_tesla_config()
             target_wh=-500,
             config_interval_secs=30,
             clock=FakeClock(fixed_now),
+            enabled=True,
         ))
         lm.nbc_reader = FreshQHReader()
-        lm.enabled = True
 
         # Pending effect AFTER data point → waiting_for_fresh_data status
         lm.state.pending_effects = [PendingEffect(
@@ -1649,9 +1649,9 @@ make_tesla_config()
             tesla_ctrl=None,
             target_wh=-500,
             config_interval_secs=30,
+            enabled=True,
         ))
         lm.nbc_reader = NoQHReader()
-        lm.enabled = True
 
         result = lm.run_cycle()
         assert result.status == "no_incomplete_qh"

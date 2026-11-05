@@ -1399,3 +1399,29 @@ class TestCacheHitReturnsFullMetrics:
             "Cache hit result has empty devices list"
         )
         assert result2["devices"][0]["name"] == "Solar Inverter"
+
+
+class TestCachedMetricsSnapshot:
+    """The request-path read returns a copy, never the stored dict by reference."""
+
+    def test_cached_metrics_copies_the_full_metrics_dict(self) -> None:
+        now = datetime(2025, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        cache = EnergyCache(ttl_seconds=60)
+        payload = {"devices": [{"name": "meter"}], "instant": now}
+        cache._data = EnergyCacheData(
+            samples=[0.0] * 10,
+            data_start=now,
+            last_sample_at=now,
+            last_fetch_at=now,
+            sample_count=10,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+            full_metrics_dict=payload,
+        )
+
+        metrics, age_secs = cache.cached_metrics(now)
+
+        assert metrics == payload
+        assert metrics is not payload
+        assert age_secs == 0.0

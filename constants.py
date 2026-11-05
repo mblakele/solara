@@ -52,6 +52,13 @@ per QH per type (see ``LoadManager._check_stale_data_alert``)."""
 PRUNE_WINDOW_SECS: int = 3600
 """Samples older than this many seconds are pruned from EnergyCache."""
 
+DEFAULT_CACHE_TTL_SECS: int = 30
+"""One TTL for every EnergyCache reader (architecture-v2 C.2).
+
+The app cache, ``NBCReader``'s default cache, and ``EnergyCache`` itself all
+use this value, so a cache entry is never fresh to one consumer and stale to
+another. A caller may still pass an explicit TTL for tests."""
+
 # ── Load management defaults ─────────────────────────────────────────
 
 DEFAULT_TARGET_WH: int = -50

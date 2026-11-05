@@ -160,9 +160,9 @@ class TestRunCycleDataHealth:
             LoadManagerConfig(
                 telegram_sender=sender, clock=clock, dry_run=True,
                 config_interval_secs=30, energy_cache=cache,
+                enabled=True,
             )
         )
-        mgr.enabled = True
         mgr._telegram_devices = None
         clock.advance(400)
         with patch.object(

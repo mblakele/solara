@@ -7,6 +7,10 @@ Write all responses in Simplified Technical English (ASD-STE100 style).
 
 Invoke tools with structured function-calling JSON, not inline XML or Markdown.
 
+When the edit tool returns `Could not find oldString ... The closest lines in
+the file are`, copy those closest lines exactly (including whitespace) into the
+next oldString and try again.
+
 ## Workflow
 
 1. Write a failing test that reproduces the bug or defines the new behavior.
@@ -56,9 +60,8 @@ Flags, report sections, and dated corpus figures for every tool:
 
 ## Planning
 
-Planning is read-only. Write the plan to `.opencode/plans/` or
-`.mimocode/plans/`. Do not write elsewhere or run anything that mutates the
-repository.
+Planning is read-only. Write the plan to `.opencode/plans/`. Do not write
+elsewhere or run anything that mutates the repository.
 
 Split a plan into subtasks of 32k-48k tokens. Split any subtask that touches
 more than 3 files or about 200 lines.
@@ -192,23 +195,28 @@ device_config.py       # devices.json loader, typed accessors, integrity checks
 energy_aggregator.py   # TOU aggregation
 energy_cache.py        # Per-second sample store, compaction, replace-not-merge
 gap_trend.py           # Adjusted-gap slope tracker for the ramp-aware stop
+hourly_fetch.py        # Hourly fetch/predict, drift alerts, create_metrics
 load_controllers.py    # Plug/Tesla/Vocolinc controllers and factories
 load_manager.py        # Cycle pipeline stages, controllers, Telegram, alerts
 load_models.py         # Cycle and telemetry dataclasses, parsing helpers
 load_nbc.py            # Cycle engine: GapMinder, TeslaDecider, effect stores
 logfmt.py              # Structured log formatting: logfmt or JSON lines
-metrics.py             # NBC fetch, HourlyProjection, cache guards, drift alerts
+metrics.py             # Re-export shim over the metrics split modules
 mockdata.py            # Test data generation
 mqtt_telemetry.py      # Tesla MQTT parsing and subscriber lifecycle
+notifier.py            # Telegram notification policy and deferred queue
+prediction.py          # Device prediction dataclasses, quantization window
 quantization.py        # N-second constant-window detection
 settle_window.py       # Adaptive prediction/settle window state machine
 sse_event.py           # SSE broadcaster and event stream
 telegram.py            # TelegramSender, NotificationEvent
 telegram_client.py     # Async Telegram Bot API client
+tou_reporter.py        # TOU report aggregation and request budget
 tesla_arbitration.py   # REST arbitration verdict state machine and cooldown
 tesla_oauth.py         # Tesla OAuth blueprint and token flow
 util.py                # Timezone, JSON, and quarter-hour helpers
 vocolinc.py            # VOCOlinc cloud API client
+vue_session.py         # VUE auth/session base, clock, metrics exceptions
 static/                # Design-system CSS and the SSE dashboard client
 templates/             # Jinja2 pages and SSE-swappable fragments
 tests/                 # Pytest suite; what each file pins: docs/TESTING.md

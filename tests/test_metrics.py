@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 import pytest
+import hourly_fetch
 import metrics
 from energy_cache import EnergyCache, EnergyCacheData
 from metrics import (
@@ -312,24 +313,24 @@ class TestHourlyProjectionErrorPaths(unittest.TestCase):
              patch.object(MetricsBase, "get_device_info"):
 
             # Patch device_info to have one device
-            with patch.dict(MetricsBase.device_info, {1: MagicMock()}):
-                vdi = MetricsBase.device_info[1]
+            hp = HourlyProjection(instant=chart_start)
+            hp.device_info = {1: MagicMock()}
+            vdi = hp.device_info[1]
 
-                # Set up channels to return empty data
-                mock_channel = MagicMock()
-                mock_channel.channel_num = 1
+            # Set up channels to return empty data
+            mock_channel = MagicMock()
+            mock_channel.channel_num = 1
 
-                def empty_fetch(*args, **kwargs):
-                    return [], None
+            def empty_fetch(*args, **kwargs):
+                return [], None
 
-                vdi.channels = [mock_channel]
-                with patch.object(
-                    MetricsBase.vue, "get_chart_usage", side_effect=empty_fetch
-                ):
+            vdi.channels = [mock_channel]
+            with patch.object(
+                hp.vue, "get_chart_usage", side_effect=empty_fetch
+            ):
 
-                    hp = HourlyProjection(instant=chart_start)
-                    with self.assertRaises(RetryableMetricsException):
-                        hp.populate(chart_start)
+                with self.assertRaises(RetryableMetricsException):
+                    hp.populate(chart_start)
 
 
 class TestHourlyProjectionPopulateChartStart(unittest.TestCase):
@@ -579,6 +580,52 @@ class TestDeviceMetricsDataClass(unittest.TestCase):
         self.assertEqual(d["prediction"], round(0.123456789012345, 14))
         self.assertEqual(d["prediction_min"], round(0.0, 14))
 
+class TestMetricsBaseSessionInjection(unittest.TestCase):
+    """A.2: MetricsBase owns per-instance VUE sessions via dependency injection."""
+
+    def test_injected_session_is_bound_per_instance(self) -> None:
+        """Injected vue/auth/device_info are bound to the instance, not ClassVars."""
+        from config import Config
+
+        vue = MagicMock()
+        auth = {"last": datetime.now(timezone.utc)}
+        device_info: dict[int, object] = {}
+
+        base = MetricsBase(
+            logger_next=MagicMock(),
+            config=Config(),
+            vue=vue,
+            vue_auth=auth,
+            device_info=device_info,
+        )
+
+        self.assertIs(base.vue, vue)
+        self.assertIs(base.vue_auth, auth)
+        self.assertIs(base.device_info, device_info)
+
+    def test_injected_sessions_are_independent_across_instances(self) -> None:
+        """Two instances with stub sessions must not share auth or device_info."""
+        from config import Config
+
+        base_a = MetricsBase(
+            logger_next=MagicMock(),
+            config=Config(),
+            vue=MagicMock(),
+            vue_auth={},
+            device_info={},
+        )
+        base_b = MetricsBase(
+            logger_next=MagicMock(),
+            config=Config(),
+            vue=MagicMock(),
+            vue_auth={},
+            device_info={},
+        )
+
+        self.assertIsNot(base_a.vue_auth, base_b.vue_auth)
+        self.assertIsNot(base_a.device_info, base_b.device_info)
+
+
 class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
     """Tests for MetricsBase.vue_init error paths."""
 
@@ -592,7 +639,7 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
         # First call (token-based) returns False → triggers password fallback
         vue_mock.login.side_effect = [False, True]
 
-        with patch.object(MetricsBase, "vue", vue_mock):
+        with patch.object(MetricsBase, "vue", vue_mock, create=True):
 
             # Create a fake .vue-keys.json so the file read doesn't fail
             import tempfile, os
@@ -610,6 +657,8 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
                 base.vue.auth = None  # type: ignore[attr-defined]
                 base.vue_keys = keys_file
                 base.logger = MagicMock()
+                base.vue_auth = {}
+                base.device_info = {}
 
                 # Inject config via DI (same path as __init__ sets self._cfg)
                 from config import Config
@@ -638,7 +687,7 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
         # Both login attempts fail
         vue_mock.login.side_effect = [False, False]
 
-        with patch.object(MetricsBase, "vue", vue_mock):
+        with patch.object(MetricsBase, "vue", vue_mock, create=True):
 
             import tempfile, os
 
@@ -653,6 +702,8 @@ class TestMetricsBaseVueInitErrorPaths(unittest.TestCase):
                 base.vue.auth = None  # type: ignore[attr-defined]
                 base.vue_keys = keys_file
                 base.logger = MagicMock()
+                base.vue_auth = {}
+                base.device_info = {}
 
                 # Inject config via DI (same path as __init__ sets self._cfg)
                 from config import Config
@@ -683,12 +734,13 @@ class TestMetricsBaseGetDeviceInfoFilters(unittest.TestCase):
         vue_mock = MagicMock()
         vue_mock.get_devices.side_effect = http_ex
 
-        with patch.object(MetricsBase, "vue", vue_mock), \
-             patch("metrics.MetricsBase.device_info", {}):
+        with patch.object(MetricsBase, "vue", vue_mock, create=True):
 
             base = MetricsBase.__new__(MetricsBase)
             # Skip __init__ to avoid real API calls; set up manually
             base.vue = vue_mock
+            base.device_info = {}
+            base.vue_auth = {"last": datetime.now(timezone.utc)}
             base.logger = MagicMock()
 
             with self.assertRaises(RetryableMetricsException):
@@ -707,18 +759,18 @@ class TestMetricsBaseGetDeviceInfoFilters(unittest.TestCase):
         vue_mock = MagicMock()
         vue_mock.get_devices.return_value = [disconnected_device]
 
-        with patch.object(MetricsBase, "vue", vue_mock), \
-             patch("metrics.MetricsBase.device_info", {}):
+        with patch.object(MetricsBase, "vue", vue_mock, create=True):
 
             base = MetricsBase.__new__(MetricsBase)
             base.vue = vue_mock
+            base.device_info = {}
+            base.vue_auth = {"last": datetime.now(timezone.utc)}
             base.logger = MagicMock()
 
             # Should not raise, but device_info should remain empty
-            with patch("metrics.MetricsBase.vue_auth", {"last": datetime.now(timezone.utc)}):
-                base.get_device_info()
+            base.get_device_info()
 
-            self.assertEqual(len(MetricsBase.device_info), 0)
+            self.assertEqual(len(base.device_info), 0)
 
     def test_get_device_info_filters_wrong_model(self):
         """Devices with model != 'ZIG001' are skipped."""
@@ -731,17 +783,17 @@ class TestMetricsBaseGetDeviceInfoFilters(unittest.TestCase):
         vue_mock = MagicMock()
         vue_mock.get_devices.return_value = [wrong_model_device]
 
-        with patch.object(MetricsBase, "vue", vue_mock), \
-             patch("metrics.MetricsBase.device_info", {}):
+        with patch.object(MetricsBase, "vue", vue_mock, create=True):
 
             base = MetricsBase.__new__(MetricsBase)
             base.vue = vue_mock
+            base.device_info = {}
+            base.vue_auth = {"last": datetime.now(timezone.utc)}
             base.logger = MagicMock()
 
-            with patch("metrics.MetricsBase.vue_auth", {"last": datetime.now(timezone.utc)}):
-                base.get_device_info()
+            base.get_device_info()
 
-            self.assertEqual(len(MetricsBase.device_info), 0)
+            self.assertEqual(len(base.device_info), 0)
 
     def test_get_device_info_filters_empty_channels(self):
         """Devices with no channels are skipped."""
@@ -755,17 +807,17 @@ class TestMetricsBaseGetDeviceInfoFilters(unittest.TestCase):
         vue_mock = MagicMock()
         vue_mock.get_devices.return_value = [empty_channels_device]
 
-        with patch.object(MetricsBase, "vue", vue_mock), \
-             patch("metrics.MetricsBase.device_info", {}):
+        with patch.object(MetricsBase, "vue", vue_mock, create=True):
 
             base = MetricsBase.__new__(MetricsBase)
             base.vue = vue_mock
+            base.device_info = {}
+            base.vue_auth = {"last": datetime.now(timezone.utc)}
             base.logger = MagicMock()
 
-            with patch("metrics.MetricsBase.vue_auth", {"last": datetime.now(timezone.utc)}):
-                base.get_device_info()
+            base.get_device_info()
 
-            self.assertEqual(len(MetricsBase.device_info), 0)
+            self.assertEqual(len(base.device_info), 0)
 
 
 class TestFetchChannelDataErrors(unittest.TestCase):
@@ -898,7 +950,7 @@ class TestFetchChannelDataErrors(unittest.TestCase):
 
         hp.vue.get_chart_usage.side_effect = _slow_get_chart_usage
 
-        with patch.object(metrics, "_monotonic", _fake_monotonic):
+        with patch.object(hourly_fetch, "_monotonic", _fake_monotonic):
             chan_mock = MagicMock()
             chan_mock.channel_num = 7
 
@@ -1186,29 +1238,53 @@ class TestTOUReporterFetchErrors(unittest.TestCase):
         http_ex.response = MagicMock()  # type: ignore[attr-defined]
         vue_mock.get_chart_usage.side_effect = http_ex
 
-        with patch.object(MetricsBase, "vue", vue_mock), \
-             patch("metrics.MetricsBase.device_info", {}):
+        with patch.object(MetricsBase, "vue", vue_mock, create=True):
 
             # Create a minimal device with channels
             vdi_mock = MagicMock()
             chan_mock = MagicMock(channel_num=1)
             vdi_mock.channels = [chan_mock]
 
-            with patch.object(MetricsBase, "device_info", {1: vdi_mock}):
-                from metrics import TOUReporter
+            from metrics import TOUReporter
 
-                from datetime import UTC, datetime as dt
+            from datetime import UTC, datetime as dt
 
-                tou = TOUReporter.__new__(TOUReporter)
-                # Set up required attributes without calling __init__ (which calls fetch_usage_data)
-                tou.vue = vue_mock
-                tou.logger = MagicMock()
-                tou.start_date = dt(2025, 1, 1, tzinfo=UTC)
-                tou.end_date = dt(2025, 1, 8, tzinfo=UTC)
+            tou = TOUReporter.__new__(TOUReporter)
+            # Set up required attributes without calling __init__ (which calls fetch_usage_data)
+            tou.vue = vue_mock
+            tou.logger = MagicMock()
+            tou.device_info = {1: vdi_mock}
+            tou.start_date = dt(2025, 1, 1, tzinfo=UTC)
+            tou.end_date = dt(2025, 1, 8, tzinfo=UTC)
 
-                with self.assertRaises(requests.exceptions.HTTPError):
-                    # Manually call fetch_usage_data (which will try to iterate device_info)
-                    tou.fetch_usage_data()
+        with self.assertRaises(requests.exceptions.HTTPError):
+            # Manually call fetch_usage_data (which will try to iterate device_info)
+            tou.fetch_usage_data()
+
+    def test_fetch_stops_at_deadline(self):
+        """A past budget deadline raises before any API call (F.2)."""
+        from datetime import UTC, datetime as dt
+        from time import monotonic
+        from unittest.mock import MagicMock
+
+        from metrics import TOUBudgetExceeded, TOUReporter
+
+        vue_mock = MagicMock()
+        vdi_mock = MagicMock()
+        vdi_mock.channels = [MagicMock(channel_num=1)]
+
+        tou = TOUReporter.__new__(TOUReporter)
+        tou.vue = vue_mock
+        tou.logger = MagicMock()
+        tou.device_info = {1: vdi_mock}
+        tou.start_date = dt(2025, 1, 1, tzinfo=UTC)
+        tou.end_date = dt(2025, 1, 8, tzinfo=UTC)
+        tou._deadline = monotonic() - 1.0
+
+        with self.assertRaises(TOUBudgetExceeded):
+            tou.fetch_usage_data()
+
+        vue_mock.get_chart_usage.assert_not_called()
 
     def test_fetch_empty_list(self):
         """fetch_usage_data with no data chunks produces empty usage_data_list."""
@@ -1219,30 +1295,29 @@ class TestTOUReporterFetchErrors(unittest.TestCase):
         # Return empty data for all calls (no chunks)
         vue_mock.get_chart_usage.return_value = ([], None)
 
-        with patch.object(MetricsBase, "vue", vue_mock), \
-             patch("metrics.MetricsBase.device_info", {}):
+        with patch.object(MetricsBase, "vue", vue_mock, create=True):
 
             vdi_mock = MagicMock()
             chan_mock = MagicMock(channel_num=1)
             vdi_mock.channels = [chan_mock]
 
-            with patch.object(MetricsBase, "device_info", {1: vdi_mock}):
-                from metrics import TOUReporter
+            from metrics import TOUReporter
 
-                tou = TOUReporter.__new__(TOUReporter)
-                tou.vue = vue_mock
-                tou.logger = MagicMock()
+            tou = TOUReporter.__new__(TOUReporter)
+            tou.vue = vue_mock
+            tou.logger = MagicMock()
+            tou.device_info = {1: vdi_mock}
 
-                # Set up dates that will result in zero iterations (start >= end)
-                now = datetime.now(timezone.utc).replace(
-                    hour=10, minute=30, second=0, microsecond=0
-                )
-                tou.start_date = now
-                tou.end_date = now  # Same time → no iterations
+        # Set up dates that will result in zero iterations (start >= end)
+        now = datetime.now(timezone.utc).replace(
+            hour=10, minute=30, second=0, microsecond=0
+        )
+        tou.start_date = now
+        tou.end_date = now  # Same time → no iterations
 
-                tou.fetch_usage_data()
+        tou.fetch_usage_data()
 
-                self.assertEqual(tou.usage_data_list, [])
+        self.assertEqual(tou.usage_data_list, [])
 
 
 class TestHourlyProjectionNoPredictions(unittest.TestCase):
@@ -2088,7 +2163,7 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
 
             # Replace HourlyProjection with a MagicMock so we can inspect
             # the constructor call without actually running the real code.
-            with patch("metrics.HourlyProjection") as MockHP:
+            with patch("hourly_fetch.HourlyProjection") as MockHP:
                 mock_instance = MockHP.return_value
                 create_metrics(
                     cache,
@@ -2123,7 +2198,7 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
 
         with mock_config():
             cache = app_mod._state.energy_cache
-            with patch("metrics.HourlyProjection") as MockHP:
+            with patch("hourly_fetch.HourlyProjection") as MockHP:
                 mock_instance = MockHP.return_value
                 mock_instance.metrics = {"devices": []}
                 now = datetime(2025, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
@@ -2165,7 +2240,7 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
             quantization_confidence=None,
         )
 
-        with patch("metrics.HourlyProjection") as MockHP:
+        with patch("hourly_fetch.HourlyProjection") as MockHP:
             mock_instance = MockHP.return_value
             create_metrics(cache, now, logging.getLogger("test"))
 
@@ -2210,7 +2285,7 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
             quantization_confidence=None,
         )
 
-        with patch("metrics.HourlyProjection") as MockHP:
+        with patch("hourly_fetch.HourlyProjection") as MockHP:
             mock_instance = MockHP.return_value
             create_metrics(cache, now, logging.getLogger("test"))
 
@@ -2255,7 +2330,7 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
             quantization_confidence=None,
         )
 
-        with patch("metrics.HourlyProjection") as MockHP:
+        with patch("hourly_fetch.HourlyProjection") as MockHP:
             mock_instance = MockHP.return_value
             create_metrics(cache, now, logging.getLogger("test"))
 
@@ -2296,7 +2371,7 @@ class TestCreateMetricsPassesCache(unittest.TestCase):
             quantization_confidence=None,
         )
 
-        with patch("metrics.HourlyProjection") as MockHP:
+        with patch("hourly_fetch.HourlyProjection") as MockHP:
             mock_instance = MockHP.return_value
             create_metrics(cache, now, logging.getLogger("test"))
 
@@ -2389,8 +2464,10 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
         """QH1 uses 30s prediction window when quantization (N=30, confidence=1.0).
 
         Data: 70 samples of 0.001 + 30 samples of 0.003 = 100.
-        With 30s window: prediction_w = 3.0 W → predicted_wh = 2560.
-        With 60s window: prediction_w = 2.0 W → predicted_wh = 1760.
+        C.2: the incomplete quarter extrapolates with the wall-clock
+        remainder (900 s at the 14:30 fixture instant), not the sample count.
+        With 30s window: prediction_w = 3.0 W → predicted_wh = 2860.
+        With 60s window: prediction_w = 2.0 W → predicted_wh = 1960.
         """
         data_start = datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         samples = [0.001] * 70 + [0.003] * 30
@@ -2401,10 +2478,10 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
 
         self.assertIsNotNone(nbc.qh1)
         self.assertFalse(nbc.qh1.complete)
-        # 30s window → predicted_wh = 2560
+        # 30s window, wall-clock 900 s → predicted_wh = 2860
         self.assertAlmostEqual(
-            nbc.qh1.predicted_wh, 2560.0, places=6,
-            msg="Expected 2560 (30s window)",
+            nbc.qh1.predicted_wh, 2860.0, places=6,
+            msg="Expected 2860 (30s window, wall-clock remainder)",
         )
 
     def test_fallback_30s_when_no_quantization(self):
@@ -2418,10 +2495,10 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
 
         self.assertIsNotNone(nbc.qh1)
         self.assertFalse(nbc.qh1.complete)
-        # 30s window → predicted_wh = 2560
+        # 30s window, wall-clock 900 s → predicted_wh = 2860
         self.assertAlmostEqual(
-            nbc.qh1.predicted_wh, 2560.0, places=6,
-            msg="Expected 2560 (30s fallback)",
+            nbc.qh1.predicted_wh, 2860.0, places=6,
+            msg="Expected 2860 (30s fallback, wall-clock remainder)",
         )
 
     def test_fallback_when_confidence_below_threshold(self):
@@ -2435,10 +2512,10 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
 
         self.assertIsNotNone(nbc.qh1)
         self.assertFalse(nbc.qh1.complete)
-        # 30s window → predicted_wh = 2560
+        # 30s window, wall-clock 900 s → predicted_wh = 2860
         self.assertAlmostEqual(
-            nbc.qh1.predicted_wh, 2560.0, places=6,
-            msg="Expected 2560 (30s fallback due to low confidence)",
+            nbc.qh1.predicted_wh, 2860.0, places=6,
+            msg="Expected 2860 (30s fallback, wall-clock remainder)",
         )
 
     def test_fallback_when_no_cache(self):
@@ -2448,10 +2525,10 @@ class TestQuantizationAwarePrediction(unittest.TestCase):
 
         self.assertIsNotNone(nbc.qh1)
         self.assertFalse(nbc.qh1.complete)
-        # 30s window → predicted_wh = 2560
+        # 30s window, wall-clock 900 s → predicted_wh = 2860
         self.assertAlmostEqual(
-            nbc.qh1.predicted_wh, 2560.0, places=6,
-            msg="Expected 2560 (30s fallback, no cache)",
+            nbc.qh1.predicted_wh, 2860.0, places=6,
+            msg="Expected 2860 (30s fallback, wall-clock remainder)",
         )
 
 
@@ -2478,6 +2555,8 @@ class TestVueInitHardening(unittest.TestCase):
         hp = HourlyProjection.__new__(HourlyProjection)
         hp.logger = MagicMock()
         hp.vue = MagicMock()
+        hp.vue_auth = {}
+        hp.device_info = {}
         if keys_content is not None:
             with open(self.keys_path, "w", encoding="utf-8") as fh:
                 fh.write(keys_content)

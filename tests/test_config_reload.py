@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import device_config
 from config import (
+    Config,
+    ConfigChanges,
     ConfigWatcher,
     check_restart_required,
     reload_dotenv,
 )
+from load_manager import LoadManager, LoadManagerConfig
 
 
 # === _parse_env_file tests ===
@@ -261,9 +266,26 @@ class TestCheckRestartRequired:
     """Tests for restart-required detection."""
 
     def test_no_restart_for_safe_keys(self) -> None:
-        """LOAD_MANAGE_ENABLED, DRY_RUN, etc. don't require restart."""
-        result = check_restart_required(["LOAD_MANAGE_ENABLED", "LOAD_TARGET_WH", "DRY_RUN"])
+        """Live and per-use keys don't require restart."""
+        result = check_restart_required(
+            ["LOAD_MANAGE_ENABLED", "LOAD_MANAGE_DRY_RUN", "LOAD_TARGET_WH"]
+        )
         assert not result
+
+    def test_restart_for_boot_frozen_keys(self) -> None:
+        """Keys resolved once at construction or boot require restart."""
+        frozen = [
+            "LOAD_NBC_DEVICE",
+            "LOAD_MANAGE_LUMPY_FIRST",
+            "LOAD_MANAGER_RAMP_AWARE",
+            "LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "LOG_FILE",
+            "LOG_MAX_BYTES",
+            "LOG_BACKUP_COUNT",
+        ]
+        assert check_restart_required(frozen) == frozen
 
     def test_restart_for_tesla_credentials(self) -> None:
         """TESLA_CLIENT_ID requires restart."""
@@ -282,12 +304,12 @@ class TestCheckRestartRequired:
         assert result == ["LOAD_PLUG_CONTROLLER"]
 
     def test_mixed_keys(self) -> None:
-        """Mix of safe and restart-required keys."""
+        """Mix of live and restart-required keys."""
         result = check_restart_required([
-            "LOAD_MANAGE_ENABLED",  # safe
+            "LOAD_MANAGE_ENABLED",  # live
             "TESLA_CLIENT_ID",      # restart
             "MQTT_HOST",            # restart
-            "DRY_RUN",              # safe
+            "LOAD_MANAGE_DRY_RUN",  # live
         ])
         assert sorted(result) == ["MQTT_HOST", "TESLA_CLIENT_ID"]
 
@@ -473,3 +495,105 @@ class TestLoadManagerReloadConfig:
              patch("load_manager.load_tesla_config", return_value=None):
             LoadManager.reload_config(lm)
             assert lm.plug_ctrl.plugs == new_plugs
+
+
+# === Live env re-resolution tests (G.1 reload contract) ===
+
+
+NOW = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+
+class _NoFileChanges:
+    """Watcher stub: report no .env / devices.json mtime change."""
+
+    def check(self) -> ConfigChanges:
+        return ConfigChanges()
+
+
+class TestLiveEnvSettings:
+    """Env knobs marked live apply on the next cycle, not only at boot."""
+
+    @staticmethod
+    def _manager(cfg: Config) -> LoadManager:
+        manager = LoadManager(LoadManagerConfig(config=cfg))
+        manager._config_watcher = _NoFileChanges()
+        return manager
+
+    def test_dry_run_flip_applies_on_next_cycle(self) -> None:
+        cfg = Config()
+        cfg.set("LOAD_MANAGE_DRY_RUN", "False")
+        manager = self._manager(cfg)
+        assert manager.dry_run is False
+
+        cfg.set("LOAD_MANAGE_DRY_RUN", "True")
+        manager._check_config_changes()
+
+        assert manager.dry_run is True
+
+    def test_enabled_flip_stops_the_manager(self) -> None:
+        cfg = Config()
+        cfg.set("LOAD_MANAGE_ENABLED", "True")
+        manager = self._manager(cfg)
+        assert manager.enabled is True
+
+        cfg.set("LOAD_MANAGE_ENABLED", "False")
+        manager._check_config_changes()
+
+        assert manager.enabled is False
+        assert manager.is_enabled_at(NOW) is False
+
+    def test_injected_dry_run_is_not_re_resolved(self) -> None:
+        cfg = Config()
+        cfg.set("LOAD_MANAGE_DRY_RUN", "False")
+        manager = LoadManager(LoadManagerConfig(config=cfg, dry_run=True))
+        manager._config_watcher = _NoFileChanges()
+
+        cfg.set("LOAD_MANAGE_DRY_RUN", "False")
+        manager._check_config_changes()
+
+        assert manager.dry_run is True
+
+    def test_injected_enabled_is_not_re_resolved(self) -> None:
+        cfg = Config()
+        cfg.set("LOAD_MANAGE_ENABLED", "False")
+        manager = LoadManager(LoadManagerConfig(config=cfg, enabled=True))
+        manager._config_watcher = _NoFileChanges()
+
+        cfg.set("LOAD_MANAGE_ENABLED", "False")
+        manager._check_config_changes()
+
+        assert manager.enabled is True
+
+    def test_target_override_tracks_env_changes(self) -> None:
+        cfg = Config()
+        cfg.set("LOAD_TARGET_WH", "-300")
+        manager = self._manager(cfg)
+        assert manager.target_wh == -300
+        assert manager.target_wh_band is None
+
+        cfg.set("LOAD_TARGET_WH", "-400")
+        manager._refresh_target(NOW)
+
+        assert manager.target_wh == -400
+        assert manager.target_wh_band is None
+
+    def test_removed_target_override_falls_back_to_devices_json(self) -> None:
+        cfg = Config()
+        cfg.set("LOAD_TARGET_WH", "-300")
+        manager = self._manager(cfg)
+
+        cfg.clear("LOAD_TARGET_WH")
+        manager._refresh_target(NOW)
+
+        assert manager.target_wh == device_config.get_target_wh(NOW)
+        assert manager.target_wh_band is None
+
+    def test_injected_target_is_not_re_resolved(self) -> None:
+        cfg = Config()
+        cfg.set("LOAD_TARGET_WH", "-300")
+        manager = LoadManager(LoadManagerConfig(config=cfg, target_wh=-500))
+
+        cfg.set("LOAD_TARGET_WH", "-999")
+        manager._refresh_target(NOW)
+
+        assert manager.target_wh == -500

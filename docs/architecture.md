@@ -23,13 +23,13 @@ flowchart LR
 
     subgraph App["Solara App"]
         subgraph Web["Flask App (app.py)"]
-            ROUTES["Routes<br/>/ · /health · /api/v1/tou<br/>/api/v1/load/status · /stream/status<br/>/api/v1/tesla/auth/initiate · /callback<br/>/api/v1/tesla/status (tesla_oauth.py)"]
+            ROUTES["Routes<br/>/ · /health · /api/v1/tou<br/>/api/v1/load/status · /api/v1/metrics<br/>/stream/status<br/>/api/v1/tesla/auth/initiate · /callback<br/>/api/v1/tesla/status (tesla_oauth.py)"]
             TEMPLATES["Jinja2 templates<br/>index.html · tou.html<br/>_metrics.html · _load_management.html<br/>error_retryable.html"]
             SSE["SSEBroadcaster<br/>(sse_event.py)"]
         end
 
         subgraph Data["Energy Data Path"]
-            METRICS["metrics.py<br/>HourlyProjection / TOUReporter<br/>cap_chart_start guard"]
+            METRICS["hourly_fetch.py / tou_reporter.py<br/>HourlyProjection / TOUReporter<br/>cap_chart_start guard"]
             CACHE["EnergyCache<br/>(energy_cache.py)<br/>TTL 30s, fetch timeout 30s"]
             AGGR["energy_aggregator.py<br/>TOU buckets"]
             QUANT["quantization.py<br/>window detection"]
@@ -95,9 +95,10 @@ quarter-hour windows (`util.inject_completed_qh`).
 
 ```mermaid
 flowchart TD
-    VUE["Emporia VUE API"] -->|"pyemvue channel fetch"| HP["HourlyProjection.populate()<br/>(metrics.py)"]
+    VUE["Emporia VUE API"] -->|"pyemvue channel fetch"| HP["HourlyProjection.populate()<br/>(hourly_fetch.py)"]
     HP -->|"per-second Wh samples"| CACHE["EnergyCache.get_or_fetch()<br/>TTL 30s, fetch timeout 30s,<br/>prune >3600s, quantization detect"]
-    CACHE -->|"stale-cache serve on retryable errors"| INDEX["index()<br/>/ (HTML or JSON)"]
+    BACKGROUND["LoadManagementLoop /<br/>_cache_refiller_loop"] -->|"warms"| CACHE
+    CACHE -->|"cached_metrics() — never fetches"| INDEX["index()<br/>/ (HTML or JSON)<br/>cold → 503 + Retry-After<br/>stale → 200 + Age"]
     HP -->|"drift rejection (firstUsageInstant != chart_start)"| DRIFT["DriftAlert → Telegram<br/>(_drain_drift_alerts)"]
 
     VUE -->|"TOUReporter.fetch_usage_data()"| AGGR["energy_aggregator.py<br/>TOU buckets"]
@@ -240,6 +241,65 @@ flowchart TD
     APP --> SHUT["cooperative shutdown<br/>request_shutdown() +<br/>install_shutdown_signal_hooks()<br/>gunicorn.conf.py hooks<br/>(post_worker_init / worker_int / worker_exit)"]
 ```
 
+Single-controller guard (architecture-v2 Phase B0.1): the first live claimant
+to run `start_background_services()` acquires the cross-process controller
+lock (`fcntl`/`flock` on `SOLARA_CONTROLLER_LOCK`; the default is
+`<tmpdir>/solara-controller-<deployment-hash>.lock`, scoped to the checkout
+directory so two deployments on one host do not collide). A second process
+claimant logs CRITICAL and skips background startup, serving reads and the SSE
+bootstrap only. A repeat call inside the same process is idempotent and does
+not log CRITICAL. The lock is held for the process lifetime and released on
+shutdown.
+
+## Config reload contract
+
+Every setting belongs to exactly one class (architecture-v2 G.1). The class
+says what a running process does when the value changes.
+
+| Class | Effect of a change | Keys |
+|---|---|---|
+| Live | Applies on the next load-management cycle | `LOAD_MANAGE_ENABLED` (disable only), `LOAD_MANAGE_DRY_RUN`, `LOAD_TARGET_WH` |
+| Read per use | No cache to refresh | `TIMEZONE`, `TESLA_NOMINAL_VOLTAGE`, `DEBUG` |
+| Restart required | Frozen at construction or boot; the watcher logs `requires_restart` | `LOAD_NBC_DEVICE`, `LOAD_MANAGE_LUMPY_FIRST`, `LOAD_MANAGER_RAMP_AWARE`, `LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `LOG_FILE`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT`, plus the credentials and controller keys in `config.RESTART_REQUIRED_KEYS` |
+
+`LoadManager._check_config_changes()` runs at the top of every cycle and ends
+with `_refresh_live_env_settings()`, which re-resolves `enabled` and `dry_run`.
+`_refresh_target()` re-reads `LOAD_TARGET_WH` each cycle and falls back to the
+`devices.json` target when the override is removed. A value injected through
+`LoadManagerConfig` is static for the manager's lifetime; the live refresh
+skips it.
+
+`LOAD_MANAGE_ENABLED` is asymmetric. Disabling is live because stage 1
+re-checks it every cycle. Enabling a process that booted disabled needs a
+restart, because the load-management thread and the cache refiller are chosen
+once in `start_background_services()`.
+
+## Runtime injection
+
+`create_app()` accepts `config`, `energy_cache`, `broadcaster`, and
+`load_manager_factory` (architecture-v2 A.1). It binds the chosen config to
+`app.config["SOLARA_CONFIG"]` and the runtime state to
+`app.extensions["solara_state"]`. Every request handler reads them through
+`_request_config()` / `_request_state()`, so two apps in one process serve
+different caches and configs. With no injected cache, broadcaster, or factory,
+the extension holds the process singleton, so the default deployment behaves
+as before. Background loops always use the process singleton; injected apps
+are for tests and embedded read-only front ends.
+
+## Request path
+
+`index()` is cache-only (architecture-v2 F.1). The load-management loop warms
+the cache when load management is enabled; `_cache_refiller_loop()` warms it
+when load management is disabled. A request never calls the Emporia API:
+
+- Cold cache: HTTP 503 with `Retry-After` (and a 5 s meta refresh for HTML).
+- Stale cache: HTTP 200 with an `Age` header carrying the snapshot age.
+
+`GET /api/v1/tou` runs under a 45 s budget (`_TOU_REQUEST_BUDGET_SECS`) on a
+shared, bounded executor; a report that overruns it returns HTTP 504. The
+executor is shared so a timed-out pyemvue call cannot leak one blocked thread
+per request.
+
 ## Data Model Axioms
 
 ### Per-second sample contiguity
@@ -265,7 +325,7 @@ on it):
 - Quarter-hour splitting is count-based (`values_len % 900` in
   `util.compute_nbc_quarters`).
 - `_data_lag_secs` is *derived from the sample count*
-  (`instant − (data_start + len(samples))` in `metrics.py`), so it measures
+  (`instant − (data_start + len(samples))` in `hourly_fetch.py`), so it measures
   tail freshness only — it cannot reveal interior gaps, and any hypothetical
   gap check built on it would be circular.
 
@@ -276,14 +336,14 @@ this axiom before adding defensive checks.
 
 ## Key entry points
 
-- **Guard functions** `metrics.py`: `cap_chart_start()`,
+- **Guard functions** `hourly_fetch.py`: `cap_chart_start()`,
   `_chart_start_for()` — cap over-fetching when cache is stale and keep the
   fetch window anchored to a stale QH-aligned `data_start` so a completed QH
   is not lost at a boundary; pure functions, independently tested
 - `EnergyCache` in `energy_cache.py` with `get_or_fetch()`, `is_valid()`,
   `sleep_interval_adjust()`, and quantization detection
-- NBC calculation in `metrics.py` (`get_current_qh()` helper)
-- `HourlyProjection` in `metrics.py` with `populate()` (uses `cap_chart_start`
+- NBC calculation in `prediction.py` (`get_current_qh()` helper)
+- `HourlyProjection` in `hourly_fetch.py` with `populate()` (uses `cap_chart_start`
   guard), `predict()`, and per-device prediction via `_predict_device()`
 - TOU in `energy_aggregator.py`
 - Load controller factories in `load_controllers.py` (`load_controller_from_env`, etc.)
@@ -317,7 +377,7 @@ this axiom before adding defensive checks.
   app-level `EnergyCache` (wired in `app._get_load_manager()`), whose TTL outlives the
   30 s cycle; a TTL-paced read would cache-hit and skip the fetch, letting data age toward
   the stale-data threshold. The reader's fast path (`get_current_qh` with `force=False`)
-  remains for other callers (e.g. `metrics.py`)
+  remains for other callers (the NBC fast path in `load_nbc.py`)
 - `_stage_compute_gap` in `load_manager.py` feeds `gap_trend.update(...)` with
   the adjusted gap and the `hysteresis / seconds_remaining` noise floor. The
   tracker returns the slope and its trust flag; `ctx.gap_trend_wh_per_s` is the
@@ -576,6 +636,9 @@ this axiom before adding defensive checks.
 
 ## Index Endpoint
 - `index()` in app.py serves HTML or JSON based on Accept header
+- Real mode is cache-only: it calls `EnergyCache.cached_metrics()` and never
+  fetches; a cold cache returns 503 + `Retry-After`, a stale cache returns
+  200 + `Age`
 - Static assets (`static/style.css`, `static/app.js`) are referenced with
   **relative paths** (not `url_for` absolute paths) so the dashboard works
   behind a transparent nginx proxy that mounts the app under a path prefix
@@ -720,7 +783,7 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
   - `sample_count`, `last_sample_at`: metadata for diagnostics
   - `full_metrics_dict`: dict[str, Any] | None — metrics dict refreshed on every fetch (not just the first),
     returned on cache hits to preserve keys like `devices`, `nbc`, `instant`
-- `_fetch_channel_data()` in `metrics.py` (HourlyProjection) — rejects a drifted API
+- `_fetch_channel_data()` in `hourly_fetch.py` (HourlyProjection) — rejects a drifted API
   `data_start` (`firstUsageInstant != requested chart_start`) by raising
   `RetryableMetricsException` before any misaligned data is stored; `_run_fetch_with_timeout`
   logs it as transient ("will retry"), `get_or_fetch` serves stale cache, and the next cycle
@@ -739,6 +802,13 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
   calls the fetcher. Fetch results replace the cached samples (no overlap merge). On cache
   hits, returns the full metrics dict (including `devices`) if stored from a prior fetch.
   Always updates `full_metrics_dict` on every fetch to keep predictions current.
+- One TTL (`constants.DEFAULT_CACHE_TTL_SECS`, 30 s): `EnergyCache`, `NBCReader`'s default
+  cache, and the app cache all use it, so one consumer never sees an entry fresh while
+  another calls it stale. Callers may pass an explicit TTL for tests.
+- One `predicted_wh`: `PredictionMixin._compute_nbc`, `EnergyCache.get_current_qh`, and
+  `NBCReader._parse_metrics` extrapolate the incomplete quarter with
+  `util.qh_seconds_remaining(now)`. The display path, cache path, and decision math share
+  one wall-clock remainder.
 
 ## Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
@@ -756,7 +826,11 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
 |---|---|
 | Flask app, routes, background loops, cooperative shutdown | `app.py` |
 | Gunicorn entry point + shutdown hooks (timeout = 60) | `wsgi.py`, `gunicorn.conf.py` |
-| Energy fetch & hourly prediction, drift rejection | `metrics.py` |
+| Energy fetch & hourly prediction, drift rejection | `hourly_fetch.py` |
+| Prediction/NBC computation mixin, device models | `prediction.py` |
+| TOU report aggregation and request budget | `tou_reporter.py` |
+| VUE auth/session base, clock, metrics exceptions | `vue_session.py` |
+| Backward-compatible re-export shim | `metrics.py` |
 | Per-second sample cache (TTL 30s, fetch timeout 30s) | `energy_cache.py` |
 | Server-side per-second sparkline SVG | `chart.py` |
 | TOU aggregation | `energy_aggregator.py` |
@@ -772,7 +846,7 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
 | Named magic-number constants | `constants.py` |
 | Structured log formatting | `logfmt.py` |
 | SSE broadcaster | `sse_event.py` |
-| Telegram notifications | `telegram.py`, `telegram_client.py` |
+| Telegram notifications and alert policy | `telegram.py`, `telegram_client.py`, `notifier.py` |
 | Deferred config, Tesla/Plug config dataclasses | `config.py`, `config_loader.py` |
 | devices.json loader & integrity validation | `device_config.py` |
 | Quarter-hour helpers, compaction records | `util.py` |

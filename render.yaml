@@ -4,6 +4,11 @@ services:
     name: solara
     env: python
     buildCommand: uv sync
+    # One controller per deployment. Multiple gunicorn workers are safe for
+    # reads: start_background_services() takes the controller lock and only
+    # the first live claimant starts the load manager and MQTT subscriber.
+    # Keep numInstances at 1 unless the instances share a
+    # SOLARA_CONTROLLER_LOCK file (they do not by default).
     startCommand: gunicorn wsgi:app -c gunicorn.conf.py --worker-class=gthread --threads=4
     healthCheckPath: /health
     plan: free

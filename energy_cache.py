@@ -16,7 +16,11 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from clock import Clock, RealClock
-from constants import MIN_SLEEP_SECS, QUANTIZATION_CONFIDENCE_THRESHOLD
+from constants import (
+    DEFAULT_CACHE_TTL_SECS,
+    MIN_SLEEP_SECS,
+    QUANTIZATION_CONFIDENCE_THRESHOLD,
+)
 from quantization import detect_quantization, usable_window
 from util import (
     CompletedNBCPeriod,
@@ -134,7 +138,7 @@ class EnergyCacheAlignmentError(Exception):
     The Emporia API reports the actual start of its data via
     ``firstUsageInstant``, which can drift off a quarter-hour boundary when
     data is missing at the head of the requested window.  Fetch-site checks
-    (``_fetch_channel_data`` in metrics.py) reject such responses before
+    (``_fetch_channel_data`` in hourly_fetch.py) reject such responses before
     they are stored, and ``compact()`` can only realign windows with
     >=900 samples — so this guard is a safety net for any path that stores
     misaligned data.
@@ -194,7 +198,7 @@ class EnergyCache:
 
     Stores raw Wh-per-second data points in a time-ordered list keyed by
     device name (currently only one device is used).  Fetches use
-    QH-window semantics (see ``_chart_start_for`` in metrics.py): the first
+    QH-window semantics (see ``_chart_start_for`` in hourly_fetch.py): the first
     fetch covers a full hour; steady-state fetches start at the current QH
     boundary.  Every fetch replaces the stored samples (``_merge_samples_replace``),
     completed QH periods are compacted into ``CompletedNBCPeriod`` records
@@ -215,7 +219,7 @@ class EnergyCache:
 
     def __init__(
         self,
-        ttl_seconds: int = 30,
+        ttl_seconds: int = DEFAULT_CACHE_TTL_SECS,
         clock: Clock | None = None,
         fetch_timeout_secs: int = 30,
     ) -> None:
@@ -235,6 +239,9 @@ class EnergyCache:
         # changing the stale-serve contract of get_or_fetch().
         self._last_fetch_error: BaseException | None = None
         self._last_fetch_error_at: datetime | None = None
+        # Observability (architecture-v2 G.2): count fetch timeouts so
+        # the metrics endpoint can expose them.
+        self._fetch_timeout_count: int = 0
 
     # ------------------------------------------------------------------
     # Public properties (mimic the old direct-attribute interface)
@@ -417,6 +424,11 @@ class EnergyCache:
         """When the last fetch failure happened, or ``None``."""
         return self._last_fetch_error_at
 
+    @property
+    def fetch_timeout_count(self) -> int:
+        """Number of fetches that hit the timeout (architecture-v2 G.2)."""
+        return self._fetch_timeout_count
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
@@ -432,6 +444,35 @@ class EnergyCache:
         """
         with self._lock:
             return self._is_valid_unlocked(now)
+
+    def cached_metrics(
+        self, now: datetime
+    ) -> tuple[dict[str, Any] | None, float | None]:
+        """Return *(metrics_dict_or_none, age_secs)* without fetching.
+
+        The request path uses this so a cold or stale cache never turns a
+        web request into a network fetch; background warmers own fetching.
+        A stale snapshot is still returned so callers can serve it with an
+        age header rather than fail.
+
+        Args:
+            now: Current time for the age calculation.
+
+        Returns:
+            A copy of the stored full metrics dict and its age in seconds,
+            or ``(None, None)`` when no full metrics dict is cached. The
+            copy keeps a caller from mutating the cached snapshot (C.1).
+        """
+        with self._lock:
+            if self._data is None or self._data.full_metrics_dict is None:
+                return None, None
+            fetched_at = self._data.last_fetch_at
+            age_secs = (
+                (now - fetched_at).total_seconds()
+                if fetched_at is not None
+                else None
+            )
+            return dict(self._data.full_metrics_dict), age_secs
 
     def _is_valid_unlocked(self, now: datetime) -> bool:
         """Check if cache has non-expired data (caller must hold lock).
@@ -664,7 +705,7 @@ class EnergyCache:
         Discards existing samples and stores only the new ones; completed
         QH periods are preserved from ``_data``.  Callers are expected to
         reject misaligned API responses (see the drift check in
-        ``_fetch_channel_data`` in metrics.py),
+        ``_fetch_channel_data`` in hourly_fetch.py),
         so the stored ``data_start`` is QH-aligned by construction.
 
         Args:
@@ -785,6 +826,7 @@ class EnergyCache:
             )
             self._last_fetch_error = exc
             self._last_fetch_error_at = self._clock.now()
+            self._fetch_timeout_count += 1
             pool.shutdown(wait=False, cancel_futures=True)
             return None
         except Exception as exc:  # noqa: BLE001

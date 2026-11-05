@@ -38,6 +38,7 @@ class SSEBroadcaster:
         self._maxsize = maxsize
         self._closed = False
         self._subscribers: set[queue.Queue] = set()
+        self._eviction_count = 0
         self._lock = threading.Lock()
 
     @property
@@ -109,12 +110,19 @@ class SSEBroadcaster:
                     dead.append(q)
             for q in dead:
                 self._subscribers.discard(q)
+            self._eviction_count += len(dead)
         return len(self._subscribers)
 
     def subscriber_count(self) -> int:
         """Return the current number of subscribers."""
         with self._lock:
             return len(self._subscribers)
+
+    @property
+    def eviction_count(self) -> int:
+        """Number of slow subscribers evicted for a full queue (G.2)."""
+        with self._lock:
+            return self._eviction_count
 
 
 def event_stream(

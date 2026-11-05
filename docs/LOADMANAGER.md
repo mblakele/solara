@@ -55,6 +55,23 @@ If actions were taken after the last data point, the system enters a
 | `DEBUG` | `False` | Debug logging and the diagnostics section on the index page |
 | `TIMEZONE` | `America/Los_Angeles` | Device timezone for display and time ranges |
 
+### Reload behaviour
+
+The load manager re-reads some settings while it runs and freezes others at
+construction. The full contract is in `docs/architecture.md`.
+
+- **Live (next cycle):** `LOAD_MANAGE_ENABLED` (disable only),
+  `LOAD_MANAGE_DRY_RUN`, `LOAD_TARGET_WH`. Removing `LOAD_TARGET_WH` returns
+  to the `devices.json` target.
+- **Restart required:** `LOAD_NBC_DEVICE`, `LOAD_MANAGE_LUMPY_FIRST`,
+  `LOAD_MANAGER_RAMP_AWARE`, `LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA`,
+  `LOAD_MANAGE_INTERVAL_SECS`, `LOAD_PLUG_CONTROLLER`,
+  `LOAD_TESLA_CONTROLLER`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and the
+  `LOG_*` keys. The config watcher logs `requires_restart` for these.
+- **Enabling a disabled process:** `LOAD_MANAGE_ENABLED=False` at boot starts
+  no load-management thread. Set it to `False` at runtime to stop actuation;
+  to start from a disabled boot, restart.
+
 ### Device Configuration (`devices.json`)
 
 Device-specific settings live in `devices.json` (copy from `devices.json.example`).
@@ -740,6 +757,17 @@ pending effects, and last cycle result.
 
 ```bash
 curl http://localhost:8000/api/v1/load/status
+```
+
+### GET /api/v1/metrics
+
+JSON counters for cycles and failure paths: per-`CycleStatus` counts,
+early-exit reasons, Tesla arbitration verdicts, drift escalations, SSE
+subscriber evictions, and cache fetch timeouts. Debugging moves here
+instead of `DEBUG` log scraping.
+
+```bash
+curl http://localhost:8000/api/v1/metrics
 ```
 
 ### Tesla OAuth Endpoints

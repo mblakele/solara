@@ -174,8 +174,12 @@ class TestLoadStatusHealthCounters:
 
         app_mod._state.consecutive_error_count = 3
         app_mod._state.last_error_type = "RuntimeError"
+        app_mod._state.load_manager = mock_lm
         try:
-            with patch("app._get_load_manager", return_value=mock_lm):
+            with patch(
+                "app._get_load_manager",
+                side_effect=AssertionError("constructed in request"),
+            ):
                 response = client.get("/api/v1/load/status")
 
             assert response.status_code == 200
@@ -187,6 +191,7 @@ class TestLoadStatusHealthCounters:
             assert "mqtt" in data
             assert "connected" in data["mqtt"]
         finally:
+            app_mod._state.load_manager = None
             app_mod._state.consecutive_error_count = 0
             app_mod._state.last_error_type = None
 
@@ -196,6 +201,7 @@ class TestMonotonicFetchTiming:
 
     def test_fetch_channel_data_uses_monotonic_clock(self, monkeypatch):
         """api_response records monotonic elapsed seconds for the API call."""
+        import hourly_fetch
         import metrics
 
         hp = metrics.HourlyProjection.__new__(metrics.HourlyProjection)
@@ -211,7 +217,7 @@ class TestMonotonicFetchTiming:
 
         clock_values = iter([100.0, 100.25])
         monkeypatch.setattr(
-            metrics,
+            hourly_fetch,
             "_monotonic",
             lambda: next(clock_values),
             raising=False,
@@ -235,7 +241,9 @@ class TestMonotonicFetchTiming:
 
     def test_monotonic_not_wall_clock_drives_duration(self, monkeypatch):
         """Advancing the wall clock must NOT change recorded durations."""
+        import hourly_fetch
         import metrics
+        import vue_session
         from clock import FakeClock
 
         hp = metrics.HourlyProjection.__new__(metrics.HourlyProjection)
@@ -251,8 +259,10 @@ class TestMonotonicFetchTiming:
         # monkeypatch restores the previous clock automatically. (A manual
         # metrics.set_clock() here leaked the FakeClock into every later
         # test in the session.)
-        monkeypatch.setattr(metrics, "_CLOCK", fake_clock)
-        monkeypatch.setattr(metrics, "_monotonic", lambda: 55.0, raising=False)
+        monkeypatch.setattr(vue_session, "_CLOCK", fake_clock)
+        monkeypatch.setattr(
+            hourly_fetch, "_monotonic", lambda: 55.0, raising=False
+        )
 
         def _slow_get_chart_usage(_channel, _start, _end, **_kwargs):
             fake_clock.advance(120)  # wall-clock jump must be ignored

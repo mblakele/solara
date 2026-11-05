@@ -45,6 +45,7 @@ from constants import (
 )
 
 from settle_window import SettleWindowMachine
+from util import qh_seconds_remaining
 
 
 logger = logging.getLogger(__name__)
@@ -258,12 +259,13 @@ class NBCReader:
 
         Args:
             energy_cache: Shared EnergyCache instance for reading cached per-second data.
-                When None, creates a default EnergyCache(ttl_seconds=30).
+                When None, creates an ``EnergyCache()`` with the shared default
+                TTL (``DEFAULT_CACHE_TTL_SECS``).
             device_name: Name of the VUE device to query. Defaults to empty string.
             metrics_fetch: Callable that fetches fresh raw metrics data. Used by
                 ``get_current_qh(force=True)`` to bypass the cache.
         """
-        self.energy_cache: EnergyCache = energy_cache or EnergyCache(ttl_seconds=30)
+        self.energy_cache: EnergyCache = energy_cache or EnergyCache()
         self.device_name = device_name
         self._metrics_fetch: Callable[[], dict[str, Any] | None] | None = metrics_fetch
 
@@ -407,19 +409,12 @@ class NBCReader:
                 continue
             if not qh_data.get("complete", True):
                 predicted_wh = qh_data.get("predicted_wh", 0)
-                # Derive seconds_remaining from wall-clock time so it stays
-                # monotonic across cache refreshes even when sample counts
-                # fluctuate due to API delivery latency.
-                # NOTE (plan 3.3 asymmetry): predicted_wh above is
-                # sample-window extrapolation (metrics._compute_nbc passes no
-                # seconds_remaining_override), so this path mixes a sample-
-                # count Wh with wall-clock remaining. Deliberate for now —
-                # see the mirrored note in metrics._compute_nbc before unifying.
+                # One time base (architecture-v2 C.2): both sides of this
+                # record come from wall-clock time, so predicted_wh and
+                # seconds_remaining always describe the same horizon.
                 now = metrics_data.get("_now")
                 if now is not None:
-                    offset_in_hour = now.second + (now.minute % 15) * 60
-                    remaining_seconds = 900 - offset_in_hour
-                    remaining_seconds = max(0, remaining_seconds)
+                    remaining_seconds = max(0, qh_seconds_remaining(now))
                 else:
                     remaining_seconds = qh_data.get(
                         "remaining_seconds", NBCPeriod.PERIOD_SECS

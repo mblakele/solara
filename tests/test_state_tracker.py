@@ -506,8 +506,11 @@ class TestPlugStateProjection:
 
         client = app_mod.app.test_client()
         client.testing = True
-        with patch("app._get_load_manager", return_value=lm):
+        app_mod._state.load_manager = lm
+        try:
             response = client.get("/api/v1/load/status")
+        finally:
+            app_mod._state.load_manager = None
 
         assert response.status_code == 200
         data = response.get_json()
@@ -1204,8 +1207,11 @@ class TestThreadSafeSnapshots:
 
         client = app_mod.app.test_client()
         client.testing = True
-        with patch("app._get_load_manager", return_value=lm):
+        app_mod._state.load_manager = lm
+        try:
             response = client.get("/api/v1/load/status")
+        finally:
+            app_mod._state.load_manager = None
 
         assert response.status_code == 200
         data = response.get_json()

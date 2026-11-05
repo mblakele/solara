@@ -140,17 +140,19 @@ class TestMetricsClockInjection:
     def test_set_clock_accepts_fakeclock(self):
         """set_clock must accept a FakeClock and make it the active clock."""
         import metrics
+        import vue_session
 
         clock = FakeClock(self.FIXED)
         metrics.set_clock(clock)
-        assert metrics._CLOCK is clock
+        assert vue_session._CLOCK is clock
 
     def test_reset_to_realclock(self):
         """Calling set_clock with RealClock must restore real time."""
         import metrics
+        import vue_session
 
         metrics.set_clock(RealClock())
-        assert isinstance(metrics._CLOCK, RealClock)
+        assert isinstance(vue_session._CLOCK, RealClock)
 
     def test_set_clock_affects_retryable_exception(self):
         """RetryableMetricsException.instant must use the injected clock."""

@@ -106,13 +106,12 @@ from gap_trend import GapTrendTracker
 from tesla_arbitration import RestArbitrationMachine
 
 from metrics import DriftAlert, drain_drift_alerts
+from notifier import Notifier
 
 from telegram import (
     NotificationEvent,
     TelegramSender,
     action_device_and_type,
-    build_error_notification,
-    build_notification,
 )
 
 
@@ -347,9 +346,11 @@ class LoadManager:
 
         if enabled is None:
             enabled = self._resolve_enabled(self._cfg)
+        self._enabled_static = cfg.enabled is not None
         self.enabled: bool | tuple[time, time] = enabled
         logger.info("LoadManager %s", self.enabled)
 
+        self._dry_run_static = cfg.dry_run is not None
         if dry_run is None:
             dry_run = self._cfg.dry_run
         self.dry_run = dry_run
@@ -414,6 +415,9 @@ class LoadManager:
         # uncorroborated ChargeAmps, no active command). The machine holds
         # the verdict and the poll clock, and owns every transition.
         self.tesla_arbitration = RestArbitrationMachine()
+        # Observability (architecture-v2 G.2): drift escalations drained
+        # by this manager, exposed via GET /api/v1/metrics.
+        self.drift_escalation_count = 0
         # Anti-spam dedup: tracks the last auth error text sent to Telegram so we
         # only send one alert per unique error message (not one per 30 s cycle).
         self._last_auth_error_msg: str | None = None
@@ -500,10 +504,9 @@ class LoadManager:
         else:
             self._telegram_devices = None
 
-        # Queue of deferred Telegram notifications to be sent synchronously
-        # after run_cycle() releases the lock. Populated by _queue_* methods
-        # during the async phase, drained by _send_pending_notifications_sync().
-        self._pending_notifications: list[NotificationEvent] = []
+        # Deferred Telegram notification policy and queue (D.2). Sends
+        # happen synchronously after run_cycle() releases the lock.
+        self.notifier = Notifier(self)
 
         if tesla_ctrl is not None:
             self.tesla_ctrl = tesla_ctrl
@@ -704,13 +707,34 @@ class LoadManager:
         return max(target_wh - low, high - target_wh)
 
     def _refresh_target(self, now: datetime) -> None:
-        """Re-resolve the target and band from devices.json for *now*.
+        """Re-resolve the target and band from env and devices.json for *now*.
 
-        A schedule moves with wall-clock time, so this runs every cycle.
-        Injected targets and the ``LOAD_TARGET_WH`` override stay fixed.
+        Runs every cycle. The ``LOAD_TARGET_WH`` override and the smartmeter
+        schedule can both change while the process runs. An injected target
+        (``LoadManagerConfig.target_wh`` / ``target_wh_band``) is fixed for
+        the manager's lifetime.
         """
-        if self._target_static or self._target_override is not None:
+        if self._target_static:
             return
+        override = self._cfg.load_target_wh_override
+        if override is not None:
+            if override == self._target_override and self.target_wh_band is None:
+                return
+            logger.warning(
+                "LOAD_TARGET_WH=%s overrides devices.json target_wh, "
+                "target_wh_range, and target_wh_schedule",
+                override,
+            )
+            self._target_override = override
+            self.target_wh = override
+            self.target_wh_band = None
+            self.engine.HYSTERESIS_WH = self._band_hysteresis(override, None)
+            return
+        if self._target_override is not None:
+            logger.info(
+                "LOAD_TARGET_WH unset — returning to devices.json target",
+            )
+            self._target_override = None
         setting = device_config.get_target_wh_setting(now)
         band = setting.band
         if setting.target_wh == self.target_wh and band == self.target_wh_band:
@@ -2195,79 +2219,17 @@ class LoadManager:
         dry_run: bool,
         now: datetime | None = None,
     ) -> None:
-        """Queue a surplus notification for deferred synchronous send.
-
-        Skipped when the sender is not configured, dry-run mode is active,
-        there are no actions, or no action matches the telegram.devices
-        whitelist. Matching events are stored in _pending_notifications
-        instead of being sent immediately.
-        """
-        if self.telegram_sender is None:
-            logger.info(
-                "Telegram notification skipped: sender not configured",
-            )
-            return
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Telegram notification skipped: sender not configured (is_configured=False)",
-            )
-            return
-        if dry_run:
-            logger.info(
-                "Telegram notification skipped: dry-run mode",
-            )
-            return
-        if not actions:
-            # Operator-facing sign convention (deliberate, do NOT "fix"):
-            # NBC-signed — negative = excess solar, positive = grid draw —
-            # matching how predictions are displayed everywhere else.
-            # This is the OPPOSITE of the engine-internal control gap
-            # (target_wh - predicted_wh) in CycleDiagnostics/gapminder logs.
-            # See docs/LOADMANAGER.md.
-            gap_wh = predicted_wh - target_wh
-            logger.info(
-                "Telegram notification skipped: no actions "
-                "(gap=%+.1f Wh, positive=grid draw)",
-                gap_wh,
-            )
-            return
-
+        """Delegate the surplus notification policy to the Notifier."""
         if now is None:
             now = self._clock.now()
-
-        event = build_notification(
-            actions=actions,
-            predicted_wh=predicted_wh,
-            target_wh=target_wh,
-            now=now,
-            runtime_today_secs=self._runtime_for_actions(actions, now),
-        )
-
-        # Whitelist gate: only queue when telegram.devices is configured
-        # AND at least one action matches.
-        if self._telegram_devices is None:
-            logger.info(
-                "Telegram notification skipped: telegram.devices whitelist not configured",
-            )
-            return
-
-        matches = any(
-            a.device_name.lower() in self._telegram_devices
-            and a.action in self._telegram_devices[a.device_name.lower()]
-            for a in actions
-        )
-        if not matches:
-            logger.info(
-                "Telegram notification skipped: no actions match telegram.devices whitelist",
-            )
-            return
-
-        self._pending_notifications.append(event)
-        device_names = ", ".join(a.device_name for a in actions)
-        logger.info(
-            "Telegram notification queued: devices=%s gap=%+.1f Wh",
-            device_names,
-            predicted_wh - target_wh,
+        runtime = self._runtime_for_actions(actions, now) if actions else None
+        self.notifier.surplus(
+            actions,
+            predicted_wh,
+            target_wh,
+            dry_run,
+            now,
+            runtime_today_secs=runtime,
         )
 
     def _queue_auth_error_notification(
@@ -2275,71 +2237,12 @@ class LoadManager:
         error_msg: str,
         login_url: str | None = None,
     ) -> None:
-        """Queue an auth error notification for deferred synchronous send.
-
-        Unlike the surplus notification, this bypasses the devices whitelist
-        and dry-run guard — auth errors alert whenever a sender is
-        configured and alert_on_auth_error is enabled.
-        """
-        if self.telegram_sender is None:
-            logger.info(
-                "Auth error notification skipped: sender not configured",
-            )
-            return
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Auth error notification skipped: sender not configured (is_configured=False)",
-            )
-            return
-        if not self._telegram_alert_on_auth_error:
-            logger.info(
-                "Auth error notification skipped: alert_on_auth_error is False",
-            )
-            return
-
-        now = self._clock.now()
-        event = build_error_notification(error_msg, now=now, login_url=login_url)
-        self._pending_notifications.append(event)
-        logger.info(
-            "Auth error notification queued: error=%s",
-            error_msg,
-        )
+        """Delegate the auth-error notification policy to the Notifier."""
+        self.notifier.auth_error(error_msg, login_url, self._clock.now())
 
     def _queue_drift_error_notification(self, alert: DriftAlert) -> None:
-        """Queue a Telegram alert for persistent Emporia data-start drift.
-
-        The Emporia API returning a ``data_start`` that drifts off the
-        requested (QH-aligned) ``chart_start`` means the head of the window
-        is missing; when the same QH key is rejected ``DRIFT_REJECTION_ALERT_AFTER``
-        consecutive times the fetch path queues a ``DriftAlert``.  This
-        method surfaces it as an error notification (bypassing the devices
-        whitelist, like auth-error alerts) via the deferred synchronous
-        send path after ``run_cycle()`` releases the lock.
-
-        Args:
-            alert: The drift alert event to surface.
-        """
-        if self.telegram_sender is None:
-            logger.info(
-                "Drift alert notification skipped: sender not configured",
-            )
-            return
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Drift alert notification skipped: sender not configured (is_configured=False)",
-            )
-            return
-
-        now = self._clock.now()
-        message = (
-            f"Emporia VUE drift: channel {alert.channel_num} QH starting "
-            f"{alert.chart_start.isoformat()} rejected {alert.count} consecutive "
-            f"fetches (API data_start {alert.data_start.isoformat()}); head of "
-            "window appears permanently missing"
-        )
-        event = build_error_notification(message, now=now)
-        self._pending_notifications.append(event)
-        logger.error("Drift alert notification queued: %s", message)
+        """Delegate the drift notification policy to the Notifier."""
+        self.notifier.drift(alert, self._clock.now())
 
     def _drain_drift_alerts(self) -> None:
         """Escalate persistent Emporia drift to ERROR + one-time Telegram alert.
@@ -2350,6 +2253,7 @@ class LoadManager:
         cycle lock is released).
         """
         for alert in drain_drift_alerts():
+            self.drift_escalation_count += 1
             logger.error(
                 "Persistent Emporia VUE drift: channel %s QH starting %s "
                 "rejected %d consecutive fetches (API data_start %s); head "
@@ -2394,91 +2298,18 @@ class LoadManager:
         return True
 
     def _queue_fetch_fatal_notification(self, error_msg: str) -> None:
-        """Queue a Telegram alert for a fatal metrics-fetch failure.
-
-        Bypasses the telegram.devices whitelist and the dry-run guard
-        (like drift/auth-error alerts): data-health alerts must fire
-        whenever a sender is configured.
-
-        Args:
-            error_msg: Human-readable fetch failure text.
-        """
-        if self.telegram_sender is None:
-            logger.info(
-                "Fetch-fatal notification skipped: sender not configured",
-            )
-            return
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Fetch-fatal notification skipped: sender not configured (is_configured=False)",
-            )
-            return
-        now = self._clock.now()
-        message = (
-            f"Emporia VUE fetch failure: {error_msg} "
-            "(no fresh data this cycle)"
-        )
-        event = build_error_notification(message, now=now)
-        self._pending_notifications.append(event)
-        logger.error("Fetch-fatal notification queued: %s", message)
+        """Delegate the fatal-fetch notification policy to the Notifier."""
+        self.notifier.fetch_fatal(error_msg, self._clock.now())
 
     def _queue_stale_data_notification(self, message: str) -> None:
-        """Queue a Telegram alert for stale or missing Emporia data.
-
-        Same bypass rules as :meth:`_queue_fetch_fatal_notification`:
-        whitelist and dry-run do not apply.
-
-        Args:
-            message: Human-readable staleness text (already includes age).
-        """
-        if self.telegram_sender is None:
-            logger.info(
-                "Stale-data notification skipped: sender not configured",
-            )
-            return
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Stale-data notification skipped: sender not configured (is_configured=False)",
-            )
-            return
-        now = self._clock.now()
-        event = build_error_notification(message, now=now)
-        self._pending_notifications.append(event)
-        logger.error("Stale-data notification queued: %s", message)
+        """Delegate the stale-data notification policy to the Notifier."""
+        self.notifier.stale_data(message, self._clock.now())
 
     def _queue_out_of_range_notification(
         self, device_name: str, time_range: tuple[time, time], now: datetime,
     ) -> None:
-        """Queue a Telegram alert for a plug ON outside its time range.
-
-        Bypasses the telegram.devices whitelist and the dry-run guard
-        (like data-health alerts): a forgotten manual ON must page
-        whenever a sender is configured.
-
-        Args:
-            device_name: Plug configuration name.
-            time_range: The plug's configured (start, end) window.
-            now: Current wall-clock time for the event timestamp.
-        """
-        if self.telegram_sender is None:
-            logger.info(
-                "Out-of-range notification skipped: sender not configured",
-            )
-            return
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Out-of-range notification skipped: sender not configured (is_configured=False)",
-            )
-            return
-        start_str = time_range[0].strftime("%H:%M")
-        end_str = time_range[1].strftime("%H:%M")
-        message = (
-            f"{device_name} is ON outside its time range "
-            f"{start_str}-{end_str}"
-        )
-        event = build_error_notification(message, now=now)
-        self._pending_notifications.append(event)
-        logger.warning("Out-of-range notification queued: %s", message)
+        """Delegate the out-of-range notification policy to the Notifier."""
+        self.notifier.out_of_range(device_name, time_range, now)
 
     def _check_out_of_range_alert(self, now: datetime) -> None:
         """Alert for managed plugs left ON outside their time range.
@@ -2569,29 +2400,8 @@ class LoadManager:
         self._queue_stale_data_notification(message)
 
     def _queue_pipeline_notification(self, message: str) -> None:
-        """Queue a Telegram alert for a stalled decision pipeline.
-
-        Same bypass rules as :meth:`_queue_stale_data_notification`:
-        whitelist and dry-run do not apply.
-
-        Args:
-            message: Human-readable stall text (already includes ages).
-        """
-        if self.telegram_sender is None:
-            logger.info(
-                "Pipeline-stall notification skipped: sender not configured",
-            )
-            return
-        if not self.telegram_sender.is_configured:
-            logger.info(
-                "Pipeline-stall notification skipped: sender not configured "
-                "(is_configured=False)",
-            )
-            return
-        now = self._clock.now()
-        event = build_error_notification(message, now=now)
-        self._pending_notifications.append(event)
-        logger.error("Pipeline-stall notification queued: %s", message)
+        """Delegate the pipeline-stall notification policy to the Notifier."""
+        self.notifier.pipeline_stall(message, self._clock.now())
 
     def _check_pipeline_stall_alert(
         self,
@@ -2687,23 +2497,29 @@ class LoadManager:
                     pipe_point, meter_age_secs, now_ref, "no_incomplete_qh"
                 )
 
+    @property
+    def _pending_notifications(self) -> list[NotificationEvent]:
+        """Pending notification queue, owned by the Notifier (D.2)."""
+        return self.notifier.events
+
+    @_pending_notifications.setter
+    def _pending_notifications(self, events: list[NotificationEvent]) -> None:
+        self.notifier.replace(events)
+
     def _send_pending_notifications_sync(self) -> None:
         """Flush all queued Telegram notifications synchronously.
 
         Must be called after run_cycle() returns, outside the lock.
-        Drains the _pending_notifications list and sends each one
-        via the synchronous send path (requests-based), so any
-        transient network errors with retry/backoff do not block
-        the load management cycle.
+        Drains the Notifier queue and sends each event via the
+        synchronous send path (requests-based), so transient network
+        errors with retry/backoff do not block the load management cycle.
         """
-        if not self._pending_notifications:
+        events = self.notifier.drain()
+        if not events:
             return
         if self.telegram_sender is None:
-            self._pending_notifications.clear()
             return
 
-        events = list(self._pending_notifications)
-        self._pending_notifications.clear()
         for event in events:
             try:
                 self.telegram_sender.send_notification_sync(event)
@@ -3215,7 +3031,9 @@ class LoadManager:
     def _check_config_changes(self) -> None:
         """Check .env and devices.json for changes; reload and log results.
 
-        Called at the top of run_cycle() under self._lock.
+        Called at the top of run_cycle() under self._lock. Live env knobs are
+        re-resolved even when no file mtime moved, because ``os.environ`` can
+        change without a file edit (tests, process managers).
         """
         config_changes = self._config_watcher.check()
         if config_changes.devices_changed:
@@ -3238,6 +3056,33 @@ class LoadManager:
                     "config_reloaded .env changed_keys=%s",
                     config_changes.env_changed,
                 )
+        self._refresh_live_env_settings()
+
+    def _refresh_live_env_settings(self) -> None:
+        """Re-resolve env settings that are live between cycles (G.1).
+
+        ``LOAD_MANAGE_ENABLED``, ``LOAD_MANAGE_DRY_RUN``, and
+        ``LOAD_TARGET_WH`` take effect on the next cycle. Values injected
+        through ``LoadManagerConfig`` stay fixed for the manager's lifetime;
+        :meth:`_refresh_target` owns the target override because decisions
+        read it per cycle.
+        """
+        if not self._enabled_static:
+            enabled = self._resolve_enabled(self._cfg)
+            if enabled != self.enabled:
+                logger.info(
+                    "LOAD_MANAGE_ENABLED changed: %s -> %s",
+                    self.enabled, enabled,
+                )
+                self.enabled = enabled
+        if not self._dry_run_static:
+            dry_run = self._cfg.dry_run
+            if dry_run != self.dry_run:
+                logger.warning(
+                    "LOAD_MANAGE_DRY_RUN changed: %s -> %s",
+                    self.dry_run, dry_run,
+                )
+                self.dry_run = dry_run
 
     def _timed(
         self, ctx: CycleContext, stage: str, fn: Callable[..., _T],

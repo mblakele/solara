@@ -595,6 +595,12 @@ RESTART_REQUIRED_KEYS = frozenset({
     "VOCOLINC_USERNAME", "VOCOLINC_PASSWORD",
     "VUE_USERNAME", "VUE_PASSWORD",
     "LOAD_MANAGE_INTERVAL_SECS",
+    # Resolved once when the load manager or logging is constructed; a live
+    # .env edit cannot reach the running object (architecture-v2 G.1).
+    "LOAD_NBC_DEVICE", "LOAD_MANAGE_LUMPY_FIRST", "LOAD_MANAGER_RAMP_AWARE",
+    "LOAD_MANAGER_DEFER_LOOKAHEAD_QUANTA",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+    "LOG_FILE", "LOG_MAX_BYTES", "LOG_BACKUP_COUNT",
 })
 
 
