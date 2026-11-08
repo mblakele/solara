@@ -411,6 +411,10 @@ class LoadManager:
         # Preserved when Location is absent so the requires_home_check gate in
         # GapMinder doesn't incorrectly block Tesla decisions.
         self._last_tesla_at_home: bool | None = None
+        # Last successful plug-controller poll (any path). Gates the
+        # pre-gate dashboard poll so 5s waiting cycles do not hit the
+        # plug API every cycle; the Stage 5 decision sync is ungated.
+        self._last_plug_sync_at: datetime | None = None
         # REST arbitration verdict for ambiguous telemetry (positive but
         # uncorroborated ChargeAmps, no active command). The machine holds
         # the verdict and the poll clock, and owns every transition.
@@ -1138,11 +1142,33 @@ class LoadManager:
         raw prediction since an early exit has no corrected gap yet;
         the async phase must not re-queue them.
 
+        TTL gate: waiting cycles run every 5s for fresh metrics
+        (``EnergyCache.sleep_interval_adjust``), so polling the plug
+        controllers every cycle would storm the plug API. The
+        pre-gate poll therefore runs at most once per
+        ``config_interval_secs``; inside that window it is skipped
+        and ``plug_pre_sync_done`` stays False. That is safe because
+        ``_stage_async_phase`` then passes ``pre_synced_external=None``
+        and Stage 5 re-syncs via ``_async_sync_and_check_sentinel``
+        before any decision, so decision cycles always see fresh
+        plug state. Staleness is bounded by the TTL (default 30s).
+
         Args:
             ctx: Current pipeline context (provides predicted_wh and
                 timestamps for the alert fallback; carries the
                 pre-sync result to Stage 5).
         """
+        now_ref = ctx.now_postfetch if ctx.now_postfetch is not None else ctx.now
+        if self._last_plug_sync_at is not None:
+            elapsed = (now_ref - self._last_plug_sync_at).total_seconds()
+            if elapsed < float(self.config_interval_secs):
+                logger.debug(
+                    "Skipping pre-gate plug sync: last sync %.1fs ago "
+                    "(TTL %.1fs)",
+                    elapsed,
+                    float(self.config_interval_secs),
+                )
+                return
         try:
             external = asyncio.run(self._sync_plug_states())
         except Exception:  # pylint: disable=broad-exception-caught
@@ -2122,6 +2148,7 @@ class LoadManager:
                     )
                     if effect is not None:
                         external.append(effect)
+        self._last_plug_sync_at = self._clock.now()
         return external
 
     def _command_may_be_in_flight(self, dev_state: DeviceState) -> bool:
