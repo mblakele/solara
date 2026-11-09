@@ -202,11 +202,23 @@ drift checks.
   process claimant defers with CRITICAL; a repeat call in one process is
   idempotent), and the cache refresher wiring for disabled load management
 - **test_oidc_auth.py**
-  anonymous reads stay open; the write gate (fetch header, 401 for anonymous,
-  403 for non-allowlisted, empty-allowlist fail-closed), `next` validation, the
+  the read gate (`FLASK_SECRET_KEY` fail-closed startup, random per-process
+  key when OIDC is off, anonymous redirects/`401`/`403`/`503` matrix,
+  loopback-only anonymous reads when OIDC is unconfigured, public paths
+  including Tesla OAuth), the callback using Authlib's validated
+  `token["userinfo"]` (fail-closed `502` on missing/malformed claims, no
+  second `parse_id_token` call), `next` hardening (backslash, encoded
+  double-slash, control characters), the `https`-only issuer (loopback
+  `http` allowed), the per-IP auth rate limit, `can_read` /
+  `login_required` on `/api/me`, the write gate (fetch header, 401 for
+  anonymous, 403 for non-allowlisted, empty-allowlist fail-closed), the
   `PUBLIC_URL`-driven redirect URI, empty-allowlist bootstrap logging,
-  `/api/me` in each state, and the session cookie config (Authlib faked,
-  `docs/AUTH.md`)
+  and the session cookie config (Authlib faked, `docs/AUTH.md`)
+- **test_oidc_frontend.py**
+  source-contract tests on `static/app.js`: header state from `can_read`,
+  `redirectToLogin()` preserving path and query, partial fetches through
+  `window.solaraFetch`, `401` redirect handling, and SSE error probing
+  with `login_required`
 - **test_notifier.py**
   the notification policy seam (D.2): gated surplus (sender, dry-run, empty
   actions, whitelist miss), bypass alerts (auth, drift, fatal fetch, stale data,

@@ -2018,7 +2018,7 @@ def create_app(
     application.extensions["solara_state"] = state
     # Register Tesla OAuth routes.
     application.register_blueprint(bp)
-    # OIDC login routes, the write gate, and session cookie config.
+    # OIDC login routes, the read/write gate, and session cookie config.
     from oidc_auth import register_oidc
 
     register_oidc(application)

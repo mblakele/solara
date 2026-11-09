@@ -231,7 +231,8 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    WSGI["wsgi.py<br/>app = create_app()<br/>start_background_services()"] --> APP["app.py create_app()<br/>routes · JSON provider · error handlers<br/>Tesla OAuth Blueprint"]
+    WSGI["wsgi.py<br/>app = create_app()<br/>start_background_services()"] --> GATE["oidc_auth.register_oidc()<br/>read/write gate · /oidc/* · /api/me"]
+    APP["app.py create_app()<br/>routes · JSON provider · error handlers<br/>Tesla OAuth Blueprint"] --> GATE
     MAIN["python app.py<br/>(dev server)"] --> APP
     CLI1["python app.py --pair-plug<br/>&lt;name> &lt;address> &lt;pin>"] --> PH["pair_homekit_accessory()"]
     CLI2["python app.py --tesla-auth-cli"] --> TA["tesla_auth_cli()"]
@@ -302,6 +303,18 @@ when load management is disabled. A request never calls the Emporia API:
 shared, bounded executor; a report that overruns it returns HTTP 504. The
 executor is shared so a timed-out pyemvue call cannot leak one blocked thread
 per request.
+
+`oidc_auth.register_oidc()` installs the read/write gate as a
+`before_request` hook in front of every route. Data reads (`/`,
+`/api/v1/tou`, `/api/v1/load/status`, `/api/v1/metrics`,
+`/api/v1/tesla/status`, `/stream/status`) require an allowlisted OIDC
+session when `OIDC_ISSUER` is set, and loopback-only anonymous access
+when it is unset (non-loopback anonymous reads fail closed with `503`).
+Writes keep the `X-Requested-With: fetch`, session, and allowlist checks.
+Public paths — `/health`, `/api/me`, `/oidc/*`, `/static/*`, and the Tesla
+OAuth routes (`/api/v1/tesla/auth/initiate`, `/callback`, gated by their
+own one-time token and owner allowlist) — pass through. Full policy,
+response matrix, and residuals: `docs/AUTH.md`.
 
 ## Data Model Axioms
 
@@ -869,6 +882,7 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
 | devices.json loader & integrity validation | `device_config.py` |
 | Quarter-hour helpers, compaction records | `util.py` |
 | Tesla OAuth Blueprint (`/api/v1/tesla/auth/initiate`, `/callback`, `/api/v1/tesla/status`) | `tesla_oauth.py` |
+| OIDC login routes, read/write gate, `/api/me` | `oidc_auth.py` |
 | FakeClock / Clock protocol | `clock.py` |
 | Test data generation | `mockdata.py` |
 | Templates | `templates/` |

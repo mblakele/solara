@@ -59,6 +59,10 @@
   var lastEventAt = Date.now()
   var silenceLimitMs = Math.max(2 * millisMax, 90 * 1000)
 
+  // One redirect guard for both fragment 401s and SSE error probes, so the
+  // two paths cannot race into a reload loop.
+  var loginRedirected = false
+
   function timestamp() {
     return new Date(Date.now()).toLocaleTimeString()
   }
@@ -81,6 +85,17 @@
 
   function scheduleReload() {
     reloadTimer = setTimeout(reloadIfVisible, millisMax)
+  }
+
+  // Send the browser to the OIDC login once, preserving the current page
+  // (path and query) as `next`.
+  function redirectToLogin() {
+    if (loginRedirected) {
+      return
+    }
+    loginRedirected = true
+    window.location.href = 'oidc/login?next=' +
+      encodeURIComponent(window.location.pathname + window.location.search)
   }
 
   // Data-freshness strip (templates/_metrics.html): the server renders the
@@ -256,7 +271,7 @@
   }
 
   function swapSection(id, url, selector) {
-    fetch(url, { headers: { Accept: 'text/html' } })
+    window.solaraFetch(url, { headers: { Accept: 'text/html' } })
       .then(function (resp) {
         return resp.ok ? resp.text() : ''
       })
@@ -331,19 +346,32 @@
     source.addEventListener('heartbeat', function () {
       noteEvent()
     })
-    // EventSource reconnects automatically; transient errors need no
-    // handling beyond a log line. A permanently dead stream trips the
-    // silence watchdog above, which re-arms the reload fallback (live
-    // pages carry no meta refresh to fall back on).
+    // EventSource reconnects automatically. On error, probe the auth state:
+    // an expired session returns 401 for the stream, which the browser
+    // cannot act on. Redirect only when login_required is true, so a local
+    // read-only session does not bounce. Other transient errors just log
+    // and let EventSource retry; a permanently dead stream still trips the
+    // silence watchdog above.
     source.onerror = function () {
-      log('sse connection error, retrying')
+      log('sse connection error, checking login state')
+      fetch('api/me', { headers: { Accept: 'application/json' } })
+        .then(function (resp) {
+          return resp.ok ? resp.json() : null
+        })
+        .then(function (me) {
+          if (me && me.login_required) {
+            redirectToLogin()
+          }
+        })
+        .catch(function () { /* transient; EventSource retries */ })
     }
   }
 
-  // Write-request wrapper: the server gate requires the same-origin
-  // fetch marker on every non-read request. Future write calls must go
-  // through this rather than bare fetch(). On 401 (session expired) it
-  // sends the user to the OIDC login with the current page as `next`.
+  // Request wrapper: the server gate requires the same-origin fetch
+  // marker on every non-read request, and fragment reads need the same
+  // 401 handling. Write calls must go through this rather than bare
+  // fetch(). On 401 (session expired or anonymous data read) it sends the
+  // user to the OIDC login with the current page as `next`.
   window.solaraFetch = function (url, options) {
     var opts = options || {}
     var headers = {}
@@ -356,15 +384,16 @@
     opts.headers = headers
     return fetch(url, opts).then(function (resp) {
       if (resp.status === 401) {
-        window.location.href = 'oidc/login?next='
-          + encodeURIComponent(window.location.pathname + window.location.search)
+        redirectToLogin()
       }
       return resp
     })
   }
 
-  // Cosmetic auth state for the header sign-in link. When the user can
-  // write, the link becomes a logout link; reads stay open regardless.
+  // Cosmetic auth state for the header sign-in link. Read and write access
+  // are separate: can_read reflects the allowlist for data, while can_write
+  // also needs the same-origin fetch marker. An authenticated user with no
+  // read access sees the logout link, not a login loop.
   fetch('api/me', { headers: { Accept: 'application/json' } })
     .then(function (resp) {
       return resp.ok ? resp.json() : null
@@ -379,8 +408,11 @@
       if (me && me.can_write) {
         link.textContent = 'Sign out'
         link.href = 'oidc/logout'
-      } else if (me && me.authenticated) {
+      } else if (me && me.can_read) {
         link.textContent = 'Signed in (read-only)'
+        link.href = 'oidc/logout'
+      } else if (me && me.authenticated) {
+        link.textContent = 'Signed in (no access)'
         link.href = 'oidc/logout'
       } else {
         link.textContent = 'Sign in'
