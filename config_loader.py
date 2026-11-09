@@ -255,8 +255,6 @@ def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[retu
 
     private_key_path = cfg.tesla_private_key_path or None
 
-    vehicle_command_proxy_url = cfg.tesla_vehicle_command_proxy_url or None
-
     client_secret: str | None = cfg.tesla_client_secret
     if not client_secret:
         return None
@@ -282,6 +280,5 @@ def load_tesla_config(config: Config | None = None) -> Any:  # type: ignore[retu
         charge_amps_max=settings.charge_amps_max,
         private_key_path=private_key_path,
         time_range=settings.time_range,
-        vehicle_command_proxy_url=vehicle_command_proxy_url,
         priority=settings.priority,
     )

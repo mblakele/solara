@@ -13,6 +13,7 @@ loop) are only started by an explicit call to
 block), so tests and tooling can import the module safely.
 """
 
+import argparse
 import asyncio
 import atexit
 from collections import Counter, deque
@@ -31,7 +32,9 @@ import tempfile
 import threading
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, get_args
+from urllib.parse import urlparse
 
 import pytz
 import requests
@@ -74,7 +77,7 @@ from metrics import (
 )
 from mockdata import MetricsMock
 import mqtt_telemetry
-from load_models import CycleResult, CycleStatus
+from load_models import CycleResult, CycleStatus, FleetTelemetryProvisionConfig
 from sse_event import SSEBroadcaster, event_stream
 from util import CustomJSONProvider, is_debug
 
@@ -2055,6 +2058,81 @@ def _route_root_logging_through_gunicorn() -> None:
     root_logger.setLevel(logging.DEBUG if is_debug() else logging.INFO)
 
 
+def _parse_provision_args(
+    argv: list[str], cfg: Config | None = None
+) -> FleetTelemetryProvisionConfig:
+    """Parse arguments for ``--provision-fleet-telemetry``.
+
+    Args:
+        argv: Command-line arguments after the
+            ``--provision-fleet-telemetry`` flag.
+        cfg: Config accessor for telemetry intervals. Defaults to the
+            module-level config.
+
+    Returns:
+        A populated provisioning config.
+
+    Raises:
+        SystemExit: On invalid arguments, a missing CA file, or a bad proxy
+            URL. ``argparse`` exits with status 2.
+    """
+    resolved = cfg if cfg is not None else _config
+    parser = argparse.ArgumentParser(
+        prog="app.py --provision-fleet-telemetry",
+        description="Provision the Tesla fleet-telemetry server.",
+    )
+    parser.add_argument(
+        "server_hostname", help="Public telemetry server hostname."
+    )
+    parser.add_argument(
+        "ca_file_path", type=Path, help="Telemetry CA certificate file."
+    )
+    parser.add_argument(
+        "server_port",
+        type=int,
+        nargs="?",
+        default=4443,
+        help="Telemetry server port (default: 4443).",
+    )
+    parser.add_argument(
+        "--tesla-vehicle-command-proxy",
+        dest="vehicle_command_proxy_url",
+        required=True,
+        help="Vehicle-command proxy URL (required).",
+    )
+    parser.add_argument(
+        "--tesla-vehicle-command-proxy-ca",
+        dest="vehicle_command_proxy_ca_file",
+        type=Path,
+        default=None,
+        help="CA certificate for a private-CA vehicle-command proxy.",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.ca_file_path.exists():
+        parser.error(f"CA file not found: {args.ca_file_path}")
+    proxy_ca = args.vehicle_command_proxy_ca_file
+    if proxy_ca is not None and not proxy_ca.exists():
+        parser.error(f"Proxy CA file not found: {proxy_ca}")
+
+    proxy_parts = urlparse(args.vehicle_command_proxy_url)
+    if proxy_parts.scheme not in {"http", "https"} or not proxy_parts.netloc:
+        parser.error(
+            "--tesla-vehicle-command-proxy must be an http:// or https:// URL"
+        )
+
+    return FleetTelemetryProvisionConfig(
+        server_hostname=args.server_hostname,
+        ca_file_path=args.ca_file_path,
+        server_port=args.server_port,
+        detailedchargestate_interval_sec=(
+            resolved.tesla_telemetry_detailedchargestate_interval
+        ),
+        vehicle_command_proxy_url=args.vehicle_command_proxy_url,
+        vehicle_command_proxy_ca_file=proxy_ca,
+    )
+
+
 if __name__ != "__main__":
     _route_root_logging_through_gunicorn()
     file_handler = _setup_file_logging(_config)
@@ -2116,31 +2194,12 @@ if __name__ == "__main__":
             sys.exit(1)
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--provision-fleet-telemetry":
-        from pathlib import Path
         from load_manager import provision_fleet_telemetry
-        from load_models import FleetTelemetryProvisionConfig  # pylint: disable=ungrouped-imports
 
-        if len(sys.argv) < 4:
-            print(
-                "Usage: uv run python app.py --provision-fleet-telemetry"
-                " <server_hostname> <ca_file_path> [server_port]"
-            )
-            sys.exit(1)
-
-        hostname = sys.argv[2]
-        ca_path = Path(sys.argv[3])
-        if not ca_path.exists():
-            print(f"CA file not found: {ca_path}")
-            sys.exit(1)
-
-        port = int(sys.argv[4]) if len(sys.argv) > 4 else 4443
-        cfg = FleetTelemetryProvisionConfig(
-            server_hostname=hostname,
-            ca_file_path=ca_path,
-            server_port=port,
-            detailedchargestate_interval_sec=_config.tesla_telemetry_detailedchargestate_interval,
+        cfg = _parse_provision_args(sys.argv[2:], _config)
+        print(
+            f"Provisioning fleet-telemetry for hostname={cfg.server_hostname} …"
         )
-        print(f"Provisioning fleet-telemetry for hostname={hostname} …")
         success = provision_fleet_telemetry(cfg)
         if success:
             print("Fleet telemetry provisioning succeeded.")

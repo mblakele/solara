@@ -3423,16 +3423,18 @@ class LoadManager:
             logger.error("provision_fleet_telemetry: Stub controller — cannot provision.")
             return False
 
-        # Validate that a vehicle-command proxy URL is configured.
-        proxy_url = self.tesla_ctrl.config.vehicle_command_proxy_url
+        # Validate that a vehicle-command proxy URL is configured for this run.
+        proxy_url = config.vehicle_command_proxy_url
         if not proxy_url:
             logger.error(
-                "provision_fleet_telemetry: TESLA_VEHICLE_COMMAND_PROXY_URL is not configured. "
-                "Set it to your vehicle-command proxy URL (e.g., https://localhost:4444)."
+                "provision_fleet_telemetry: --tesla-vehicle-command-proxy is "
+                "required. Pass the vehicle-command proxy URL (e.g., "
+                "https://localhost:4444)."
             )
             print(
-                "ERROR: TESLA_VEHICLE_COMMAND_PROXY_URL is not configured.  "
-                "Set it to your vehicle-command proxy URL (e.g., https://localhost:4444).",
+                "ERROR: --tesla-vehicle-command-proxy is required.  "
+                "Pass the vehicle-command proxy URL (e.g., "
+                "https://localhost:4444).",
                 file=sys.stderr,
             )
             return False
@@ -3450,6 +3452,13 @@ class LoadManager:
             return False
 
         try:
+            # Configure the proxy for this provisioning run only. This must
+            # happen before fleet_telemetry_config_create() calls _ensure_api(),
+            # which creates and caches the aiohttp session and API client.
+            self.tesla_ctrl.configure_vehicle_command_proxy(
+                config.vehicle_command_proxy_url,
+                config.vehicle_command_proxy_ca_file,
+            )
             asyncio.run(fleet_telemetry_config_create(self.tesla_ctrl, config))
             logger.info("provision_fleet_telemetry: Provisioning succeeded.")
             from mqtt_telemetry import _FLEET_TELEMETRY_DOTFILE

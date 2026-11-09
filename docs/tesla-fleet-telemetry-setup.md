@@ -139,7 +139,36 @@ mosquitto 2.x defaults to denying anonymous connections, so `allow_anonymous tru
 
 ## Provisioning
 
-Before the vehicle will stream telemetry, you must register the fleet-telemetry server with Tesla. Solara handles this via its `--provision-fleet-telemetry` command, which calls the Tesla Fleet API with the server hostname and the fields to stream:
+Before the vehicle will stream telemetry, you must register the fleet-telemetry server with Tesla. Solara handles this via its `--provision-fleet-telemetry` command, which calls the Tesla Fleet API with the server hostname and the fields to stream.
+
+The command requires the vehicle-command proxy URL. The proxy is used only for
+this one-shot provisioning run. The serving process does not read it from
+`.env`.
+
+```bash
+uv run python app.py --provision-fleet-telemetry \
+  <your-public-hostname> <telemetry-ca-file> [server-port] \
+  --tesla-vehicle-command-proxy https://localhost:4444
+```
+
+- `<telemetry-ca-file>` is the PEM CA certificate for the fleet-telemetry
+  server.
+- `[server-port]` defaults to `4443`.
+- `--tesla-vehicle-command-proxy` is required.
+- For a proxy with a private CA, add
+  `--tesla-vehicle-command-proxy-ca /path/to/proxy-ca.pem`.
+- A plain HTTP proxy on loopback is also accepted, for example
+  `--tesla-vehicle-command-proxy http://127.0.0.1:4444`. Tesla HTTPS
+  verification stays on.
+
+TLS verification is never disabled. An `https://` proxy with an untrusted
+certificate fails unless you pass `--tesla-vehicle-command-proxy-ca`.
+
+**Migration:** if `.env` still contains `TESLA_VEHICLE_COMMAND_PROXY_URL`,
+remove it. The serving process ignores it. Pass the URL to the provisioning
+command instead.
+
+The command sends this configuration:
 
 ```json
 {

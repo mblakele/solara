@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import ssl
 import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -282,6 +283,10 @@ class RealTeslaController(AbstractTeslaController):
         """True when the last command failed with VehicleOffline."""
         self._last_resolved_at_home: bool | None = None
         """Last location-resolved at_home (None = never resolved)."""
+        self._vehicle_command_proxy_url: str | None = None
+        """Provisioning-only vehicle-command proxy URL (None = no proxy)."""
+        self._vehicle_command_proxy_ca_file: Path | None = None
+        """Optional CA file for a private-CA provisioning proxy."""
 
     def _reset_runtime_state(self) -> None:
         """Reset cached session, API client, and last error.
@@ -295,13 +300,15 @@ class RealTeslaController(AbstractTeslaController):
         self._api: Any | None = None  # TeslaFleetOAuth instance
         self.last_error: str | None = None
 
-    async def _get_session(self, ssl: bool = True) -> aiohttp.ClientSession:
+    async def _get_session(
+        self, ssl_context: ssl.SSLContext | bool = True
+    ) -> aiohttp.ClientSession:
         """Get or create the aiohttp session.
 
         Args:
-            ssl: Whether to verify SSL certificates. Set to ``False`` when
-                using a vehicle-command proxy with a hostname-mismatched
-                certificate.
+            ssl_context: SSL setting for the TCP connector. ``True`` uses the
+                default system verification; an ``SSLContext`` supplies custom
+                roots. Never pass ``False``.
 
         NOTE: A cached ClientSession binds to the event loop active at creation
         time.  When ``asyncio.run()`` creates a fresh loop and closes it, the
@@ -310,9 +317,49 @@ class RealTeslaController(AbstractTeslaController):
         ``asyncio.run()`` invocation.
         """
         if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(ssl=ssl)
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
             self._session = aiohttp.ClientSession(connector=connector)
         return self._session
+
+    def configure_vehicle_command_proxy(
+        self, url: str, ca_file: Path | None = None
+    ) -> None:
+        """Configure a provisioning-only vehicle-command proxy.
+
+        Call this before the first API session is created. It is meant for the
+        one-shot fleet-telemetry provisioning command, not for the serving
+        process.
+
+        Args:
+            url: Proxy base URL (``http://`` or ``https://``).
+            ca_file: Optional CA certificate for a private-CA proxy.
+
+        Raises:
+            RuntimeError: If an API session or client already exists.
+        """
+        if self._session is not None or self._api is not None:
+            raise RuntimeError(
+                "configure_vehicle_command_proxy must be called before the "
+                "Tesla API session is created"
+            )
+        self._vehicle_command_proxy_url = url or None
+        self._vehicle_command_proxy_ca_file = ca_file
+
+    def _proxy_ssl_context(
+        self, proxy_url: str | None, ca_file: Path | None
+    ) -> ssl.SSLContext | bool:
+        """Return the SSL setting for the cached Tesla session.
+
+        The same context covers Tesla OAuth and proxy requests. Verification
+        stays on for both. An ``https://`` proxy with a private CA needs
+        *ca_file*; without it the connection uses system roots and fails
+        closed if the proxy certificate is untrusted.
+        """
+        if not proxy_url or not proxy_url.lower().startswith("https://"):
+            return True
+        if ca_file is not None:
+            return ssl.create_default_context(cafile=str(ca_file))
+        return ssl.create_default_context()
 
     async def _ensure_api(self) -> None:
         """Initialize the TeslaFleetOAuth API client if needed.
@@ -323,7 +370,10 @@ class RealTeslaController(AbstractTeslaController):
         from tesla_fleet_api import TeslaFleetOAuth
 
         session = await self._get_session(
-            ssl=not bool(self.config.vehicle_command_proxy_url),
+            ssl_context=self._proxy_ssl_context(
+                self._vehicle_command_proxy_url,
+                self._vehicle_command_proxy_ca_file,
+            ),
         )
         region = cast(Literal["na", "eu", "cn"], self._cfg.tesla_region)
 
@@ -355,14 +405,14 @@ class RealTeslaController(AbstractTeslaController):
                 await self._api.get_private_key(self.config.private_key_path)
                 logger.debug("Loaded Tesla private key from %s", self.config.private_key_path)
 
-            # Override Tesla API server URL if a vehicle-command proxy is
+            # Override Tesla API server URL when a provisioning proxy is
             # configured.  Setting ``self._api.server`` after construction
             # overrides the region-based URL for all subsequent API calls.
-            if self.config.vehicle_command_proxy_url:
-                self._api.server = self.config.vehicle_command_proxy_url
+            if self._vehicle_command_proxy_url:
+                self._api.server = self._vehicle_command_proxy_url
                 logger.info(
                     "Using vehicle-command proxy for Tesla API: %s",
-                    self.config.vehicle_command_proxy_url,
+                    self._vehicle_command_proxy_url,
                 )
         else:
             # API already exists — update the session in case the previous one

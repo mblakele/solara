@@ -514,7 +514,6 @@ class TestStageAsyncPhase:
 
         ctrl = RealTeslaController.__new__(RealTeslaController)
         ctrl.config = MagicMock()
-        ctrl.config.vehicle_command_proxy_url = ""
         ctrl.config.vehicle_id = "VIN"
         ctrl.config.client_id = ""
         ctrl.config.client_secret = ""
@@ -531,6 +530,8 @@ class TestStageAsyncPhase:
         ctrl._last_init_attempt = 0.0
         ctrl._last_saved_tokens_at = 0.0
         ctrl._init_state = None
+        ctrl._vehicle_command_proxy_url = None
+        ctrl._vehicle_command_proxy_ca_file = None
 
         mock_session = MagicMock()
         mock_session.closed = False

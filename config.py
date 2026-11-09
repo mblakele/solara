@@ -441,11 +441,6 @@ class Config:
         return self._get("TESLA_REGION", "na") or "na"
 
     @property
-    def tesla_vehicle_command_proxy_url(self) -> str | None:
-        """Return the vehicle-command proxy URL, or None if not configured."""
-        return self._get("TESLA_VEHICLE_COMMAND_PROXY_URL") or None
-
-    @property
     def tesla_vehicle_id(self) -> Optional[str]:
         """Return Tesla vehicle ID, or None if not configured."""
         return self._get("TESLA_VEHICLE_ID") or None

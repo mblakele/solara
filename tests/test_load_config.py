@@ -222,39 +222,27 @@ def test_load_tesla_config_optionals():
     assert tesla_config.priority == 0
 
 
-def test_load_tesla_config_vehicle_command_proxy_url():
-    """Loads vehicle_command_proxy_url when env var is set."""
+def test_config_has_no_vehicle_command_proxy_property():
+    """The serving config no longer exposes a vehicle-command proxy URL."""
+    assert not hasattr(Config(), "tesla_vehicle_command_proxy_url")
+
+
+def test_load_tesla_config_ignores_vehicle_command_proxy_env():
+    """The old environment variable does not reach the runtime Tesla config."""
     config.set("TESLA_CLIENT_ID", "client-id")
     config.set("TESLA_CLIENT_SECRET", "client-secret")
     config.set("TESLA_VEHICLE_ID", "vehicle-123")
     config.set("TESLA_HOME_LAT", "37.7749")
     config.set("TESLA_HOME_LON", "-122.4194")
     config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
-    config.set("TESLA_VEHICLE_COMMAND_PROXY_URL", "https://localhost:4444")
+    config.set("TESLA_VEHICLE_COMMAND_PROXY_URL", "https://evil.example:4444")
 
     with patch("device_config._load", return_value={}):
         device_config.reload()
         tesla_config = load_tesla_config()
 
     assert tesla_config is not None
-    assert tesla_config.vehicle_command_proxy_url == "https://localhost:4444"
-
-
-def test_load_tesla_config_vehicle_command_proxy_url_none_when_unset():
-    """vehicle_command_proxy_url is None when env var is not set."""
-    config.set("TESLA_CLIENT_ID", "client-id")
-    config.set("TESLA_CLIENT_SECRET", "client-secret")
-    config.set("TESLA_VEHICLE_ID", "vehicle-123")
-    config.set("TESLA_HOME_LAT", "37.7749")
-    config.set("TESLA_HOME_LON", "-122.4194")
-    config.set("TESLA_REDIRECT_URI", "http://localhost/callback")
-
-    with patch("device_config._load", return_value={}):
-        device_config.reload()
-        tesla_config = load_tesla_config()
-
-    assert tesla_config is not None
-    assert tesla_config.vehicle_command_proxy_url is None
+    assert getattr(tesla_config, "vehicle_command_proxy_url", None) is None
 
 
 # --- Parse load manage enabled tests ---

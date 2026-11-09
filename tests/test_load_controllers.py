@@ -415,20 +415,19 @@ class TestRealTeslaControllerResetSession:
 
 
 # =============================================================================
-# 8. RealTeslaController._ensure_api with vehicle-command proxy (lines ~757-775)
+# 8. RealTeslaController vehicle-command proxy (provisioning-only)
 # =============================================================================
 
 
-class TestRealTeslaControllerProxyUrl:
+def test_tesla_config_has_no_vehicle_command_proxy_field():
+    """The runtime Tesla config carries no provisioning proxy setting."""
+    assert "vehicle_command_proxy_url" not in TeslaConfig.__dataclass_fields__
 
-    def test_ensure_api_sets_server_from_proxy_url(self):
-        """_ensure_api overrides _api.server when vehicle_command_proxy_url
-        is set on TeslaConfig."""
-        import asyncio
 
-        from load_controllers import RealTeslaController
+class TestRealTeslaControllerVehicleCommandProxy:
 
-        config = TeslaConfig(
+    def _config(self) -> TeslaConfig:
+        return TeslaConfig(
             client_id="test-id",
             client_secret="secret",
             redirect_uri="http://localhost/callback",
@@ -436,125 +435,134 @@ class TestRealTeslaControllerProxyUrl:
             home_lat=37.0,
             home_lon=-122.0,
             home_radius_m=500,
-            vehicle_command_proxy_url="https://localhost:4444",
         )
 
-        ctrl = RealTeslaController(config)
+    def test_configure_proxy_sets_provisioning_fields(self, tmp_path):
+        """configure_vehicle_command_proxy stores the URL and CA path."""
+        from load_controllers import RealTeslaController
+
+        ctrl = RealTeslaController(self._config())
+        ca = tmp_path / "proxy-ca.pem"
+        ca.write_text("cert")
+
+        ctrl.configure_vehicle_command_proxy("https://localhost:4444", ca)
+
+        assert ctrl._vehicle_command_proxy_url == "https://localhost:4444"
+        assert ctrl._vehicle_command_proxy_ca_file == ca
+
+    def test_configure_proxy_applies_api_server(self):
+        """_ensure_api points the API client at the configured proxy."""
+        from load_controllers import RealTeslaController
+
+        ctrl = RealTeslaController(self._config())
+        ctrl.configure_vehicle_command_proxy("https://localhost:4444")
 
         mock_api = MagicMock()
         mock_session = MagicMock()
 
         with (
-            patch.object(ctrl, "_get_session", new_callable=lambda: AsyncMock(return_value=mock_session)),
-            patch(
-                "tesla_fleet_api.TeslaFleetOAuth", return_value=mock_api
-            ) as mock_oauth_class,
+            patch.object(
+                ctrl,
+                "_get_session",
+                new_callable=lambda: AsyncMock(return_value=mock_session),
+            ),
+            patch("tesla_fleet_api.TeslaFleetOAuth", return_value=mock_api),
         ):
             asyncio.run(ctrl._ensure_api())
 
-        mock_oauth_class.assert_called_once()
-        call_kwargs = mock_oauth_class.call_args.kwargs
-        assert call_kwargs["region"] == "na"
-
         assert mock_api.server == "https://localhost:4444"
 
-    def test_ensure_api_no_override_when_proxy_url_is_none(self):
-        """_ensure_api leaves _api.server untouched when vehicle_command_proxy_url
-        is None."""
-        import asyncio
+    def test_https_proxy_with_ca_uses_ssl_context(self, tmp_path):
+        """An HTTPS proxy with a CA builds a context that loads that CA."""
+        from load_controllers import RealTeslaController
+
+        ctrl = RealTeslaController(self._config())
+        ca = tmp_path / "proxy-ca.pem"
+        ca.write_text("cert")
+
+        with patch("load_controllers.ssl.create_default_context") as mock_ctx:
+            result = ctrl._proxy_ssl_context("https://localhost:4444", ca)
+
+        mock_ctx.assert_called_once_with(cafile=str(ca))
+        assert result is mock_ctx.return_value
+
+    def test_https_proxy_without_ca_uses_system_roots(self):
+        """An HTTPS proxy without a CA uses the default system roots."""
+        from load_controllers import RealTeslaController
+
+        ctrl = RealTeslaController(self._config())
+
+        with patch("load_controllers.ssl.create_default_context") as mock_ctx:
+            result = ctrl._proxy_ssl_context("https://localhost:4444", None)
+
+        mock_ctx.assert_called_once_with()
+        assert result is mock_ctx.return_value
+
+    def test_http_proxy_keeps_tls_verification(self):
+        """A plain HTTP proxy leaves Tesla HTTPS verification on."""
+        from load_controllers import RealTeslaController
+
+        ctrl = RealTeslaController(self._config())
+
+        assert ctrl._proxy_ssl_context("http://127.0.0.1:4444", None) is True
+
+    def test_get_session_passes_ssl_context(self):
+        """_get_session forwards the SSL context to the TCP connector."""
+        import aiohttp
 
         from load_controllers import RealTeslaController
 
-        config = TeslaConfig(
-            client_id="test-id",
-            client_secret="secret",
-            redirect_uri="http://localhost/callback",
-            vehicle_id="v123",
-            home_lat=37.0,
-            home_lon=-122.0,
-            home_radius_m=500,
-        )
+        ctrl = RealTeslaController(self._config())
+        context = MagicMock()
 
-        ctrl = RealTeslaController(config)
+        with (
+            patch.object(aiohttp, "TCPConnector") as mock_connector,
+            patch.object(aiohttp, "ClientSession"),
+        ):
+            asyncio.run(ctrl._get_session(ssl_context=context))
+
+        mock_connector.assert_called_once_with(ssl=context)
+
+    def test_no_proxy_keeps_default_tesla_server(self):
+        """Without a provisioning proxy, _api.server is untouched."""
+        from load_controllers import RealTeslaController
+
+        ctrl = RealTeslaController(self._config())
 
         mock_api = MagicMock(server="https://fleet-api.prd.na.vn.cloud.tesla.com")
         mock_session = MagicMock()
 
         with (
-            patch.object(ctrl, "_get_session", new_callable=lambda: AsyncMock(return_value=mock_session)),
-            patch(
-                "tesla_fleet_api.TeslaFleetOAuth", return_value=mock_api
-            ) as mock_oauth_class,
+            patch.object(
+                ctrl,
+                "_get_session",
+                new_callable=lambda: AsyncMock(return_value=mock_session),
+            ),
+            patch("tesla_fleet_api.TeslaFleetOAuth", return_value=mock_api),
         ):
             asyncio.run(ctrl._ensure_api())
 
-        mock_oauth_class.assert_called_once()
         assert mock_api.server == "https://fleet-api.prd.na.vn.cloud.tesla.com"
 
-
-# =============================================================================
-# 9. RealTeslaController _get_session SSL handling for vehicle-command proxy
-# =============================================================================
-
-
-class TestRealTeslaControllerProxySsl:
-
-    def test_session_ssl_false_when_proxy_configured(self):
-        """When vehicle_command_proxy_url is set, _get_session creates a
-        TCPConnector with ssl=False to avoid hostname-mismatch errors."""
-        from unittest.mock import patch
-
-        import aiohttp
-
+    def test_configure_proxy_after_api_init_raises(self):
+        """A late proxy setup must not split the cached API stack."""
         from load_controllers import RealTeslaController
-        from load_models import TeslaConfig
 
-        config = TeslaConfig(
-            client_id="test-id",
-            client_secret="secret",
-            redirect_uri="http://localhost/callback",
-            vehicle_id="v123",
-            home_lat=37.0,
-            home_lon=-122.0,
-            home_radius_m=500,
-            vehicle_command_proxy_url="https://localhost:4444",
-        )
+        ctrl = RealTeslaController(self._config())
+        ctrl._api = MagicMock()  # type: ignore[assignment]
 
-        ctrl = RealTeslaController(config)
+        with pytest.raises(RuntimeError):
+            ctrl.configure_vehicle_command_proxy("http://127.0.0.1:4444")
 
-        with patch.object(aiohttp, "TCPConnector") as mock_connector:
-            with patch.object(aiohttp, "ClientSession"):
-                asyncio.run(ctrl._get_session(ssl=False))
-
-        mock_connector.assert_called_once_with(ssl=False)
-
-    def test_session_ssl_true_when_no_proxy(self):
-        """When vehicle_command_proxy_url is not set, _get_session creates a
-        TCPConnector with ssl=True (default)."""
-        from unittest.mock import patch
-
-        import aiohttp
-
+    def test_configure_proxy_after_session_init_raises(self):
+        """A late proxy setup must not split the cached session stack."""
         from load_controllers import RealTeslaController
-        from load_models import TeslaConfig
 
-        config = TeslaConfig(
-            client_id="test-id",
-            client_secret="secret",
-            redirect_uri="http://localhost/callback",
-            vehicle_id="v123",
-            home_lat=37.0,
-            home_lon=-122.0,
-            home_radius_m=500,
-        )
+        ctrl = RealTeslaController(self._config())
+        ctrl._session = MagicMock()  # type: ignore[assignment]
 
-        ctrl = RealTeslaController(config)
-
-        with patch.object(aiohttp, "TCPConnector") as mock_connector:
-            with patch.object(aiohttp, "ClientSession"):
-                asyncio.run(ctrl._get_session(ssl=True))
-
-        mock_connector.assert_called_once_with(ssl=True)
+        with pytest.raises(RuntimeError):
+            ctrl.configure_vehicle_command_proxy("http://127.0.0.1:4444")
 
 
 # =============================================================================
@@ -977,6 +985,7 @@ class TestProvisionFleetTelemetryPreFlight:
         cfg = FleetTelemetryProvisionConfig(
             server_hostname="telemetry.example.com",
             ca_file_path=ca_file,
+            vehicle_command_proxy_url="https://localhost:4444",
         )
 
         result = provision_fleet_telemetry(cfg)
@@ -990,39 +999,99 @@ class TestProvisionFleetTelemetryPreFlight:
 
 class TestProvisionFleetTelemetryProxyUrlCheck:
 
-    def test_prints_error_when_proxy_url_not_configured(self, capsys, monkeypatch):
-        """provision_fleet_telemetry prints a clear error to stderr when
-        TESLA_VEHICLE_COMMAND_PROXY_URL is not set."""
+    def test_provision_requires_proxy_url_from_config(self, tmp_path):
+        """An empty config proxy URL fails before any API call."""
         from unittest.mock import MagicMock
 
         from load_controllers import RealTeslaController
-        from load_manager import LoadManager, provision_fleet_telemetry
-        from load_models import TeslaConfig
+        from load_manager import LoadManager
+        from load_models import FleetTelemetryProvisionConfig
 
-        # Create a LoadManager and inject a RealTeslaController mock
-        # with no proxy URL — use spec so isinstance checks pass.
         lm = LoadManager()
-        mock_ctrl = MagicMock(spec=RealTeslaController)
-        mock_ctrl.config = TeslaConfig(
-            client_id="test",
-            client_secret="test",
-            vehicle_id="VIN123",
-            home_lat=37.0,
-            home_lon=-122.0,
-            home_radius_m=500.0,
-            redirect_uri="http://localhost/callback",
-            vehicle_command_proxy_url=None,
-        )
-        lm.tesla_ctrl = mock_ctrl
+        lm.tesla_ctrl = MagicMock(spec=RealTeslaController)
 
-        result = lm.provision_fleet_telemetry(None)
+        ca_file = tmp_path / "ca.pem"
+        ca_file.write_text("-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----")
+        cfg = FleetTelemetryProvisionConfig(
+            server_hostname="telemetry.example.com",
+            ca_file_path=ca_file,
+        )
+
+        result = lm.provision_fleet_telemetry(cfg)
         assert result is False
 
-        # The error message should be printed to stderr so the user sees
-        # it immediately, rather than having to dig through log files.
+    def test_provision_error_names_cli_option(self, tmp_path, capsys):
+        """The error text names the CLI option, not the old env variable."""
+        from unittest.mock import MagicMock
+
+        from load_controllers import RealTeslaController
+        from load_manager import LoadManager
+        from load_models import FleetTelemetryProvisionConfig
+
+        lm = LoadManager()
+        lm.tesla_ctrl = MagicMock(spec=RealTeslaController)
+
+        ca_file = tmp_path / "ca.pem"
+        ca_file.write_text("-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----")
+        cfg = FleetTelemetryProvisionConfig(
+            server_hostname="telemetry.example.com",
+            ca_file_path=ca_file,
+        )
+
+        lm.provision_fleet_telemetry(cfg)
+
         stderr = capsys.readouterr().err
-        assert "TESLA_VEHICLE_COMMAND_PROXY_URL" in stderr
-        assert "https://localhost:4444" in stderr
+        assert "--tesla-vehicle-command-proxy" in stderr
+        assert "TESLA_VEHICLE_COMMAND_PROXY_URL" not in stderr
+
+    def test_provision_configures_proxy_before_api_call(
+        self, tmp_path, monkeypatch
+    ):
+        """The controller proxy is set before fleet_telemetry_config_create."""
+        from unittest.mock import MagicMock
+
+        from load_controllers import RealTeslaController
+        from load_manager import LoadManager
+        from load_models import FleetTelemetryProvisionConfig
+
+        lm = LoadManager()
+        ctrl = MagicMock(spec=RealTeslaController)
+        lm.tesla_ctrl = ctrl
+
+        ca_file = tmp_path / "ca.pem"
+        ca_file.write_text("-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----")
+        cfg = FleetTelemetryProvisionConfig(
+            server_hostname="telemetry.example.com",
+            ca_file_path=ca_file,
+            vehicle_command_proxy_url="https://localhost:4444",
+        )
+
+        order: list[str] = []
+        ctrl.configure_vehicle_command_proxy.side_effect = (
+            lambda *args, **kwargs: order.append("configure")
+        )
+
+        async def fake_create(*args, **kwargs):
+            order.append("create")
+
+        monkeypatch.setattr(
+            "load_controllers.fleet_telemetry_config_create", fake_create
+        )
+        monkeypatch.setattr(
+            "load_manager.load_tesla_tokens",
+            lambda: {"access_token": "a", "refresh_token": "r", "expires": 0},
+        )
+        monkeypatch.setattr(
+            "load_manager._write_fleet_telemetry_dotfile", lambda path: None
+        )
+
+        result = lm.provision_fleet_telemetry(cfg)
+
+        assert result is True
+        assert order == ["configure", "create"]
+        ctrl.configure_vehicle_command_proxy.assert_called_once_with(
+            "https://localhost:4444", None
+        )
 
 
     def test_returns_false_when_tokens_missing_keys(self, tmp_path, monkeypatch):
@@ -1044,6 +1113,7 @@ class TestProvisionFleetTelemetryProxyUrlCheck:
         cfg = FleetTelemetryProvisionConfig(
             server_hostname="telemetry.example.com",
             ca_file_path=ca_file,
+            vehicle_command_proxy_url="https://localhost:4444",
         )
 
         result = provision_fleet_telemetry(cfg)
