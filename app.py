@@ -2133,6 +2133,38 @@ def _parse_provision_args(
     )
 
 
+def _print_tesla_auth_url(
+    cfg: Config | None = None, token_path: Path | str | None = None
+) -> None:
+    """Generate and print a one-time Tesla OAuth initiate URL.
+
+    Args:
+        cfg: Optional Config instance. Falls back to the module singleton.
+        token_path: Optional token file path override, mainly for tests.
+    """
+    from tesla_oauth import generate_tesla_auth_token
+
+    resolved = cfg if cfg is not None else _config
+    if token_path is None:
+        token, expires = generate_tesla_auth_token()
+    else:
+        token, expires = generate_tesla_auth_token(path=Path(token_path))
+
+    expires_at = datetime.fromtimestamp(expires, tz=timezone.utc).isoformat()
+    url = (
+        f"{resolved.public_url.rstrip('/')}"
+        f"/api/v1/tesla/auth/initiate?token={token}"
+    )
+    print(f"One-time Tesla auth token (valid until {expires_at}):")
+    print(token)
+    print(f"Open this URL in your browser:\n{url}")
+    if not resolved.tesla_owner_emails:
+        print(
+            "Warning: TESLA_OWNER_EMAILS is empty. Authentication will be "
+            "rejected."
+        )
+
+
 if __name__ != "__main__":
     _route_root_logging_through_gunicorn()
     file_handler = _setup_file_logging(_config)
@@ -2182,7 +2214,7 @@ if __name__ == "__main__":
             print("Pairing failed. Check logs for detail.")
             sys.exit(1)
 
-    elif len(sys.argv) > 1 and sys.argv[1] == "--tesla-auth":
+    elif len(sys.argv) > 1 and sys.argv[1] == "--tesla-auth-cli":
         from load_controllers import tesla_auth_cli
 
         success = asyncio.run(tesla_auth_cli())
@@ -2192,6 +2224,10 @@ if __name__ == "__main__":
         else:
             print("Tesla authentication failed. Check logs for detail.")
             sys.exit(1)
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "--tesla-auth-url":
+        _print_tesla_auth_url()
+        sys.exit(0)
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--provision-fleet-telemetry":
         from load_manager import provision_fleet_telemetry

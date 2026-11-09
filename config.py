@@ -441,6 +441,21 @@ class Config:
         return self._get("TESLA_REGION", "na") or "na"
 
     @property
+    def tesla_owner_emails(self) -> tuple[str, ...]:
+        """Return the allowed Tesla account emails, normalized.
+
+        Entries are split on commas, stripped, and casefolded. Empty entries
+        are dropped. An unset or empty value returns an empty tuple, which the
+        auth paths treat as "reject all".
+        """
+        raw = self._get("TESLA_OWNER_EMAILS", "") or ""
+        return tuple(
+            entry.strip().casefold()
+            for entry in raw.split(",")
+            if entry.strip()
+        )
+
+    @property
     def tesla_vehicle_id(self) -> Optional[str]:
         """Return Tesla vehicle ID, or None if not configured."""
         return self._get("TESLA_VEHICLE_ID") or None

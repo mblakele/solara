@@ -652,6 +652,7 @@ section. The minimum required variables for Tesla are:
 | `TESLA_CLIENT_ID` | From Tesla developer portal | Your Fleet API app's Client ID |
 | `TESLA_CLIENT_SECRET` | From Tesla developer portal | Your Fleet API app's Client Secret |
 | `TESLA_REDIRECT_URI` | `http://localhost:8000/callback` | Must match what you registered |
+| `TESLA_OWNER_EMAILS` | Comma-separated emails | Tesla accounts allowed to authenticate; empty rejects all |
 | `TESLA_VEHICLE_ID` | Your VIN | e.g., `5YJ3E1EA8KF000000` |
 | `TESLA_REGION` | `na` (default) | Use `cn` only for China-region accounts |
 | `TESLA_PRIVATE_KEY_PATH` | Path to PEM file | Required for vehicle commands (set_amps, etc.) |
@@ -674,22 +675,27 @@ LOAD_TESLA_CONTROLLER=real
 
 ### Step 3: Authenticate
 
+`TESLA_OWNER_EMAILS` must list the Tesla account email you will sign in with.
+The callback and the CLI both reject any other account before saving tokens.
+An empty list rejects every authentication attempt.
+
 You have two options. Both save tokens automatically to `.tesla-tokens.json`
 in the project root.
 
 #### Option A: Web-based (Recommended)
 
-1. Start the dev server:
+1. Generate a one-time initiation token:
+   ```bash
+   uv run python app.py --tesla-auth-url
+   ```
+
+2. Start the dev server:
    ```bash
    uv run python app.py
    ```
 
-2. Open this URL in your browser:
-   ```
-   http://localhost:8000/api/v1/tesla/auth/initiate
-   ```
-
-3. The response includes a `loginUrl`. Open that URL in your browser.
+3. Open the URL printed by the command in your browser. It looks like
+   `http://localhost:8000/api/v1/tesla/auth/initiate?token=...`.
 
 4. Sign in to your Tesla account and authorize the app.
 
@@ -697,13 +703,21 @@ in the project root.
    The server automatically exchanges the code for tokens and saves them.
    You'll see a confirmation page.
 
+The initiation token is valid for 10 minutes and works once. Run
+`--tesla-auth-url` again to start another flow. A second use of the same URL
+returns `403`.
+
 #### Option B: CLI-only
 
 Run the CLI auth helper from the project root:
 
 ```bash
-uv run python app.py --tesla-auth
+uv run python app.py --tesla-auth-cli
 ```
+
+This command still needs a browser: it prints a Tesla login URL, and you open
+that URL in a browser to authorize. It runs in the terminal because you paste
+the authorization code back.
 
 1. The command prints an authorization URL. Open it in your browser.
 2. Sign in and authorize the app.
@@ -772,8 +786,11 @@ curl http://localhost:8000/api/v1/metrics
 
 ### Tesla OAuth Endpoints
 
-- **GET** `/api/v1/tesla/auth/initiate` — Start OAuth flow, returns login URL
-- **GET** `/callback` — OAuth redirect handler (exchanges code for tokens)
+- **GET** `/api/v1/tesla/auth/initiate` — Start the OAuth flow. Requires a
+  single-use `token` query parameter from `--tesla-auth-url`; returns the
+  login URL. Missing, invalid, expired, or reused tokens return `403`.
+- **GET** `/callback` — OAuth redirect handler (exchanges code for tokens).
+  Rejects any account not listed in `TESLA_OWNER_EMAILS`.
 - **GET** `/api/v1/tesla/status` — Check authentication status and token expiry
 
 ## Telegram notifications

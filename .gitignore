@@ -9,6 +9,7 @@ __pycache__/
 .opencode
 .mimocode
 .tesla-tokens.json
+.tesla-auth-token.json
 .venv
 .vue-keys.json
 bin/

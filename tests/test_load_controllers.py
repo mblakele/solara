@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from config import Config
+
 # Import directly from load_controllers (not via load_manager)
 from load_controllers import (
     CompositePlugController,
@@ -415,7 +417,146 @@ class TestRealTeslaControllerResetSession:
 
 
 # =============================================================================
-# 8. RealTeslaController vehicle-command proxy (provisioning-only)
+# 8. Tesla owner email verification
+# =============================================================================
+
+
+class TestTeslaOwnerEmail:
+
+    def test_fetch_tesla_account_email_returns_email(self):
+        """The helper returns the normalized email from users/me."""
+        from load_controllers import fetch_tesla_account_email
+
+        api = MagicMock()
+        api.user.me = AsyncMock(return_value={"email": " Owner@Example.com "})
+
+        email = asyncio.run(fetch_tesla_account_email(api))
+        assert email == "owner@example.com"
+
+    def test_fetch_tesla_account_email_returns_none_for_missing_field(self):
+        """A response without an email fails closed."""
+        from load_controllers import fetch_tesla_account_email
+
+        api = MagicMock()
+        api.user.me = AsyncMock(return_value={"full_name": "Owner"})
+
+        assert asyncio.run(fetch_tesla_account_email(api)) is None
+
+    def test_fetch_tesla_account_email_returns_none_on_api_error(self):
+        """An API failure fails closed."""
+        from load_controllers import fetch_tesla_account_email
+
+        api = MagicMock()
+        api.user.me = AsyncMock(side_effect=RuntimeError("boom"))
+
+        assert asyncio.run(fetch_tesla_account_email(api)) is None
+
+    def test_owner_email_allowed_is_case_insensitive(self):
+        """The allowlist match is case-insensitive and exact."""
+        from load_controllers import tesla_owner_email_allowed
+
+        assert tesla_owner_email_allowed(
+            "Owner@Example.com", ("owner@example.com",)
+        )
+        assert not tesla_owner_email_allowed(
+            "other@example.com", ("owner@example.com",)
+        )
+
+    def test_owner_email_allowed_rejects_empty_allowlist(self):
+        """An empty allowlist rejects every account."""
+        from load_controllers import tesla_owner_email_allowed
+
+        assert not tesla_owner_email_allowed("owner@example.com", ())
+        assert not tesla_owner_email_allowed(None, ())
+        assert not tesla_owner_email_allowed("", ("owner@example.com",))
+
+
+class TestTeslaAuthCliOwnerAllowlist:
+
+    def _api(self, email: str) -> MagicMock:
+        api = MagicMock()
+        api.get_login_url.return_value = "https://auth.tesla.com/login"
+        api.get_refresh_token = AsyncMock()
+        api.refresh_token = "refresh"
+        api._access_token = "access"
+        api.expires = 12345
+        api.user.me = AsyncMock(return_value={"email": email})
+        return api
+
+    def _run(self, monkeypatch, api, cfg, input_value="code"):
+        from load_controllers import tesla_auth_cli
+        from types import SimpleNamespace
+
+        session = MagicMock()
+        session.close = AsyncMock()
+        monkeypatch.setattr(
+            "load_controllers.aiohttp.ClientSession", lambda: session
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "tesla_fleet_api",
+            SimpleNamespace(TeslaFleetOAuth=lambda **kwargs: api),
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt="": input_value)
+        return asyncio.run(tesla_auth_cli(cfg))
+
+    def _cfg(self, allowed: str) -> Config:
+        return Config(
+            overrides={
+                "TESLA_CLIENT_ID": "client-id",
+                "TESLA_CLIENT_SECRET": "client-secret",
+                "TESLA_REDIRECT_URI": "http://localhost/callback",
+                "TESLA_OWNER_EMAILS": allowed,
+            }
+        )
+
+    def test_tesla_auth_cli_rejects_empty_allowlist(
+        self, monkeypatch, capsys
+    ):
+        """The CLI refuses to start without an owner allowlist."""
+        api = self._api("owner@example.com")
+
+        result = self._run(monkeypatch, api, self._cfg(""))
+
+        assert result is False
+        api.get_login_url.assert_not_called()
+        assert "TESLA_OWNER_EMAILS" in capsys.readouterr().out
+
+    def test_tesla_auth_cli_rejects_non_owner_email(
+        self, monkeypatch
+    ):
+        """The CLI does not save a non-owner account."""
+        save_tokens = MagicMock()
+        monkeypatch.setattr(
+            "load_controllers.save_tesla_tokens", save_tokens
+        )
+        api = self._api("attacker@example.com")
+
+        result = self._run(
+            monkeypatch, api, self._cfg("owner@example.com")
+        )
+
+        assert result is False
+        save_tokens.assert_not_called()
+
+    def test_tesla_auth_cli_saves_owner_token(self, monkeypatch):
+        """The CLI saves tokens for an allowlisted account."""
+        save_tokens = MagicMock()
+        monkeypatch.setattr(
+            "load_controllers.save_tesla_tokens", save_tokens
+        )
+        api = self._api("owner@example.com")
+
+        result = self._run(
+            monkeypatch, api, self._cfg("owner@example.com")
+        )
+
+        assert result is True
+        save_tokens.assert_called_once()
+
+
+# =============================================================================
+# 9. RealTeslaController vehicle-command proxy (provisioning-only)
 # =============================================================================
 
 

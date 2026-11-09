@@ -1170,3 +1170,7 @@ class CycleContext:
 
 class TeslaAuthError(Exception):
     """Raised when Tesla credentials are invalid or expired."""
+
+
+class TeslaOwnerEmailError(TeslaAuthError):
+    """Raised when the authenticated Tesla account is not the owner."""

@@ -216,7 +216,9 @@ flowchart TD
     DECIDE -->|"set_amps / stop-charge"| TESLA
 
     subgraph OAuth["Tesla OAuth (tesla_oauth.py Blueprint)"]
-        INIT["GET /api/v1/tesla/auth/initiate"] --> CALLBACK["GET /callback<br/>stores tokens → .tesla-tokens.json"]
+        CLI4["python app.py --tesla-auth-url"] --> TOKEN[".tesla-auth-token.json<br/>SHA-256 hash + expiry"]
+        TOKEN --> INIT["GET /api/v1/tesla/auth/initiate<br/>consumes one-time token"]
+        INIT --> CALLBACK["GET /callback<br/>checks TESLA_OWNER_EMAILS<br/>stores tokens → .tesla-tokens.json"]
         CALLBACK --> REST
         STATUS["GET /api/v1/tesla/status"]
     end
@@ -232,8 +234,9 @@ flowchart TD
     WSGI["wsgi.py<br/>app = create_app()<br/>start_background_services()"] --> APP["app.py create_app()<br/>routes · JSON provider · error handlers<br/>Tesla OAuth Blueprint"]
     MAIN["python app.py<br/>(dev server)"] --> APP
     CLI1["python app.py --pair-plug<br/>&lt;name> &lt;address> &lt;pin>"] --> PH["pair_homekit_accessory()"]
-    CLI2["python app.py --tesla-auth"] --> TA["tesla_auth_cli()"]
-    CLI3["python app.py --provision-fleet-telemetry"] --> PT["provision_fleet_telemetry(cfg)<br/>(FleetTelemetryProvisionConfig)"]
+    CLI2["python app.py --tesla-auth-cli"] --> TA["tesla_auth_cli()"]
+    CLI3["python app.py --tesla-auth-url"] --> URL["_print_tesla_auth_url()<br/>writes .tesla-auth-token.json"]
+    CLI4["python app.py --provision-fleet-telemetry"] --> PT["provision_fleet_telemetry(cfg)<br/>(FleetTelemetryProvisionConfig)"]
 
     start_background_services["start_background_services()<br/>MQTT only if load_tesla_controller == 'real'<br/>load thread unless load_manage_enabled is False"] --> MQTTSTART["MQTT subscriber thread"]
     start_background_services --> LMTHREAD["Load management thread<br/>(if load management enabled)"]

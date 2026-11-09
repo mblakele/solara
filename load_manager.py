@@ -3446,8 +3446,10 @@ class LoadManager:
         if tokens is None:
             logger.error(
                 "provision_fleet_telemetry: No Tesla OAuth tokens found. "
-                "Run 'python app.py --tesla-auth' on a machine with a browser to "
-                "authenticate, then copy .tesla-tokens.json to this machine."
+                "Run 'python app.py --tesla-auth-cli' on a machine with a "
+                "browser: it prints a Tesla login URL, then asks you to paste "
+                "the authorization code. Copy the resulting "
+                ".tesla-tokens.json to this machine."
             )
             return False
 

@@ -223,10 +223,11 @@ class TestOAuthStatePruning:
         assert not errors, f"concurrent insert hit {errors[0]!r}"
         assert removed == 20000
 
-    def test_initiate_prunes_before_inserting(self, monkeypatch):
+    def test_initiate_prunes_before_inserting(self, monkeypatch, tmp_path):
         """The initiate route sweeps expired states on every call."""
         import app as app_mod_inner
         import tesla_oauth
+        from tesla_oauth import generate_tesla_auth_token
 
         monkeypatch.setenv("TESLA_CLIENT_ID", "id")
         monkeypatch.setenv("TESLA_CLIENT_SECRET", "secret")
@@ -246,9 +247,16 @@ class TestOAuthStatePruning:
             "_controllers",
             lambda: (MagicMock(), lambda: None, lambda *a, **k: None),
         )
+        token_path = tmp_path / "token.json"
+        monkeypatch.setattr(
+            tesla_oauth, "TESLA_AUTH_TOKEN_FILE", token_path
+        )
+        token, _ = generate_tesla_auth_token(path=token_path)
 
         client = app_mod_inner.app.test_client()
-        response = client.get("/api/v1/tesla/auth/initiate")
+        response = client.get(
+            f"/api/v1/tesla/auth/initiate?token={token}"
+        )
         assert response.status_code in (200, 500)  # config-dependent tail
         assert calls["n"] == 1, "initiate must sweep expired oauth states"
 

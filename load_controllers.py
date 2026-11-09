@@ -259,6 +259,50 @@ def remove_tesla_tokens(tokens_path: Path = TESLA_TOKENS_FILE) -> None:
 # === Real Tesla Controller Implementation ===
 
 
+async def fetch_tesla_account_email(api: Any) -> str | None:
+    """Return the Tesla account email for the current access token.
+
+    The call runs on the controller's verified TLS session. Any failure is
+    treated as "no verified email" so callers can fail closed.
+
+    Args:
+        api: A ``TeslaFleetOAuth`` instance with an authenticated session.
+
+    Returns:
+        The normalized email address, or ``None`` when unavailable.
+    """
+    try:
+        account = await api.user.me()
+    except Exception as e:
+        logger.error("Failed to fetch Tesla account email: %s", e)
+        return None
+    if not isinstance(account, dict):
+        logger.error("Tesla users/me returned a non-object response")
+        return None
+    email = account.get("email")
+    if not isinstance(email, str) or not email.strip():
+        logger.error("Tesla users/me response has no usable email")
+        return None
+    return email.strip().casefold()
+
+
+def tesla_owner_email_allowed(
+    email: str | None, allowed: tuple[str, ...]
+) -> bool:
+    """Return True only for a non-empty, allowlisted email.
+
+    Args:
+        email: Email returned by ``fetch_tesla_account_email``.
+        allowed: Normalized owner allowlist from ``Config``.
+
+    Returns:
+        True when *email* exactly matches an allowlist entry.
+    """
+    if not email or not allowed:
+        return False
+    return email.strip().casefold() in allowed
+
+
 class RealTeslaController(AbstractTeslaController):
     """Controls Tesla vehicle charging via tesla-fleet-api.
 
@@ -1018,11 +1062,20 @@ async def tesla_auth_cli(config: Config | None = None) -> bool:
     from tesla_fleet_api import TeslaFleetOAuth
 
     cfg = config if config is not None else _cfg_mod._config
+    owner_emails = cfg.tesla_owner_emails
+    if not owner_emails:
+        print(
+            "Error: TESLA_OWNER_EMAILS is empty. Add the Tesla account email "
+            "allowed to authenticate this deployment before running "
+            "--tesla-auth-cli."
+        )
+        return False
+
     client_id = cfg.tesla_client_id or ""
     if not client_id:
         print(
             "Error: TESLA_CLIENT_ID not set in environment. "
-            "Set it before running --tesla-auth."
+            "Set it before running --tesla-auth-cli."
         )
         return False
 
@@ -1053,6 +1106,15 @@ async def tesla_auth_cli(config: Config | None = None) -> bool:
         refresh_token = api.refresh_token
         if refresh_token is None:
             print("Error: Failed to obtain refresh token.")
+            return False
+
+        email = await fetch_tesla_account_email(api)
+        if not tesla_owner_email_allowed(email, owner_emails):
+            logger.warning("Tesla CLI auth rejected account email: %s", email)
+            print(
+                "Error: This Tesla account is not listed in "
+                "TESLA_OWNER_EMAILS. Tokens were not saved."
+            )
             return False
 
         # pylint: disable=protected-access

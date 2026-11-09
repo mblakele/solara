@@ -245,6 +245,48 @@ def test_load_tesla_config_ignores_vehicle_command_proxy_env():
     assert getattr(tesla_config, "vehicle_command_proxy_url", None) is None
 
 
+def test_tesla_owner_emails_parses_csv():
+    """The allowlist parses a comma-separated list."""
+    cfg = Config(
+        overrides={
+            "TESLA_OWNER_EMAILS": "owner@example.com,second@example.com",
+        }
+    )
+    assert cfg.tesla_owner_emails == (
+        "owner@example.com",
+        "second@example.com",
+    )
+
+
+def test_tesla_owner_emails_normalizes_case_and_space():
+    """Entries are stripped and casefolded."""
+    cfg = Config(
+        overrides={
+            "TESLA_OWNER_EMAILS": " Owner@Example.COM , second@example.com ",
+        }
+    )
+    assert cfg.tesla_owner_emails == (
+        "owner@example.com",
+        "second@example.com",
+    )
+
+
+def test_tesla_owner_emails_empty_is_empty_tuple():
+    """An unset or empty allowlist is an empty tuple."""
+    assert Config(overrides={"TESLA_OWNER_EMAILS": ""}).tesla_owner_emails == ()
+    assert Config().tesla_owner_emails == ()
+
+
+def test_tesla_owner_emails_drops_empty_entries():
+    """Empty CSV entries are ignored."""
+    cfg = Config(
+        overrides={
+            "TESLA_OWNER_EMAILS": "owner@example.com, ,",
+        }
+    )
+    assert cfg.tesla_owner_emails == ("owner@example.com",)
+
+
 # --- Parse load manage enabled tests ---
 
 
