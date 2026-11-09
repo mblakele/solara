@@ -446,6 +446,35 @@ class TestApp(unittest.TestCase):
                 self.assertEqual(response.status_code, 500)
                 self.assertIn(b"Error fetching usage data", response.data)
 
+    def test_tou_api_failure_does_not_leak_upstream_body(self):
+        """tou() logs the Emporia body but returns only a generic message."""
+        mock_response = type(
+            "MockResponse",
+            (),
+            {
+                "status_code": 500,
+                "text": "upstream-secret-detail",
+            },
+        )()
+
+        http_error = requests.exceptions.HTTPError()
+        http_error.response = mock_response
+
+        with mock_config(MOCK=False, VUE_USERNAME="test_user"):
+            with patch("app.TOUReporter") as mock_tou:
+                mock_tou.side_effect = http_error
+                with self.assertLogs("app", level="ERROR") as captured:
+                    response = self.app.get(
+                        "/api/v1/tou?start_date=2026-01-01&end_date=2026-01-02"
+                    )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn(b"upstream-secret-detail", response.data)
+        self.assertTrue(
+            any("upstream-secret-detail" in line for line in captured.output),
+            "the upstream body must still be logged server-side",
+        )
+
     def test_tou_endpoint_mock_realistic_values(self):
         """Verify TOU endpoint returns non-zero buckets in mock mode."""
         with mock_config(MOCK=True):

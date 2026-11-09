@@ -1194,7 +1194,7 @@ def tou() -> ResponseReturnValue:
             except (requests.exceptions.RequestException, AttributeError):
                 pass
         logger.error("TOU error: %s", error_msg)
-        return abort(500, f"Error fetching usage data: {error_msg}")
+        return abort(500, "Error fetching usage data")
 
     buckets = tou_data.buckets
     nbc = tou_data.nbc
