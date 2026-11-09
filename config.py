@@ -51,6 +51,7 @@ _env_data: dict[str, str] | None = None
 # (PATH, HOME, test-runner vars, etc.) are left intact.
 _APP_ENV_KEY_PREFIXES = (
     "LOAD_", "LOG_", "MQTT_", "TELEGRAM_", "TESLA_", "VOCOLINC_", "VUE_",
+    "OIDC_", "FLASK_", "SESSION_COOKIE_", "PROXY_",
 )
 _APP_ENV_KEY_NAMES = frozenset({
     "DEBUG", "MOCK", "MOCK_ERROR", "PUBLIC_URL", "TIMEZONE",
@@ -531,6 +532,76 @@ class Config:
     def public_url(self) -> str:
         """Return the public URL the app is served on, or a sensible default."""
         return self._get("PUBLIC_URL", "http://localhost:8000") or "http://localhost:8000"
+
+    @property
+    def flask_secret_key(self) -> str:
+        """Return the Flask session secret key, or an empty string."""
+        return self._get("FLASK_SECRET_KEY", "") or ""
+
+    @property
+    def oidc_issuer(self) -> str | None:
+        """Return the OIDC issuer URL, or None when OIDC login is disabled."""
+        return self._get("OIDC_ISSUER") or None
+
+    @property
+    def oidc_client_id(self) -> str | None:
+        """Return the OIDC client ID, or None when not configured."""
+        return self._get("OIDC_CLIENT_ID") or None
+
+    @property
+    def oidc_client_secret(self) -> str | None:
+        """Return the OIDC client secret, or None when not configured."""
+        return self._get("OIDC_CLIENT_SECRET") or None
+
+    @property
+    def oidc_allowed_subs(self) -> frozenset[tuple[str, str]]:
+        """Return the write allowlist as (iss, sub) pairs.
+
+        ``OIDC_ALLOWED_SUB`` holds a comma-separated list of
+        ``iss|sub`` pairs (for example,
+        ``https://issuer.example.com|abc123``). Blank entries are
+        ignored. An empty result fails closed: nobody can write.
+        """
+        raw = self._get("OIDC_ALLOWED_SUB", "") or ""
+        pairs: set[tuple[str, str]] = set()
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "|" not in entry:
+                logger.warning("OIDC_ALLOWED_SUB entry %r lacks 'iss|sub'; skipping", entry)
+                continue
+            iss, _, sub = entry.partition("|")
+            if iss and sub:
+                pairs.add((iss, sub))
+        return frozenset(pairs)
+
+    @property
+    def session_cookie_secure(self) -> bool:
+        """Return whether the session cookie needs the Secure attribute.
+
+        An explicit ``SESSION_COOKIE_SECURE`` env var wins; otherwise it is
+        on for https ``PUBLIC_URL`` values and off for local http, so a
+        plain local run needs no extra config.
+        """
+        raw = self._get("SESSION_COOKIE_SECURE")
+        if raw is not None and str(raw).strip() != "":
+            return _strtobool(str(raw))
+        return self.public_url.startswith("https://")
+
+    @property
+    def proxy_trusted_hops(self) -> int:
+        """Return how many proxy hops to trust for X-Forwarded-* headers.
+
+        Zero (the default) disables ProxyFix: the app is served directly
+        on 127.0.0.1 in the known deployments.
+        """
+        try:
+            hops = int(self._get("PROXY_TRUSTED_HOPS", "0") or "0")
+        except (TypeError, ValueError):
+            logger.warning("Invalid PROXY_TRUSTED_HOPS value; using 0")
+            return 0
+        return max(0, hops)
 
     @property
     def load_plug_controller(self) -> str:

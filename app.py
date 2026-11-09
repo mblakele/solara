@@ -2018,6 +2018,18 @@ def create_app(
     application.extensions["solara_state"] = state
     # Register Tesla OAuth routes.
     application.register_blueprint(bp)
+    # OIDC login routes, the write gate, and session cookie config.
+    from oidc_auth import register_oidc
+
+    register_oidc(application)
+    # Behind an HTTPS reverse proxy, the proxy headers carry the scheme.
+    hops = cfg.proxy_trusted_hops
+    if hops > 0:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+
+        application.wsgi_app = ProxyFix(  # type: ignore[assignment]
+            application.wsgi_app, x_for=hops, x_proto=hops, x_host=hops
+        )
     application.jinja_env.filters["astimezonestr"] = astimezone_filter
     application.jinja_env.filters["per_second_sparkline"] = per_second_sparkline
     application.jinja_env.globals["_status_label"] = _status_label

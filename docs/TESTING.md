@@ -201,6 +201,12 @@ drift checks.
   path, two apps do not share state), the single-controller guard (second
   process claimant defers with CRITICAL; a repeat call in one process is
   idempotent), and the cache refresher wiring for disabled load management
+- **test_oidc_auth.py**
+  anonymous reads stay open; the write gate (fetch header, 401 for anonymous,
+  403 for non-allowlisted, empty-allowlist fail-closed), `next` validation, the
+  `PUBLIC_URL`-driven redirect URI, empty-allowlist bootstrap logging,
+  `/api/me` in each state, and the session cookie config (Authlib faked,
+  `docs/AUTH.md`)
 - **test_notifier.py**
   the notification policy seam (D.2): gated surplus (sender, dry-run, empty
   actions, whitelist miss), bypass alerts (auth, drift, fatal fetch, stale data,
