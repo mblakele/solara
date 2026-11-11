@@ -456,6 +456,41 @@ def test_callback_logs_iss_sub_when_allowlist_empty(caplog: Any) -> None:
     assert "iss=" in caplog.text
 
 
+def test_startup_logs_oidc_config_at_debug(caplog: Any) -> None:
+    """Startup logs the issuer and parsed allowlist at DEBUG."""
+    with caplog.at_level(logging.DEBUG, logger="oidc_auth"):
+        _make_app()
+    assert f"issuer={ISSUER}" in caplog.text
+    assert f"{ISSUER}|sub-1" in caplog.text
+
+
+def test_callback_logs_allowlist_mismatch_at_debug(caplog: Any) -> None:
+    """A trailing-slash allowlist mismatch shows up at DEBUG on login."""
+    flask_app = _make_app(OIDC_ALLOWED_SUB=f"{ISSUER}/|sub-1")
+    with caplog.at_level(logging.DEBUG, logger="oidc_auth"):
+        flask_app.test_client().get("/oidc/callback")
+    assert "allowlisted=False" in caplog.text
+    assert f"iss={ISSUER}" in caplog.text
+
+
+def test_denied_read_logs_identity_at_debug(client: Any, caplog: Any) -> None:
+    """A non-allowlisted session logs its identity at DEBUG on denial."""
+    _login_as(client, {"iss": ISSUER, "sub": "other"})
+    with caplog.at_level(logging.DEBUG, logger="oidc_auth"):
+        resp = client.get("/api/v1/metrics")
+    assert resp.status_code == 403
+    assert "sub=other" in caplog.text
+    assert "not in allowlist" in caplog.text
+
+
+def test_anonymous_denial_logs_no_identity(client: Any, caplog: Any) -> None:
+    """Anonymous denials stay quiet so unknown clients add no debug noise."""
+    with caplog.at_level(logging.DEBUG, logger="oidc_auth"):
+        resp = client.get("/api/v1/metrics")
+    assert resp.status_code == 401
+    assert "not in allowlist" not in caplog.text
+
+
 def test_callback_uses_userinfo_from_authorize_access_token() -> None:
     """The callback trusts the claims Authlib already validated in the token."""
     flask_app = _make_app()

@@ -16,7 +16,8 @@ Routes (registered by :func:`register_oidc` at app build time):
   the session, and redirect to the provider.
 - ``GET /oidc/callback`` — exchange the code, store {iss, sub, email} in
   the session, mark it permanent, and redirect to the stored ``next``.
-- ``GET /oidc/logout`` — clear the session and redirect to ``/``.
+- ``GET /oidc/logout`` — clear the session and redirect to the app root
+  (including any reverse-proxy prefix).
 - ``GET /api/me`` — {"authenticated": bool, "can_read": bool,
   "can_write": bool, "login_required": bool}; cosmetic only, the
   server-side gate is the real protection.
@@ -146,7 +147,16 @@ def _can_access() -> bool:
     allowed = _request_config().oidc_allowed_subs
     if not allowed:
         return False
-    return (user.get("iss"), user.get("sub")) in allowed
+    granted = (user.get("iss"), user.get("sub")) in allowed
+    if not granted:
+        # DEBUG only: an authenticated non-allowlisted caller can repeat this
+        # on every request. Anonymous callers never reach this branch.
+        logger.debug(
+            "OIDC access denied: iss=%s sub=%s not in allowlist",
+            user.get("iss"),
+            user.get("sub"),
+        )
+    return granted
 
 
 def _is_loopback_addr(addr: str | None) -> bool:
@@ -375,13 +385,23 @@ def callback() -> ResponseReturnValue:
     email = claims.get("email")
     if isinstance(email, str):
         user["email"] = email
+    allowed = _request_config().oidc_allowed_subs
     session["user"] = user
     session.permanent = True
-    if not _request_config().oidc_allowed_subs:
+    if not allowed:
         logger.info(
             "OIDC login bootstrap: iss=%s sub=%s not yet allowlisted; writes denied",
             iss,
             sub,
+        )
+    else:
+        # DEBUG only: the login callback is rate-limited, and this pinpoints
+        # an allowlist typo (for example a trailing slash on iss).
+        logger.debug(
+            "OIDC login: iss=%s sub=%s allowlisted=%s",
+            iss,
+            sub,
+            (iss, sub) in allowed,
         )
     next_path = validate_next(session.pop("post_login_next", None), _local_root())
     return redirect(next_path)  # type: ignore[return-value]
@@ -473,3 +493,10 @@ def register_oidc(application: Flask) -> None:
             )
         application.secret_key = secret_key
         application.config["SESSION_COOKIE_SECURE"] = cfg.session_cookie_secure
+        if cfg.oidc_issuer:
+            logger.debug(
+                "OIDC config: issuer=%s allowlist=%s",
+                cfg.oidc_issuer,
+                [f"{iss}|{sub}" for iss, sub in sorted(cfg.oidc_allowed_subs)]
+                or "empty",
+            )

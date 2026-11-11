@@ -152,6 +152,24 @@ for several users), then restart the app. The log line exists only for
 bootstrap; it is not a user-facing feature. Remove it once every
 deployment has a non-empty allowlist.
 
+## Diagnosing a denial
+
+With `DEBUG` enabled, `oidc_auth` logs these lines:
+
+- `OIDC config: issuer=... allowlist=[...]` — at startup, the parsed
+  pairs (not the raw env value), so a typo is visible.
+- `OIDC login: iss=... sub=... allowlisted=False` — at the callback,
+  when a non-empty allowlist rejects the identity.
+- `OIDC access denied: iss=... sub=... not in allowlist` — on each
+  denied request from an authenticated session.
+
+Anonymous denials log nothing, so unknown clients cannot add debug
+noise. The lines are off unless `DEBUG` is on.
+
+The match is exact. The `iss` claim from Google is
+`https://accounts.google.com` with no trailing slash, even when
+`OIDC_ISSUER` has one. The parser does not trim spaces around `|`.
+
 ## Providers
 
 The issuer is the only per-provider input, so Google, Authentik, and

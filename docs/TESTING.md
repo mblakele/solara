@@ -214,8 +214,9 @@ drift checks.
   anonymous, 403 for non-allowlisted, empty-allowlist fail-closed), the
   `PUBLIC_URL`-driven redirect URI, empty-allowlist bootstrap logging,
   subpath mounts (`SCRIPT_NAME`/`X-Forwarded-Prefix` in login, logout,
-  and the `next` fallback; forged prefix rejected), and the session
-  cookie config (Authlib faked, `docs/AUTH.md`)
+  and the `next` fallback; forged prefix rejected), DEBUG diagnostics
+  for the parsed allowlist, callback match result, and denied identity,
+  and the session cookie config (Authlib faked, `docs/AUTH.md`)
 - **test_oidc_frontend.py**
   source-contract tests on `static/app.js`: header state from `can_read`,
   `redirectToLogin()` preserving path and query, partial fetches through
