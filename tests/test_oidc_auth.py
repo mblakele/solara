@@ -646,3 +646,27 @@ def test_oidc_never_uses_fixed_fallback_key() -> None:
     for flask_app in (first, second):
         assert flask_app.secret_key != "dev-only-insecure-key"
     assert first.secret_key != second.secret_key
+
+
+def test_proxy_hops_without_oidc_fails_startup() -> None:
+    """Trusting proxy headers without OIDC lets a remote client spoof loopback."""
+    with pytest.raises(RuntimeError, match="PROXY_TRUSTED_HOPS"):
+        app_mod.create_app(
+            config=Config(
+                overrides={
+                    "OIDC_ISSUER": "",
+                    "FLASK_SECRET_KEY": "test-secret-key",
+                    "PROXY_TRUSTED_HOPS": "1",
+                    "MOCK": "True",
+                }
+            )
+        )
+
+
+def test_proxy_hops_with_oidc_warns_about_forwarded_headers(caplog: Any) -> None:
+    """A trusted hop count is safe only if the proxy sets the forwarded headers."""
+    with caplog.at_level(logging.WARNING):
+        _make_app(PROXY_TRUSTED_HOPS="1")
+    assert any(
+        "X-Forwarded-For" in record.getMessage() for record in caplog.records
+    )

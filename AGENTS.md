@@ -11,6 +11,9 @@ When the edit tool returns `Could not find oldString ... The closest lines in
 the file are`, copy those closest lines exactly (including whitespace) into the
 next oldString and try again.
 
+Do not attempt to use `/tmp/opencode`. Instead, create a project-specific
+subdirectory under `/tmp`.
+
 ## Workflow
 
 1. Write a failing test that reproduces the bug or defines the new behavior.

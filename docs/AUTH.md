@@ -114,9 +114,13 @@ Set in `.env` (see `env.example`):
 - `SESSION_COOKIE_SECURE` — leave unset: it follows `PUBLIC_URL`
   (secure on https, off for local http). Set explicitly only when the
   proxy chain needs it.
-- `PROXY_TRUSTED_HOPS` — number of reverse-proxy hops to trust for
+- `PROXY_TRUSTED_HOPS` — exact number of reverse-proxy hops to trust for
   `X-Forwarded-For/Proto/Host` (ProxyFix). Default `0` disables it.
-  Set to the real hop count when serving behind an HTTPS proxy.
+  Must stay `0` when `OIDC_ISSUER` is unset: startup raises
+  `RuntimeError` otherwise, because forwarded headers would let a remote
+  client spoof the loopback read exception. When OIDC is enabled,
+  startup warns and the proxy must append or overwrite the headers.
+  See the configuration safety matrix in `docs/SECURITY.md` (M6).
 
 Session cookies: `HttpOnly`, `SameSite=Lax`, 30-day permanent lifetime.
 The allowlist is checked on every request; there is no server-side
@@ -159,9 +163,13 @@ Keycloak all work through the same discovery URL:
 
 The app binds `127.0.0.1:8000` under gunicorn; behind a TLS-terminating
 proxy, set `PUBLIC_URL` to the public `https://...` URL and
-`PROXY_TRUSTED_HOPS` to the hop count. The Tesla OAuth flow remains on
-`/api/v1/tesla/auth/initiate` and `/callback`, so the OIDC redirect URI
-is intentionally namespaced under `/oidc/callback`.
+`PROXY_TRUSTED_HOPS` to the exact hop count. The proxy must append or
+overwrite `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`;
+never forward a client-supplied `X-Forwarded-For` unchanged. OIDC must
+be enabled whenever hops > 0: startup refuses the unsafe combination.
+See the safety matrix in `docs/SECURITY.md` (M6). The Tesla OAuth flow
+remains on `/api/v1/tesla/auth/initiate` and `/callback`, so the OIDC
+redirect URI is intentionally namespaced under `/oidc/callback`.
 
 Enable OIDC before exposing the app publicly: anonymous data reads are
 denied once `OIDC_ISSUER` is set, and a non-loopback deployment with

@@ -2024,7 +2024,20 @@ def create_app(
     register_oidc(application)
     # Behind an HTTPS reverse proxy, the proxy headers carry the scheme.
     hops = cfg.proxy_trusted_hops
+    if hops > 0 and not cfg.oidc_issuer:
+        raise RuntimeError(
+            "PROXY_TRUSTED_HOPS must be 0 when OIDC_ISSUER is unset; "
+            "trusting X-Forwarded-* would let a remote client spoof the "
+            "loopback anonymous read exception"
+        )
     if hops > 0:
+        application.logger.warning(
+            "PROXY_TRUSTED_HOPS=%d: trusting the last %d X-Forwarded-For/"
+            "Proto/Host hop(s); the reverse proxy must overwrite or append "
+            "these headers",
+            hops,
+            hops,
+        )
         from werkzeug.middleware.proxy_fix import ProxyFix
 
         application.wsgi_app = ProxyFix(  # type: ignore[assignment]
