@@ -126,7 +126,7 @@ def client() -> Any:
     return flask_app.test_client()
 
 
-def _login_as(flask_client: Any, user: dict[str, str] | None) -> None:
+def _signin_as(flask_client: Any, user: dict[str, str] | None) -> None:
     """Store *user* (or no user) in the test client's session."""
     with flask_client.session_transaction() as sess:
         if user is None:
@@ -135,12 +135,12 @@ def _login_as(flask_client: Any, user: dict[str, str] | None) -> None:
             sess["user"] = user
 
 
-def test_anonymous_html_read_redirects_to_login(client: Any) -> None:
+def test_anonymous_html_read_redirects_to_signin(client: Any) -> None:
     """An anonymous HTML page read is sent to the provider with a local next."""
     resp = client.get("/", headers={"Accept": "text/html"})
     assert resp.status_code == 302
     location = resp.headers["Location"]
-    assert location.startswith("/oidc/login?next=")
+    assert location.startswith("/oidc/signin?next=")
     assert "%2F" in location
 
 
@@ -149,7 +149,7 @@ def test_public_paths_remain_anonymous(client: Any) -> None:
     assert client.get("/health").status_code == 200
     assert client.get("/api/me").status_code == 200
     assert client.get("/static/style.css").status_code == 200
-    assert client.get("/oidc/logout").status_code == 302
+    assert client.get("/oidc/signout").status_code == 200
 
 
 def test_tesla_auth_paths_remain_public(client: Any) -> None:
@@ -198,7 +198,7 @@ def test_partial_fetch_returns_401_not_redirect(client: Any) -> None:
 
 def test_allowlisted_read_succeeds(client: Any) -> None:
     """An allowlisted session can read data."""
-    _login_as(client, SESSION_USER)
+    _signin_as(client, SESSION_USER)
     resp = client.get("/", headers={"Accept": "application/json"})
     assert resp.status_code == 200
     assert "devices" in resp.get_json()
@@ -206,7 +206,7 @@ def test_allowlisted_read_succeeds(client: Any) -> None:
 
 def test_non_allowlisted_read_returns_403(client: Any) -> None:
     """An authenticated user who is not allowlisted is denied with 403."""
-    _login_as(client, {"iss": ISSUER, "sub": "other", "email": "o@example.com"})
+    _signin_as(client, {"iss": ISSUER, "sub": "other", "email": "o@example.com"})
     resp = client.get("/", headers={"Accept": "application/json"})
     assert resp.status_code == 403
     assert resp.is_json
@@ -259,14 +259,14 @@ def test_anonymous_write_without_header_returns_403(client: Any) -> None:
 
 def test_logged_in_non_allowlisted_write_returns_403(client: Any) -> None:
     """Logged-in user whose (iss, sub) is not allowlisted is refused with 403."""
-    _login_as(client, {"iss": ISSUER, "sub": "other", "email": "o@example.com"})
+    _signin_as(client, {"iss": ISSUER, "sub": "other", "email": "o@example.com"})
     resp = client.post(WRITE_PATH, headers=WRITE_HEADERS)
     assert resp.status_code == 403
 
 
 def test_allowlisted_write_succeeds(client: Any) -> None:
     """Allowlisted user with the fetch header can write."""
-    _login_as(client, SESSION_USER)
+    _signin_as(client, SESSION_USER)
     resp = client.post(WRITE_PATH, headers=WRITE_HEADERS)
     assert resp.status_code == 200
     assert resp.data == b"ok"
@@ -274,7 +274,7 @@ def test_allowlisted_write_succeeds(client: Any) -> None:
 
 def test_allowlisted_write_without_header_returns_403(client: Any) -> None:
     """Even an allowlisted user needs the X-Requested-With header."""
-    _login_as(client, SESSION_USER)
+    _signin_as(client, SESSION_USER)
     resp = client.post(WRITE_PATH)
     assert resp.status_code == 403
 
@@ -283,7 +283,7 @@ def test_empty_allowlist_denies_all_writes() -> None:
     """An empty OIDC_ALLOWED_SUB fails closed: nobody can write."""
     flask_app = _make_app(OIDC_ALLOWED_SUB="")
     test_client = flask_app.test_client()
-    _login_as(test_client, SESSION_USER)
+    _signin_as(test_client, SESSION_USER)
     resp = test_client.post(WRITE_PATH, headers=WRITE_HEADERS)
     assert resp.status_code == 403
 
@@ -292,7 +292,7 @@ def test_wrong_issuer_is_not_allowlisted() -> None:
     """Allowlist matches on (iss, sub): a foreign issuer's sub never matches."""
     flask_app = _make_app()
     test_client = flask_app.test_client()
-    _login_as(
+    _signin_as(
         test_client,
         {"iss": "https://evil.example.com", "sub": "sub-1", "email": "u@example.com"},
     )
@@ -353,80 +353,80 @@ def test_issuer_allows_http_loopback(issuer: str) -> None:
 
 
 def test_get_client_rejects_insecure_issuer(caplog: Any) -> None:
-    """An insecure issuer cannot start the login flow."""
+    """An insecure issuer cannot start the signin flow."""
     flask_app = _make_app(OIDC_ISSUER="http://issuer.example.com")
     flask_app.extensions.pop("oidc_client")
     with caplog.at_level(logging.ERROR, logger="oidc_auth"):
-        resp = flask_app.test_client().get("/oidc/login")
+        resp = flask_app.test_client().get("/oidc/signin")
     assert resp.status_code == 503
     assert "https" in caplog.text
     assert "oidc_client" not in flask_app.extensions
 
 
-def test_login_rate_limit_returns_429(client: Any) -> None:
+def test_signin_rate_limit_returns_429(client: Any) -> None:
     """The 21st auth request in one window is refused with 429."""
     for _ in range(20):
-        assert client.get("/oidc/login").status_code == 302
-    resp = client.get("/oidc/login")
+        assert client.get("/oidc/signin").status_code == 302
+    resp = client.get("/oidc/signin")
     assert resp.status_code == 429
     assert resp.headers["Retry-After"] == "60"
     assert resp.is_json
 
 
-def test_login_rate_limit_is_per_ip() -> None:
+def test_signin_rate_limit_is_per_ip() -> None:
     """One client exhausting the window does not affect another IP."""
     test_client = _make_app().test_client()
     first = {"REMOTE_ADDR": "203.0.113.5"}
     second = {"REMOTE_ADDR": "203.0.113.6"}
     for _ in range(20):
         assert (
-            test_client.get("/oidc/login", environ_overrides=first).status_code
+            test_client.get("/oidc/signin", environ_overrides=first).status_code
             == 302
         )
     assert (
-        test_client.get("/oidc/login", environ_overrides=first).status_code == 429
+        test_client.get("/oidc/signin", environ_overrides=first).status_code == 429
     )
     assert (
-        test_client.get("/oidc/login", environ_overrides=second).status_code
+        test_client.get("/oidc/signin", environ_overrides=second).status_code
         == 302
     )
 
 
-def test_login_rate_limit_window_resets(client: Any, monkeypatch: Any) -> None:
+def test_signin_rate_limit_window_resets(client: Any, monkeypatch: Any) -> None:
     """A new fixed window allows requests from the same IP again."""
     clock = [1000.0]
     monkeypatch.setattr(oidc_auth, "_monotonic", lambda: clock[0])
     for _ in range(20):
-        assert client.get("/oidc/login").status_code == 302
-    assert client.get("/oidc/login").status_code == 429
+        assert client.get("/oidc/signin").status_code == 302
+    assert client.get("/oidc/signin").status_code == 429
     clock[0] += oidc_auth.AUTH_RATE_WINDOW_SECS + 1
-    assert client.get("/oidc/login").status_code == 302
+    assert client.get("/oidc/signin").status_code == 302
 
 
 @pytest.mark.parametrize(
     "bad_next",
     ["//evil.com", "https://evil.com", "evil.com", ""],
 )
-def test_login_rejects_non_local_next(client: Any, bad_next: str) -> None:
+def test_signin_rejects_non_local_next(client: Any, bad_next: str) -> None:
     """A non-local `next` is replaced with "/" before it reaches the session."""
-    resp = client.get(f"/oidc/login?next={bad_next}")
+    resp = client.get(f"/oidc/signin?next={bad_next}")
     assert resp.status_code == 302
     with client.session_transaction() as sess:
-        assert sess.get("post_login_next") == "/"
+        assert sess.get("post_signin_next") == "/"
 
 
-def test_login_keeps_local_next(client: Any) -> None:
-    """A local `next` path is stored verbatim for the post-login redirect."""
-    resp = client.get("/oidc/login?next=/api/v1/tou")
+def test_signin_keeps_local_next(client: Any) -> None:
+    """A local `next` path is stored verbatim for the post-signin redirect."""
+    resp = client.get("/oidc/signin?next=/api/v1/tou")
     assert resp.status_code == 302
     with client.session_transaction() as sess:
-        assert sess.get("post_login_next") == "/api/v1/tou"
+        assert sess.get("post_signin_next") == "/api/v1/tou"
 
 
-def test_login_builds_redirect_uri_from_public_url() -> None:
+def test_signin_builds_redirect_uri_from_public_url() -> None:
     """The provider redirect URI is <PUBLIC_URL>/oidc/callback."""
     flask_app = _make_app(PUBLIC_URL="https://solara.example.com")
-    flask_app.test_client().get("/oidc/login")
+    flask_app.test_client().get("/oidc/signin")
     fake = flask_app.extensions["oidc_client"]
     assert fake.authorized_redirect_uri == "https://solara.example.com/oidc/callback"
 
@@ -434,7 +434,7 @@ def test_login_builds_redirect_uri_from_public_url() -> None:
 def test_callback_stores_user_and_redirects_to_next(client: Any) -> None:
     """Callback stores {iss, sub, email}, marks the session permanent, redirects."""
     with client.session_transaction() as sess:
-        sess["post_login_next"] = "/api/v1/tou"
+        sess["post_signin_next"] = "/api/v1/tou"
     resp = client.get("/oidc/callback")
     assert resp.status_code == 302
     assert resp.headers["Location"].endswith("/api/v1/tou")
@@ -467,7 +467,7 @@ def test_startup_logs_oidc_config_at_debug(caplog: Any) -> None:
 
 
 def test_callback_logs_allowlist_mismatch_at_debug(caplog: Any) -> None:
-    """A trailing-slash allowlist mismatch shows up at DEBUG on login."""
+    """A trailing-slash allowlist mismatch shows up at DEBUG on signin."""
     flask_app = _make_app(OIDC_ALLOWED_SUB=f"{ISSUER}/|sub-1")
     with caplog.at_level(logging.DEBUG, logger="oidc_auth"):
         flask_app.test_client().get("/oidc/callback")
@@ -477,7 +477,7 @@ def test_callback_logs_allowlist_mismatch_at_debug(caplog: Any) -> None:
 
 def test_denied_read_logs_identity_at_debug(client: Any, caplog: Any) -> None:
     """A non-allowlisted session logs its identity at DEBUG on denial."""
-    _login_as(client, {"iss": ISSUER, "sub": "other"})
+    _signin_as(client, {"iss": ISSUER, "sub": "other"})
     with caplog.at_level(logging.DEBUG, logger="oidc_auth"):
         resp = client.get("/api/v1/metrics")
     assert resp.status_code == 403
@@ -568,37 +568,53 @@ def test_callback_omits_non_string_email() -> None:
         assert sess["user"] == {"iss": ISSUER, "sub": "sub-1"}
 
 
-def test_logout_clears_session(client: Any) -> None:
-    """Logout clears the session and redirects to "/"."""
-    _login_as(client, SESSION_USER)
-    resp = client.get("/oidc/logout")
-    assert resp.status_code == 302
-    assert resp.headers["Location"].endswith("/")
+def test_signout_clears_session_and_renders_page(client: Any) -> None:
+    """Signout clears the session and renders the landing page."""
+    _signin_as(client, SESSION_USER)
+    resp = client.get("/oidc/signout")
+    assert resp.status_code == 200
+    assert "Location" not in resp.headers
+    assert "signed out" in resp.get_data(as_text=True).lower()
     with client.session_transaction() as sess:
         assert "user" not in sess
+
+
+def test_signout_page_names_the_provider(client: Any) -> None:
+    """The page says the provider session may still be active."""
+    resp = client.get("/oidc/signout")
+    body = resp.get_data(as_text=True)
+    assert "issuer.example.com" in body
+    assert "still be signed in" in body
+
+
+def test_signout_page_omits_provider_when_oidc_is_off() -> None:
+    """Without OIDC there is no provider session to explain."""
+    resp = _make_local_app().test_client().get("/oidc/signout")
+    assert resp.status_code == 200
+    assert "issuer.example.com" not in resp.get_data(as_text=True)
 
 
 SUBPATH_ENV = {"SCRIPT_NAME": "/solara"}
 
 
-def test_login_redirect_keeps_proxy_prefix() -> None:
-    """A subpath mount redirects to <prefix>/oidc/login with a prefixed next."""
+def test_signin_redirect_keeps_proxy_prefix() -> None:
+    """A subpath mount redirects to <prefix>/oidc/signin with a prefixed next."""
     flask_client = _make_app().test_client()
     resp = flask_client.get(
         "/", headers={"Accept": "text/html"}, environ_overrides=SUBPATH_ENV
     )
     assert resp.status_code == 302
     location = resp.headers["Location"]
-    assert location.startswith("/solara/oidc/login?next=")
+    assert location.startswith("/solara/oidc/signin?next=")
     assert "next=%2Fsolara%2F" in location
 
 
-def test_login_stores_prefixed_next_when_none_given() -> None:
-    """A bare login request stores the prefixed root as the post-login target."""
+def test_signin_stores_prefixed_next_when_none_given() -> None:
+    """A bare signin request stores the prefixed root as the post-signin target."""
     flask_client = _make_app().test_client()
-    flask_client.get("/oidc/login", environ_overrides=SUBPATH_ENV)
+    flask_client.get("/oidc/signin", environ_overrides=SUBPATH_ENV)
     with flask_client.session_transaction() as sess:
-        assert sess["post_login_next"] == "/solara/"
+        assert sess["post_signin_next"] == "/solara/"
 
 
 def test_callback_defaults_to_proxy_prefix() -> None:
@@ -609,23 +625,28 @@ def test_callback_defaults_to_proxy_prefix() -> None:
     assert resp.headers["Location"] == "/solara/"
 
 
-def test_logout_redirects_to_proxy_prefix() -> None:
-    """Logout returns to the prefixed root, not the site root."""
+def test_signout_page_links_keep_proxy_prefix() -> None:
+    """The signout page resolves its links under the proxy prefix."""
     flask_client = _make_app().test_client()
-    _login_as(flask_client, SESSION_USER)
-    resp = flask_client.get("/oidc/logout", environ_overrides=SUBPATH_ENV)
-    assert resp.status_code == 302
-    assert resp.headers["Location"] == "/solara/"
+    _signin_as(flask_client, SESSION_USER)
+    resp = flask_client.get("/oidc/signout", environ_overrides=SUBPATH_ENV)
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert 'href="/solara/oidc/signin"' in body
+    assert 'href="/solara/static/style.css"' in body
 
 
-def test_protocol_relative_prefix_cannot_open_redirect() -> None:
-    """A forged prefix must not turn logout into a protocol-relative redirect."""
+def test_protocol_relative_prefix_cannot_poison_signout_page() -> None:
+    """A forged prefix must not produce protocol-relative page links."""
     flask_client = _make_app().test_client()
-    _login_as(flask_client, SESSION_USER)
+    _signin_as(flask_client, SESSION_USER)
     resp = flask_client.get(
-        "/oidc/logout", environ_overrides={"SCRIPT_NAME": "//evil.example.com"}
+        "/oidc/signout", environ_overrides={"SCRIPT_NAME": "//evil.example.com"}
     )
-    assert resp.headers["Location"] == "/"
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "//evil.example.com" not in body
+    assert 'href="/oidc/signin"' in body
 
 
 def test_proxy_fix_honours_forwarded_prefix() -> None:
@@ -636,75 +657,75 @@ def test_proxy_fix_honours_forwarded_prefix() -> None:
         headers={"Accept": "text/html", "X-Forwarded-Prefix": "/solara"},
     )
     assert resp.status_code == 302
-    assert resp.headers["Location"].startswith("/solara/oidc/login?next=")
+    assert resp.headers["Location"].startswith("/solara/oidc/signin?next=")
 
 
-def test_login_request_has_no_prompt_by_default() -> None:
-    """A normal login lets the provider reuse its browser session."""
+def test_signin_request_has_no_prompt_by_default() -> None:
+    """A normal signin lets the provider reuse its browser session."""
     flask_app = _make_app()
-    flask_app.test_client().get("/oidc/login")
+    flask_app.test_client().get("/oidc/signin")
     fake = flask_app.extensions["oidc_client"]
     assert "prompt" not in fake.authorized_params
 
 
-def test_logout_forces_account_choice_on_next_login_only() -> None:
-    """An explicit logout makes the next login ask for an account, once."""
+def test_signout_forces_account_choice_on_next_signin_only() -> None:
+    """An explicit signout makes the next signin ask for an account, once."""
     flask_app = _make_app()
     flask_client = flask_app.test_client()
-    _login_as(flask_client, SESSION_USER)
+    _signin_as(flask_client, SESSION_USER)
     fake = flask_app.extensions["oidc_client"]
-    flask_client.get("/oidc/logout")
-    flask_client.get("/oidc/login")
+    flask_client.get("/oidc/signout")
+    flask_client.get("/oidc/signin")
     assert fake.authorized_params.get("prompt") == "select_account"
     fake.authorized_params.clear()
-    flask_client.get("/oidc/login")
+    flask_client.get("/oidc/signin")
     assert "prompt" not in fake.authorized_params
 
 
 def test_api_me_anonymous(client: Any) -> None:
-    """Anonymous /api/me reports no user, no access, and that login is required."""
+    """Anonymous /api/me reports no user, no access, and that signin is required."""
     resp = client.get("/api/me")
     assert resp.status_code == 200
     assert resp.get_json() == {
         "authenticated": False,
         "can_read": False,
         "can_write": False,
-        "login_required": True,
+        "signin_required": True,
     }
 
 
 def test_api_me_non_allowlisted(client: Any) -> None:
-    """A logged-in non-allowlisted user gets 403, not a login redirect loop."""
-    _login_as(client, {"iss": ISSUER, "sub": "other", "email": "o@example.com"})
+    """A signed-in non-allowlisted user gets 403, not a signin redirect loop."""
+    _signin_as(client, {"iss": ISSUER, "sub": "other", "email": "o@example.com"})
     resp = client.get("/api/me")
     assert resp.get_json() == {
         "authenticated": True,
         "can_read": False,
         "can_write": False,
-        "login_required": False,
+        "signin_required": False,
     }
 
 
 def test_api_me_allowlisted(client: Any) -> None:
     """An allowlisted /api/me reports read and write access."""
-    _login_as(client, SESSION_USER)
+    _signin_as(client, SESSION_USER)
     resp = client.get("/api/me")
     assert resp.get_json() == {
         "authenticated": True,
         "can_read": True,
         "can_write": True,
-        "login_required": False,
+        "signin_required": False,
     }
 
 
-def test_api_me_reports_can_read_and_login_required() -> None:
-    """Local anonymous reads report can_read without demanding a login."""
+def test_api_me_reports_can_read_and_signin_required() -> None:
+    """Local anonymous reads report can_read without demanding a signin."""
     resp = _make_local_app().test_client().get("/api/me")
     assert resp.get_json() == {
         "authenticated": False,
         "can_read": True,
         "can_write": False,
-        "login_required": False,
+        "signin_required": False,
     }
 
 

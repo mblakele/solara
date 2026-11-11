@@ -61,7 +61,7 @@
 
   // One redirect guard for both fragment 401s and SSE error probes, so the
   // two paths cannot race into a reload loop.
-  var loginRedirected = false
+  var signinRedirected = false
 
   function timestamp() {
     return new Date(Date.now()).toLocaleTimeString()
@@ -87,14 +87,14 @@
     reloadTimer = setTimeout(reloadIfVisible, millisMax)
   }
 
-  // Send the browser to the OIDC login once, preserving the current page
+  // Send the browser to the OIDC signin once, preserving the current page
   // (path and query) as `next`.
-  function redirectToLogin() {
-    if (loginRedirected) {
+  function redirectToSignin() {
+    if (signinRedirected) {
       return
     }
-    loginRedirected = true
-    window.location.href = 'oidc/login?next=' +
+    signinRedirected = true
+    window.location.href = 'oidc/signin?next=' +
       encodeURIComponent(window.location.pathname + window.location.search)
   }
 
@@ -348,19 +348,19 @@
     })
     // EventSource reconnects automatically. On error, probe the auth state:
     // an expired session returns 401 for the stream, which the browser
-    // cannot act on. Redirect only when login_required is true, so a local
+    // cannot act on. Redirect only when signin_required is true, so a local
     // read-only session does not bounce. Other transient errors just log
     // and let EventSource retry; a permanently dead stream still trips the
     // silence watchdog above.
     source.onerror = function () {
-      log('sse connection error, checking login state')
+      log('sse connection error, checking signin state')
       fetch('api/me', { headers: { Accept: 'application/json' } })
         .then(function (resp) {
           return resp.ok ? resp.json() : null
         })
         .then(function (me) {
-          if (me && me.login_required) {
-            redirectToLogin()
+          if (me && me.signin_required) {
+            redirectToSignin()
           }
         })
         .catch(function () { /* transient; EventSource retries */ })
@@ -371,7 +371,7 @@
   // marker on every non-read request, and fragment reads need the same
   // 401 handling. Write calls must go through this rather than bare
   // fetch(). On 401 (session expired or anonymous data read) it sends the
-  // user to the OIDC login with the current page as `next`.
+  // user to the OIDC signin with the current page as `next`.
   window.solaraFetch = function (url, options) {
     var opts = options || {}
     var headers = {}
@@ -384,7 +384,7 @@
     opts.headers = headers
     return fetch(url, opts).then(function (resp) {
       if (resp.status === 401) {
-        redirectToLogin()
+        redirectToSignin()
       }
       return resp
     })
@@ -393,7 +393,7 @@
   // Cosmetic auth state for the header sign-in link. Read and write access
   // are separate: can_read reflects the allowlist for data, while can_write
   // also needs the same-origin fetch marker. An authenticated user with no
-  // read access sees the logout link, not a login loop.
+  // read access sees the signout link, not a signin loop.
   fetch('api/me', { headers: { Accept: 'application/json' } })
     .then(function (resp) {
       return resp.ok ? resp.json() : null
@@ -407,16 +407,16 @@
       host.removeAttribute('hidden')
       if (me && me.can_write) {
         link.textContent = 'Sign out'
-        link.href = 'oidc/logout'
+        link.href = 'oidc/signout'
       } else if (me && me.can_read) {
         link.textContent = 'Signed in (read-only)'
-        link.href = 'oidc/logout'
+        link.href = 'oidc/signout'
       } else if (me && me.authenticated) {
         link.textContent = 'Signed in (no access)'
-        link.href = 'oidc/logout'
+        link.href = 'oidc/signout'
       } else {
         link.textContent = 'Sign in'
-        link.href = 'oidc/login?next='
+        link.href = 'oidc/signin?next='
           + encodeURIComponent(window.location.pathname + window.location.search)
       }
     })

@@ -540,7 +540,7 @@ class Config:
 
     @property
     def oidc_issuer(self) -> str | None:
-        """Return the OIDC issuer URL, or None when OIDC login is disabled."""
+        """Return the OIDC issuer URL, or None when OIDC signin is disabled."""
         return self._get("OIDC_ISSUER") or None
 
     @property

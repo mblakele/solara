@@ -890,7 +890,7 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
 | devices.json loader & integrity validation | `device_config.py` |
 | Quarter-hour helpers, compaction records | `util.py` |
 | Tesla OAuth Blueprint (`/api/v1/tesla/auth/initiate`, `/callback`, `/api/v1/tesla/status`) | `tesla_oauth.py` |
-| OIDC login routes, read/write gate, `/api/me` | `oidc_auth.py` |
+| OIDC signin/signout routes, read/write gate, `/api/me` | `oidc_auth.py` |
 | FakeClock / Clock protocol | `clock.py` |
 | Test data generation | `mockdata.py` |
 | Templates | `templates/` |

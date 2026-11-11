@@ -6,7 +6,7 @@ every write requires one in all configurations.
 
 ## Flow
 
-- `GET /oidc/login` — stores a validated `next` path in the session, then
+- `GET /oidc/signin` — stores a validated `next` path in the session, then
   redirects to the provider (authorization code + PKCE via Authlib).
 - `GET /oidc/callback` — exchanges the code, validates the ID token
   (state, nonce, signature, issuer, audience, expiry via Authlib), then
@@ -14,16 +14,17 @@ every write requires one in all configurations.
   `token["userinfo"]` without re-parsing the ID token. Missing or
   malformed claims fail closed with `502` and store no session user.
   Marks the session permanent and redirects to `next`.
-- `GET /oidc/logout` — clears the session, sets a one-shot flag, and
-  redirects to the app root. The next login adds
+- `GET /oidc/signout` — clears the session, sets a one-shot flag, and
+  renders the signout landing page (`templates/signout.html`). The page
+  names the provider and links back to signin. The next signin adds
   `prompt=select_account`, so the provider shows its account chooser
-  instead of silently reusing the browser session. Later logins stay
-  silent. See "Logout scope".
+  instead of silently reusing the browser session. Later signins stay
+  silent. See "Signout scope".
 - `GET /api/me` — `{"authenticated": bool, "can_read": bool,
-  "can_write": bool, "login_required": bool}`. Cosmetic only; the
+  "can_write": bool, "signin_required": bool}`. Cosmetic only; the
   server-side gate is the real protection.
 
-Authentication (OIDC login) and authorization (allowlist) are separate
+Authentication (OIDC signin) and authorization (allowlist) are separate
 steps. The allowlist matches on `(iss, sub)` pairs, never on email.
 
 ## The read gate
@@ -40,7 +41,7 @@ applies to every request source, including loopback.
 When `OIDC_ISSUER` is unset, anonymous reads are allowed only when both
 `request.remote_addr` and the request host are loopback. This keeps
 local development and the test client working. A non-loopback request
-is denied with `503` because no login flow exists to satisfy the gate.
+is denied with `503` because no signin flow exists to satisfy the gate.
 The loopback exception never applies when `OIDC_ISSUER` is set.
 
 Public paths (safe reads, no session needed):
@@ -48,9 +49,9 @@ Public paths (safe reads, no session needed):
 ```text
 /health
 /api/me
-/oidc/login
+/oidc/signin
 /oidc/callback
-/oidc/logout
+/oidc/signout
 /api/v1/tesla/auth/initiate
 /callback
 /static/*
@@ -67,7 +68,7 @@ data to it.
 | Request | Session / allowlist | Result |
 |---|---|---|
 | Public safe path | any | pass |
-| Data read, OIDC configured, anonymous | none | HTML page: `302` to `/oidc/login?next=...`; API/SSE/partial: `401` |
+| Data read, OIDC configured, anonymous | none | HTML page: `302` to `/oidc/signin?next=...`; API/SSE/partial: `401` |
 | Data read, OIDC configured, authenticated but not allowlisted | user, no match | `403` |
 | Data read, OIDC configured, allowlisted | match | pass |
 | Data read, OIDC unconfigured, loopback request | none | pass |
@@ -82,7 +83,7 @@ with `Accept: text/html`). API paths, `X-Requested-With: fetch`
 requests, and `?partial=` requests return JSON `401`. SSE
 (`/stream/status`) returns a plain `401`; EventSource cannot read the
 status, so the dashboard probes `/api/me` on error and redirects only
-when `login_required` is true.
+when `signin_required` is true.
 
 Writes keep the existing `X-Requested-With: fetch` requirement, session
 requirement, and allowlist check. There are currently no write routes
@@ -104,8 +105,8 @@ Set in `.env` (see `env.example`):
 - `OIDC_ISSUER` — issuer URL; discovery runs against
   `<OIDC_ISSUER>/.well-known/openid-configuration`. Must use `https`;
   `http` is accepted only for loopback hosts (`localhost`, `127.0.0.1`,
-  `::1`). An insecure issuer makes the login flow return `503` and
-  data reads fail closed. Leave unset to disable the login flow
+  `::1`). An insecure issuer makes the signin flow return `503` and
+  data reads fail closed. Leave unset to disable the signin flow
   (writes fail closed either way; reads become loopback-only).
 - `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` — the OAuth client
   credentials issued by the provider.
@@ -132,26 +133,26 @@ Session cookies: `HttpOnly`, `SameSite=Lax`, 30-day permanent lifetime.
 The allowlist is checked on every request; there is no server-side
 session store or token revocation.
 
-## Logout scope
+## Signout scope
 
-`/oidc/logout` ends the Solara session only. The provider's browser
-session is separate: the redirect to the app root reaches the read gate,
-which sends an anonymous HTML request to the provider, and the provider
-can authenticate the user without a prompt.
+`/oidc/signout` ends the Solara session only. The provider's browser
+session is separate: signing out renders a local landing page that says
+so, and a later signin reaches the provider, which can authenticate the
+user without a prompt.
 
 The one-shot `prompt=select_account` flag forces one account choice
-after an explicit logout. It is a speed bump, not a provider logout.
-Later logins do not send it.
+after an explicit signout. It is a speed bump, not a provider signout.
+Later signins do not send it.
 
 Google's discovery document has no `end_session_endpoint`, so there is
-no portable provider logout to call. Signing out of Google also ends
+no portable provider signout to call. Signing out of Google also ends
 Gmail and every other Google session in that browser, which is why this
 app does not do it. On a shared device, sign out of the provider as
-well. The allowlist, not logout, is the security boundary.
+well. The allowlist, not signout, is the security boundary.
 
 ## Rate limiting
 
-`/oidc/login` and `/oidc/callback` share an in-memory fixed-window
+`/oidc/signin` and `/oidc/callback` share an in-memory fixed-window
 limiter keyed by `request.remote_addr`: 20 requests per 60 seconds per
 IP, returning `429` with `Retry-After: 60` beyond that. The lock covers
 one process, so multi-worker (gunicorn) deployments get a per-worker
@@ -165,7 +166,7 @@ With `OIDC_ALLOWED_SUB` empty, the callback logs the authenticated
 identity at INFO so it can be copied into config:
 
 ```text
-OIDC login bootstrap: iss=... sub=... not yet allowlisted; writes denied
+OIDC signin bootstrap: iss=... sub=... not yet allowlisted; writes denied
 ```
 
 Copy the pair into `.env` as `OIDC_ALLOWED_SUB=iss|sub` (comma-separated
@@ -179,7 +180,7 @@ With `DEBUG` enabled, `oidc_auth` logs these lines:
 
 - `OIDC config: issuer=... allowlist=[...]` — at startup, the parsed
   pairs (not the raw env value), so a typo is visible.
-- `OIDC login: iss=... sub=... allowlisted=False` — at the callback,
+- `OIDC signin: iss=... sub=... allowlisted=False` — at the callback,
   when a non-empty allowlist rejects the identity.
 - `OIDC access denied: iss=... sub=... not in allowlist` — on each
   denied request from an authenticated session.
@@ -225,8 +226,8 @@ location /solara/ {
 }
 ```
 
-`ProxyFix` turns that header into `SCRIPT_NAME`, so login, logout, and
-the post-login redirect stay under `/solara`. Set
+`ProxyFix` turns that header into `SCRIPT_NAME`, so signin, signout, and
+the post-signin redirect stay under `/solara`. Set
 `PUBLIC_URL=https://<host>/solara` and register
 `https://<host>/solara/oidc/callback` with the provider. The dashboard
 HTML and `static/app.js` already use relative URLs, so they need no
@@ -242,11 +243,15 @@ would weaken the loopback exception.
 
 The header shows a sign-in link that becomes a sign-out (or read-only
 note) based on `/api/me` (`can_read` drives the read state,
-`login_required` drives the redirect). A `window.solaraFetch` wrapper
+`signin_required` drives the redirect). A `window.solaraFetch` wrapper
 sends `X-Requested-With: fetch` on partial fragment fetches and
-redirects to `/oidc/login?next=...` on a `401`. On SSE `onerror` the
-client re-fetches `/api/me` and redirects only when `login_required`
+redirects to `/oidc/signin?next=...` on a `401`. On SSE `onerror` the
+client re-fetches `/api/me` and redirects only when `signin_required`
 is true, which avoids a redirect loop for authenticated but
-non-allowlisted users (they get `403`, not a login redirect). No HTML
+non-allowlisted users (they get `403`, not a signin redirect). No HTML
 forms post writes, so no CSRF token is needed; the fetch header check
 serves that role.
+
+The signout page uses the validated `_local_root()` for its links
+instead of `url_for`, so a forged `SCRIPT_NAME` cannot produce
+protocol-relative URLs.

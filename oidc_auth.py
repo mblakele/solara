@@ -12,19 +12,18 @@ in the Flask session.
 
 Routes (registered by :func:`register_oidc` at app build time):
 
-- ``GET /oidc/login`` — validate ``next`` (local path only), store it in
+- ``GET /oidc/signin`` — validate ``next`` (local path only), store it in
   the session, and redirect to the provider.
 - ``GET /oidc/callback`` — exchange the code, store {iss, sub, email} in
   the session, mark it permanent, and redirect to the stored ``next``.
-- ``GET /oidc/logout`` — clear the session, set a one-shot "ask for an
-  account" flag, and redirect to the app root (including any
-  reverse-proxy prefix). The next ``/oidc/login`` sends
-  ``prompt=select_account``.
+- ``GET /oidc/signout`` — clear the session, set a one-shot "ask for an
+  account" flag, and render the signout page. The next
+  ``/oidc/signin`` sends ``prompt=select_account``.
 - ``GET /api/me`` — {"authenticated": bool, "can_read": bool,
-  "can_write": bool, "login_required": bool}; cosmetic only, the
+  "can_write": bool, "signin_required": bool}; cosmetic only, the
   server-side gate is the real protection.
 
-When the provider is not configured the login endpoint returns 503.
+When the provider is not configured the signin endpoint returns 503.
 Writes always fail closed; reads fail closed with 503 for non-loopback
 requests.
 """
@@ -40,7 +39,16 @@ from datetime import timedelta
 from typing import Any
 from urllib.parse import unquote, urlencode, urlsplit
 
-from flask import Flask, Response, abort, current_app, redirect, request, session
+from flask import (
+    Flask,
+    Response,
+    abort,
+    current_app,
+    redirect,
+    render_template,
+    request,
+    session,
+)
 from flask.typing import ResponseReturnValue
 
 from config import Config
@@ -54,14 +62,14 @@ _PUBLIC_ENDPOINTS = {
     "static",
     "health",
     "api_me",
-    "oidc_login",
+    "oidc_signin",
     "oidc_callback",
-    "oidc_logout",
+    "oidc_signout",
     "tesla.tesla_auth_initiate",
     "tesla.tesla_auth_callback",
 }
 
-# Endpoints that render a full HTML page and can therefore redirect to login.
+# Endpoints that render a full HTML page and can therefore redirect to signin.
 _HTML_PAGE_ENDPOINTS = {"index", "tou"}
 
 # Methods that read rather than write.
@@ -75,12 +83,12 @@ _FETCH_VALUE = "fetch"
 
 PERMANENT_SESSION_LIFETIME = timedelta(days=30)
 
-# One-shot flag: the login after an explicit logout asks the provider to
+# One-shot flag: the signin after an explicit signout asks the provider to
 # show the account chooser instead of silently reusing the browser session.
-# The next /oidc/login pops it, so later logins stay silent.
-_SELECT_ACCOUNT_KEY = "post_logout_select_account"
+# The next /oidc/signin pops it, so later signins stay silent.
+_SELECT_ACCOUNT_KEY = "post_signout_select_account"
 
-# In-memory fixed-window limit for the login handshake. It protects one
+# In-memory fixed-window limit for the signin handshake. It protects one
 # process; a multi-worker deployment should also limit at the proxy.
 AUTH_RATE_LIMIT = 20
 AUTH_RATE_WINDOW_SECS = 60.0
@@ -246,8 +254,8 @@ def _can_read() -> bool:
     return _can_access() or _local_anonymous_read_allowed()
 
 
-def _login_required() -> bool:
-    """Return True when logging in could grant this request read access.
+def _signin_required() -> bool:
+    """Return True when signing in could grant this request read access.
 
     A non-allowlisted session gets 403 instead of a redirect, so this is
     true only for anonymous requests while OIDC is configured.
@@ -290,14 +298,14 @@ def _deny_read(status: int, message: str) -> Response:
     return _json_error(message, status)
 
 
-def _login_redirect() -> Response:
+def _signin_redirect() -> Response:
     """Send a browser page request to the provider with a local ``next``."""
     root = _local_root()
     target = root.rstrip("/") + request.full_path
     if target.endswith("?"):
         target = target[:-1]
-    login_url = f"{root}oidc/login"
-    return redirect(f"{login_url}?{urlencode({'next': target})}")  # type: ignore[return-value]
+    signin_url = f"{root}oidc/signin"
+    return redirect(f"{signin_url}?{urlencode({'next': target})}")  # type: ignore[return-value]
 
 
 def validate_next(raw: str | None, default: str = "/") -> str:
@@ -340,24 +348,24 @@ def _local_root() -> str:
     return validate_next(f"{request.script_root.rstrip('/')}/")
 
 
-def login() -> ResponseReturnValue:
+def signin() -> ResponseReturnValue:
     """Redirect the browser to the OIDC provider.
 
     The requested ``next`` path (local only) is stored in the session so
-    the callback can return the user there after login.
+    the callback can return the user there after signin.
     """
     limited = _check_auth_rate_limit()
     if limited is not None:
         return limited
     client = _get_client()
     if client is None:
-        abort(503, "OIDC login is not configured")
-    session["post_login_next"] = validate_next(
+        abort(503, "OIDC signin is not configured")
+    session["post_signin_next"] = validate_next(
         request.args.get("next"), _local_root()
     )
     redirect_uri = f"{_request_config().public_url.rstrip('/')}/oidc/callback"
-    # After an explicit logout, force the provider's account chooser so the
-    # browser session cannot silently sign the user straight back in.
+    # After an explicit signout, force the provider's account chooser so
+    # the browser session cannot silently sign the user straight back in.
     extra = (
         {"prompt": "select_account"}
         if session.pop(_SELECT_ACCOUNT_KEY, False)
@@ -367,7 +375,7 @@ def login() -> ResponseReturnValue:
 
 
 def callback() -> ResponseReturnValue:
-    """Complete the OIDC login and store the identity in the session.
+    """Complete the OIDC signin and store the identity in the session.
 
     Authlib validates state, nonce, and the ID token. Failures abort with
     502 rather than letting an unverified identity into the session. When
@@ -380,21 +388,21 @@ def callback() -> ResponseReturnValue:
         return limited
     client = _get_client()
     if client is None:
-        abort(503, "OIDC login is not configured")
+        abort(503, "OIDC signin is not configured")
     try:
         token = client.authorize_access_token()
     except Exception:  # pylint: disable=broad-exception-caught
         logger.error("OIDC token exchange or ID token validation failed", exc_info=True)
-        abort(502, "OIDC login failed")
+        abort(502, "OIDC signin failed")
     claims = token.get("userinfo") if isinstance(token, dict) else None
     if not isinstance(claims, dict):
-        logger.error("OIDC login failed: token has no validated userinfo")
-        abort(502, "OIDC login failed")
+        logger.error("OIDC signin failed: token has no validated userinfo")
+        abort(502, "OIDC signin failed")
     iss = claims.get("iss")
     sub = claims.get("sub")
     if not isinstance(iss, str) or not iss or not isinstance(sub, str) or not sub:
-        logger.error("OIDC login failed: token claims lack string iss/sub")
-        abort(502, "OIDC login failed")
+        logger.error("OIDC signin failed: token claims lack string iss/sub")
+        abort(502, "OIDC signin failed")
     user = {"iss": iss, "sub": sub}
     email = claims.get("email")
     if isinstance(email, str):
@@ -404,34 +412,37 @@ def callback() -> ResponseReturnValue:
     session.permanent = True
     if not allowed:
         logger.info(
-            "OIDC login bootstrap: iss=%s sub=%s not yet allowlisted; writes denied",
+            "OIDC signin bootstrap: iss=%s sub=%s not yet allowlisted; writes denied",
             iss,
             sub,
         )
     else:
-        # DEBUG only: the login callback is rate-limited, and this pinpoints
+        # DEBUG only: the signin callback is rate-limited, and this pinpoints
         # an allowlist typo (for example a trailing slash on iss).
         logger.debug(
-            "OIDC login: iss=%s sub=%s allowlisted=%s",
+            "OIDC signin: iss=%s sub=%s allowlisted=%s",
             iss,
             sub,
             (iss, sub) in allowed,
         )
-    next_path = validate_next(session.pop("post_login_next", None), _local_root())
+    next_path = validate_next(session.pop("post_signin_next", None), _local_root())
     return redirect(next_path)  # type: ignore[return-value]
 
 
-def logout() -> ResponseReturnValue:
-    """Clear the session, then force an account choice on the next login.
+def signout() -> ResponseReturnValue:
+    """Clear the session and render the signout landing page.
 
     This ends only the Solara session. The provider's browser session is
-    separate, so the next login asks it for an explicit account choice
-    instead of silently signing the user back in.
+    separate, so the page says so, and the next signin asks the provider
+    for an explicit account choice instead of silently signing the user
+    back in.
     """
     session.clear()
     session[_SELECT_ACCOUNT_KEY] = True
     session.permanent = True
-    return redirect(_local_root())  # type: ignore[return-value]
+    issuer = _request_config().oidc_issuer
+    provider = urlsplit(issuer).hostname if issuer else None
+    return render_template("signout.html", provider=provider, root=_local_root())
 
 
 def me() -> Response:
@@ -441,7 +452,7 @@ def me() -> Response:
         "authenticated": user is not None,
         "can_read": _can_read(),
         "can_write": _can_access(),
-        "login_required": _login_required(),
+        "signin_required": _signin_required(),
     }
     return _json_response(payload)
 
@@ -460,7 +471,7 @@ def _gate_reads() -> Response | None:
     if _get_user() is not None:
         return _deny_read(403, "Not allowed to read")
     if _wants_html_page():
-        return _login_redirect()
+        return _signin_redirect()
     return _deny_read(401, "Authentication required")
 
 
@@ -491,9 +502,9 @@ def register_oidc(application: Flask) -> None:
     Args:
         application: The Flask app being built (from ``create_app()``).
     """
-    application.route("/oidc/login", endpoint="oidc_login")(login)
+    application.route("/oidc/signin", endpoint="oidc_signin")(signin)
     application.route("/oidc/callback", endpoint="oidc_callback")(callback)
-    application.route("/oidc/logout", endpoint="oidc_logout")(logout)
+    application.route("/oidc/signout", endpoint="oidc_signout")(signout)
     application.route("/api/me", endpoint="api_me", methods=["GET"])(me)
     application.before_request(_gate_requests)
     application.config["SESSION_COOKIE_HTTPONLY"] = True

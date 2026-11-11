@@ -176,7 +176,7 @@ file passes 250 lines, or when a line passes 100 characters.
 Put new reference text in `docs/`, not here:
 
 - `docs/architecture.md` — module internals, data flow, state ownership.
-- `docs/AUTH.md` — OIDC login, read/write gate, allowlist, deployment.
+- `docs/AUTH.md` — OIDC signin/signout, read/write gate, allowlist, deployment.
 - `docs/LOADMANAGER.md` — load manager settings, decision rules, Tesla setup.
 - `docs/MEASUREMENTS.md` — dated measurements and shipped verdicts.
 - `docs/TESTING.md` — what each test file pins.
@@ -210,7 +210,7 @@ metrics.py             # Re-export shim over the metrics split modules
 mockdata.py            # Test data generation
 mqtt_telemetry.py      # Tesla MQTT parsing and subscriber lifecycle
 notifier.py            # Telegram notification policy and deferred queue
-oidc_auth.py           # OIDC login routes, read/write gate, /api/me
+oidc_auth.py           # OIDC signin/signout routes, read/write gate, /api/me
 prediction.py          # Device prediction dataclasses, quantization window
 quantization.py        # N-second constant-window detection
 settle_window.py       # Adaptive prediction/settle window state machine

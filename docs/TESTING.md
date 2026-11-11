@@ -210,20 +210,21 @@ drift checks.
   second `parse_id_token` call), `next` hardening (backslash, encoded
   double-slash, control characters), the `https`-only issuer (loopback
   `http` allowed), the per-IP auth rate limit, `can_read` /
-  `login_required` on `/api/me`, the write gate (fetch header, 401 for
+  `signin_required` on `/api/me`, the write gate (fetch header, 401 for
   anonymous, 403 for non-allowlisted, empty-allowlist fail-closed), the
   `PUBLIC_URL`-driven redirect URI, empty-allowlist bootstrap logging,
-  subpath mounts (`SCRIPT_NAME`/`X-Forwarded-Prefix` in login, logout,
+  subpath mounts (`SCRIPT_NAME`/`X-Forwarded-Prefix` in signin, signout,
   and the `next` fallback; forged prefix rejected), the one-shot
-  `prompt=select_account` after logout (and its absence on later
-  logins), DEBUG diagnostics for the parsed allowlist, callback match
-  result, and denied identity, and the session cookie config (Authlib
-  faked, `docs/AUTH.md`)
+  `prompt=select_account` after signout (and its absence on later
+  signins), the signout landing page (session cleared, provider named,
+  provider omitted when OIDC is off), DEBUG diagnostics for the parsed
+  allowlist, callback match result, and denied identity, and the session
+  cookie config (Authlib faked, `docs/AUTH.md`)
 - **test_oidc_frontend.py**
   source-contract tests on `static/app.js`: header state from `can_read`,
-  `redirectToLogin()` preserving path and query, partial fetches through
+  `redirectToSignin()` preserving path and query, partial fetches through
   `window.solaraFetch`, `401` redirect handling, and SSE error probing
-  with `login_required`
+  with `signin_required`
 - **test_notifier.py**
   the notification policy seam (D.2): gated surplus (sender, dry-run, empty
   actions, whitelist miss), bypass alerts (auth, drift, fatal fetch, stale data,
