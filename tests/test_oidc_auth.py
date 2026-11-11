@@ -44,13 +44,15 @@ class FakeOidcClient:
         self.claims = claims if claims is not None else dict(SESSION_USER)
         self.include_userinfo = include_userinfo
         self.authorized_redirect_uri: str | None = None
+        self.authorized_params: dict[str, Any] = {}
         self.parse_id_token_calls = 0
 
     def authorize_redirect(
         self, redirect_uri: str | None = None, **kwargs: Any
-    ) -> Response:  # pylint: disable=unused-argument
-        """Record the redirect URI and return a redirect to a fake provider."""
+    ) -> Response:
+        """Record the redirect URI and extra params, return a fake provider redirect."""
         self.authorized_redirect_uri = redirect_uri
+        self.authorized_params = dict(kwargs)
         return redirect("https://issuer.example.com/authorize")
 
     def authorize_access_token(self) -> dict[str, Any]:
@@ -635,6 +637,28 @@ def test_proxy_fix_honours_forwarded_prefix() -> None:
     )
     assert resp.status_code == 302
     assert resp.headers["Location"].startswith("/solara/oidc/login?next=")
+
+
+def test_login_request_has_no_prompt_by_default() -> None:
+    """A normal login lets the provider reuse its browser session."""
+    flask_app = _make_app()
+    flask_app.test_client().get("/oidc/login")
+    fake = flask_app.extensions["oidc_client"]
+    assert "prompt" not in fake.authorized_params
+
+
+def test_logout_forces_account_choice_on_next_login_only() -> None:
+    """An explicit logout makes the next login ask for an account, once."""
+    flask_app = _make_app()
+    flask_client = flask_app.test_client()
+    _login_as(flask_client, SESSION_USER)
+    fake = flask_app.extensions["oidc_client"]
+    flask_client.get("/oidc/logout")
+    flask_client.get("/oidc/login")
+    assert fake.authorized_params.get("prompt") == "select_account"
+    fake.authorized_params.clear()
+    flask_client.get("/oidc/login")
+    assert "prompt" not in fake.authorized_params
 
 
 def test_api_me_anonymous(client: Any) -> None:

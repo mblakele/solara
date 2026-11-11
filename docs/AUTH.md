@@ -14,7 +14,11 @@ every write requires one in all configurations.
   `token["userinfo"]` without re-parsing the ID token. Missing or
   malformed claims fail closed with `502` and store no session user.
   Marks the session permanent and redirects to `next`.
-- `GET /oidc/logout` — clears the session and redirects to `/`.
+- `GET /oidc/logout` — clears the session, sets a one-shot flag, and
+  redirects to the app root. The next login adds
+  `prompt=select_account`, so the provider shows its account chooser
+  instead of silently reusing the browser session. Later logins stay
+  silent. See "Logout scope".
 - `GET /api/me` — `{"authenticated": bool, "can_read": bool,
   "can_write": bool, "login_required": bool}`. Cosmetic only; the
   server-side gate is the real protection.
@@ -127,6 +131,23 @@ Set in `.env` (see `env.example`):
 Session cookies: `HttpOnly`, `SameSite=Lax`, 30-day permanent lifetime.
 The allowlist is checked on every request; there is no server-side
 session store or token revocation.
+
+## Logout scope
+
+`/oidc/logout` ends the Solara session only. The provider's browser
+session is separate: the redirect to the app root reaches the read gate,
+which sends an anonymous HTML request to the provider, and the provider
+can authenticate the user without a prompt.
+
+The one-shot `prompt=select_account` flag forces one account choice
+after an explicit logout. It is a speed bump, not a provider logout.
+Later logins do not send it.
+
+Google's discovery document has no `end_session_endpoint`, so there is
+no portable provider logout to call. Signing out of Google also ends
+Gmail and every other Google session in that browser, which is why this
+app does not do it. On a shared device, sign out of the provider as
+well. The allowlist, not logout, is the security boundary.
 
 ## Rate limiting
 

@@ -16,8 +16,10 @@ Routes (registered by :func:`register_oidc` at app build time):
   the session, and redirect to the provider.
 - ``GET /oidc/callback`` — exchange the code, store {iss, sub, email} in
   the session, mark it permanent, and redirect to the stored ``next``.
-- ``GET /oidc/logout`` — clear the session and redirect to the app root
-  (including any reverse-proxy prefix).
+- ``GET /oidc/logout`` — clear the session, set a one-shot "ask for an
+  account" flag, and redirect to the app root (including any
+  reverse-proxy prefix). The next ``/oidc/login`` sends
+  ``prompt=select_account``.
 - ``GET /api/me`` — {"authenticated": bool, "can_read": bool,
   "can_write": bool, "login_required": bool}; cosmetic only, the
   server-side gate is the real protection.
@@ -72,6 +74,11 @@ _FETCH_HEADER = "X-Requested-With"
 _FETCH_VALUE = "fetch"
 
 PERMANENT_SESSION_LIFETIME = timedelta(days=30)
+
+# One-shot flag: the login after an explicit logout asks the provider to
+# show the account chooser instead of silently reusing the browser session.
+# The next /oidc/login pops it, so later logins stay silent.
+_SELECT_ACCOUNT_KEY = "post_logout_select_account"
 
 # In-memory fixed-window limit for the login handshake. It protects one
 # process; a multi-worker deployment should also limit at the proxy.
@@ -349,7 +356,14 @@ def login() -> ResponseReturnValue:
         request.args.get("next"), _local_root()
     )
     redirect_uri = f"{_request_config().public_url.rstrip('/')}/oidc/callback"
-    return client.authorize_redirect(redirect_uri)  # type: ignore[return-value]
+    # After an explicit logout, force the provider's account chooser so the
+    # browser session cannot silently sign the user straight back in.
+    extra = (
+        {"prompt": "select_account"}
+        if session.pop(_SELECT_ACCOUNT_KEY, False)
+        else {}
+    )
+    return client.authorize_redirect(redirect_uri, **extra)  # type: ignore[return-value]
 
 
 def callback() -> ResponseReturnValue:
@@ -408,8 +422,15 @@ def callback() -> ResponseReturnValue:
 
 
 def logout() -> ResponseReturnValue:
-    """Clear the session and redirect to the dashboard."""
+    """Clear the session, then force an account choice on the next login.
+
+    This ends only the Solara session. The provider's browser session is
+    separate, so the next login asks it for an explicit account choice
+    instead of silently signing the user back in.
+    """
     session.clear()
+    session[_SELECT_ACCOUNT_KEY] = True
+    session.permanent = True
     return redirect(_local_root())  # type: ignore[return-value]
 
 
