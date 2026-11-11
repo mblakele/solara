@@ -2083,15 +2083,19 @@ def create_app(
     if hops > 0:
         application.logger.warning(
             "PROXY_TRUSTED_HOPS=%d: trusting the last %d X-Forwarded-For/"
-            "Proto/Host hop(s); the reverse proxy must overwrite or append "
-            "these headers",
+            "Proto/Host/Prefix hop(s); the reverse proxy must overwrite or "
+            "append these headers",
             hops,
             hops,
         )
         from werkzeug.middleware.proxy_fix import ProxyFix
 
         application.wsgi_app = ProxyFix(  # type: ignore[assignment]
-            application.wsgi_app, x_for=hops, x_proto=hops, x_host=hops
+            application.wsgi_app,
+            x_for=hops,
+            x_proto=hops,
+            x_host=hops,
+            x_prefix=hops,
         )
     application.jinja_env.filters["astimezonestr"] = astimezone_filter
     application.jinja_env.filters["per_second_sparkline"] = per_second_sparkline

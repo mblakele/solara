@@ -275,38 +275,52 @@ def _deny_read(status: int, message: str) -> Response:
 
 def _login_redirect() -> Response:
     """Send a browser page request to the provider with a local ``next``."""
-    target = request.script_root + request.full_path
+    root = _local_root()
+    target = root.rstrip("/") + request.full_path
     if target.endswith("?"):
         target = target[:-1]
-    login_url = f"{request.script_root}/oidc/login"
+    login_url = f"{root}oidc/login"
     return redirect(f"{login_url}?{urlencode({'next': target})}")  # type: ignore[return-value]
 
 
-def validate_next(raw: str | None) -> str:
-    """Return *raw* when it is a local path, else ``"/"``.
+def validate_next(raw: str | None, default: str = "/") -> str:
+    """Return *raw* when it is a local path, else *default*.
 
     A valid ``next`` starts with ``/`` but not ``//`` (a protocol-relative
     URL such as ``//evil.com``). Absolute URLs are rejected too. Encoded
     backslashes, encoded ``//`` prefixes, and control characters are
     rejected after one round of percent-decoding, because browsers and
     proxies disagree about which form they normalize.
+
+    ``default`` lets a subpath deployment fall back to its own root
+    instead of the site root.
     """
     if raw is None:
-        return "/"
+        return default
     raw = raw.strip()
     if not raw or not raw.startswith("/") or raw.startswith("//"):
-        return "/"
+        return default
     decoded = unquote(raw)
     if decoded.startswith("//"):
-        return "/"
+        return default
     if "\\" in decoded:
-        return "/"
+        return default
     if any(ord(char) < 32 or ord(char) == 127 for char in decoded):
-        return "/"
+        return default
     parts = urlsplit(raw)
     if parts.scheme or parts.netloc:
-        return "/"
+        return default
     return raw
+
+
+def _local_root() -> str:
+    """Return this app's root path, including any reverse-proxy prefix.
+
+    The prefix arrives as ``SCRIPT_NAME`` (``ProxyFix`` reads
+    ``X-Forwarded-Prefix``). It is re-validated so a forged prefix cannot
+    turn a redirect into a protocol-relative URL.
+    """
+    return validate_next(f"{request.script_root.rstrip('/')}/")
 
 
 def login() -> ResponseReturnValue:
@@ -321,7 +335,9 @@ def login() -> ResponseReturnValue:
     client = _get_client()
     if client is None:
         abort(503, "OIDC login is not configured")
-    session["post_login_next"] = validate_next(request.args.get("next"))
+    session["post_login_next"] = validate_next(
+        request.args.get("next"), _local_root()
+    )
     redirect_uri = f"{_request_config().public_url.rstrip('/')}/oidc/callback"
     return client.authorize_redirect(redirect_uri)  # type: ignore[return-value]
 
@@ -367,14 +383,14 @@ def callback() -> ResponseReturnValue:
             iss,
             sub,
         )
-    next_path = validate_next(session.pop("post_login_next", None))
+    next_path = validate_next(session.pop("post_login_next", None), _local_root())
     return redirect(next_path)  # type: ignore[return-value]
 
 
 def logout() -> ResponseReturnValue:
     """Clear the session and redirect to the dashboard."""
     session.clear()
-    return redirect("/")  # type: ignore[return-value]
+    return redirect(_local_root())  # type: ignore[return-value]
 
 
 def me() -> Response:

@@ -110,13 +110,15 @@ Set in `.env` (see `env.example`):
   closed).
 - `PUBLIC_URL` — the public base URL (existing knob). The provider
   redirect URI is `<PUBLIC_URL>/oidc/callback`; register that exact
-  URI with the provider.
+  URI with the provider. Include any subpath prefix in this value
+  (for example `https://host/solara`), because the app cannot detect
+  the prefix that the proxy strips.
 - `SESSION_COOKIE_SECURE` — leave unset: it follows `PUBLIC_URL`
   (secure on https, off for local http). Set explicitly only when the
   proxy chain needs it.
 - `PROXY_TRUSTED_HOPS` — exact number of reverse-proxy hops to trust for
-  `X-Forwarded-For/Proto/Host` (ProxyFix). Default `0` disables it.
-  Must stay `0` when `OIDC_ISSUER` is unset: startup raises
+  `X-Forwarded-For/Proto/Host/Prefix` (ProxyFix). Default `0` disables
+  it. Must stay `0` when `OIDC_ISSUER` is unset: startup raises
   `RuntimeError` otherwise, because forwarded headers would let a remote
   client spoof the loopback read exception. When OIDC is enabled,
   startup warns and the proxy must append or overwrite the headers.
@@ -167,9 +169,29 @@ proxy, set `PUBLIC_URL` to the public `https://...` URL and
 overwrite `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`;
 never forward a client-supplied `X-Forwarded-For` unchanged. OIDC must
 be enabled whenever hops > 0: startup refuses the unsafe combination.
-See the safety matrix in `docs/SECURITY.md` (M6). The Tesla OAuth flow
-remains on `/api/v1/tesla/auth/initiate` and `/callback`, so the OIDC
-redirect URI is intentionally namespaced under `/oidc/callback`.
+The Tesla OAuth flow remains on `/api/v1/tesla/auth/initiate` and
+`/callback`, so the OIDC redirect URI is intentionally namespaced under
+`/oidc/callback`.
+
+To mount the app under a subpath such as `/solara`, strip the prefix at
+the proxy and send it in `X-Forwarded-Prefix`:
+
+```nginx
+location /solara/ {
+    proxy_pass http://127.0.0.1:8000/;
+    proxy_set_header X-Forwarded-Prefix /solara;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+}
+```
+
+`ProxyFix` turns that header into `SCRIPT_NAME`, so login, logout, and
+the post-login redirect stay under `/solara`. Set
+`PUBLIC_URL=https://<host>/solara` and register
+`https://<host>/solara/oidc/callback` with the provider. The dashboard
+HTML and `static/app.js` already use relative URLs, so they need no
+prefix configuration. See the safety matrix in `docs/SECURITY.md` (M6).
 
 Enable OIDC before exposing the app publicly: anonymous data reads are
 denied once `OIDC_ISSUER` is set, and a non-loopback deployment with

@@ -541,6 +541,67 @@ def test_logout_clears_session(client: Any) -> None:
         assert "user" not in sess
 
 
+SUBPATH_ENV = {"SCRIPT_NAME": "/solara"}
+
+
+def test_login_redirect_keeps_proxy_prefix() -> None:
+    """A subpath mount redirects to <prefix>/oidc/login with a prefixed next."""
+    flask_client = _make_app().test_client()
+    resp = flask_client.get(
+        "/", headers={"Accept": "text/html"}, environ_overrides=SUBPATH_ENV
+    )
+    assert resp.status_code == 302
+    location = resp.headers["Location"]
+    assert location.startswith("/solara/oidc/login?next=")
+    assert "next=%2Fsolara%2F" in location
+
+
+def test_login_stores_prefixed_next_when_none_given() -> None:
+    """A bare login request stores the prefixed root as the post-login target."""
+    flask_client = _make_app().test_client()
+    flask_client.get("/oidc/login", environ_overrides=SUBPATH_ENV)
+    with flask_client.session_transaction() as sess:
+        assert sess["post_login_next"] == "/solara/"
+
+
+def test_callback_defaults_to_proxy_prefix() -> None:
+    """Without a stored next, the callback returns to the prefixed root."""
+    flask_client = _make_app().test_client()
+    resp = flask_client.get("/oidc/callback", environ_overrides=SUBPATH_ENV)
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/solara/"
+
+
+def test_logout_redirects_to_proxy_prefix() -> None:
+    """Logout returns to the prefixed root, not the site root."""
+    flask_client = _make_app().test_client()
+    _login_as(flask_client, SESSION_USER)
+    resp = flask_client.get("/oidc/logout", environ_overrides=SUBPATH_ENV)
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/solara/"
+
+
+def test_protocol_relative_prefix_cannot_open_redirect() -> None:
+    """A forged prefix must not turn logout into a protocol-relative redirect."""
+    flask_client = _make_app().test_client()
+    _login_as(flask_client, SESSION_USER)
+    resp = flask_client.get(
+        "/oidc/logout", environ_overrides={"SCRIPT_NAME": "//evil.example.com"}
+    )
+    assert resp.headers["Location"] == "/"
+
+
+def test_proxy_fix_honours_forwarded_prefix() -> None:
+    """PROXY_TRUSTED_HOPS wires X-Forwarded-Prefix into script_root."""
+    flask_client = _make_app(PROXY_TRUSTED_HOPS="1").test_client()
+    resp = flask_client.get(
+        "/",
+        headers={"Accept": "text/html", "X-Forwarded-Prefix": "/solara"},
+    )
+    assert resp.status_code == 302
+    assert resp.headers["Location"].startswith("/solara/oidc/login?next=")
+
+
 def test_api_me_anonymous(client: Any) -> None:
     """Anonymous /api/me reports no user, no access, and that login is required."""
     resp = client.get("/api/me")
