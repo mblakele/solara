@@ -15,7 +15,7 @@ Both bypass the telegram.devices whitelist and fire in dry-run. Fire-only.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from clock import FakeClock
 from load_manager import LoadManager, LoadManagerConfig
@@ -32,6 +32,40 @@ def _mgr(now: datetime, **kw) -> LoadManager:
             config_interval_secs=30,
             **kw,
         )
+    )
+
+
+def _cycle_mgr(now: datetime) -> tuple[LoadManager, FakeClock]:
+    """Manager wirable for run_cycle, with a controllable meter cache."""
+    from energy_cache import EnergyCache
+
+    sender = MagicMock(is_configured=True)
+    clock = FakeClock(now)
+    cache = EnergyCache(ttl_seconds=30, clock=clock)
+    mgr = LoadManager(
+        LoadManagerConfig(
+            telegram_sender=sender, clock=clock, dry_run=True,
+            config_interval_secs=30, energy_cache=cache, enabled=True,
+        )
+    )
+    mgr._telegram_devices = None
+    return mgr, clock
+
+
+def _seed_cache(mgr: LoadManager, last_sample_at: datetime,
+                now: datetime) -> None:
+    """Seed the shared meter cache with one sample at *last_sample_at*."""
+    from energy_cache import EnergyCacheData
+
+    mgr.nbc_reader.energy_cache._data = EnergyCacheData(  # pylint: disable=protected-access
+        samples=[-0.04],
+        data_start=last_sample_at,
+        last_sample_at=last_sample_at,
+        last_fetch_at=now,
+        sample_count=1,
+        quantization_seconds=None,
+        quantization_offset=None,
+        quantization_confidence=None,
     )
 
 
@@ -185,10 +219,13 @@ class TestStaleSplit:
     """Split meter-staleness from pipeline-stall (bugs/2026-10-13 log).
 
     The 16:00:12 alert reported "last data point 369s old" while the
-    meter was ~11s old: the QH rollover yielded 1 sample so ctx
-    carried no data point and the check fell back to the last
-    acted-on point (15:54:01Z). Meter health and prediction health
-    must alert separately with honest text.
+    meter was ~11s old. Meter health and prediction health must alert
+    separately with honest text.
+
+    The 2026-10-13 log has no pipeline page: the split post-dates it, so
+    the prediction ages seeded here are synthetic. What these tests pin
+    is the routing — a fresh meter plus an old *usable prediction* pages
+    the pipeline, never the meter.
     """
 
     def _incident_mgr(self, now: datetime) -> LoadManager:
@@ -206,33 +243,18 @@ class TestStaleSplit:
         mgr._telegram_devices = None
         return mgr
 
-    def _seed_cache(self, mgr: LoadManager, last_sample_at: datetime,
-                    now: datetime) -> None:
-        from energy_cache import EnergyCacheData
-
-        mgr.nbc_reader.energy_cache._data = EnergyCacheData(  # pylint: disable=protected-access
-            samples=[-0.04],
-            data_start=last_sample_at,
-            last_sample_at=last_sample_at,
-            last_fetch_at=now,
-            sample_count=1,
-            quantization_seconds=None,
-            quantization_offset=None,
-            quantization_confidence=None,
-        )
-
     def test_qh_boundary_fresh_meter_pages_pipeline_not_meter(self):
         """Fresh meter + stalled pipeline: one pipeline alert, no meter alert."""
         from load_models import CycleContext
 
         now = datetime(2026, 10, 13, 16, 0, 9, tzinfo=timezone.utc)
         mgr = self._incident_mgr(now)
-        # Last acted-on point frozen since 15:54:01Z (waiting_for_fresh_data).
-        mgr.state.last_data_point_at = datetime(
+        # No usable prediction since 15:54:01Z (368s before the check).
+        mgr._last_usable_prediction_at = datetime(
             2026, 10, 13, 15, 54, 1, tzinfo=timezone.utc
         )
         # Meter just fetched OK: last sample 16:00:01Z (~8s old).
-        self._seed_cache(
+        _seed_cache(
             mgr, datetime(2026, 10, 13, 16, 0, 1, tzinfo=timezone.utc), now
         )
         ctx = CycleContext(now=now, data_point_at=None, now_postfetch=None)
@@ -249,10 +271,10 @@ class TestStaleSplit:
 
         now = datetime(2026, 10, 13, 16, 0, 9, tzinfo=timezone.utc)
         mgr = self._incident_mgr(now)
-        mgr.state.last_data_point_at = datetime(
+        mgr._last_usable_prediction_at = datetime(
             2026, 10, 13, 15, 54, 1, tzinfo=timezone.utc
         )
-        self._seed_cache(
+        _seed_cache(
             mgr, now - timedelta(seconds=400), now - timedelta(seconds=400)
         )
         ctx = CycleContext(now=now, data_point_at=None, now_postfetch=None)
@@ -263,13 +285,109 @@ class TestStaleSplit:
         assert "prediction stalled" not in descs[0]
 
     def test_fresh_meter_and_pipeline_stays_quiet(self):
-        """Fresh meter + recent decision point: no alert at all."""
+        """Fresh meter + recent usable prediction: no alert at all."""
         from load_models import CycleContext
 
         now = datetime(2026, 10, 13, 16, 0, 9, tzinfo=timezone.utc)
         mgr = self._incident_mgr(now)
-        mgr.state.last_data_point_at = now - timedelta(seconds=30)
-        self._seed_cache(mgr, now - timedelta(seconds=8), now)
+        mgr._last_usable_prediction_at = now - timedelta(seconds=30)
+        _seed_cache(mgr, now - timedelta(seconds=8), now)
         ctx = CycleContext(now=now, data_point_at=None, now_postfetch=None)
         mgr._check_data_health_alerts(ctx)  # pylint: disable=protected-access
         assert not mgr._pending_notifications
+
+
+class TestPipelineUsablePrediction:
+    """The pipeline page measures the last usable prediction, not a decision.
+
+    The 2026-11-10 20:30:37 page fired at 304s on ``last_data_point_at``
+    while a prediction had been produced 64s earlier and the loop was
+    only waiting on its own pending effects.
+    """
+
+    def test_stage_nbc_fetch_records_usable_prediction(self):
+        """A cycle past the sample gate records the post-fetch time."""
+        from load_nbc import NBCFetchResult
+
+        now = datetime(2026, 11, 10, 20, 29, 30, tzinfo=timezone.utc)
+        mgr, _ = _cycle_mgr(now)
+        _seed_cache(mgr, now - timedelta(seconds=30), now)
+        fetched = NBCFetchResult(
+            qh_name="QH1", predicted_wh=0.35, seconds_remaining=30,
+            data_point_at=now - timedelta(seconds=28), samples_used=30,
+        )
+        with patch.object(
+            mgr.nbc_reader, "get_current_qh", return_value=fetched
+        ):
+            mgr.run_cycle()
+        tracked = mgr._last_usable_prediction_at
+        assert tracked is not None
+        assert abs((tracked - now).total_seconds()) < 1.0
+
+    def test_incident_20261110_does_not_page(self):
+        """304s on the old anchor, 64s on the usable-prediction anchor."""
+        from load_models import CycleContext
+
+        now = datetime(2026, 11, 10, 20, 30, 37, tzinfo=timezone.utc)
+        mgr, _ = _cycle_mgr(now)
+        _seed_cache(
+            mgr, datetime(2026, 11, 10, 20, 30, 3, tzinfo=timezone.utc), now
+        )
+        # The old measure: last compute_gap at 20:25:33 (304s).
+        mgr.state.last_data_point_at = datetime(
+            2026, 11, 10, 20, 25, 33, tzinfo=timezone.utc
+        )
+        # The new measure: prediction produced at 20:29:33 (64s).
+        mgr._last_usable_prediction_at = datetime(
+            2026, 11, 10, 20, 29, 33, tzinfo=timezone.utc
+        )
+        ctx = CycleContext(now=now, data_point_at=None, now_postfetch=None)
+        mgr._check_data_health_alerts(ctx)  # pylint: disable=protected-access
+        assert not mgr._pending_notifications
+
+    def test_previous_qh_prediction_counts_as_usable(self):
+        """The 2026-10-17 shape: prediction produced 156s ago, no page."""
+        from load_models import CycleContext
+
+        now = datetime(2026, 10, 17, 15, 32, 47, tzinfo=timezone.utc)
+        mgr, _ = _cycle_mgr(now)
+        _seed_cache(
+            mgr, datetime(2026, 10, 17, 15, 30, 5, tzinfo=timezone.utc), now
+        )
+        mgr.state.last_data_point_at = now - timedelta(seconds=306)
+        mgr._last_usable_prediction_at = now - timedelta(seconds=156)
+        ctx = CycleContext(now=now, data_point_at=None, now_postfetch=None)
+        mgr._check_data_health_alerts(ctx)  # pylint: disable=protected-access
+        assert not mgr._pending_notifications
+
+    def test_real_stall_pages_with_stage2_reason(self):
+        """No prediction for 400s pages once, with the real stage-2 reason."""
+        from load_nbc import NBCFetchResult
+
+        now = datetime(2026, 11, 10, 21, 0, 9, tzinfo=timezone.utc)
+        mgr, clock = _cycle_mgr(now)
+        _seed_cache(mgr, now - timedelta(seconds=30), now)
+        mgr.state.last_data_point_at = now - timedelta(seconds=400)
+        mgr._last_usable_prediction_at = now - timedelta(seconds=400)
+        starved = NBCFetchResult(
+            qh_name="QH1", predicted_wh=0.0, seconds_remaining=30,
+            data_point_at=now, samples_used=1,
+        )
+        with patch.object(
+            mgr.nbc_reader, "get_current_qh", return_value=starved
+        ):
+            result = mgr.run_cycle()
+        assert result.status == "no_incomplete_qh"
+        descs = [e.description for e in mgr._pending_notifications]
+        assert len(descs) == 1
+        assert "last usable prediction 400s old" in descs[0]
+        assert "reason=insufficient_samples" in descs[0]
+        assert "decision point" not in descs[0]
+        # Same QH: the per-QH throttle still holds.
+        clock.advance(30)
+        _seed_cache(mgr, clock.now() - timedelta(seconds=30), clock.now())
+        with patch.object(
+            mgr.nbc_reader, "get_current_qh", return_value=starved
+        ):
+            mgr.run_cycle()
+        assert len(mgr._pending_notifications) == 1

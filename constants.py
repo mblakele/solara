@@ -54,11 +54,18 @@ detected quantization window. Mirrors the 2-minute fallback reload timer
 in ``static/app.js``."""
 
 DATA_STALE_ALERT_THRESHOLD_SECS: int = 300
-"""Wall-clock age (seconds) of the most recent NBC data point before the
-load manager queues a Telegram data-health alert. Covers both stale
-``data_point_at`` and the boot-empty case (age measured from manager
-start when no data point has ever been seen). Throttled to one alert
-per QH per type (see ``LoadManager._check_stale_data_alert``)."""
+"""Wall-clock age (seconds) of the most recent meter sample before the load
+manager queues a meter-staleness Telegram alert. Covers the boot-empty case
+too (age measured from manager start when no sample has ever been seen).
+Throttled to one alert per QH (see ``LoadManager._check_stale_data_alert``).
+Meter feed only — pipeline health has its own constant below."""
+
+PIPELINE_STALL_ALERT_THRESHOLD_SECS: int = 300
+"""Wall-clock age (seconds) of the most recent usable prediction before the
+load manager queues a pipeline-stall Telegram alert. A usable prediction is
+one the NBC fetch produced with at least ``MIN_SAMPLES_FOR_PREDICTION``
+samples; it need not have reached a decision. Throttled to one alert per QH
+(see ``LoadManager._check_pipeline_stall_alert``)."""
 
 PRUNE_WINDOW_SECS: int = 3600
 """Samples older than this many seconds are pruned from EnergyCache."""

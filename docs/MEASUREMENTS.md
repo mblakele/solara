@@ -386,3 +386,37 @@ and never forecast. The 1 s incident is accepted; the 61 s case seen earlier in
 the same log is rejected, leaving QH2 empty rather than moving 16:00 into the
 finished slot. The trade is bounded: at 7 kW, 5 s is about 10 Wh against a
 2625 Wh quarter, and the value self-corrects when the full 900 samples land.
+
+## 2026-11-11: pipeline-stall alert measures the last usable prediction
+
+Two pipeline pages exist in the corpus, 2 s apart on the old anchor, so no
+threshold separates them from normal operation:
+
+| Log | Old anchor (`last_data_point_at`) | Page | New age | Outcome |
+|---|---|---|---|---|
+| `2026-11-09-8022f13cbb…log` | 304 s | 20:30:37 | 64 s | page removed |
+| `2026-10-17-d4ef488ca2…log` | 306 s | 15:32:47 | 147 s | page removed |
+
+Ad hoc read-only sweep (not checked in). For each log, the usable-prediction
+events are the cycles that got past the NBC fetch stage: `cycle_complete`,
+`cycle_waiting_for_fresh_data`, `cycle_previous_qh`, or a `cycle_early_exit` at
+a stage other than `nbc_fetch` / `enabled_check`, deduplicated by cycle id.
+Both pages were re-measured at the same ages. The largest gap between
+consecutive usable predictions is 304 s, in the 2026-10-17 log, and it spans a
+process restart (pid changes, `LoadManager shut down cleanly`, no cycles from
+18:29:03 to 18:34:07), so no check could fire. Normal gaps are 54–130 s.
+
+The incident's forecaster was alive throughout: stage 2 succeeded every cycle
+to 20:29:33, the pipeline was blocked at `pending_check` by its own pending
+effects for 180 s, then the 20:30 fetch missed and recovered at 20:30:46, 9 s
+after the page. The 2026-10-17 page fired 10 s before self-recovery.
+
+Verdict (shipped, option A): the page measures the age of the most recent
+prediction with at least `MIN_SAMPLES_FOR_PREDICTION` samples
+(`PIPELINE_STALL_ALERT_THRESHOLD_SECS`, 300 s). It no longer measures the last
+`compute_gap`, which also required a decision to run. Accepted loss: a long
+`waiting_for_fresh_data` wait with a live forecaster (the 2026-10-13 shape,
+~363 s) no longer pages; that is a separate failure mode and needs its own
+rule. With no prediction yet, the anchor is `None` and the page stays silent,
+as before.
+

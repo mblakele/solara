@@ -34,6 +34,7 @@ from constants import (
     DEFAULT_PREDICTION_WINDOW_SECS,
     DEFAULT_SLEEP_HINT_SECS,
     MIN_SAMPLES_FOR_PREDICTION,
+    PIPELINE_STALL_ALERT_THRESHOLD_SECS,
     STALE_DATA_THRESHOLD_SECS,
 )
 
@@ -436,6 +437,11 @@ class LoadManager:
         self._last_fetch_fatal_alert_qh: datetime | None = None
         self._last_stale_alert_qh: datetime | None = None
         self._last_pipeline_alert_qh: datetime | None = None
+        # Wall-clock time of the most recent usable prediction (a fetch that
+        # passed MIN_SAMPLES_FOR_PREDICTION). The pipeline-stall alert measures
+        # this, not the last decision: a cycle can forecast and still stop at
+        # pending effects (the 2026-11-10 20:30:37 page).
+        self._last_usable_prediction_at: datetime | None = None
         # Out-of-range ON alerts: per-device QH throttle so a forgotten
         # manual ON pages once per quarter-hour, not every 30 s cycle.
         self._last_out_of_range_alert_qh: dict[str, datetime] = {}
@@ -676,7 +682,8 @@ class LoadManager:
         If samples_used < MIN_SAMPLES_FOR_PREDICTION, returns early with a short
         sleep hint instead of acting on unreliable data.  Otherwise populates
         ctx.qh_name, ctx.predicted_wh, ctx.seconds_remaining, ctx.data_point_at,
-        and ctx.now_postfetch, then returns None.
+        and ctx.now_postfetch, records ``_last_usable_prediction_at``, then
+        returns None.
         """
         fetch_start = _time_mod.perf_counter()
         qh_result = self.nbc_reader.get_current_qh(force=True, now=ctx.now)
@@ -698,6 +705,7 @@ class LoadManager:
         ctx.data_point_at = qh_result.data_point_at
         fetch_end = _time_mod.perf_counter()
         ctx.now_postfetch = ctx.now + timedelta(seconds=fetch_end - fetch_start)
+        self._last_usable_prediction_at = ctx.now_postfetch
         return None
 
     @staticmethod
@@ -2467,7 +2475,7 @@ class LoadManager:
 
     def _check_pipeline_stall_alert(
         self,
-        pipe_point_at: datetime | None,
+        prediction_at: datetime | None,
         meter_age_secs: float | None,
         now: datetime,
         reason: str,
@@ -2476,25 +2484,26 @@ class LoadManager:
 
         Fires only when the meter feed itself is fresh (the caller gates
         on meter age): the Emporia data is arriving but the pipeline has
-        not produced a decision-grade point — e.g. QH-boundary
-        ``insufficient_samples`` or a long ``waiting_for_fresh_data``
-        stall. The message reports both ages so the page cannot be read
-        as meter staleness.
+        produced no new prediction — e.g. QH-boundary
+        ``insufficient_samples`` or a long fetch outage. A prediction
+        blocked downstream by pending effects is not a pipeline stall
+        and does not page; only forecast production does. The message
+        reports both ages so the page cannot be read as meter staleness.
 
         Args:
-            pipe_point_at: Last decision-grade data point, or None when
-                no decision has ever been made (then the meter alert
-                owns the page, not this one).
+            prediction_at: Time the most recent usable prediction was
+                produced, or None when none has been produced yet (then
+                the meter alert owns the page, not this one).
             meter_age_secs: Age of the most recent meter sample, or None
                 when unknown.
             now: Current wall-clock time for age math and the QH key.
-            reason: Short tag included in the alert text (e.g.
-                ``no_incomplete_qh``).
+            reason: Short tag for the stage-2 exit that starved this
+                cycle (e.g. ``insufficient_samples``).
         """
-        if pipe_point_at is None:
+        if prediction_at is None:
             return
-        pipe_age_secs = (now - pipe_point_at).total_seconds()
-        if pipe_age_secs <= DATA_STALE_ALERT_THRESHOLD_SECS:
+        pipe_age_secs = (now - prediction_at).total_seconds()
+        if pipe_age_secs <= PIPELINE_STALL_ALERT_THRESHOLD_SECS:
             return
         qh = floor_to_qh(now)
         if self._last_pipeline_alert_qh == qh:
@@ -2505,14 +2514,15 @@ class LoadManager:
             else "unknown age"
         )
         message = (
-            f"Solara prediction stalled: no usable prediction for "
-            f"{pipe_age_secs:.0f}s (last decision point "
-            f"{pipe_age_secs:.0f}s old, meter data {meter_txt}, "
+            f"Solara prediction stalled: last usable prediction "
+            f"{pipe_age_secs:.0f}s old (meter data {meter_txt}, "
             f"reason={reason})"
         )
         self._queue_pipeline_notification(message)
 
-    def _check_data_health_alerts(self, ctx: CycleContext) -> None:
+    def _check_data_health_alerts(
+        self, ctx: CycleContext, pipeline_reason: str = "unknown"
+    ) -> None:
         """Run data-health alert checks for the current cycle.
 
         Called by ``run_cycle()`` right after the NBC fetch stage (on both
@@ -2522,14 +2532,18 @@ class LoadManager:
         to ``last_fetch_at``), never from the pipeline's last acted-on
         point: a fresh fetch with ``insufficient_samples`` at a QH
         boundary must not page as stale data
-        (bugs/2026-10-13-stale-data-369s-alert.log). A stalled pipeline
-        with a fresh meter pages separately via
-        :meth:`_check_pipeline_stall_alert` so the two failure modes stay
-        distinguishable; a stale meter suppresses the pipeline page to
-        avoid a double alert for one outage.
+        (bugs/2026-10-13-stale-data-369s-alert.log). A pipeline that
+        produces no usable prediction with a fresh meter pages separately
+        via :meth:`_check_pipeline_stall_alert` so the two failure modes
+        stay distinguishable; a stale meter suppresses the pipeline page
+        to avoid a double alert for one outage.
 
         Args:
             ctx: Current pipeline context.
+            pipeline_reason: Stage-2 exit reason for the pipeline page
+                (default ``unknown`` for direct calls). Unused when stage
+                2 succeeded: the prediction age is then ~0 and no page
+                fires.
         """
         ec = getattr(self.nbc_reader, "energy_cache", None)
         err = getattr(ec, "last_fetch_error", None) if ec is not None else None
@@ -2549,14 +2563,14 @@ class LoadManager:
             self._check_stale_data_alert(None, now_ref, "no_data")
             meter_age_secs = None
         if ctx.data_point_at is None:
-            pipe_point = self.state.last_data_point_at
+            pipe_point = self._last_usable_prediction_at
             if (
                 pipe_point is not None
                 and meter_age_secs is not None
                 and meter_age_secs <= DATA_STALE_ALERT_THRESHOLD_SECS
             ):
                 self._check_pipeline_stall_alert(
-                    pipe_point, meter_age_secs, now_ref, "no_incomplete_qh"
+                    pipe_point, meter_age_secs, now_ref, pipeline_reason
                 )
 
     @property
@@ -3233,11 +3247,17 @@ class LoadManager:
             )
             # Escalate any persistent Emporia drift detected during the fetch
             # to ERROR + one-time Telegram alert, on both the success and
-            # early-exit paths. Data-health alerts (fatal fetch errors +
-            # 300 s stale/no-data) run on the same paths so a swallowed
-            # fetch exception still pages (bugs/2026-09-16).
+            # early-exit paths. Data-health alerts (fatal fetch errors,
+            # 300 s meter staleness, pipeline stall) run on the same paths so
+            # a swallowed fetch exception still pages (bugs/2026-09-16).
             self._drain_drift_alerts()
-            self._check_data_health_alerts(ctx)
+            stage2_reason = (
+                stage2_result.diagnostics.reason
+                if stage2_result is not None
+                and stage2_result.diagnostics is not None
+                else "ok"
+            )
+            self._check_data_health_alerts(ctx, pipeline_reason=stage2_reason)
             if stage2_result:
                 logger.info("cycle_early_exit stage=nbc_fetch status=%s reason=%s",
                             stage2_result.status, stage2_result.diagnostics.reason if stage2_result.diagnostics else "none",
