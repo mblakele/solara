@@ -759,6 +759,41 @@ class LoadManager:
             setting.target_wh, band
         )
 
+    def target_wh_at(self, dt: datetime) -> int:
+        """Return the target Wh in effect at wall-clock *dt*.
+
+        A target that is fixed for the manager lifetime (an injected target
+        or a ``LOAD_TARGET_WH`` override) returns the current value for every
+        *dt*. Otherwise the devices.json schedule resolves at *dt*.
+
+        Args:
+            dt: Wall-clock time to resolve the target for.
+
+        Returns:
+            The aim point in Wh.
+        """
+        if self._target_static or self._target_override is not None:
+            return self.target_wh
+        return device_config.get_target_wh_setting(dt).target_wh
+
+    def hysteresis_wh_at(self, dt: datetime) -> int:
+        """Return the deadband width in effect at wall-clock *dt*.
+
+        Uses the same fixed-target rule as ``target_wh_at``. With a band the
+        width is the farthest distance from the aim to a band edge; without
+        one it is ``int(abs(target_wh) / 3)``.
+
+        Args:
+            dt: Wall-clock time to resolve the deadband for.
+
+        Returns:
+            The deadband width in Wh.
+        """
+        if self._target_static or self._target_override is not None:
+            return self.engine.HYSTERESIS_WH
+        setting = device_config.get_target_wh_setting(dt)
+        return self._band_hysteresis(setting.target_wh, setting.band)
+
     def _inside_target_band(self, value: float) -> bool:
         """Return True when *value* needs no action.
 

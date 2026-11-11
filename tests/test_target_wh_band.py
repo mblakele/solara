@@ -194,3 +194,100 @@ def test_inside_target_band_without_band_uses_heuristic(tmp_path: Path) -> None:
 
     assert manager._inside_target_band(-7.0) is True    # gap 2 <= 3
     assert manager._inside_target_band(-5.0) is False   # gap 4 > 3
+
+
+# --- Per-quarter target lookup ---
+
+
+def test_target_wh_at_resolves_each_schedule_window(tmp_path: Path) -> None:
+    """The lookup returns the aim of the window that covers the given time."""
+    path = tmp_path / "devices.json"
+    path.write_text(json.dumps(_payload({
+        "target_wh": -9,
+        "target_wh_schedule": [
+            {"time_range": "00:00-15:00", "target_wh_range": [90, 110]},
+            {"time_range": "15:00-00:00", "target_wh_range": [-10, -5]},
+        ],
+    })))
+    manager = _manager(path, FakeClock(NOW))
+
+    assert manager.target_wh_at(datetime(2026, 5, 7, 14, 0, tzinfo=UTC)) == 100
+    # Windows are half-open: 15:00 belongs to the second window.
+    assert manager.target_wh_at(datetime(2026, 5, 7, 15, 0, tzinfo=UTC)) == -8
+
+
+def test_hysteresis_wh_at_resolves_each_schedule_window(tmp_path: Path) -> None:
+    """The deadband follows the band of the window that covers the time."""
+    path = tmp_path / "devices.json"
+    path.write_text(json.dumps(_payload({
+        "target_wh": -9,
+        "target_wh_schedule": [
+            {"time_range": "00:00-15:00", "target_wh_range": [90, 110]},
+            {"time_range": "15:00-00:00", "target_wh_range": [-10, -5]},
+        ],
+    })))
+    manager = _manager(path, FakeClock(NOW))
+
+    assert manager.hysteresis_wh_at(datetime(2026, 5, 7, 14, 0, tzinfo=UTC)) == 10
+    assert manager.hysteresis_wh_at(datetime(2026, 5, 7, 15, 0, tzinfo=UTC)) == 3
+
+
+def test_target_wh_at_without_band_uses_heuristic(tmp_path: Path) -> None:
+    """A scalar target keeps the int(abs(target)/3) deadband at every time."""
+    path = tmp_path / "devices.json"
+    path.write_text(json.dumps(_payload({"target_wh": -9})))
+    manager = _manager(path, FakeClock(NOW))
+
+    for hour in (0, 12, 23):
+        moment = datetime(2026, 5, 7, hour, 0, tzinfo=UTC)
+        assert manager.target_wh_at(moment) == -9
+        assert manager.hysteresis_wh_at(moment) == 3
+
+
+def test_target_wh_at_is_constant_for_injected_target(tmp_path: Path) -> None:
+    """An injected target is fixed for the manager lifetime."""
+    path = tmp_path / "devices.json"
+    path.write_text(json.dumps(_payload({
+        "target_wh": -9,
+        "target_wh_schedule": [
+            {"time_range": "00:00-15:00", "target_wh_range": [90, 110]},
+        ],
+    })))
+    with patch.object(device_config, "_DEVICES_FILE", path):
+        device_config.reload()
+        manager = LoadManager(
+            LoadManagerConfig(
+                config=None,
+                plug_ctrl=PlugController({}),
+                tesla_ctrl=None,
+                nbc_device="M1",
+                enabled=True,
+                dry_run=True,
+                clock=FakeClock(NOW),
+                target_wh=-500,
+            )
+        )
+
+    for hour in (0, 12, 23):
+        moment = datetime(2026, 5, 7, hour, 0, tzinfo=UTC)
+        assert manager.target_wh_at(moment) == -500
+        assert manager.hysteresis_wh_at(moment) == 166
+
+
+def test_target_wh_at_is_constant_for_env_override(tmp_path: Path) -> None:
+    """LOAD_TARGET_WH wins at every time."""
+    path = tmp_path / "devices.json"
+    path.write_text(json.dumps(_payload({
+        "target_wh": -9,
+        "target_wh_schedule": [
+            {"time_range": "00:00-15:00", "target_wh_range": [90, 110]},
+        ],
+    })))
+    cfg = Config(overrides={"LOAD_TARGET_WH": "-1000"})
+    manager = _manager(path, FakeClock(NOW), config=cfg)
+
+    for hour in (0, 12, 23):
+        moment = datetime(2026, 5, 7, hour, 0, tzinfo=UTC)
+        assert manager.target_wh_at(moment) == -1000
+        assert manager.hysteresis_wh_at(moment) == 333
+

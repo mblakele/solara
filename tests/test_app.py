@@ -3,15 +3,18 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time as time_module
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import requests
 from werkzeug.exceptions import BadRequest
+import device_config
 from app import app
 from config import Config
 
@@ -529,6 +532,9 @@ def _make_lm(result, *, interval=30):
     lm.target_wh = -500
     lm.nbc_device = "test_nbc"
     lm.state.to_dict.return_value = {}
+    # The payload builder resolves per-quarter targets through these.
+    lm.target_wh_at.side_effect = lambda _dt: lm.target_wh
+    lm.hysteresis_wh_at.side_effect = lambda _dt: 50
     if interval is not None:
         lm.config_interval_secs = interval
     if result is not None:
@@ -1692,6 +1698,178 @@ class TestBuildLoadManagementPayloadLocked(unittest.TestCase):
         self.assertEqual(result["enabled"], True)
         self.assertEqual(result["target_wh"], -500)
         self.assertEqual(result["state"], {"devices": {}})
+
+
+class TestHistoryTargetsPayload(unittest.TestCase):
+    """_build_load_management_payload grades each Recent pill per quarter."""
+
+    def setUp(self):
+        import app as app_mod
+        self._app = app_mod
+        state = app_mod._state
+        self._orig_data = state.energy_cache._data
+        self.addCleanup(setattr, state.energy_cache, "_data", self._orig_data)
+        state.energy_cache._data = None
+        state.load_manager = None
+        state.last_cycle_result = None
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._devices_path = Path(tmp.name) / "devices.json"
+        devices_patch = patch.object(
+            device_config, "_DEVICES_FILE", self._devices_path
+        )
+        devices_patch.start()
+        self.addCleanup(devices_patch.stop)
+        self.addCleanup(device_config.reload)
+
+    def _manager(self, smartmeter: dict, clock: datetime) -> Any:
+        """Build a LoadManager against a temporary devices.json."""
+        from clock import FakeClock
+        from load_controllers import PlugController
+        from load_manager import LoadManager, LoadManagerConfig
+
+        self._devices_path.write_text(json.dumps({
+            "timezone": "UTC",
+            "smartmeter": {"device": "M1", **smartmeter},
+        }))
+        device_config.reload()
+        return LoadManager(
+            LoadManagerConfig(
+                plug_ctrl=PlugController({}),
+                tesla_ctrl=None,
+                nbc_device="M1",
+                enabled=True,
+                dry_run=True,
+                clock=FakeClock(clock),
+            )
+        )
+
+    @staticmethod
+    def _metrics(
+        data_start: datetime, fetched_at: datetime, sample_count: int
+    ) -> dict:
+        """Metrics dict whose nbc device window is data_start + sample_count."""
+        return {
+            "data_start": data_start,
+            "_fetched_at": fetched_at,
+            "devices": [
+                {
+                    "name": "METER",
+                    "nbc": {
+                        "QH1": {"raw_wh": 1.0, "complete": True},
+                        "QH2": {"raw_wh": 2.0, "complete": True},
+                        "QH3": {"raw_wh": 3.0, "complete": True},
+                        "QH4": {"raw_wh": 4.0, "complete": True},
+                    },
+                    "per_second_data": [0.0] * sample_count,
+                }
+            ],
+        }
+
+    def _cache_with_metrics(self, metrics: dict | None) -> None:
+        """Store *metrics* as the cache's full metrics dict."""
+        from energy_cache import EnergyCacheData
+
+        data_start = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+        self._app._state.energy_cache._data = EnergyCacheData(
+            samples=[0.0] * 3600,
+            data_start=data_start,
+            last_sample_at=datetime(2026, 5, 7, 13, 0, tzinfo=timezone.utc),
+            last_fetch_at=datetime(2026, 5, 7, 12, 32, tzinfo=timezone.utc),
+            sample_count=3600,
+            quantization_seconds=None,
+            quantization_offset=None,
+            quantization_confidence=None,
+            full_metrics_dict=metrics,
+        )
+
+    def test_history_targets_resolve_each_quarter(self):
+        """Each pill gets the target of the quarter it ran in."""
+        from app import _build_load_management_payload
+
+        manager = self._manager(
+            {
+                "target_wh": 100,
+                "target_wh_schedule": [
+                    {"time_range": "00:00-12:30", "target_wh": 0},
+                    {"time_range": "12:30-00:00", "target_wh": 100},
+                ],
+            },
+            datetime(2026, 5, 7, 12, 32, tzinfo=timezone.utc),
+        )
+        self._cache_with_metrics(self._metrics(
+            datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc),
+            datetime(2026, 5, 7, 12, 32, tzinfo=timezone.utc),
+            3600,
+        ))
+
+        payload = _build_load_management_payload(manager)
+
+        self.assertEqual(
+            payload["history_targets"],
+            {
+                "QH1": {"target_wh": 100, "hysteresis_wh": 33},
+                "QH2": {"target_wh": 100, "hysteresis_wh": 33},
+                "QH3": {"target_wh": 0, "hysteresis_wh": 0},
+                "QH4": {"target_wh": 0, "hysteresis_wh": 0},
+            },
+        )
+
+    def test_history_targets_empty_without_metrics(self):
+        """No cached metrics means no per-quarter map."""
+        from app import _build_load_management_payload
+
+        manager = self._manager(
+            {"target_wh": 100}, datetime(2026, 5, 7, 12, 32, tzinfo=timezone.utc)
+        )
+
+        payload = _build_load_management_payload(manager)
+
+        self.assertEqual(payload["history_targets"], {})
+
+    def test_history_targets_empty_without_fetched_at(self):
+        """A metrics dict without _fetched_at cannot be anchored."""
+        from app import _build_load_management_payload
+
+        manager = self._manager(
+            {"target_wh": 100}, datetime(2026, 5, 7, 12, 32, tzinfo=timezone.utc)
+        )
+        metrics = self._metrics(
+            datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc),
+            datetime(2026, 5, 7, 12, 32, tzinfo=timezone.utc),
+            3600,
+        )
+        del metrics["_fetched_at"]
+        self._cache_with_metrics(metrics)
+
+        payload = _build_load_management_payload(manager)
+
+        self.assertEqual(payload["history_targets"], {})
+
+    def test_history_targets_constant_for_static_target(self):
+        """A static target repeats for every quarter."""
+        from app import _build_load_management_payload
+
+        manager = self._manager(
+            {"target_wh": -9}, datetime(2026, 5, 7, 12, 32, tzinfo=timezone.utc)
+        )
+        self._cache_with_metrics(self._metrics(
+            datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc),
+            datetime(2026, 5, 7, 12, 32, tzinfo=timezone.utc),
+            3600,
+        ))
+
+        payload = _build_load_management_payload(manager)
+
+        self.assertEqual(
+            payload["history_targets"],
+            {
+                "QH1": {"target_wh": -9, "hysteresis_wh": 3},
+                "QH2": {"target_wh": -9, "hysteresis_wh": 3},
+                "QH3": {"target_wh": -9, "hysteresis_wh": 3},
+                "QH4": {"target_wh": -9, "hysteresis_wh": 3},
+            },
+        )
 
 
 class TestBuildLoadManagementPayloadDisabled(unittest.TestCase):
@@ -3316,6 +3494,63 @@ class TestActiveDevicesPendingEffects(unittest.TestCase):
         self.assertIn(
             '<span class="history__pill history__pill--gen">-100</span>', html
         )
+        self.assertIn('<span class="history__pill">-50</span>', html)
+
+    def test_recent_pills_use_per_quarter_target(self):
+        """A pill is graded against the target of its own quarter.
+
+        The current target is 100 Wh. QH2 ran under a 0 Wh target and used
+        0 Wh, so it is on target and stays grey. QH3 ran under the same
+        0 Wh target and used -100 Wh, so it is below and tints gen.
+        """
+        from flask import render_template
+        import app as app_mod
+
+        def qh(raw: float) -> dict:
+            return {
+                "raw_wh": raw,
+                "wh": raw,
+                "predicted_wh": raw,
+                "prediction_w": raw / 60.0,
+                "complete": True,
+            }
+
+        metrics = {
+            "devices": [
+                {
+                    "name": "METER",
+                    "nbc": {
+                        "QH1": qh(100.0),
+                        "QH2": qh(0.0),
+                        "QH3": qh(-100.0),
+                        "QH4": qh(-50.0),
+                    },
+                }
+            ]
+        }
+        load_management = {
+            "target_wh": 100.0,
+            "history_targets": {
+                "QH2": {"target_wh": 0.0, "hysteresis_wh": 0.0},
+                "QH3": {"target_wh": 0.0, "hysteresis_wh": 0.0},
+                "QH4": {"target_wh": -50.0, "hysteresis_wh": 0.0},
+            },
+            "last_cycle_result": {"diagnostics": {"hysteresis_wh": 33.0}},
+        }
+        with app_mod.app.test_request_context():
+            html = render_template(
+                "_metrics.html",
+                metrics=metrics,
+                load_management=load_management,
+                freshness=None,
+            )
+        # QH2 = 0 Wh against its own 0 Wh target: inside the envelope.
+        self.assertIn('<span class="history__pill">0</span>', html)
+        # QH3 = -100 Wh against 0 Wh: below the envelope.
+        self.assertIn(
+            '<span class="history__pill history__pill--gen">-100</span>', html
+        )
+        # QH4 = -50 Wh against its own -50 Wh target: inside the envelope.
         self.assertIn('<span class="history__pill">-50</span>', html)
 
     def test_recent_pills_grey_when_no_envelope(self):

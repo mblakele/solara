@@ -79,7 +79,7 @@ from mockdata import MetricsMock
 import mqtt_telemetry
 from load_models import CycleResult, CycleStatus, FleetTelemetryProvisionConfig
 from sse_event import SSEBroadcaster, event_stream
-from util import CustomJSONProvider, is_debug
+from util import CustomJSONProvider, is_debug, qh_starts_for_window
 
 from tesla_oauth import bp
 
@@ -1305,6 +1305,53 @@ def sort_devices_for_display(
     return dict(sorted(devices.items(), key=lambda item: sort_key(item[0])))
 
 
+def _history_targets(
+    lm: Any, metrics_dict: dict[str, Any] | None
+) -> dict[str, dict[str, int]]:
+    """Per-quarter target envelope for the index page's Recent pills.
+
+    The Recent pills show QH2-QH4 of the NBC window. Each pill must be
+    graded against the target that was in effect during its own quarter, so
+    the map resolves at each slot's wall-clock start instead of the current
+    time.
+
+    Args:
+        lm: LoadManager instance that owns target resolution.
+        metrics_dict: Full metrics dict from ``EnergyCache.full_metrics_dict``.
+            Its top-level ``data_start`` and ``_fetched_at`` and the nbc
+            device's ``per_second_data`` describe the window behind the nbc
+            set.
+
+    Returns:
+        Dict of QH name to ``{"target_wh": ..., "hysteresis_wh": ...}``.
+        Empty when the window cannot be identified.
+    """
+    if not metrics_dict:
+        return {}
+    data_start = metrics_dict.get("data_start")
+    fetched_at = metrics_dict.get("_fetched_at")
+    nbc_device = next(
+        (d for d in (metrics_dict.get("devices") or []) if d.get("nbc")),
+        None,
+    )
+    if data_start is None or fetched_at is None or nbc_device is None:
+        return {}
+    sample_count = len(nbc_device.get("per_second_data") or [])
+    if sample_count <= 0:
+        return {}
+    starts = qh_starts_for_window(data_start, sample_count, fetched_at)
+    history: dict[str, dict[str, int]] = {}
+    for qh_key, quarter in (nbc_device.get("nbc") or {}).items():
+        start = starts.get(qh_key)
+        if quarter is None or start is None:
+            continue
+        history[qh_key] = {
+            "target_wh": lm.target_wh_at(start),
+            "hysteresis_wh": lm.hysteresis_wh_at(start),
+        }
+    return history
+
+
 def _build_load_management_payload(lm: Any = None) -> dict:
     """Build a load management state payload for the index endpoint.
 
@@ -1362,6 +1409,9 @@ def _build_load_management_payload(lm: Any = None) -> dict:
         "enabled": lm.enabled,
         "dry_run": lm.dry_run,
         "target_wh": lm.target_wh,
+        "history_targets": _history_targets(
+            lm, state.energy_cache.full_metrics_dict
+        ),
         "nbc_device": lm.nbc_device,
         "state": state_dict,
         "sentinel_names": sentinel_names,

@@ -265,6 +265,69 @@ def is_stale_trailing_qh(
         is not TrailingChunkKind.CURRENT
     )
 
+
+def qh_starts_for_window(
+    data_start: datetime,
+    sample_count: int,
+    now: datetime,
+    max_shortfall_secs: int = FINALIZE_MAX_SHORTFALL_SECS,
+) -> dict[str, datetime]:
+    """Return the wall-clock start of each QH slot for a fetch window.
+
+    The slot set and the starts follow ``compute_nbc_quarters`` and
+    ``PredictionMixin._compute_nbc``. While the trailing chunk is current the
+    most recent slot is QH1. A near-full finished chunk becomes QH2. A short
+    finished chunk leaves QH2 empty and starts the fallback at QH3.
+
+    Slots older than the most recent one step back in ``QH_PERIOD_SECONDS``
+    increments. The map therefore also names slots that
+    ``inject_completed_qh`` fills from ``CompletedNBCPeriod`` records, which
+    carry no per-second data of their own. Callers intersect the map with the
+    quarters that are actually present.
+
+    Args:
+        data_start: Wall-clock start of the first sample in the window.
+        sample_count: Number of contiguous one-second samples in the window.
+        now: Wall-clock time the window was classified with. Use the fetch
+            instant, not the render time.
+        max_shortfall_secs: Largest missing-seconds count still accepted as
+            near full. Passed through to ``classify_trailing_chunk``.
+
+    Returns:
+        Dict of QH name to the wall-clock start of that quarter, from the
+        most recent slot back to QH4. Empty when the window holds no quarter.
+    """
+    if sample_count <= 0:
+        return {}
+    chunk_start = trailing_chunk_start(data_start, sample_count)
+    info = classify_trailing_chunk(
+        data_start, sample_count, now, max_shortfall_secs=max_shortfall_secs
+    )
+    if info.kind is TrailingChunkKind.CURRENT:
+        latest_index = 0
+        latest_start = chunk_start
+        if sample_count % QH_PERIOD_SECONDS == 0:
+            # The window ends on a boundary, so the last complete quarter is
+            # the most recent slot.
+            latest_start -= timedelta(seconds=QH_PERIOD_SECONDS)
+    elif info.kind is TrailingChunkKind.FINISHED_NEAR_FULL:
+        latest_index = 1
+        latest_start = chunk_start
+    else:
+        if sample_count - info.sample_count <= 0:
+            # The dropped chunk is the whole window: no complete quarter
+            # precedes it, so the nbc set is empty.
+            return {}
+        latest_index = 2
+        latest_start = chunk_start - timedelta(seconds=QH_PERIOD_SECONDS)
+    return {
+        name: latest_start
+        - timedelta(seconds=QH_PERIOD_SECONDS * (index - latest_index))
+        for index, name in enumerate(QH_NAMES)
+        if index >= latest_index
+    }
+
+
 @dataclass(frozen=True)
 class NBCQuarter:
     """NBC (Non-Bypassable Charge) metrics for a single 15-minute quarter-hour.

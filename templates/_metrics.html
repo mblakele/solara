@@ -209,17 +209,25 @@
       <div class="demand__label">Recent</div>
       {% set hist_target = load_management.get("target_wh") if load_management else none %}
       {% set hist_hyst = diag.hysteresis_wh if diag else none %}
+      {# Per-quarter envelope: each pill is graded against the target that
+         was in effect during its own quarter, not the current one. The
+         payload map carries one entry per QH slot; without it the pills
+         fall back to the current target. #}
+      {% set hist_env = load_management.get("history_targets") if load_management else none %}
       {# QH2 is the headline when QH1 is absent; start at QH3 so the same
          value is not shown twice. #}
       {% set hist_keys = ["QH3", "QH4"] if qh1 is none else ["QH2", "QH3", "QH4"] %}
       {% for qh_key in hist_keys %}
       {% set qh = vd.nbc.get(qh_key) %}
       {% if qh is not none and qh is not false %}
+      {% set qh_env = hist_env.get(qh_key) if hist_env else none %}
+      {% set qh_target = qh_env.target_wh if qh_env else hist_target %}
+      {% set qh_hyst = qh_env.hysteresis_wh if qh_env else hist_hyst %}
       {% set pill_class = "" %}
-      {% if hist_target is not none and hist_hyst is not none %}
-      {% if qh.raw_wh > hist_target + hist_hyst %}
+      {% if qh_target is not none and qh_hyst is not none %}
+      {% if qh.raw_wh > qh_target + qh_hyst %}
       {% set pill_class = " history__pill--load" %}
-      {% elif qh.raw_wh < hist_target - hist_hyst %}
+      {% elif qh.raw_wh < qh_target - qh_hyst %}
       {% set pill_class = " history__pill--gen" %}
       {% endif %}
       {% endif %}

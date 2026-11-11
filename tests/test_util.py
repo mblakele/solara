@@ -7,7 +7,7 @@ Covers:
 
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -18,6 +18,7 @@ from util import (
     complete_quarter,
     compute_nbc_quarter,
     is_stale_trailing_qh,
+    qh_starts_for_window,
     TrailingChunkKind,
 )
 
@@ -604,3 +605,120 @@ class TestStaleTrailingQH:
         assert (
             is_stale_trailing_qh(self.DATA_START, sample_count, now) is expected
         )
+
+
+class TestQhStartsForWindow:
+    """Wall-clock start of each QH slot for a fetch window.
+
+    ``data_start`` is 16:15. The starts follow ``compute_nbc_quarters`` and
+    ``PredictionMixin._compute_nbc``: the most recent slot is QH1 while the
+    trailing chunk is current, QH2 after a near-full finalize, and QH3 after
+    a short one. Older slots step back in 900-second increments, so the map
+    also covers slots that ``inject_completed_qh`` fills from
+    ``CompletedNBCPeriod`` records.
+    """
+
+    DATA_START = datetime(2026, 11, 5, 16, 15, 0, tzinfo=timezone.utc)
+    UTC = timezone.utc
+
+    def test_current_partial_window(self) -> None:
+        """A partial trailing chunk is QH1; older slots step back 900 s."""
+        starts = qh_starts_for_window(
+            self.DATA_START,
+            899,
+            datetime(2026, 11, 5, 16, 29, 59, tzinfo=self.UTC),
+        )
+        assert starts == {
+            "QH1": datetime(2026, 11, 5, 16, 15, tzinfo=self.UTC),
+            "QH2": datetime(2026, 11, 5, 16, 0, tzinfo=self.UTC),
+            "QH3": datetime(2026, 11, 5, 15, 45, tzinfo=self.UTC),
+            "QH4": datetime(2026, 11, 5, 15, 30, tzinfo=self.UTC),
+        }
+
+    def test_current_window_ending_on_boundary(self) -> None:
+        """A window that ends on a boundary makes the last full quarter QH1."""
+        starts = qh_starts_for_window(
+            self.DATA_START,
+            1800,
+            datetime(2026, 11, 5, 16, 32, tzinfo=self.UTC),
+        )
+        assert starts == {
+            "QH1": datetime(2026, 11, 5, 16, 30, tzinfo=self.UTC),
+            "QH2": datetime(2026, 11, 5, 16, 15, tzinfo=self.UTC),
+            "QH3": datetime(2026, 11, 5, 16, 0, tzinfo=self.UTC),
+            "QH4": datetime(2026, 11, 5, 15, 45, tzinfo=self.UTC),
+        }
+
+    def test_near_full_finalize_starts_at_qh2(self) -> None:
+        """A near-full finished chunk becomes QH2; QH1 is absent."""
+        starts = qh_starts_for_window(
+            self.DATA_START,
+            899,
+            datetime(2026, 11, 5, 16, 30, 25, tzinfo=self.UTC),
+        )
+        assert starts == {
+            "QH2": datetime(2026, 11, 5, 16, 15, tzinfo=self.UTC),
+            "QH3": datetime(2026, 11, 5, 16, 0, tzinfo=self.UTC),
+            "QH4": datetime(2026, 11, 5, 15, 45, tzinfo=self.UTC),
+        }
+
+    def test_short_finalize_starts_at_qh3(self) -> None:
+        """A short finished chunk leaves QH2 empty; the fallback starts at QH3."""
+        starts = qh_starts_for_window(
+            self.DATA_START,
+            1739,
+            datetime(2026, 11, 5, 16, 45, 7, tzinfo=self.UTC),
+        )
+        assert starts == {
+            "QH3": datetime(2026, 11, 5, 16, 15, tzinfo=self.UTC),
+            "QH4": datetime(2026, 11, 5, 16, 0, tzinfo=self.UTC),
+        }
+
+    def test_short_finalize_without_complete_quarter_is_empty(self) -> None:
+        """A dropped chunk that is the whole window names no quarter."""
+        starts = qh_starts_for_window(
+            self.DATA_START,
+            839,
+            datetime(2026, 11, 5, 16, 45, 7, tzinfo=self.UTC),
+        )
+        assert starts == {}
+
+    def test_missing_window_starts_at_qh3(self) -> None:
+        """A whole missing trailing window still starts the fallback at QH3."""
+        starts = qh_starts_for_window(
+            self.DATA_START,
+            900,
+            datetime(2026, 11, 5, 16, 45, tzinfo=self.UTC),
+        )
+        assert starts == {
+            "QH3": datetime(2026, 11, 5, 16, 15, tzinfo=self.UTC),
+            "QH4": datetime(2026, 11, 5, 16, 0, tzinfo=self.UTC),
+        }
+
+    def test_short_window_still_maps_qh2_to_qh4(self) -> None:
+        """A 100-sample window maps every slot; injection fills QH2-QH4."""
+        starts = qh_starts_for_window(
+            self.DATA_START,
+            100,
+            datetime(2026, 11, 5, 16, 16, 40, tzinfo=self.UTC),
+        )
+        assert set(starts) == {"QH1", "QH2", "QH3", "QH4"}
+        assert starts["QH2"] == datetime(2026, 11, 5, 16, 0, tzinfo=self.UTC)
+
+    @pytest.mark.parametrize(
+        "sample_count,now",
+        [
+            (100, datetime(2026, 11, 5, 16, 16, 40, tzinfo=timezone.utc)),
+            (899, datetime(2026, 11, 5, 16, 29, 59, tzinfo=timezone.utc)),
+            (1800, datetime(2026, 11, 5, 16, 32, 0, tzinfo=timezone.utc)),
+            (2700, datetime(2026, 11, 5, 17, 2, 0, tzinfo=timezone.utc)),
+        ],
+    )
+    def test_qh1_start_matches_sample_alignment(
+        self, sample_count: int, now: datetime
+    ) -> None:
+        """QH1 starts at the first sample of the trailing chunk."""
+        starts = qh_starts_for_window(self.DATA_START, sample_count, now)
+        remainder = sample_count % 900
+        first_sample = sample_count - (remainder or 900)
+        assert starts["QH1"] == self.DATA_START + timedelta(seconds=first_sample)

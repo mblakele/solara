@@ -840,6 +840,14 @@ Sample contiguity and its consequences: see "Per-second sample contiguity" above
   line (INFO for near full, WARNING for short). The index template shows the finalized
   QH2 value as the headline while the warn label stays visible, and `Recent` starts at
   QH3 so that value is not shown twice.
+- `Recent` pill targets: the three "Recent" pills (QH2-QH4) are graded against the target
+  that was in effect during their own quarter, not the current one. `_history_targets` in
+  `app.py` builds a `history_targets` map (QH slot to `target_wh` + `hysteresis_wh`) for
+  the index payload. Slot starts come from `util.qh_starts_for_window` over the fetch
+  window (`data_start` plus the nbc device's `per_second_data` length, classified with
+  `_fetched_at`), and the target is resolved by `LoadManager.target_wh_at` /
+  `hysteresis_wh_at`. Without the map the template falls back to the current `target_wh`
+  and `diagnostics.hysteresis_wh`.
 
 ## Key Architecture
 - LoadManager orchestrates cycles every 30 seconds via background thread, calling `run_cycle(force=False)` by default.
